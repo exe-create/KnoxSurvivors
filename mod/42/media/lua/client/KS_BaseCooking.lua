@@ -99,10 +99,11 @@ local function usable(object)
         return call(container, "isPowered", false) == true
     end
     if call(container, "isPowered", false) == true then return true end
-    -- Gas/wood stoves: accept if they can heat (temperature/fuel available).
+    -- Residual heat is observable here. Fuel-backed stove semantics are not
+    -- inferred without a supported native fuel signal.
     local temp = call(object, "getCurrentTemperature", 0)
     if tonumber(temp) ~= nil and tonumber(temp) > 0 then return true end
-    return true
+    return false
 end
 
 local function applianceType(object)

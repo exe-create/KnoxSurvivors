@@ -34,6 +34,7 @@ local GROUP_DEFENSE_RADIUS = 12
 local pairStates = {}
 local pendingMeetings = {}
 local lastGroupAssignmentTick = -60
+local groupAssignmentRefreshRequested = false
 local lastFactionEvaluationTick = -600
 local lastBaseScoutingTick = -600
 
@@ -297,13 +298,28 @@ local function readPendingMeet(id)
     return state.pendingMeet
 end
 
-local function clearPendingMeet(id)
+local function pendingMeetToken(intent)
+    if type(intent) ~= "table" then return nil end
+    return {
+        pairPhase = intent.pairPhase,
+        kind = intent.kind,
+        atHours = tonumber(intent.atHours) or 0,
+    }
+end
+
+local function clearPendingMeet(id, otherId, token)
     if KnoxPersistence.getUnloadedSurvivalState == nil
         or KnoxPersistence.setUnloadedSurvivalState == nil then
         return
     end
     local ok, state = pcall(KnoxPersistence.getUnloadedSurvivalState, id)
-    if ok and type(state) == "table" and state.pendingMeet ~= nil then
+    local intent = ok and type(state) == "table" and state.pendingMeet or nil
+    if type(intent) == "table"
+        and tostring(intent.with) == tostring(otherId)
+        and type(token) == "table"
+        and intent.pairPhase == token.pairPhase
+        and intent.kind == token.kind
+        and (tonumber(intent.atHours) or 0) == token.atHours then
         state.pendingMeet = nil
         pcall(KnoxPersistence.setUnloadedSurvivalState, id, state)
     end
@@ -326,16 +342,27 @@ function Relationships.pendingMeetOutcome(firstId, secondId, worldAge)
     end
     if intent == nil then return nil end
     local age = now - (tonumber(intent.atHours) or 0)
-    if age < 0 or age > Relationships.PENDING_MEET_FRESH_HOURS then return nil end
-    if intent.kind == "rob" then return "hostile" end
-    if intent.kind == "tail" then return "lure" end
-    if intent.kind == "befriend" or intent.kind == "greet" then return "greet" end
+    if age < 0 then return nil end
+    if age > Relationships.PENDING_MEET_FRESH_HOURS then
+        local token = pendingMeetToken(intent)
+        clearPendingMeet(firstId, secondId, token)
+        clearPendingMeet(secondId, firstId, token)
+        return nil
+    end
+    local token = pendingMeetToken(intent)
+    if intent.kind == "rob" then return "hostile", token end
+    if intent.kind == "tail" then return "lure", token end
+    if intent.kind == "befriend" or intent.kind == "greet" then
+        return "greet", token
+    end
     return nil
 end
 
-function Relationships.consumePendingMeet(firstId, secondId)
-    clearPendingMeet(firstId)
-    clearPendingMeet(secondId)
+function Relationships.consumePendingMeet(firstId, secondId, pairPhase)
+    if type(pairPhase) ~= "table" then return false end
+    clearPendingMeet(firstId, secondId, pairPhase)
+    clearPendingMeet(secondId, firstId, pairPhase)
+    return true
 end
 
 -- A nearby ally may defend a threatened member for this loaded encounter.
@@ -559,11 +586,12 @@ local function observePair(first, second, worldAge, ticks, participants)
         if canMeet and cooldownComplete then
             -- Offscreen history takes priority: a pair that met out there
             -- resolves that intent first when both load near each other.
-            local pendingOverride = Relationships.pendingMeetOutcome(first.id, second.id, worldAge)
+            local pendingOverride, pendingMeetToken = Relationships.pendingMeetOutcome(
+                first.id, second.id, worldAge
+            )
             local outcome = pendingOverride
                 or decideEncounterOutcome(first.id, second.id, record)
             if pendingOverride ~= nil then
-                Relationships.consumePendingMeet(first.id, second.id)
                 print(TAG .. " pending-meet-override=" .. first.id .. "," .. second.id
                     .. " outcome=" .. tostring(pendingOverride))
             end
@@ -609,6 +637,7 @@ local function observePair(first, second, worldAge, ticks, participants)
                     phase = "REQUESTED",
                     startedAt = ticks,
                     outcome = outcome,
+                    pendingMeetToken = pendingMeetToken,
                     aggressorId = aggressorId,
                     firstGroupId = firstGroup ~= nil and firstGroup.id or nil,
                     secondGroupId = secondGroup ~= nil and secondGroup.id or nil,
@@ -707,8 +736,8 @@ local function abortMeeting(key, meeting, first, second, ticks, reason)
         .. " reason=" .. tostring(reason))
 end
 
-local function assignGroupLeaders(controllers, orderedIds, ticks)
-    if ticks - lastGroupAssignmentTick < 60 then
+local function assignGroupLeaders(controllers, orderedIds, ticks, forceReadOnly)
+    if not forceReadOnly and ticks - lastGroupAssignmentTick < 60 then
         return
     end
     lastGroupAssignmentTick = ticks
@@ -757,21 +786,26 @@ local function assignGroupLeaders(controllers, orderedIds, ticks)
                     formationSlot,
                     #(group.memberIds or {}),
                     objective,
-                    leaderOrder
+                    leaderOrder,
+                    forceReadOnly
                 )
                 controller:setGroupMembers(members)
             elseif group ~= nil then
-                if controller.lifeIntent ~= nil then
-                    KnoxPersistence.setTravelGroupObjective(
-                        group.id,
-                        id,
-                        controller.lifeIntent,
-                        now
-                    )
-                else
-                    KnoxPersistence.clearTravelGroupObjective(group.id, id)
+                if not forceReadOnly then
+                    if controller.lifeIntent ~= nil then
+                        KnoxPersistence.setTravelGroupObjective(
+                            group.id,
+                            id,
+                            controller.lifeIntent,
+                            now
+                        )
+                    else
+                        KnoxPersistence.clearTravelGroupObjective(group.id, id)
+                    end
                 end
-                objective = KnoxPersistence.getTravelGroupObjective(group.id)
+                if not forceReadOnly then
+                    objective = KnoxPersistence.getTravelGroupObjective(group.id)
+                end
                 local members = {}
                 for _, memberId in ipairs(group.memberIds or {}) do
                     local member = controllers[memberId]
@@ -781,7 +815,7 @@ local function assignGroupLeaders(controllers, orderedIds, ticks)
                 end
                 controller:clearGroupLeader()
                 controller:setGroupMembers(members)
-                controller:setGroupObjective(objective)
+                controller:setGroupObjective(objective, forceReadOnly)
                 if controller.setGroupLeaderOrder ~= nil then
                     controller:setGroupLeaderOrder(leaderOrder)
                 end
@@ -794,8 +828,21 @@ local function assignGroupLeaders(controllers, orderedIds, ticks)
     end
 end
 
+-- Persistence owns membership and asks the existing coordinator to refresh
+-- loaded projections on its next tick. This request is transient and contains
+-- no group state of its own.
+function Relationships.requestGroupAssignmentRefresh()
+    groupAssignmentRefreshRequested = true
+    return true
+end
+
 function Relationships.coordinate(controllers, orderedIds, ticks)
-    assignGroupLeaders(controllers, orderedIds, ticks)
+    if groupAssignmentRefreshRequested then
+        groupAssignmentRefreshRequested = false
+        assignGroupLeaders(controllers, orderedIds, ticks, true)
+    else
+        assignGroupLeaders(controllers, orderedIds, ticks)
+    end
     if KnoxSettings.allowNPCFactions()
         and ticks - lastFactionEvaluationTick >= 600 and getGameTime() ~= nil then
         lastFactionEvaluationTick = ticks
@@ -936,9 +983,22 @@ function Relationships.coordinate(controllers, orderedIds, ticks)
                         pcall(function() signals.play(victim.character, "surrender") end)
                     end
                     victim:holdForRobbery(aggressor, ticks)
-                    if not aggressor:beginRobbery(victim, ticks) then
+                    local robberyStarted = aggressor:beginRobbery(victim, ticks)
+                    if not robberyStarted then
                         victim:releaseRobberyHold(aggressor.character, ticks, "no_transfer")
                         aggressor:resumeAfterGreeting(ticks)
+                    end
+                    if conflict ~= nil or robberyStarted then
+                        Relationships.consumePendingMeet(
+                            first.id, second.id, meeting.pendingMeetToken
+                        )
+                    else
+                        -- Keep the durable offscreen intent for a later
+                        -- attempt, but do not re-elect the same failed
+                        -- loaded handoff on every coordinator tick.
+                        recordEncounterCooldown(
+                            first.id, second.id, "neutral", worldAge, ABORT_COOLDOWN_HOURS
+                        )
                     end
                     pendingMeetings[key] = nil
                     print(
@@ -958,6 +1018,11 @@ function Relationships.coordinate(controllers, orderedIds, ticks)
                     if dispositionRecord ~= nil then
                         recordFinalizedEncounter(first.id, second.id, "declined", worldAge)
                     end
+                    if dispositionRecord ~= nil then
+                        Relationships.consumePendingMeet(
+                            first.id, second.id, meeting.pendingMeetToken
+                        )
+                    end
                     first:resumeAfterGreeting(ticks)
                     second:resumeAfterGreeting(ticks)
                     pendingMeetings[key] = nil
@@ -972,6 +1037,9 @@ function Relationships.coordinate(controllers, orderedIds, ticks)
                         GREETING_COOLDOWN_HOURS
                     )
                     recordFinalizedEncounter(first.id, second.id, "friendly", worldAge)
+                    Relationships.consumePendingMeet(
+                        first.id, second.id, meeting.pendingMeetToken
+                    )
                     local greetSignals = rawget(_G, "KnoxOrderSignals")
                     if greetSignals ~= nil and greetSignals.play ~= nil then
                         pcall(function() greetSignals.play(first.character, "wavehi") end)
@@ -1017,6 +1085,9 @@ function Relationships.coordinate(controllers, orderedIds, ticks)
                         second:resumeAfterGreeting(ticks)
                         pendingMeetings[key] = nil
                         recordFinalizedEncounter(first.id, second.id, "parted", worldAge)
+                        Relationships.consumePendingMeet(
+                            first.id, second.id, meeting.pendingMeetToken
+                        )
                         print(
                             TAG .. " encounter-outcome=join-rejected "
                                 .. first.id .. "," .. second.id
@@ -1034,6 +1105,9 @@ function Relationships.coordinate(controllers, orderedIds, ticks)
                         )
                         if group ~= nil then
                         recordFinalizedEncounter(first.id, second.id, "joined", worldAge)
+                        Relationships.consumePendingMeet(
+                            first.id, second.id, meeting.pendingMeetToken
+                        )
                         end
                         first:resumeAfterGreeting(ticks)
                         second:resumeAfterGreeting(ticks)
@@ -1059,6 +1133,7 @@ function Relationships.resetRuntime()
     pairStates = {}
     pendingMeetings = {}
     lastGroupAssignmentTick = -60
+    groupAssignmentRefreshRequested = false
     lastFactionEvaluationTick = -600
     lastBaseScoutingTick = -600
 end

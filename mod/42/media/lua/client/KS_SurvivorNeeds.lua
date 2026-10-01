@@ -1,5 +1,6 @@
 require "TimedActions/ISEatFoodAction"
 require "TimedActions/ISDrinkFromBottle"
+require "TimedActions/ISTakeWaterAction"
 require "TimedActions/ISTimedActionQueue"
 require "KS_SurvivalMedical"
 require "KS_SurvivorMedicalActions"
@@ -80,13 +81,15 @@ local function waterState(item)
     if fluid:isEmpty() or not fluid:isWaterSource() then
         return nil
     end
-    local tainted = false
+    -- Unknown fluid state is not potable by default. Native drinking checks
+    -- this same tag and can apply sickness/poison, so a missing enum or failed
+    -- accessor must not be treated as clean water.
     local success, result = pcall(function()
+        if Fluid == nil or Fluid.TaintedWater == nil then return nil end
         return fluid:contains(Fluid.TaintedWater)
     end)
-    if success then
-        tainted = result == true
-    end
+    if not success or type(result) ~= "boolean" then return nil end
+    local tainted = result
     return { item = item, tainted = tainted, amount = fluid:getAmount() }
 end
 
@@ -112,6 +115,22 @@ end
 function Needs.isWaterItem(item, allowTainted)
     local state = waterState(item)
     return state ~= nil and (allowTainted or not state.tainted)
+end
+
+-- Loaded IsoObjects expose the same real fluid/taint facts used by vanilla's
+-- ISTakeWaterAction. Missing accessors and unreadable taint fail closed.
+function Needs.waterSourceState(source)
+    if source == nil then return nil end
+    local ok, hasFluid, amount, tainted = pcall(function()
+        if source.hasFluid == nil or source.getFluidAmount == nil
+            or source.isTaintedWater == nil then return nil, nil, nil end
+        return source:hasFluid(), source:getFluidAmount(), source:isTaintedWater()
+    end)
+    amount = ok and tonumber(amount) or nil
+    if not ok or type(hasFluid) ~= "boolean" or amount == nil or amount < 0
+        or type(tainted) ~= "boolean" then return nil end
+    return { source = source, amount = amount,
+        available = hasFluid and amount > 0, tainted = tainted }
 end
 
 -- Smoking runs through the same native eat action as food: vanilla
@@ -376,6 +395,34 @@ function Needs.execute(character, decision)
             item = decision.item,
         })
     end
+    if decision.kind == "drink_world" then
+        local sourceState = Needs.waterSourceState(decision.source)
+        if sourceState == nil or not sourceState.available then
+            return report(nil, "water_source_unavailable")
+        end
+        if sourceState.tainted and decision.state.thirst < 0.90 then
+            return report(nil, "tainted_water_not_emergency_eligible")
+        end
+        -- Vanilla rejects this action when inventory is full even for direct
+        -- drinking. Do not make room or bypass that native check.
+        local fullOk, full = pcall(function() return character:hasFullInventory() end)
+        if fullOk and full == true then
+            return report(nil, "native_water_action_refused_full_inventory")
+        end
+        local action = ISTakeWaterAction:new(
+            character, nil, decision.source, sourceState.tainted)
+        ISTimedActionQueue.add(action)
+        if not actionAccepted(character, action) then
+            return report(nil, "native_water_action_queue_rejected")
+        end
+        return report(action, "queued_native_water_drink", {
+            kind = "drink_world",
+            before = decision.state,
+            source = decision.source,
+            sourceAmount = sourceState.amount,
+            tainted = sourceState.tainted,
+        })
+    end
     if decision.kind == "eat" then
         local benefit = math.max(0.01, math.abs(decision.item:getHungerChange()))
         local percentage = math.max(
@@ -453,6 +500,16 @@ function Needs.verify(character, intent)
     if intent.kind == "drink" then
         return after.thirst < intent.before.thirst - NEED_CHANGE_EPSILON,
             "thirst=" .. tostring(intent.before.thirst) .. "->" .. tostring(after.thirst)
+    end
+    if intent.kind == "drink_world" then
+        local sourceState = Needs.waterSourceState(intent.source)
+        local thirstChanged = after.thirst < intent.before.thirst - NEED_CHANGE_EPSILON
+        local sourceChanged = sourceState ~= nil
+            and sourceState.amount < intent.sourceAmount - NEED_CHANGE_EPSILON
+        return thirstChanged and sourceChanged,
+            "thirst=" .. tostring(intent.before.thirst) .. "->" .. tostring(after.thirst)
+                .. " sourceAmount=" .. tostring(intent.sourceAmount) .. "->"
+                .. tostring(sourceState ~= nil and sourceState.amount or "unavailable")
     end
     if intent.kind == "bandage" then
         local treated = intent.bodyPart ~= nil

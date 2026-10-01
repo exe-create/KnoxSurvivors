@@ -12,6 +12,9 @@ local KS_SafeCall = require "KS_SafeCall"
 local Firearms = rawget(_G, "KnoxFirearmSupport") or {}
 _G.KnoxFirearmSupport = Firearms
 local FIREARM_SWITCH_MARGIN = 1.5
+-- Forward declaration: exact-weapon melee helpers are defined after the
+-- inventory walkers that classify them.
+local isUsableMelee
 -- This is telemetry only.  It records a successful call into the same native
 -- hook a local player uses; it never substitutes for vanilla ballistics or
 -- changes a weapon's ammunition/chamber state.
@@ -45,6 +48,13 @@ local function canShoot(character, gun)
         and safe(function()
             return ISReloadWeaponAction.canShoot(character, gun)
         end, false)
+end
+
+-- Read-only classification used by the controller to distinguish "holding a
+-- functional gun" (which may still need ammo/reload) from a melee weapon. It
+-- never inspects or mutates ammunition/chamber state.
+function Firearms.isFunctionalGun(item)
+    return isFunctionalGun(item)
 end
 
 local function queueFor(character)
@@ -202,6 +212,32 @@ local function equipMeleeFallback(id, bridge)
     return tostring(bridge:equipBestNpc(id))
 end
 
+-- Equip the exact carried melee instance rather than letting the Java chooser
+-- pick a same-type alternative. Falls back to the existing best-melee bridge
+-- when the item id or the id-based bridge is unavailable. Never creates or
+-- duplicates an item.
+local function equipExactCarriedMelee(id, character, bridge)
+    local weapon = Firearms.findCarriedMelee(character)
+    if weapon == nil then return nil, "no_carried_melee" end
+    local inventory = safe(function() return character:getInventory() end, nil)
+    if inventory ~= nil then
+        pcall(function() inventory:AddItem(weapon) end)
+    end
+    local itemId = tonumber(safe(function() return weapon:getID() end, nil))
+    if itemId ~= nil and bridge ~= nil and bridge.equipNpcOwnedWeaponById ~= nil then
+        local result = tostring(bridge:equipNpcOwnedWeaponById(
+            id, weapon:getFullType(), itemId
+        ))
+        if isUsableMelee(safe(function() return character:getPrimaryHandItem() end, nil)) then
+            return result, "melee_equipped"
+        end
+    end
+    if bridge == nil or bridge.equipBestNpc == nil then
+        return nil, "no_equip_bridge"
+    end
+    return tostring(bridge:equipBestNpc(id)), "melee_best"
+end
+
 function Firearms.preferenceFor(id)
     local persistence = rawget(_G, "KnoxPersistence")
     local policies = persistence ~= nil and persistence.getSurvivorPolicies ~= nil
@@ -265,7 +301,7 @@ local function hasUsableMelee(character)
     return false
 end
 
-local function isUsableMelee(item)
+isUsableMelee = function(item)
     if item == nil then return false end
     local weapon = KS_SafeCall.invoke(item, "IsWeapon")
     local ranged = KS_SafeCall.invoke(item, "isRanged")
@@ -311,23 +347,20 @@ end
 function Firearms.pullMeleeToHands(id, character, bridge)
     local primary = safe(function() return character:getPrimaryHandItem() end, nil)
     if isUsableMelee(primary) then return true, "already_equipped" end
-    local weapon = Firearms.findCarriedMelee(character)
-    if weapon == nil then return false, "no_carried_melee" end
-    local inventory = safe(function() return character:getInventory() end, nil)
-    if inventory ~= nil then
-        pcall(function() inventory:AddItem(weapon) end)
-    end
-    if bridge == nil or bridge.equipBestNpc == nil then
-        return isUsableMelee(safe(function() return character:getPrimaryHandItem() end, nil)),
-            "no_equip_bridge"
-    end
-    local result = tostring(bridge:equipBestNpc(id))
+    local result = equipExactCarriedMelee(id, character, bridge)
+    if result == nil then return false, "no_carried_melee" end
     return isUsableMelee(safe(function() return character:getPrimaryHandItem() end, nil)), result
 end
 
 -- This decides preference, never firearm viability. Native ammo/reload checks
 -- still decide whether a ranged choice can actually be used.
-function Firearms.wantsRanged(id, character, target)
+--
+-- `retainRanged` is a bounded hysteresis flag supplied by the controller for the
+-- encounter it has already committed to a gun. It keeps the committed class
+-- until the threat is genuinely close, so a target pacing across the
+-- survivor-choice threshold cannot flip ranged/melee every engagement. It never
+-- overrides an explicit melee order or the absence of a real threat.
+function Firearms.wantsRanged(id, character, target, retainRanged)
     local preference = Firearms.preferenceFor(id)
     if preference == "ranged" then return true, "ordered_ranged" end
     if not hasUsableMelee(character) then return true, "no_usable_melee" end
@@ -337,6 +370,9 @@ function Firearms.wantsRanged(id, character, target)
         if target == nil or character:getZ() ~= target:getZ() then return 0 end
         return (character:getX() - target:getX()) ^ 2 + (character:getY() - target:getY()) ^ 2
     end, 0)
+    if retainRanged == true and distance >= 4 then
+        return true, "survivor_choice_retained"
+    end
     -- Novices normally keep noise down. A trained shot with room to aim may
     -- choose a gun; close-pressure fallback remains owned by native combat.
     return aiming >= 4 and distance >= 9, "survivor_choice"
@@ -398,7 +434,7 @@ end
 
 -- Returns ready, reloading, or melee.  Reloading deliberately yields combat ownership
 -- for the native timed action; a later threat scan resumes once the actual weapon can fire.
-function Firearms.prepareForThreat(id, character, bridge, target)
+function Firearms.prepareForThreat(id, character, bridge, target, retainRanged)
     if character == nil or bridge == nil or bridge.equipNpcOwnedWeapon == nil then
         return "melee", "bridge_unavailable"
     end
@@ -407,9 +443,11 @@ function Firearms.prepareForThreat(id, character, bridge, target)
         return "reloading", "native_action_active"
     end
 
-    local ranged, preferenceReason = Firearms.wantsRanged(id, character, target)
+    local ranged, preferenceReason = Firearms.wantsRanged(
+        id, character, target, retainRanged
+    )
     if not ranged then
-        return "melee", preferenceReason .. " " .. equipMeleeFallback(id, bridge)
+        return "melee", preferenceReason .. " " .. Firearms.fallbackToMelee(id, bridge, character)
     end
 
     local ready = bestReadyGun(character)
@@ -421,7 +459,7 @@ function Firearms.prepareForThreat(id, character, bridge, target)
     local reloadable = bestReloadableGun(character)
     if reloadable == nil then
         diagFirearm(id, "no_usable_firearm", nil)
-        return "melee", "no_usable_firearm " .. equipMeleeFallback(id, bridge)
+        return "melee", "no_usable_firearm " .. Firearms.fallbackToMelee(id, bridge, character)
     end
     local equipped, result = equip(id, character, bridge, reloadable)
     if not equipped then
@@ -437,14 +475,24 @@ function Firearms.prepareForThreat(id, character, bridge, target)
         return "reloading", preparation
     end
     diagFirearm(id, "reload_failed", { detail = tostring(preparation) })
-    return "melee", preparation .. " " .. equipMeleeFallback(id, bridge)
+    return "melee", preparation .. " " .. Firearms.fallbackToMelee(id, bridge, character)
 end
 
 function Firearms.isReady(character, gun)
     return canShoot(character, gun)
 end
 
-function Firearms.fallbackToMelee(id, bridge)
+-- Release firearm ownership and hold an actually carried melee weapon. When a
+-- character is supplied and already holds usable melee, this is a no-op so a
+-- bounded fallback window cannot repeatedly reset the native melee model/hand
+-- state. Only a real carried melee instance is equipped; nothing is fabricated.
+function Firearms.fallbackToMelee(id, bridge, character)
+    if character ~= nil then
+        local primary = safe(function() return character:getPrimaryHandItem() end, nil)
+        if isUsableMelee(primary) then return "already_armed_melee" end
+        local result = equipExactCarriedMelee(id, character, bridge)
+        if result ~= nil then return result end
+    end
     return equipMeleeFallback(id, bridge)
 end
 

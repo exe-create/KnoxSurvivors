@@ -27,6 +27,7 @@ local DEFAULTS = {
     NPCFactionMinimumMembers = 4,
     NPCFactionMaxMembers = 8,
     AllowHostileEncounters = true,
+    AllowAutonomousRetreat = true,
     AllowFactionRaids = false,
     FactionRaidMinimumDays = 14,
     FactionRaidIntervalDays = 7,
@@ -34,6 +35,7 @@ local DEFAULTS = {
     ShowActivityFeed = true,
     ShowSurvivorSpeech = true,
     OrderGestures = true,
+    ShowRadialOrders = true,
     ShowLegacyContextCommands = false,
     AllowSurvivorDoorWindowOpening = true,
     CautiousTravel = true,
@@ -45,7 +47,6 @@ local DEFAULTS = {
     AllowSurvivorPlayerCombat = true,
     UseReputation = true,
     EnableDeveloperTools = false,
-    AutomatedQAMode = false,
     IgnoreJobResourceRequirements = false,
     DeveloperScenario = 1,
     DeveloperSpawnDistance = 10,
@@ -224,6 +225,10 @@ function Settings.allowHostileEncounters()
     return value("AllowHostileEncounters") ~= false
 end
 
+function Settings.allowAutonomousRetreat()
+    return value("AllowAutonomousRetreat") ~= false
+end
+
 function Settings.allowFactionRaids()
     return Settings.enabled() and Settings.allowNPCFactions()
         and Settings.allowHostileEncounters() and value("AllowFactionRaids") ~= false
@@ -269,20 +274,18 @@ function Settings.orderGesturesEnabled()
     return Settings.enabled() and value("OrderGestures") ~= false
 end
 
--- Classic right-click Follow/Hold/Relax/Auto-Loot entries. Off by default:
--- the emote radial is the primary way to command. Nil-safe for old saves
--- that predate the option (value() falls back to DEFAULTS).
+function Settings.showRadialOrders()
+    return Settings.enabled() and value("ShowRadialOrders") ~= false
+end
+
+-- Optional right-click order menus. Off by default so the emote radial is the
+-- primary command surface. Nil-safe for old saves through DEFAULTS.
 function Settings.showLegacyContextCommands()
     return Settings.enabled() and value("ShowLegacyContextCommands") == true
 end
 
 function Settings.developerToolsEnabled()
     return Settings.enabled() and value("EnableDeveloperTools") == true
-end
-
-function Settings.automatedQAMode()
-    return Settings.enabled() and Settings.developerToolsEnabled()
-        and value("AutomatedQAMode") == true
 end
 
 function Settings.developerJobSuppliesEnabled()

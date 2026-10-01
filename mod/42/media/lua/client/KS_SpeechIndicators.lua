@@ -150,6 +150,17 @@ end
 
 local Overlay = ISPanel:derive("KnoxSpeechIndicatorOverlay")
 
+-- This panel spans the player's viewport only to make screen-space drawing
+-- convenient. It is not an interaction surface: never consume/capture input,
+-- even if the UI manager forwards an event to it before its mouse preference
+-- has been applied to the native element.
+function Overlay:onMouseDown() return false end
+function Overlay:onMouseUp() return false end
+function Overlay:onRightMouseDown() return false end
+function Overlay:onRightMouseUp() return false end
+function Overlay:onMouseMove() return false end
+function Overlay:onMouseMoveOutside() return false end
+
 function Overlay:prerender()
     ISPanel.prerender(self)
     Indicators.prerender(self.playerNum or 0, self)
@@ -182,6 +193,11 @@ function Indicators.panelFor(playerNum)
     if panel.setRenderThisPlayerOnly ~= nil then panel:setRenderThisPlayerOnly(playerNum) end
     panel.playerNum = playerNum
     panel:addToUIManager()
+    -- addToUIManager has now created/registered the Java UI element. Apply
+    -- the pass-through settings again at that boundary and explicitly disable
+    -- pointer capture so the full-screen render layer cannot retain input.
+    if panel.setWantMouseEvents ~= nil then panel:setWantMouseEvents(false) end
+    if panel.setCapture ~= nil then panel:setCapture(false) end
     panels[playerNum] = panel
     return panel
 end

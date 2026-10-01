@@ -4,6 +4,7 @@ require "KS_SurvivorRuntime"
 require "KS_BaseStorage"
 require "KS_ToolCupboard"
 require "KS_Settings"
+require "Util/AdjacentFreeTileFinder"
 
 local BaseManager = rawget(_G, "KnoxBaseManager") or {}
 _G.KnoxBaseManager = BaseManager
@@ -350,6 +351,185 @@ local function ensureFactionStorage(base)
     end
 end
 
+local AUTO_BED_QUALITY = {
+    goodBed = 5,
+    averageBed = 4,
+    badBed = 2,
+}
+local factionBedAttemptedMembership = {}
+
+local function bedReferenceKey(ref)
+    return table.concat({ tostring(ref.x), tostring(ref.y), tostring(ref.z),
+        tostring(ref.objectIndex) }, ":")
+end
+
+-- Faction bed placement is a projection of the faction's existing base and
+-- resident records. Only loaded native beds in that exact building are
+-- considered; no bed, square, or body is created by this pass.
+local function discoverFactionBeds(base, faction)
+    local area = base ~= nil and (base.home or faction.homeBase) or nil
+    local cell = getCell ~= nil and getCell() or nil
+    local buildingId = area ~= nil and area.buildingId or nil
+    local minX, minY = area ~= nil and tonumber(area.minX), area ~= nil and tonumber(area.minY)
+    local width, height = area ~= nil and tonumber(area.width), area ~= nil and tonumber(area.height)
+    if cell == nil or type(buildingId) ~= "string" or buildingId == ""
+        or minX == nil or minY == nil or width == nil or height == nil
+        or width < 1 or height < 1 or width * height > 4096 then
+        return {}
+    end
+    local beds = {}
+    -- Build 42 rooms can place beds on upper floors even when the base marker
+    -- was founded on the ground floor. Query only already-loaded squares.
+    for z = -2, 8 do
+        for x = minX, minX + width - 1 do
+            for y = minY, minY + height - 1 do
+                local square = cell:getGridSquare(x, y, z)
+                local building = square ~= nil and square:getBuilding() or nil
+                local definition = building ~= nil and building:getDef() or nil
+                local sameBuilding = false
+                pcall(function()
+                    sameBuilding = definition ~= nil
+                        and tostring(definition:getID()) == tostring(buildingId)
+                end)
+                if sameBuilding and square.getObjects ~= nil then
+                    local objects = square:getObjects()
+                    for objectIndex = 0, objects:size() - 1 do
+                        local object = objects:get(objectIndex)
+                        local properties = object ~= nil and object:getProperties() or nil
+                        local bedType = properties ~= nil
+                            and tostring(properties:get("BedType") or "") or ""
+                        local quality = AUTO_BED_QUALITY[bedType]
+                        local index = object ~= nil and object:getObjectIndex() or -1
+                        if quality ~= nil and index >= 0 then
+                            beds[#beds + 1] = {
+                                object = object,
+                                square = square,
+                                quality = quality,
+                                ref = { x = square:getX(), y = square:getY(),
+                                    z = square:getZ(), objectIndex = index },
+                            }
+                        end
+                    end
+                end
+            end
+        end
+    end
+    table.sort(beds, function(a, b)
+        if a.quality ~= b.quality then return a.quality > b.quality end
+        if a.ref.z ~= b.ref.z then return a.ref.z < b.ref.z end
+        if a.ref.y ~= b.ref.y then return a.ref.y < b.ref.y end
+        if a.ref.x ~= b.ref.x then return a.ref.x < b.ref.x end
+        return a.ref.objectIndex < b.ref.objectIndex
+    end)
+    return beds
+end
+
+local function ensureFactionBeds(base, faction)
+    if base == nil or faction == nil or base.ownerKind ~= "faction"
+        or base.ownerId ~= faction.id or KnoxPersistence.setFactionResidentBed == nil then
+        return 0
+    end
+    local members, seen = {}, {}
+    local function append(id)
+        if type(id) ~= "string" or seen[id] then return end
+        seen[id] = true
+        members[#members + 1] = id
+    end
+    append(faction.leaderId)
+    for _, id in ipairs(faction.memberIds or {}) do append(id) end
+    table.sort(members, function(a, b)
+        if a == faction.leaderId then return true end
+        if b == faction.leaderId then return false end
+        return a < b
+    end)
+
+    local unassignedLoaded = {}
+    for _, id in ipairs(members) do
+        local policies = KnoxPersistence.getSurvivorPolicies ~= nil
+            and KnoxPersistence.getSurvivorPolicies(id) or nil
+        local assigned = type(policies) == "table" and policies.assignedBed or nil
+        if assigned == nil or (type(assigned) == "table"
+            and assigned.autoFactionId == faction.id
+            and assigned.autoBaseId ~= base.id) then
+            local runtime = rawget(_G, "KnoxSurvivorRuntime")
+            local character = runtime ~= nil and runtime.getCharacter ~= nil
+                and runtime.getCharacter(id) or nil
+            if character ~= nil then unassignedLoaded[#unassignedLoaded + 1] = id end
+        end
+    end
+    if #unassignedLoaded == 0 then return 0 end
+    local signature = base.id .. ":" .. table.concat(unassignedLoaded, ",")
+    local now = worldAge()
+    local previous = factionBedAttemptedMembership[base.id]
+    if type(previous) == "table" and previous.signature == signature
+        and now - (tonumber(previous.atHours) or 0) < 0.5 then
+        return 0
+    end
+    factionBedAttemptedMembership[base.id] = {
+        signature = signature, atHours = now,
+    }
+
+    local beds = discoverFactionBeds(base, faction)
+    if #beds == 0 then return 0 end
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+
+    local claimed = {}
+    for _, id in ipairs(members) do
+        local policies = KnoxPersistence.getSurvivorPolicies ~= nil
+            and KnoxPersistence.getSurvivorPolicies(id) or nil
+        local assigned = type(policies) == "table" and policies.assignedBed or nil
+        if type(assigned) == "table" then
+            claimed[bedReferenceKey(assigned)] = true
+        end
+    end
+
+    local assignedCount = 0
+    for _, id in ipairs(unassignedLoaded) do
+        local policies = KnoxPersistence.getSurvivorPolicies ~= nil
+            and KnoxPersistence.getSurvivorPolicies(id) or nil
+        local assigned = type(policies) == "table" and policies.assignedBed or nil
+        local canRefresh = type(assigned) == "table"
+            and assigned.autoFactionId == faction.id
+            and assigned.autoBaseId ~= base.id
+        if assigned == nil or canRefresh then
+            local character = runtime ~= nil and runtime.getCharacter ~= nil
+                and runtime.getCharacter(id) or nil
+            if character ~= nil then
+                for _, bed in ipairs(beds) do
+                    local key = bedReferenceKey(bed.ref)
+                    if not claimed[key] then
+                        local occupiedOk, occupied = pcall(function()
+                            return bed.object:isFurnitureOccupied(character)
+                        end)
+                        -- nil means the engine could not tell us whether the
+                        -- furniture is occupied. Treat that as unavailable;
+                        -- auto-assignment must not overwrite ambiguous beds.
+                        local approachOk, approach = false, nil
+                        if occupiedOk and occupied == false then
+                            approachOk, approach = pcall(function()
+                                return AdjacentFreeTileFinder.Find(
+                                    bed.square, character, nil
+                                )
+                            end)
+                        end
+                        if approachOk and approach ~= nil then
+                            local ok = KnoxPersistence.setFactionResidentBed(
+                                id, faction.id, base.id, bed.ref, worldAge()
+                            )
+                            if ok then
+                                claimed[key] = true
+                                assignedCount = assignedCount + 1
+                            end
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return assignedCount
+end
+
 function BaseManager.get(id)
     return KnoxPersistence.getBase(id)
 end
@@ -465,6 +645,11 @@ function BaseManager.ensureFactionBase(faction)
     if base ~= nil and (base.ownerKind ~= "faction" or base.ownerId ~= faction.id) then
         print("[KnoxSurvivors][BaseManager] discarded-stale-faction-base="
             .. tostring(faction.homeBaseId) .. " faction=" .. tostring(faction.id))
+        if KnoxPersistence.clearFactionResidentBed ~= nil then
+            for _, survivorId in ipairs(faction.memberIds or {}) do
+                KnoxPersistence.clearFactionResidentBed(survivorId, faction.id)
+            end
+        end
         faction.homeBaseId = nil
         base = nil
     end
@@ -510,6 +695,9 @@ function BaseManager.ensureFactionBase(faction)
                 KnoxSurvivorRuntime.notifyDutyChanged(survivorId)
             end
         end
+        if KnoxSettings.autoGenerateBaseWorkAreas() then
+            ensureFactionBeds(base, faction)
+        end
     end
     return base, base ~= nil and result or "failed"
 end
@@ -519,6 +707,10 @@ function BaseManager.ensureFactionBases()
         BaseManager.ensureFactionBase(faction)
     end
 end
+
+-- Exposed for focused offline coverage; gameplay invokes it through the
+-- canonical faction-base refresh above.
+BaseManager.ensureFactionBeds = ensureFactionBeds
 
 function BaseManager.ensurePlayerBases()
     -- Player work areas and storage policies are explicit choices made through
@@ -672,8 +864,9 @@ function BaseManager.setStoragePolicy(baseId, object, category, containerIndex)
     KnoxBaseStorage.policies(base)
     local policy, result = KnoxPersistence.setBaseStoragePolicy(baseId, reference, category, false)
     if policy ~= nil then
-        -- Mirror the assigned type onto the world container for organization,
-        -- and grant infinite weight (native max + bypass markers).
+        -- Mirror the assigned type onto the world container and apply the
+        -- native capacity ceiling while retaining the pre-assignment value for
+        -- the existing storage-removal boundary.
         local container = object.getContainerByIndex ~= nil
             and object:getContainerByIndex(tonumber(containerIndex) or 0) or nil
         if container ~= nil then
@@ -682,7 +875,45 @@ function BaseManager.setStoragePolicy(baseId, object, category, containerIndex)
             end
             if KnoxToolCupboard ~= nil and KnoxToolCupboard.applyInfinite ~= nil then
                 pcall(function()
-                    KnoxToolCupboard.applyInfinite(object, container, policy.key)
+                    KnoxToolCupboard.applyInfinite(
+                        object, container, policy.key, containerIndex
+                    )
+                end)
+            end
+        end
+    end
+    return policy, result
+end
+
+function BaseManager.setStorageFilters(baseId, object, filters, containerIndex)
+    local base = KnoxPersistence.getBase(baseId)
+    if base == nil or object == nil
+        or not BaseManager.containsSquare(base, object:getSquare()) then
+        return nil, "outside_base"
+    end
+    if type(filters) ~= "table" then return nil, "invalid_storage_filters" end
+    for category, enabled in pairs(filters) do
+        if enabled == true and not KnoxBaseStorage.isValidFilterCategory(category) then
+            return nil, "unknown_storage_category"
+        end
+    end
+    local reference = BaseManager.containerReference(object, containerIndex, baseId)
+    if reference == nil then return nil, "not_a_container" end
+    local kind = string.lower(reference.containerType)
+    if kind == "corpse" or kind:find("water", 1, true) or kind:find("rain", 1, true) then
+        return nil, "use_item_storage"
+    end
+    local policy, result = KnoxPersistence.setBaseStorageFilters(baseId, reference, filters)
+    if policy ~= nil then
+        local container = object.getContainerByIndex ~= nil
+            and object:getContainerByIndex(tonumber(containerIndex) or 0) or nil
+        if container ~= nil then
+            if KnoxBaseStorage.syncContainerName ~= nil then
+                KnoxBaseStorage.syncContainerName(policy, container)
+            end
+            if KnoxToolCupboard ~= nil and KnoxToolCupboard.applyInfinite ~= nil then
+                pcall(function()
+                    KnoxToolCupboard.applyInfinite(object, container, policy.key, containerIndex)
                 end)
             end
         end

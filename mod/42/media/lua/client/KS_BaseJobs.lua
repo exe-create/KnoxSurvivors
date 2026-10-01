@@ -743,38 +743,34 @@ local function ensureCookingTask(base, now, character)
     return task,result
 end
 
--- RimWorld work priorities: explicit 1-4 orders eligible task groups with
--- a decisive but not absolute bonus; false (never) excludes the group from
--- automatic election. Tasks owned by several groups (barricade is both
--- woodwork and barricade) take the best number and are excluded only when
--- every owner says never. Tasks outside every group, and fully-automatic
--- survivors, behave exactly as before.
-local function workPriorityScore(priorities, taskType)
-    if type(priorities) ~= "table" then return 0, false end
+-- Player preferences only break otherwise equal selector choices. They never
+-- replace queued task urgency, existing settlement scoring, eligibility, or
+-- the task board's atomic claim. For overlapping groups, an allowed group
+-- keeps the task eligible and the strongest state wins.
+local WORK_PREFERENCE_RANK = { high = 3, normal = 2, low = 1 }
+local function workPreferenceRank(preferences, taskType)
+    if type(preferences) ~= "table" then return 2, false end
     local catalog = rawget(_G, "KnoxOrderCatalog")
     local groups = catalog ~= nil and catalog.preferenceTaskGroups or nil
-    if type(groups) ~= "table" then return 0, false end
+    if type(groups) ~= "table" then return 2, false end
     local key = tostring(taskType or "")
-    local best, owned, excluded = nil, false, true
+    local best, owned, allowed = nil, false, false
     for groupKey, set in pairs(groups) do
         if type(set) == "table" and set[key] == true then
             owned = true
-            local value = priorities[groupKey]
-            if value == false then
-                -- never from this owner; another owner may still allow
-            elseif tonumber(value) ~= nil then
-                excluded = false
-                local number = math.floor(tonumber(value))
-                if best == nil or number < best then best = number end
+            local state = preferences[groupKey] or "normal"
+            if state ~= "disabled" then
+                allowed = true
+                local rank = WORK_PREFERENCE_RANK[state] or 2
+                if best == nil or rank > best then best = rank end
             else
-                excluded = false
+                -- A task can belong to more than one group. Disabled excludes
+                -- it only when every owning group is disabled.
             end
         end
     end
-    if owned ~= true then return 0, false end
-    if excluded then return 0, true end
-    if best ~= nil then return (5 - best) * 10, false end
-    return 0, false
+    if owned and not allowed then return 2, true end
+    return best or 2, false
 end
 
 local function matchesPreference(task, preference)
@@ -943,11 +939,25 @@ function BaseJobs.selectEligibleTask(tasks, survivorId, baseId, preference, canP
             if previousJobType == "" then previousJobType = nil end
         end
     end
-    -- Explicit work priorities gate and order the automatic election below.
-    -- Nil (fully automatic) preserves historical behavior exactly.
-    local workPriorities = nil
-    if survivorId ~= nil and KnoxPersistence.getWorkPriorities ~= nil then
-        workPriorities = KnoxPersistence.getWorkPriorities(survivorId)
+    -- Work preferences apply only to a player-owned resident at this exact
+    -- base. Active companions, independent survivors, and faction residents
+    -- keep their existing autonomous behavior.
+    local workPreferences = nil
+    if survivorId ~= nil and KnoxPersistence.getWorkPreferences ~= nil
+        and KnoxPersistence.getSurvivorDuty ~= nil
+        and KnoxPersistence.getSurvivorAffiliation ~= nil then
+        local duty = KnoxPersistence.getSurvivorDuty(survivorId)
+        local affiliation = KnoxPersistence.getSurvivorAffiliation(survivorId)
+        local base = KnoxPersistence.getBase ~= nil
+            and KnoxPersistence.getBase(baseId) or nil
+        if type(duty) == "table" and duty.mode == "base"
+            and tostring(duty.baseId or "") == tostring(baseId or "")
+            and type(affiliation) == "table" and affiliation.kind == "player"
+            and affiliation.ownerId == duty.ownerId
+            and base ~= nil and base.ownerKind == "player"
+            and base.ownerId == affiliation.ownerId then
+            workPreferences = KnoxPersistence.getWorkPreferences(survivorId)
+        end
     end
     -- Keep the perimeter covered without turning every resident into a guard.
     -- Small camps need one watch; established bases get a second watcher so a
@@ -977,7 +987,7 @@ function BaseJobs.selectEligibleTask(tasks, survivorId, baseId, preference, canP
     local selectionModes = mustFillSecurity and { true, false } or { false }
     for _, securityOnly in ipairs(selectionModes) do
         for pass = 1, preferredPasses do
-            local best, bestScore, bestId = nil, nil, nil
+            local best, bestScore, bestId, bestPreferenceRank = nil, nil, nil, nil
             for _, task in ipairs(tasks) do
             -- A stale or concurrently claimed record may still be present in a
             -- caller's snapshot. Count it for coverage/fairness above, but
@@ -986,13 +996,14 @@ function BaseJobs.selectEligibleTask(tasks, survivorId, baseId, preference, canP
             local preferred = matchesPreference(task, preference)
             local taskType = canonicalTaskType(task.type)
             local securityTask = taskType == "guard" or taskType == "patrol"
-            local priorityBonus, priorityExcluded = workPriorityScore(workPriorities, taskType)
+            local preferenceRank, preferenceExcluded = workPreferenceRank(
+                workPreferences, taskType
+            )
             if available and (not securityOnly or securityTask)
                 and ((pass == 1 and preferred) or (pass == 2 and not preferred)) then
                 local eligible = survivorId == nil or canPerform(survivorId, baseId, task)
-                if eligible and priorityExcluded ~= true then
+                if eligible and preferenceExcluded ~= true then
                     local score = tonumber(task.priority) or 0
-                    score = score + priorityBonus
                     local activeOfType = activeByType[tostring(taskType or "")] or 0
                     score = score - math.min(12, activeOfType * 4)
                     score = score + skillAffinity(survivorId, taskType)
@@ -1031,8 +1042,11 @@ function BaseJobs.selectEligibleTask(tasks, survivorId, baseId, preference, canP
                     end
                     local taskId = tostring(task.id or "")
                     if best == nil or score > bestScore
-                        or (score == bestScore and taskId < bestId) then
+                        or (score == bestScore and preferenceRank > bestPreferenceRank)
+                        or (score == bestScore and preferenceRank == bestPreferenceRank
+                            and taskId < bestId) then
                         best, bestScore, bestId = task, score, taskId
+                        bestPreferenceRank = preferenceRank
                     end
                 end
             end

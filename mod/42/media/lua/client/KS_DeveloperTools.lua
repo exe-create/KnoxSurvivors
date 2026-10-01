@@ -327,6 +327,7 @@ local function onFill(playerNum, context, worldObjects, test)
     local rootOption = context:addOption("Knox Survivors - Developer Tools", nil, nil)
     local menu = ISContextMenu:getNew(context)
     context:addSubMenu(rootOption, menu)
+
     local populationOption = menu:addOption("Population Scenarios", nil, nil)
     local populationMenu = ISContextMenu:getNew(menu)
     menu:addSubMenu(populationOption, populationMenu)

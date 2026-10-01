@@ -41,8 +41,10 @@ end
 function FeedWindow:createChildren()
     ISCollapsableWindow.createChildren(self)
     if self.closeButton ~= nil then
-        self.closeButton:setVisible(false)
-        self.closeButton:setEnable(false)
+        self.closeButton:setVisible(true)
+        self.closeButton:setEnable(true)
+        self.closeButton.target = self
+        self.closeButton.onclick = FeedWindow.close
     end
     local titleHeight = self:titleBarHeight()
     local pad = 10
@@ -65,8 +67,14 @@ function FeedWindow:createChildren()
     self:addChild(self.messagePanel)
 end
 
+-- Closing the window hides it without discarding the bounded activity history.
+function FeedWindow:close()
+    ActivityFeed.hide()
+end
+
 ActivityFeed.lines = ActivityFeed.lines or {}
 ActivityFeed.window = ActivityFeed.window or nil
+ActivityFeed.userHidden = ActivityFeed.userHidden == true
 
 local function ensureWindow()
     if ActivityFeed.window ~= nil then
@@ -94,14 +102,13 @@ local function refreshWindow()
         0,
         window.messagePanel:getScrollHeight() - window.messagePanel:getHeight()
     ))
-    window:setVisible(true)
-    window:bringToTop()
+    if KnoxSettings.showActivityFeed() and not ActivityFeed.userHidden then
+        window:setVisible(true)
+        window:bringToTop()
+    end
 end
 
 local function addLine(text, colour)
-    if not KnoxSettings.showActivityFeed() then
-        return
-    end
     ActivityFeed.lines[#ActivityFeed.lines + 1] = {
         text = tostring(text),
         colour = colour,
@@ -109,7 +116,8 @@ local function addLine(text, colour)
     while #ActivityFeed.lines > MAX_LINES do
         table.remove(ActivityFeed.lines, 1)
     end
-    refreshWindow()
+    -- Visibility is presentation policy; retain bounded events while hidden.
+    if KnoxSettings.showActivityFeed() then refreshWindow() end
 end
 
 local function stableColour(key)
@@ -203,6 +211,8 @@ function ActivityFeed.reputation(character, change)
 end
 
 function ActivityFeed.show()
+    if not KnoxSettings.showActivityFeed() then return nil end
+    ActivityFeed.userHidden = false
     local window = ensureWindow()
     refreshWindow()
     window:setVisible(true)
@@ -211,19 +221,33 @@ function ActivityFeed.show()
 end
 
 function ActivityFeed.hide()
-    -- Feed stays open and resizable; X removed, so hide is a no-op that keeps it visible.
+    ActivityFeed.userHidden = true
     if ActivityFeed.window ~= nil then
-        ActivityFeed.window:setVisible(true)
-        ActivityFeed.window:bringToTop()
+        ActivityFeed.window:setVisible(false)
     end
 end
 
 function ActivityFeed.toggle()
-    ActivityFeed.show()
+    if ActivityFeed.isVisible() then
+        ActivityFeed.hide()
+        return false
+    end
+    return ActivityFeed.show() ~= nil
+end
+
+function ActivityFeed.isVisible()
+    local window = ActivityFeed.window
+    if window == nil then return false end
+    if window.isVisible ~= nil then
+        local ok, visible = pcall(function() return window:isVisible() end)
+        if ok then return visible == true end
+    end
+    return window.visible == true
 end
 
 local function reset()
     ActivityFeed.lines = {}
+    ActivityFeed.userHidden = false
     if ActivityFeed.window ~= nil then
         ActivityFeed.window:removeFromUIManager()
         ActivityFeed.window = nil

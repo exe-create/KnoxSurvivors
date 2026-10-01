@@ -1,8 +1,8 @@
 -- Knox radial orders: a vanilla-style command hierarchy on the emote radial.
 --
---   Knox Orders -> Party Orders  -> (follow/hold/relax/return/needs/autoloot)
---               -> Followers     -> <companion> -> (same + unstick)
---               -> Residents     -> <resident>  -> (needs/recall/unstick)
+--   Knox Orders -> Party Orders  -> quick commands + categorized More pages
+--               -> Followers     -> <companion> -> movement/survival/policies
+--               -> Residents     -> <resident>  -> needs/work/supply/policies
 --               -> Nearby Survivors -> <stranger> -> (talk/recruit)
 --
 -- Design rules that keep this conflict-safe:
@@ -19,7 +19,9 @@
 --     -nearby (recruit lives only in Nearby), no position-bound orders
 --     (Movement, location directives, driving stay in the world/map menus).
 --   * Absent/incompatible API (or any error) -> dormant one-line log and no
---     wrapping. Context menus and the companion HUD are untouched.
+--     wrapping. Right-click order visibility remains a separate save option.
+
+require "KS_Settings"
 
 local Radial = rawget(_G, "KnoxRadialOrders") or {}
 _G.KnoxRadialOrders = Radial
@@ -27,6 +29,15 @@ _G.KnoxRadialOrders = Radial
 local installed = false
 local loggedDormant = false
 local previousFill = nil
+
+local function featureEnabled()
+    local settings = rawget(_G, "KnoxSettings")
+    if type(settings) ~= "table" or type(settings.showRadialOrders) ~= "function" then
+        return true
+    end
+    local ok, enabled = pcall(settings.showRadialOrders)
+    return ok and enabled ~= false
+end
 
 -- Transients only: rebuilt on every fill, never persisted.
 local NEARBY_TILES_SQUARED = 49
@@ -37,8 +48,6 @@ local PARTY_ORDERS = {
     { kind = "relax", label = "Relax", fallbackIcon = "signalok" },
     { kind = "return_to_base", label = "Return to Base", fallbackIcon = "comehere" },
     { kind = "check_needs", label = "Check Needs", fallbackIcon = "signalok" },
-    { kind = "enable_autoloot", label = "Auto-Loot On", fallbackIcon = "moveout" },
-    { kind = "disable_autoloot", label = "Auto-Loot Off", fallbackIcon = "signalok" },
     { kind = "more", label = "More Orders", fallbackIcon = "group" },
 }
 
@@ -49,6 +58,10 @@ local PARTY_MORE = {
     { kind = "movements", label = "Movements", fallbackIcon = "moveout" },
     { kind = "tactics", label = "Tactics", fallbackIcon = "stop" },
     { kind = "permissions", label = "Permissions", fallbackIcon = "signalok" },
+    { kind = "vehicles", label = "Vehicles", fallbackIcon = "group" },
+    { kind = "pickup", label = "Pickup", fallbackIcon = "moveout" },
+    { kind = "formation", label = "Formation", fallbackIcon = "group" },
+    { kind = "equipment", label = "Equipment", fallbackIcon = "signalok" },
 }
 local PARTY_MOVEMENTS = {
     { kind = "regroup", label = "Regroup on Me", fallbackIcon = "comehere" },
@@ -69,19 +82,70 @@ local PARTY_PERMISSIONS = {
     { kind = "weapon_ranged", label = "Weapons: Ranged", fallbackIcon = "stop" },
     { kind = "weapon_auto", label = "Weapons: Choice", fallbackIcon = "signalok" },
 }
+local PARTY_VEHICLES = {
+    { kind = "enter_vehicle", label = "Enter My Vehicle", fallbackIcon = "group" },
+    { kind = "exit_vehicle", label = "Exit Vehicle", fallbackIcon = "back" },
+}
+local PARTY_PICKUP = {
+    { kind = "enable_autoloot", label = "Pick Up Useful Items", fallbackIcon = "moveout" },
+    { kind = "disable_autoloot", label = "Do Not Pick Up Items", fallbackIcon = "signalok" },
+}
+local PARTY_EQUIPMENT = {
+    { kind = "enable_auto_equipment", label = "Upgrade Better Gear", fallbackIcon = "moveout" },
+    { kind = "disable_auto_equipment", label = "Keep Current Equipment", fallbackIcon = "stop" },
+}
 
 local SOLO_ORDERS = {
+    { kind = "movement", label = "Movement", fallbackIcon = "followme" },
+    { kind = "survival", label = "Survival", fallbackIcon = "moveout" },
+    { kind = "tactics", label = "Tactics", fallbackIcon = "stop" },
+    { kind = "vehicles", label = "Vehicles", fallbackIcon = "group" },
+    { kind = "more", label = "More Orders", fallbackIcon = "signalok" },
+}
+
+local FOLLOWER_MOVEMENTS = {
     { kind = "follow", label = "Follow", fallbackIcon = "followme" },
     { kind = "hold", label = "Hold", fallbackIcon = "stop" },
     { kind = "relax", label = "Relax", fallbackIcon = "signalok" },
-    { kind = "return_to_base", label = "Return to Base", fallbackIcon = "comehere" },
-    { kind = "check_needs", label = "Check Needs", fallbackIcon = "signalok" },
-    { kind = "survival", label = "Survival Orders", fallbackIcon = "moveout" },
-    { kind = "tactics", label = "Tactics", fallbackIcon = "stop" },
-    { kind = "enable_autoloot", label = "Auto-Loot On", fallbackIcon = "moveout" },
-    { kind = "disable_autoloot", label = "Auto-Loot Off", fallbackIcon = "signalok" },
-    { kind = "unstick", label = "Unstick", fallbackIcon = "signalok" },
+    { kind = "go_to", label = "Come to Me", fallbackIcon = "comehere" },
+    { kind = "more_movement", label = "More Movement", fallbackIcon = "group" },
 }
+local FOLLOWER_MOVEMENTS_MORE = {
+    { kind = "guard", label = "Guard Here", fallbackIcon = "stop" },
+    { kind = "patrol", label = "Patrol Here", fallbackIcon = "moveout" },
+    { kind = "resume_normal_duty", label = "Clear Current Order", fallbackIcon = "back" },
+    { kind = "return_to_base", label = "Return to Base", fallbackIcon = "group" },
+}
+
+local FOLLOWER_MORE = {
+    { kind = "formation", label = "Formation", fallbackIcon = "group" },
+    { kind = "gear", label = "Gear & Pickup", fallbackIcon = "moveout" },
+    { kind = "check_needs", label = "Check Needs", fallbackIcon = "signalok" },
+    { kind = "unstick", label = "Unstick", fallbackIcon = "back" },
+    { kind = "dismiss", label = "Dismiss from Party", fallbackIcon = "shrug" },
+}
+
+local FOLLOWER_GEAR = {
+    { kind = "weapon_melee", label = "Prefer Melee", fallbackIcon = "stop" },
+    { kind = "weapon_ranged", label = "Prefer Ranged", fallbackIcon = "stop" },
+    { kind = "weapon_auto", label = "Survivor Choice", fallbackIcon = "signalok" },
+    { kind = "enable_autoequipment", label = "Upgrade Gear", fallbackIcon = "moveout" },
+    { kind = "disable_autoequipment", label = "Keep Current Gear", fallbackIcon = "stop" },
+    { kind = "enable_autoloot", label = "Pick Up Useful Items", fallbackIcon = "moveout" },
+    { kind = "disable_autoloot", label = "Do Not Pick Up Items", fallbackIcon = "signalok" },
+}
+
+local FOLLOWER_FORMATION = {
+    { label = "Paired - spacing 1", formation = "paired", spacing = 1 },
+    { label = "Paired - spacing 2", formation = "paired", spacing = 2 },
+    { label = "Paired - spacing 3", formation = "paired", spacing = 3 },
+    { label = "Single File - spacing 1", formation = "single_file", spacing = 1 },
+    { label = "Single File - spacing 2", formation = "single_file", spacing = 2 },
+    { label = "Single File - spacing 3", formation = "single_file", spacing = 3 },
+}
+
+local RESIDENT_WORK = { "auto", "guard", "patrol", "rest" }
+local RESIDENT_WORK_MORE = { "cooking", "farming", "woodwork", "barricade", "hauling", "repair" }
 
 -- Follower tactics: stance, climbing and doors are companion policies, so
 -- they are valid here (residents cannot take them; their wheel omits them).
@@ -96,27 +160,32 @@ local FOLLOWER_TACTICS = {
 }
 
 -- Base residents cannot take companion-only policies (follow/hold/relax,
--- autoloot, doors, vehicles). Their wheel is needs, survival, recall, and
--- unstick. Survival kinds route to survivor-specific base supply orders
+-- autoloot, doors, vehicles). Their wheel includes needs, supplies, work,
+-- resident policies, recall, and unstick. Survival kinds route to base supply
 -- through the normal issueOrder boundary, never party-wide.
 local RESIDENT_ORDERS = {
     { kind = "check_needs", label = "Check Needs", fallbackIcon = "signalok" },
     { kind = "survival", label = "Survival Orders", fallbackIcon = "moveout" },
     { kind = "recall_to_party", label = "Recall to Party", fallbackIcon = "comehere" },
+    { kind = "work", label = "Work Preference", fallbackIcon = "group" },
+    { kind = "resident_policies", label = "Resident Policies", fallbackIcon = "signalok" },
+    { kind = "resume_normal_duty", label = "Cancel Supply Order", fallbackIcon = "back" },
     { kind = "unstick", label = "Unstick", fallbackIcon = "signalok" },
 }
 
 -- Survivor-specific survival orders. Followers get a bounded search around
--- themselves; residents get a durable base supply duty. The full nine-kind
--- set stays in the survivor context menu; the wheel carries the essentials.
+-- themselves; residents get a durable base supply duty. Pages split supported
+-- categories so the entire list is not placed on one ring.
 local SURVIVAL_FOLLOWER = { "find_food", "find_water", "find_medical", "find_weapon", "find_tools" }
+local SURVIVAL_FOLLOWER_MORE = { "find_wood", "find_materials", "find_clothing", "find_ammo", "clean_inventory" }
 local SURVIVAL_RESIDENT = { "find_food", "find_water", "find_wood", "find_medical", "find_weapon", "find_tools" }
+local SURVIVAL_RESIDENT_MORE = { "find_materials", "find_clothing", "find_ammo" }
 
--- Strangers: conversation only. Recruit is deliberately offered here and
--- nowhere else on the wheel.
+-- Nearby survivors use the same eligibility-aware interaction window as the
+-- F prompt. Do not maintain a second social action
+-- list on the radial.
 local NEARBY_ORDERS = {
-    { kind = "talk", label = "Talk", fallbackIcon = "wavehi" },
-    { kind = "recruit", label = "Recruit", fallbackIcon = "thumbsup" },
+    { kind = "interact", label = "Interact", fallbackIcon = "wavehi" },
 }
 
 local function dormant(reason)
@@ -328,20 +397,37 @@ local function residentMembers(playerNum)
     if origin == nil then return {} end
     local okId, playerId = pcall(function() return service.getPlayerId(player) end)
     if not okId or playerId == nil then return {} end
-    local okBase, base = pcall(function()
-        return manager.getForOwner("player", playerId)
-    end)
-    if not okBase or base == nil or base.id == nil then return {} end
-    local okIds, ids = pcall(function()
-        return persistence.getBaseResidentIds(base.id)
-    end)
-    if not okIds or type(ids) ~= "table" then return {} end
+    local bases = {}
+    if persistence.getBasesForOwner ~= nil then
+        local okBases, list = pcall(function()
+            return persistence.getBasesForOwner("player", playerId)
+        end)
+        if okBases and type(list) == "table" then bases = list end
+    end
+    if #bases == 0 then
+        local okBase, base = pcall(function()
+            return manager.getForOwner("player", playerId)
+        end)
+        if okBase and base ~= nil and base.id ~= nil then bases = { base } end
+    end
+    if #bases == 0 then return {} end
     local companions = companionIdSet(player)
-    local found = {}
-    for _, id in ipairs(ids) do
-        if companions[tostring(id)] == nil and aliveCheck(id)
-            and squareNear(origin, characterSquare(liveCharacter(id))) then
-            found[#found + 1] = { id = id, name = survivorName(id, playerNum) }
+    local found, seen = {}, {}
+    for _, base in ipairs(bases) do
+        if base ~= nil and base.id ~= nil then
+            local okIds, ids = pcall(function()
+                return persistence.getBaseResidentIds(base.id)
+            end)
+            if okIds and type(ids) == "table" then
+                for _, id in ipairs(ids) do
+                    local key = tostring(id)
+                    if not seen[key] and companions[key] == nil and aliveCheck(id)
+                        and squareNear(origin, characterSquare(liveCharacter(id))) then
+                        seen[key] = true
+                        found[#found + 1] = { id = id, name = survivorName(id, playerNum) }
+                    end
+                end
+            end
         end
     end
     return sortMembers(found)
@@ -466,11 +552,35 @@ end
 
 -- Party submenu navigation: "pm:<level>" keys mirror the follower style.
 function Radial.orderPartyMore(radialSelf, level)
-    if type(level) == "string" and (level == "move" or level == "tactics" or level == "perms") then
+    if type(level) == "string" and (level == "move" or level == "tactics"
+        or level == "perms" or level == "vehicles" or level == "pickup"
+        or level == "formation" or level == "equipment") then
         Radial.fillKnox(radialSelf, "pm:" .. level)
         return
     end
     Radial.fillKnox(radialSelf, "knox_party_more")
+end
+
+function Radial.orderPartyFormation(radialSelf, formation, spacing)
+    local service = rawget(_G, "KnoxCompanionService")
+    local playerNum = radialSelf ~= nil and radialSelf.playerNum or 0
+    local player = playerFor(playerNum)
+    if service ~= nil and service.setFormation ~= nil and player ~= nil then
+        for _, id in ipairs(service.getCompanionIds(player) or {}) do
+            pcall(service.setFormation, player, id, formation, spacing)
+        end
+    end
+    Radial.fillKnox(radialSelf, "pm:formation")
+end
+
+function Radial.orderPartyEquipment(radialSelf, allowed)
+    local service = rawget(_G, "KnoxCompanionService")
+    local playerNum = radialSelf ~= nil and radialSelf.playerNum or 0
+    local player = playerFor(playerNum)
+    if service ~= nil and service.setAutoEquipmentAll ~= nil and player ~= nil then
+        pcall(service.setAutoEquipmentAll, player, allowed == true)
+    end
+    Radial.fillKnox(radialSelf, "pm:equipment")
 end
 
 local function playerSquarePayload(player, radius)
@@ -556,6 +666,15 @@ function Radial.orderOne(radialSelf, survivorId, kind)
     local playerNum = radialSelf ~= nil and radialSelf.playerNum or 0
     local player = playerFor(playerNum)
     if player == nil then return end
+    if kind == "movement" then
+        Radial.fillKnox(radialSelf, "fm:" .. tostring(survivorId)); return
+    elseif kind == "vehicles" then
+        Radial.fillKnox(radialSelf, "fv:" .. tostring(survivorId)); return
+    elseif kind == "more" then
+        Radial.fillKnox(radialSelf, "fmore:" .. tostring(survivorId)); return
+    elseif kind == "more_movement" then
+        Radial.fillKnox(radialSelf, "fm2:" .. tostring(survivorId)); return
+    end
     if kind == "survival" then
         Radial.fillKnox(radialSelf, "sf:" .. tostring(survivorId))
         return
@@ -576,6 +695,73 @@ function Radial.orderOne(radialSelf, survivorId, kind)
         end
     end)
     Radial.fillKnox(radialSelf, "f:" .. tostring(survivorId))
+end
+
+function Radial.orderFormationF(radialSelf, survivorId, formation, spacing)
+    local service = rawget(_G, "KnoxCompanionService")
+    local playerNum = radialSelf ~= nil and radialSelf.playerNum or 0
+    local player = playerFor(playerNum)
+    if service ~= nil and service.setFormation ~= nil and player ~= nil then
+        pcall(service.setFormation, player, survivorId, formation, spacing)
+    end
+    Radial.fillKnox(radialSelf, "ff:" .. tostring(survivorId))
+end
+
+function Radial.orderGearF(radialSelf, survivorId, kind)
+    local service = rawget(_G, "KnoxCompanionService")
+    local playerNum = radialSelf ~= nil and radialSelf.playerNum or 0
+    local player = playerFor(playerNum)
+    if service ~= nil and player ~= nil then
+        pcall(function()
+            if kind == "weapon_melee" or kind == "weapon_ranged" or kind == "weapon_auto" then
+                if service.setWeaponPreference ~= nil then
+                    service.setWeaponPreference(player, survivorId,
+                        kind == "weapon_melee" and "melee" or kind == "weapon_ranged" and "ranged" or "auto")
+                end
+            elseif kind == "enable_autoequipment" or kind == "disable_autoequipment" then
+                if service.setAutoEquipment ~= nil then
+                    service.setAutoEquipment(player, survivorId, kind == "enable_autoequipment")
+                end
+            elseif service.issueOrder ~= nil then
+                service.issueOrder(player, survivorId, kind)
+            end
+        end)
+    end
+    Radial.fillKnox(radialSelf, "fg:" .. tostring(survivorId))
+end
+
+function Radial.orderResidentPreference(radialSelf, survivorId, preference)
+    local service = rawget(_G, "KnoxCompanionService")
+    local playerNum = radialSelf ~= nil and radialSelf.playerNum or 0
+    local player = playerFor(playerNum)
+    local persistence = rawget(_G, "KnoxPersistence")
+    local duty = persistence ~= nil and persistence.getSurvivorDuty ~= nil
+        and persistence.getSurvivorDuty(survivorId) or {}
+    if service ~= nil and service.setBaseJobPreference ~= nil and player ~= nil
+        and duty.baseId ~= nil then
+        pcall(service.setBaseJobPreference, player, survivorId, preference, duty.baseId)
+    end
+    Radial.fillKnox(radialSelf, "rw:" .. tostring(survivorId))
+end
+
+function Radial.orderResidentPolicy(radialSelf, survivorId, kind)
+    local service = rawget(_G, "KnoxCompanionService")
+    local playerNum = radialSelf ~= nil and radialSelf.playerNum or 0
+    local player = playerFor(playerNum)
+    if service ~= nil and player ~= nil then
+        pcall(function()
+            if kind == "loot_runs_on" and service.setResidentLootRuns ~= nil then
+                service.setResidentLootRuns(player, survivorId, true)
+            elseif kind == "loot_runs_off" and service.setResidentLootRuns ~= nil then
+                service.setResidentLootRuns(player, survivorId, false)
+            elseif kind == "equipment_on" and service.setAutoEquipment ~= nil then
+                service.setAutoEquipment(player, survivorId, true)
+            elseif kind == "equipment_off" and service.setAutoEquipment ~= nil then
+                service.setAutoEquipment(player, survivorId, false)
+            end
+        end)
+    end
+    Radial.fillKnox(radialSelf, "rp:" .. tostring(survivorId))
 end
 
 -- Follower tactics slice: stance, climbing and doors through the
@@ -613,6 +799,9 @@ function Radial.orderSurvivalF(radialSelf, survivorId, kind)
     local playerNum = radialSelf ~= nil and radialSelf.playerNum or 0
     local player = playerFor(playerNum)
     if player == nil then return end
+    if kind == "more_supplies" then
+        Radial.fillKnox(radialSelf, "sf2:" .. tostring(survivorId)); return
+    end
     pcall(function()
         if service.issueOrder ~= nil then
             service.issueOrder(player, survivorId, kind)
@@ -628,6 +817,11 @@ function Radial.orderResident(radialSelf, survivorId, kind)
     local playerNum = radialSelf ~= nil and radialSelf.playerNum or 0
     local player = playerFor(playerNum)
     if player == nil then return end
+    if kind == "work" then
+        Radial.fillKnox(radialSelf, "rw:" .. tostring(survivorId)); return
+    elseif kind == "resident_policies" then
+        Radial.fillKnox(radialSelf, "rp:" .. tostring(survivorId)); return
+    end
     if kind == "survival" then
         Radial.fillKnox(radialSelf, "sr:" .. tostring(survivorId))
         return
@@ -651,6 +845,9 @@ function Radial.orderSurvivalR(radialSelf, survivorId, kind)
     local playerNum = radialSelf ~= nil and radialSelf.playerNum or 0
     local player = playerFor(playerNum)
     if player == nil then return end
+    if kind == "more_supplies" then
+        Radial.fillKnox(radialSelf, "sr2:" .. tostring(survivorId)); return
+    end
     pcall(function()
         if service.issueOrder ~= nil then
             service.issueOrder(player, survivorId, kind)
@@ -661,18 +858,22 @@ end
 
 -- Nearby-stranger slice callback: invoked as callback(radialSelf, id, kind).
 function Radial.orderNearby(radialSelf, survivorId, kind)
-    local service = rawget(_G, "KnoxCompanionService")
-    if service == nil or survivorId == nil or type(kind) ~= "string" then return end
+    if survivorId == nil or kind ~= "interact" then return end
     local playerNum = radialSelf ~= nil and radialSelf.playerNum or 0
     local player = playerFor(playerNum)
     if player == nil then return end
-    pcall(function()
-        if kind == "talk" and service.talk ~= nil then
-            service.talk(player, survivorId)
-        elseif kind == "recruit" and service.recruit ~= nil then
-            service.recruit(player, survivorId)
-        end
-    end)
+    local interaction = rawget(_G, "KnoxSurvivorInteractionUI")
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    local viewModel = rawget(_G, "KnoxSurvivorViewModel")
+    if interaction == nil or interaction.open == nil or runtime == nil
+        or runtime.getCharacter == nil then return end
+    local character = runtime.getCharacter(survivorId)
+    if character == nil then return end
+    local view = viewModel ~= nil and viewModel.getSurvivor ~= nil
+        and viewModel.getSurvivor(survivorId, playerNum) or nil
+    local name = view ~= nil and view.displayName or survivorName(survivorId, playerNum)
+    pcall(interaction.open, playerNum,
+        { id = survivorId, character = character, name = name }, player)
     Radial.fillKnox(radialSelf, "n:" .. tostring(survivorId))
 end
 
@@ -691,14 +892,22 @@ end
 
 -- Knox submenu fill. Key is "knox", "knox_party", "knox_party_more",
 -- "pm:move", "pm:tactics", "pm:perms", "knox_followers", "knox_residents",
--- "knox_nearby", "f:<id>", "r:<id>", "n:<id>", "sf:<id>" (follower
--- survival), "ft:<id>" (follower tactics), or "sr:<id>" (resident
--- survival).
+-- "knox_nearby", "f:<id>", "r:<id>", "n:<id>", and typed follower/resident
+-- pages. Each level stays short and sends actions through existing services.
 -- Mirrors the vanilla fill contract (clear, add slices, display).
 function Radial.fillKnox(radialSelf, key)
     local playerNum = radialSelf ~= nil and radialSelf.playerNum or 0
     local menu = radialMenuFor(playerNum)
     if menu == nil or menu.clear == nil or menu.addSlice == nil then return nil end
+    if not featureEnabled() then
+        -- A wheel opened before Knox was disabled may still invoke an old
+        -- callback. Restore the vanilla root instead of exposing Knox actions.
+        if previousFill ~= nil then
+            pcall(function() previousFill(radialSelf, nil) end)
+            showMenu(playerNum)
+        end
+        return nil
+    end
     local ok = pcall(function()
         menu:clear()
         if key == "knox_party" then
@@ -713,7 +922,8 @@ function Radial.fillKnox(radialSelf, key)
                 menu:addSlice(orderLabel(entry.kind, entry.label),
                     iconFor(entry.fallbackIcon), Radial.orderPartyMore,
                     radialSelf, entry.kind == "movements" and "move"
-                        or entry.kind == "tactics" and "tactics" or "perms")
+                        or entry.kind == "tactics" and "tactics"
+                        or entry.kind == "permissions" and "perms" or entry.kind)
             end
             addBack(menu, radialSelf, "knox_party")
         elseif key == "pm:move" then
@@ -744,6 +954,30 @@ function Radial.fillKnox(radialSelf, key)
                     radialSelf, arg)
             end
             addBack(menu, radialSelf, "knox_party_more")
+        elseif key == "pm:vehicles" then
+            for _, entry in ipairs(PARTY_VEHICLES) do
+                menu:addSlice(entry.label, iconFor(entry.fallbackIcon), Radial.orderParty,
+                    radialSelf, entry.kind)
+            end
+            addBack(menu, radialSelf, "knox_party_more")
+        elseif key == "pm:pickup" then
+            for _, entry in ipairs(PARTY_PICKUP) do
+                menu:addSlice(entry.label, iconFor(entry.fallbackIcon), Radial.orderParty,
+                    radialSelf, entry.kind)
+            end
+            addBack(menu, radialSelf, "knox_party_more")
+        elseif key == "pm:formation" then
+            for _, entry in ipairs(FOLLOWER_FORMATION) do
+                menu:addSlice(entry.label, iconFor("group"), Radial.orderPartyFormation,
+                    radialSelf, entry.formation, entry.spacing)
+            end
+            addBack(menu, radialSelf, "knox_party_more")
+        elseif key == "pm:equipment" then
+            for _, entry in ipairs(PARTY_EQUIPMENT) do
+                menu:addSlice(entry.label, iconFor(entry.fallbackIcon), Radial.orderPartyEquipment,
+                    radialSelf, entry.kind == "enable_auto_equipment")
+            end
+            addBack(menu, radialSelf, "knox_party_more")
         elseif key == "knox_followers" or key == "knox_residents"
             or key == "knox_nearby" then
             local list = key == "knox_followers" and followerMembers(playerNum)
@@ -770,6 +1004,84 @@ function Radial.fillKnox(radialSelf, key)
                     radialSelf, id, entry.kind)
             end
             addBack(menu, radialSelf, "knox_followers")
+        elseif type(key) == "string" and string.sub(key, 3, 3) == ":"
+            and string.sub(key, 1, 3) == "fm:" then
+            local id = string.sub(key, 4)
+            if not memberIn(followerMembers(playerNum), id) then
+                Radial.fillKnox(radialSelf, "knox_followers"); return
+            end
+            for _, entry in ipairs(FOLLOWER_MOVEMENTS) do
+                menu:addSlice(entry.label, iconFor(entry.fallbackIcon), Radial.orderOne,
+                    radialSelf, id, entry.kind)
+            end
+            addBack(menu, radialSelf, "f:" .. id)
+        elseif type(key) == "string" and string.sub(key, 1, 4) == "fm2:" then
+            local id = string.sub(key, 5)
+            if not memberIn(followerMembers(playerNum), id) then
+                Radial.fillKnox(radialSelf, "knox_followers"); return
+            end
+            for _, entry in ipairs(FOLLOWER_MOVEMENTS_MORE) do
+                menu:addSlice(entry.label, iconFor(entry.fallbackIcon), Radial.orderOne,
+                    radialSelf, id, entry.kind)
+            end
+            addBack(menu, radialSelf, "fm:" .. id)
+        elseif type(key) == "string" and string.sub(key, 1, 3) == "fv:" then
+            local id = string.sub(key, 4)
+            if not memberIn(followerMembers(playerNum), id) then
+                Radial.fillKnox(radialSelf, "knox_followers"); return
+            end
+            local player = playerFor(playerNum)
+            local character = liveCharacter(id)
+            if character ~= nil and character.getVehicle ~= nil and character:getVehicle() ~= nil then
+                menu:addSlice("Exit Vehicle", iconFor("back"), Radial.orderOne,
+                    radialSelf, id, "exit_vehicle")
+            elseif player ~= nil and player.getVehicle ~= nil and player:getVehicle() ~= nil then
+                menu:addSlice("Take Passenger Seat", iconFor("group"), Radial.orderOne,
+                    radialSelf, id, "enter_vehicle")
+                menu:addSlice("Take Driver Seat & Drive", iconFor("moveout"), Radial.orderOne,
+                    radialSelf, id, "drive_ahead")
+            else
+                menu:addSlice("Drive Nearest Vehicle", iconFor("moveout"), Radial.orderOne,
+                    radialSelf, id, "drive_nearest_vehicle")
+            end
+            addBack(menu, radialSelf, "f:" .. id)
+        elseif type(key) == "string" and string.sub(key, 1, 6) == "fmore:" then
+            local id = string.sub(key, 7)
+            if not memberIn(followerMembers(playerNum), id) then
+                Radial.fillKnox(radialSelf, "knox_followers"); return
+            end
+            for _, entry in ipairs(FOLLOWER_MORE) do
+                local target = entry.kind == "formation" and "ff:" .. id
+                    or entry.kind == "gear" and "fg:" .. id or nil
+                if target ~= nil then
+                    menu:addSlice(entry.label, iconFor(entry.fallbackIcon), Radial.fillKnox,
+                        radialSelf, target)
+                else
+                    menu:addSlice(entry.label, iconFor(entry.fallbackIcon), Radial.orderOne,
+                        radialSelf, id, entry.kind)
+                end
+            end
+            addBack(menu, radialSelf, "f:" .. id)
+        elseif type(key) == "string" and string.sub(key, 1, 3) == "ff:" then
+            local id = string.sub(key, 4)
+            if not memberIn(followerMembers(playerNum), id) then
+                Radial.fillKnox(radialSelf, "knox_followers"); return
+            end
+            for _, entry in ipairs(FOLLOWER_FORMATION) do
+                menu:addSlice(entry.label, iconFor("group"), Radial.orderFormationF,
+                    radialSelf, id, entry.formation, entry.spacing)
+            end
+            addBack(menu, radialSelf, "fmore:" .. id)
+        elseif type(key) == "string" and string.sub(key, 1, 3) == "fg:" then
+            local id = string.sub(key, 4)
+            if not memberIn(followerMembers(playerNum), id) then
+                Radial.fillKnox(radialSelf, "knox_followers"); return
+            end
+            for _, entry in ipairs(FOLLOWER_GEAR) do
+                menu:addSlice(entry.label, iconFor(entry.fallbackIcon), Radial.orderGearF,
+                    radialSelf, id, entry.kind)
+            end
+            addBack(menu, radialSelf, "fmore:" .. id)
         elseif type(key) == "string" and string.sub(key, 1, 2) == "r:" then
             local id = string.sub(key, 3)
             if not memberIn(residentMembers(playerNum), id) then
@@ -782,6 +1094,41 @@ function Radial.fillKnox(radialSelf, key)
                     radialSelf, id, entry.kind)
             end
             addBack(menu, radialSelf, "knox_residents")
+        elseif type(key) == "string" and string.sub(key, 1, 3) == "rw:" then
+            local id = string.sub(key, 4)
+            if not memberIn(residentMembers(playerNum), id) then
+                Radial.fillKnox(radialSelf, "knox_residents"); return
+            end
+            for _, preference in ipairs(RESIDENT_WORK) do
+                menu:addSlice(KnoxOrderCatalog.label(preference, preference), iconFor("group"),
+                    Radial.orderResidentPreference, radialSelf, id, preference)
+            end
+            menu:addSlice("More Work", iconFor("moveout"), Radial.fillKnox,
+                radialSelf, "rw2:" .. id)
+            addBack(menu, radialSelf, "r:" .. id)
+        elseif type(key) == "string" and string.sub(key, 1, 4) == "rw2:" then
+            local id = string.sub(key, 5)
+            if not memberIn(residentMembers(playerNum), id) then
+                Radial.fillKnox(radialSelf, "knox_residents"); return
+            end
+            for _, preference in ipairs(RESIDENT_WORK_MORE) do
+                menu:addSlice(KnoxOrderCatalog.label(preference, preference), iconFor("group"),
+                    Radial.orderResidentPreference, radialSelf, id, preference)
+            end
+            addBack(menu, radialSelf, "rw:" .. id)
+        elseif type(key) == "string" and string.sub(key, 1, 3) == "rp:" then
+            local id = string.sub(key, 4)
+            if not memberIn(residentMembers(playerNum), id) then
+                Radial.fillKnox(radialSelf, "knox_residents"); return
+            end
+            for _, entry in ipairs({
+                { "Allow Loot Runs", "loot_runs_on" }, { "Stay Home", "loot_runs_off" },
+                { "Upgrade Gear", "equipment_on" }, { "Keep Current Gear", "equipment_off" },
+            }) do
+                menu:addSlice(entry[1], iconFor("signalok"), Radial.orderResidentPolicy,
+                    radialSelf, id, entry[2])
+            end
+            addBack(menu, radialSelf, "r:" .. id)
         elseif type(key) == "string" and string.sub(key, 1, 3) == "sf:" then
             local id = string.sub(key, 4)
             if not memberIn(followerMembers(playerNum), id) then
@@ -793,7 +1140,19 @@ function Radial.fillKnox(radialSelf, key)
                     iconFor("moveout"), Radial.orderSurvivalF,
                     radialSelf, id, kind)
             end
+            menu:addSlice("More Supplies", iconFor("group"), Radial.orderSurvivalF,
+                radialSelf, id, "more_supplies")
             addBack(menu, radialSelf, "f:" .. id)
+        elseif type(key) == "string" and string.sub(key, 1, 4) == "sf2:" then
+            local id = string.sub(key, 5)
+            if not memberIn(followerMembers(playerNum), id) then
+                Radial.fillKnox(radialSelf, "knox_followers"); return
+            end
+            for _, kind in ipairs(SURVIVAL_FOLLOWER_MORE) do
+                menu:addSlice(orderLabel(kind, kind), iconFor("moveout"),
+                    Radial.orderSurvivalF, radialSelf, id, kind)
+            end
+            addBack(menu, radialSelf, "sf:" .. id)
         elseif type(key) == "string" and string.sub(key, 1, 3) == "ft:" then
             local id = string.sub(key, 4)
             if not memberIn(followerMembers(playerNum), id) then
@@ -817,7 +1176,19 @@ function Radial.fillKnox(radialSelf, key)
                     iconFor("moveout"), Radial.orderSurvivalR,
                     radialSelf, id, kind)
             end
+            menu:addSlice("More Supplies", iconFor("group"), Radial.orderSurvivalR,
+                radialSelf, id, "more_supplies")
             addBack(menu, radialSelf, "r:" .. id)
+        elseif type(key) == "string" and string.sub(key, 1, 4) == "sr2:" then
+            local id = string.sub(key, 5)
+            if not memberIn(residentMembers(playerNum), id) then
+                Radial.fillKnox(radialSelf, "knox_residents"); return
+            end
+            for _, kind in ipairs(SURVIVAL_RESIDENT_MORE) do
+                menu:addSlice(orderLabel(kind, kind), iconFor("moveout"),
+                    Radial.orderSurvivalR, radialSelf, id, kind)
+            end
+            addBack(menu, radialSelf, "sr:" .. id)
         elseif type(key) == "string" and string.sub(key, 1, 2) == "n:" then
             local id = string.sub(key, 3)
             if not memberIn(nearbyMembers(playerNum), id) then
@@ -832,10 +1203,17 @@ function Radial.fillKnox(radialSelf, key)
             addBack(menu, radialSelf, "knox_nearby")
         else
             local followers = followerMembers(playerNum)
-            local partyOk = #followers > 0
+            -- Party-wide orders target the durable player roster and remain
+            -- useful while members are stored/offscreen. Keep the individual
+            -- follower page proximity-gated because those actions target one
+            -- live body.
+            local _, ownedCompanions = companionIdSet(playerFor(playerNum))
+            local partyOk = #ownedCompanions > 0
             if partyOk then
                 menu:addSlice("Party Orders", iconFor("group"), Radial.fillKnox,
                     radialSelf, "knox_party")
+            end
+            if #followers > 0 then
                 menu:addSlice("Followers", iconFor("followme"), Radial.fillKnox,
                     radialSelf, "knox_followers")
             end
@@ -882,9 +1260,11 @@ function Radial.install()
             pcall(function()
                 -- Base level only. Submenus (vanilla or Knox) render exactly
                 -- what their own fill put there.
-                if submenu == nil and okFill and self ~= nil then
-                    local followers = followerMembers(self.playerNum)
-                    local show = #followers > 0
+                if submenu == nil and okFill and self ~= nil
+                    and featureEnabled() then
+                    local player = playerFor(self.playerNum)
+                    local _, ownedCompanions = companionIdSet(player)
+                    local show = #ownedCompanions > 0
                         or #residentMembers(self.playerNum) > 0
                         or #nearbyMembers(self.playerNum) > 0
                     if show then

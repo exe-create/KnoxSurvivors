@@ -6,7 +6,7 @@ purpose: canonical AI/tool routing workflow
 
 # Knox Survivors — AI development workflow
 
-Updated: 2026-09-27
+Updated: 2026-09-30
 
 ## Goal
 
@@ -98,7 +98,7 @@ For imported production tasks/bugs, ModForge is a **view/editor of repository tr
 For an approved work item, authority is deliberately separated:
 
 1. **Human owner:** final product, reputation, release, public claims, permissions, and save-breaking decisions.
-2. **Codex / Astra:** primary technical implementation authority for heavy engineering assigned to Codex.
+2. **Codex / assigned Boss:** technical implementation authority for engineering assigned to Codex; normally GPT-6 Luna, with Sol/Astra only through the explicit escalation rules below.
 3. **OpenCode:** technical implementation authority for bounded budget/scoped engineering assigned to OpenCode.
 4. **ModForge / Boss / Planner:** production coordination, scope, priority, constraints, evidence, and routing. They do not rewrite the active implementer's approach just to express a different preference.
 5. **Cheap subagents:** research, scoping, cleanup, independent review, and evidence support only unless explicitly promoted.
@@ -142,7 +142,7 @@ The free OpenCode catalog remains the default for ModForge/OpenCode roles. A fre
 
 If an implementation conflicts with recorded project vision, architecture ownership, task scope, or evidence requirements, ModForge/Boss can stop/escalate it. Otherwise the assigned coding tool gets room to work coherently like the project's engineering department.
 
-## Codex / Astra — heavyweight engineering department
+## Codex — implementation and escalation
 
 Use the normal Luna Boss for:
 
@@ -157,7 +157,8 @@ Use Sol only for:
   to resolve after repeated attempts;
 - an explicit owner request for a higher-tier focused pass.
 
-Use Astra for:
+The following boundaries can justify an Astra escalation or explicit owner
+assignment; they do not automatically select Astra or bypass the ladder:
 
 - architecture-sensitive changes;
 - persistence, identity, lifecycle, ownership, reconstruction;
@@ -170,6 +171,10 @@ Use Astra for:
 Normal Codex startup:
 
 `AGENTS.md` → current production docs → generated project state → smallest relevant technical authority → Git status/diff.
+
+The 2026-09-30 whole-project coherence pass is an explicitly owner-authorized
+Astra exception. One Astra owner integrates the existing OpenCode diff and
+cheap read-only planning/review; this does not change normal model routing.
 
 The main Codex session normally runs on GPT-6 Luna for cost-controlled
 development. GPT-5.6 Luna handles planning; GPT-5.6 Terra handles Grunt,

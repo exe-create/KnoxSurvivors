@@ -10,8 +10,48 @@ _G.KnoxPersistence = KnoxPersistence
 
 -- Kept separate from the legacy IsoZombie mod data that may exist in reused saves.
 local MOD_DATA_KEY = "KnoxSurvivors_IsoPlayer"
-local SCHEMA_VERSION = 18
+local SCHEMA_VERSION = 19
 local TEST_SURVIVOR_ID = "ks-test-1"
+
+local WORK_PREFERENCE_GROUPS = {
+    guard = true, patrol = true, repair = true, cooking = true,
+    farming = true, woodwork = true, barricade = true, hauling = true,
+}
+local WORK_PREFERENCE_STATES = {
+    high = true, normal = true, low = true, disabled = true,
+}
+
+local function normalizeWorkPreference(value)
+    if value == false then return "disabled" end
+    local number = tonumber(value)
+    if number ~= nil then
+        if number == 1 then return "high" end
+        if number == 2 then return "normal" end
+        if number == 3 or number == 4 then return "low" end
+        return nil
+    end
+    if type(value) ~= "string" then return nil end
+    local state = string.lower(value)
+    return WORK_PREFERENCE_STATES[state] and state or nil
+end
+
+local function normalizeWorkPreferences(map)
+    if type(map) ~= "table" then return nil end
+    local normalized = {}
+    local hasPreference = false
+    for key, value in pairs(map) do
+        if WORK_PREFERENCE_GROUPS[key] == true then
+            local state = normalizeWorkPreference(value)
+            if state ~= nil and state ~= "normal" then
+                normalized[key] = state
+                hasPreference = true
+            end
+        end
+    end
+    -- Project Zomboid's Kahlua environment does not expose Lua's global
+    -- `next`; preference writes from the Notebook must use supported pairs.
+    return hasPreference and normalized or nil
+end
 
 local function sanitizeOriginMetadata(origin, preserveMissing)
     local policy = rawget(_G, "KnoxSurvivorOrigins")
@@ -589,6 +629,11 @@ local function root()
             survivor.duty.revision = math.max(0,
                 math.floor(tonumber(survivor.duty.revision) or 0))
             survivor.duty.mode = tostring(survivor.duty.mode or "autonomous")
+            -- Migrate the existing sparse base-work preference map in place.
+            -- Older saves used 1-4 / false; missing values remain Normal.
+            survivor.duty.workPriorities = normalizeWorkPreferences(
+                survivor.duty.workPriorities
+            )
             local rawOrder = tostring(survivor.duty.order or "survive")
             local normalizedOrder = canonicalOrder(rawOrder)
             if survivor.duty.mode == "companion" then
@@ -1216,6 +1261,65 @@ function KnoxPersistence.allocateDeveloperSurvivorId()
     return id
 end
 
+-- Automated QA ownership lives on the canonical survivor identity record so a
+-- reload does not erase the provenance required for safe fixture cleanup.
+function KnoxPersistence.tagDeveloperQaFixture(id, runId, ownerToken, scenarioId)
+    if type(id) ~= "string" or string.find(id, "ks-dev-", 1, true) ~= 1
+        or type(runId) ~= "string" or runId == ""
+        or type(ownerToken) ~= "string" or ownerToken == "" then
+        return false, "invalid_qa_fixture_owner"
+    end
+    local survivor = ensureSurvivorState(id)
+    local current = survivor.qaOwnership
+    if type(current) == "table"
+        and (current.runId ~= runId or current.ownerToken ~= ownerToken) then
+        return false, "fixture_owned_by_another_run"
+    end
+    survivor.qaOwnership = {
+        runId = runId,
+        ownerToken = ownerToken,
+        scenarioId = type(scenarioId) == "string" and scenarioId or "unknown",
+    }
+    return true, "tagged"
+end
+
+function KnoxPersistence.getDeveloperQaFixtureOwner(id)
+    if type(id) ~= "string" or string.find(id, "ks-dev-", 1, true) ~= 1 then return nil end
+    local owner = root().survivors[id] ~= nil and root().survivors[id].qaOwnership or nil
+    if type(owner) ~= "table" or type(owner.runId) ~= "string"
+        or type(owner.ownerToken) ~= "string" then return nil end
+    return { runId = owner.runId, ownerToken = owner.ownerToken,
+        scenarioId = tostring(owner.scenarioId or "unknown") }
+end
+
+function KnoxPersistence.listDeveloperQaFixtures()
+    local fixtures = {}
+    for id, survivor in pairs(root().survivors) do
+        local owner = type(survivor) == "table" and survivor.qaOwnership or nil
+        if type(id) == "string" and string.find(id, "ks-dev-", 1, true) == 1
+            and type(owner) == "table" and type(owner.runId) == "string"
+            and type(owner.ownerToken) == "string" then
+            fixtures[#fixtures + 1] = {
+                id = id,
+                owner = { runId = owner.runId, ownerToken = owner.ownerToken,
+                    scenarioId = tostring(owner.scenarioId or "unknown") },
+            }
+        end
+    end
+    table.sort(fixtures, function(a, b) return a.id < b.id end)
+    return fixtures
+end
+
+function KnoxPersistence.clearDeveloperQaFixtureOwner(id, runId, ownerToken)
+    local current = KnoxPersistence.getDeveloperQaFixtureOwner(id)
+    if current == nil or current.runId ~= runId or current.ownerToken ~= ownerToken then
+        return false, "qa_fixture_owner_mismatch"
+    end
+    local survivor = root().survivors[id]
+    survivor.qaOwnership = nil
+    return true, "cleared"
+end
+
 function KnoxPersistence.allocateWorldSurvivor(origin, worldAgeHours)
     if type(origin) ~= "table" or tonumber(origin.x) == nil or tonumber(origin.y) == nil then
         return nil, "invalid_origin"
@@ -1408,6 +1512,10 @@ function KnoxPersistence.markSurvivorDead(id, worldAgeHours, reason, evidence)
     if survivor.alive == false then return true end
     survivor.deathEvidence = deathEvidenceFor(survivor, worldAgeHours, reason, evidence)
     survivor.alive = false
+    local assignedBed = survivor.policies ~= nil and survivor.policies.assignedBed or nil
+    if type(assignedBed) == "table" and assignedBed.autoFactionId ~= nil then
+        survivor.policies.assignedBed = nil
+    end
     -- Death wins over a same-tick event withdrawal. The corpse lifecycle must
     -- remain authoritative and a dead entrant must never be recorded as having
     -- safely left Knox County.
@@ -2435,6 +2543,7 @@ function KnoxPersistence.setPlayerCompanion(id, playerId, order, worldAgeHours)
     if survivor.duty.mode == "base" then
         requeueClaimsForSurvivor(id, survivor.duty.baseId, "recalled_as_companion")
     end
+    local workPriorities = normalizeWorkPreferences(survivor.duty.workPriorities)
     -- Player ownership is authoritative. Remove stale copies left in NPC rosters
     -- before assigning the player faction so later faction maintenance cannot
     -- absorb a companion back into an autonomous group.
@@ -2467,6 +2576,7 @@ function KnoxPersistence.setPlayerCompanion(id, playerId, order, worldAgeHours)
     survivor.duty = {
         mode = "companion",
         order = order == "hold" and "hold" or "follow",
+        workPriorities = workPriorities,
         followerFormation = survivor.duty.followerFormation,
         followerSpacing = survivor.duty.followerSpacing,
         combatStance = "defensive",
@@ -2493,9 +2603,11 @@ function KnoxPersistence.setPlayerBaseResident(id, playerId, baseId, worldAgeHou
     if survivor.duty.mode == "base" and survivor.duty.baseId ~= baseId then
         requeueClaimsForSurvivor(id, survivor.duty.baseId, "base_changed")
     end
+    local workPriorities = normalizeWorkPreferences(survivor.duty.workPriorities)
     survivor.duty = {
         mode = "base",
         order = "available",
+        workPriorities = workPriorities,
         jobPreference = survivor.duty ~= nil and survivor.duty.jobPreference or "auto",
         followerFormation = survivor.duty.followerFormation,
         followerSpacing = survivor.duty.followerSpacing,
@@ -2528,6 +2640,11 @@ function KnoxPersistence.setFactionBaseResident(id, factionId, baseId, worldAgeH
     end
     if survivor.duty.mode == "base" then
         requeueClaimsForSurvivor(id, survivor.duty.baseId, "base_changed")
+    end
+    local bed = survivor.policies ~= nil and survivor.policies.assignedBed or nil
+    if type(bed) == "table" and bed.autoFactionId ~= nil
+        and (bed.autoFactionId ~= factionId or bed.autoBaseId ~= baseId) then
+        survivor.policies.assignedBed = nil
     end
     survivor.duty = {
         mode = "base",
@@ -2831,53 +2948,49 @@ function KnoxPersistence.setBaseDutySchedule(id, playerId, baseId, schedule, wor
     return KnoxPersistence.setDutySchedule(id, schedule, worldAgeHours)
 end
 
--- RimWorld-style work priorities: per-survivor map of work-group key to
--- 1-4 (1 first) or false (never). Keys are the order-catalogue preference
--- groups (guard, patrol, repair, cooking, farming, woodwork, barricade,
--- hauling); absent keys mean automatic (legacy behavior). A nil or empty
--- map clears back to fully automatic. Same-save safe: a new optional duty
--- field read only by the automatic election.
-local WORK_PRIORITY_GROUPS = {
-    guard = true, patrol = true, repair = true, cooking = true,
-    farming = true, woodwork = true, barricade = true, hauling = true,
-}
-
-function KnoxPersistence.validWorkPriorities(map)
+-- Four-state preferences are a sparse projection over the existing base task
+-- groups. Missing entries mean Normal; old 1-4/false values were normalized
+-- when the save root was loaded. This remains inert outside player base duty.
+function KnoxPersistence.validWorkPreferences(map)
     if type(map) ~= "table" then return false end
-    local count = 0
     for key, value in pairs(map) do
-        if WORK_PRIORITY_GROUPS[key] ~= true then return false end
-        if value ~= false then
-            local number = tonumber(value)
-            if number == nil or number < 1 or number > 4
-                or math.floor(number) ~= number then
-                return false
-            end
+        if WORK_PREFERENCE_GROUPS[key] ~= true
+            or normalizeWorkPreference(value) == nil then
+            return false
         end
-        count = count + 1
     end
-    return count >= 1 and count <= 8
+    return true
 end
 
--- Returns a copy of the explicit map, or nil when the survivor is fully
--- automatic (legacy election applies untouched).
-function KnoxPersistence.getWorkPriorities(id)
+function KnoxPersistence.getWorkPreference(id, group)
+    if WORK_PREFERENCE_GROUPS[group] ~= true then return "normal" end
     local survivor = ensureSurvivorState(id)
-    local map = survivor ~= nil and survivor.duty ~= nil
-        and survivor.duty.workPriorities or nil
-    if type(map) ~= "table" then return nil end
-    local count = 0
-    for _ in pairs(map) do count = count + 1 end
-    if count == 0 then return nil end
-    return copySerializable(map)
+    local duty = survivor ~= nil and survivor.duty or nil
+    local base = duty ~= nil and KnoxPersistence.getBase ~= nil
+        and KnoxPersistence.getBase(duty.baseId) or nil
+    if type(duty) ~= "table" or duty.mode ~= "base"
+        or survivor.affiliation == nil or survivor.affiliation.kind ~= "player"
+        or survivor.affiliation.ownerId ~= duty.ownerId
+        or base == nil or base.ownerKind ~= "player"
+        or base.ownerId ~= survivor.affiliation.ownerId then
+        return "normal"
+    end
+    local map = normalizeWorkPreferences(duty.workPriorities)
+    return map ~= nil and map[group] or "normal"
 end
 
--- Player-facing work-priority writer: same ownership gating as the other
--- base-tab writers. A nil map clears back to automatic.
-function KnoxPersistence.setBaseWorkPriorities(id, playerId, baseId, map, worldAgeHours)
+function KnoxPersistence.getWorkPreferences(id)
+    local preferences = {}
+    for group in pairs(WORK_PREFERENCE_GROUPS) do
+        preferences[group] = KnoxPersistence.getWorkPreference(id, group)
+    end
+    return preferences
+end
+
+function KnoxPersistence.setBaseWorkPreferences(id, playerId, baseId, map, worldAgeHours)
     local survivor = ensureSurvivorState(id)
     if survivor == nil or survivor.alive == false then return false end
-    if map ~= nil and not KnoxPersistence.validWorkPriorities(map) then
+    if map ~= nil and not KnoxPersistence.validWorkPreferences(map) then
         return false
     end
     if survivor.affiliation.kind ~= "player"
@@ -2886,16 +2999,18 @@ function KnoxPersistence.setBaseWorkPriorities(id, playerId, baseId, map, worldA
         or survivor.duty.mode ~= "base" or survivor.duty.baseId ~= baseId then
         return false
     end
-    local stored = nil
-    if map ~= nil then
-        stored = {}
-        for key, value in pairs(map) do stored[key] = value end
-    end
+    local stored = map ~= nil and normalizeWorkPreferences(map) or nil
     survivor.duty.workPriorities = stored
     survivor.duty.changedAtHours = tonumber(worldAgeHours) or 0
     survivor.duty.revision = (tonumber(survivor.duty.revision) or 0) + 1
     return true
 end
+
+-- Keep the old entry points available to local scripts and older UI callers;
+-- the stored representation and visible controls now use the four states.
+KnoxPersistence.validWorkPriorities = KnoxPersistence.validWorkPreferences
+KnoxPersistence.getWorkPriorities = KnoxPersistence.getWorkPreferences
+KnoxPersistence.setBaseWorkPriorities = KnoxPersistence.setBaseWorkPreferences
 
 -- Per-resident loot-run permission. Residents stay home unless the player
 -- explicitly allows loot runs for them; the automatic shortage election
@@ -3211,6 +3326,28 @@ local function bedOwnerId(playerId, survivor)
     return false
 end
 
+-- Automatic equipment upgrades are a player preference, not a combat rule.
+-- Nil preserves historical enabled behavior for old saves.
+function KnoxPersistence.setPlayerAutoEquipment(id, playerId, allowed, worldAgeHours)
+    if type(id) ~= "string" or root().survivors[id] == nil
+        or type(playerId) ~= "string" or playerId == "" then
+        return false, "not_your_survivor"
+    end
+    local survivor = ensureSurvivorState(id)
+    if survivor == nil or not bedOwnerId(playerId, survivor)
+        or (allowed ~= nil and type(allowed) ~= "boolean") then
+        return false, "not_your_survivor"
+    end
+    local value = allowed
+    if value ~= nil then value = value == true end
+    if survivor.policies.autoEquipment ~= value then
+        survivor.policies.autoEquipment = value
+        survivor.duty.changedAtHours = tonumber(worldAgeHours) or 0
+        survivor.duty.revision = (tonumber(survivor.duty.revision) or 0) + 1
+    end
+    return true
+end
+
 function KnoxPersistence.setSurvivorBed(id, playerId, bedRef, worldAgeHours)
     local survivor = ensureSurvivorState(id)
     if survivor == nil or type(bedRef) ~= "table"
@@ -3244,6 +3381,62 @@ function KnoxPersistence.clearSurvivorBed(id, playerId, worldAgeHours)
     survivor.policies.assignedBed = nil
     survivor.duty.changedAtHours = tonumber(worldAgeHours) or 0
     survivor.duty.revision = (tonumber(survivor.duty.revision) or 0) + 1
+    return true
+end
+
+-- Faction bed assignments are automatic base policy, not a player command.
+-- Keep this writer separate from setSurvivorBed so a faction can never use
+-- the player-owned bed assignment path to mutate a companion or player base.
+function KnoxPersistence.setFactionResidentBed(id, factionId, baseId, bedRef, worldAgeHours)
+    local survivor = ensureSurvivorState(id)
+    local faction = KnoxPersistence.getFaction(factionId)
+    local base = KnoxPersistence.getBase(baseId)
+    if survivor == nil or survivor.alive == false
+        or faction == nil or faction.kind == "player"
+        or base == nil or base.ownerKind ~= "faction" or base.ownerId ~= factionId
+        or faction.homeBaseId ~= baseId
+        or survivor.affiliation.factionId ~= factionId
+        or survivor.duty.mode ~= "base" or survivor.duty.baseId ~= baseId
+        or type(bedRef) ~= "table" then
+        return false, "not_faction_resident"
+    end
+    local x, y, z = tonumber(bedRef.x), tonumber(bedRef.y), tonumber(bedRef.z)
+    local objectIndex = tonumber(bedRef.objectIndex)
+    if not finiteCoordinate(x) or not finiteCoordinate(y)
+        or not finiteCoordinate(z) or z % 1 ~= 0
+        or objectIndex == nil or objectIndex % 1 ~= 0 or objectIndex < 0 then
+        return false, "invalid_bed"
+    end
+    local existing = survivor.policies.assignedBed
+    if type(existing) == "table" then
+        local alreadyThisBed = tonumber(existing.x) == x
+            and tonumber(existing.y) == y and tonumber(existing.z) == z
+            and tonumber(existing.objectIndex) == objectIndex
+            and existing.autoFactionId == factionId
+            and existing.autoBaseId == baseId
+        if alreadyThisBed then return true, "existing" end
+        if existing.autoFactionId ~= factionId then
+            return false, "bed_already_assigned"
+        end
+    end
+    survivor.policies.assignedBed = {
+        x = x, y = y, z = z, objectIndex = objectIndex,
+        autoFactionId = factionId, autoBaseId = baseId,
+    }
+    survivor.duty.changedAtHours = tonumber(worldAgeHours) or 0
+    survivor.duty.revision = (tonumber(survivor.duty.revision) or 0) + 1
+    return true, existing ~= nil and "reassigned" or "assigned"
+end
+
+function KnoxPersistence.clearFactionResidentBed(id, factionId, baseId)
+    local survivor = type(id) == "string" and root().survivors[id] or nil
+    local bed = survivor ~= nil and survivor.policies ~= nil
+        and survivor.policies.assignedBed or nil
+    if type(bed) ~= "table" or bed.autoFactionId ~= factionId
+        or (baseId ~= nil and bed.autoBaseId ~= baseId) then
+        return false
+    end
+    survivor.policies.assignedBed = nil
     return true
 end
 
@@ -3413,6 +3606,13 @@ function KnoxPersistence.adoptPendingPlayerSuccession(player, worldAgeHours)
         end
     end
     data.pendingPlayerSuccession = nil
+    -- This character inherited the existing household and companions. Do not
+    -- also run the fresh-character spouse starter for the successor.
+    local playerModData = player.getModData ~= nil and player:getModData() or nil
+    if playerModData ~= nil then
+        playerModData.KnoxSurvivors = playerModData.KnoxSurvivors or {}
+        playerModData.KnoxSurvivors.spouseStart = { status = "skipped_succession" }
+    end
     return true, base.id
 end
 
@@ -4307,6 +4507,7 @@ function KnoxPersistence.removeFactionMember(factionId, survivorId, preserveDuty
     if faction.memberJoinedAtHours ~= nil then
         faction.memberJoinedAtHours[survivorId] = nil
     end
+    KnoxPersistence.clearFactionResidentBed(survivorId, factionId)
     if survivor.affiliation.factionId == factionId then
         if survivor.duty.mode == "base" then
             requeueClaimsForSurvivor(
@@ -4352,6 +4553,12 @@ function KnoxPersistence.getTravelGroupFor(id)
         end
     end
     return matches[1] ~= nil and matches[1].group or nil
+end
+
+-- Read-only QA/diagnostic enumeration. Persistence remains the membership
+-- owner; consumers must not mutate the returned canonical roster table.
+function KnoxPersistence.getTravelGroups()
+    return root().travelGroups
 end
 
 -- A travel-group objective is a durable, read-only summary of the leader's
@@ -4520,6 +4727,13 @@ function KnoxPersistence.removeTravelGroupMember(survivorId)
     local affiliation = KnoxPersistence.getSurvivorAffiliation(survivorId) or {}
     if affiliation.factionId ~= nil and factionIds[affiliation.factionId] then
         KnoxPersistence.removeFactionMember(affiliation.factionId, survivorId)
+    end
+    if removed then
+        local relationships = rawget(_G, "KnoxSurvivorRelationships")
+        if relationships ~= nil
+            and relationships.requestGroupAssignmentRefresh ~= nil then
+            pcall(relationships.requestGroupAssignmentRefresh)
+        end
     end
     return removed
 end
@@ -4874,13 +5088,19 @@ function KnoxPersistence.addTravelGroupMember(groupId, survivorId)
             return nil, "faction_member_limit"
         end
     end
+    local now = getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
+    if group.factionId ~= nil and not alreadyMember
+        and not KnoxPersistence.addFactionMember(group.factionId, survivorId, now) then
+        -- Faction admission owns lifecycle, affiliation, and away-team gates.
+        -- Do not report a group join or mutate relationships when that
+        -- authoritative membership owner rejects the survivor.
+        return nil, "faction_admission_rejected"
+    end
     if not alreadyMember then
         group.memberIds[#group.memberIds + 1] = survivorId
         table.sort(group.memberIds)
         group.memberJoinedAtHours = group.memberJoinedAtHours or {}
-        group.memberJoinedAtHours[survivorId] = getGameTime() ~= nil
-            and getGameTime():getWorldAgeHours()
-            or 0
+        group.memberJoinedAtHours[survivorId] = now
     end
     for _, memberId in ipairs(group.memberIds) do
         if memberId ~= survivorId then
@@ -4888,19 +5108,11 @@ function KnoxPersistence.addTravelGroupMember(groupId, survivorId)
                 memberId,
                 survivorId,
                 "allied",
-                getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
+                now
             )
         end
     end
     if group.factionId ~= nil then
-        local survivor = ensureSurvivorState(survivorId)
-        survivor.affiliation.kind = "faction"
-        survivor.affiliation.ownerId = nil
-        KnoxPersistence.addFactionMember(
-            group.factionId,
-            survivorId,
-            getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
-        )
         -- A faction that already owns a home must admit a new member into the
         -- same resident lifecycle immediately. Leaving the survivor in
         -- autonomous duty would make them appear recruited while the base
@@ -4911,7 +5123,7 @@ function KnoxPersistence.addTravelGroupMember(groupId, survivorId)
                 survivorId,
                 group.factionId,
                 faction.homeBaseId,
-                getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
+                now
             )
             if resident and residentResult ~= "existing"
                 and rawget(_G, "KnoxSurvivorRuntime") ~= nil
@@ -5152,6 +5364,14 @@ function KnoxPersistence.normalizeRelationshipDomains()
                 if group.objective ~= nil then
                     group.objective = nil
                     group.objectiveRevision = (tonumber(group.objectiveRevision) or 0) + 1
+                end
+                -- Direct removal already retires the old leader's order. Apply
+                -- the same rule when repairing an interrupted or legacy save;
+                -- getters reject stale issuers, but leaving the record behind
+                -- would preserve a directive that no current leader owns.
+                if group.leaderOrder ~= nil then
+                    group.leaderOrder = nil
+                    group.leaderOrderRevision = (tonumber(group.leaderOrderRevision) or 0) + 1
                 end
                 changes = changes + 1
             end
@@ -5693,6 +5913,103 @@ function KnoxPersistence.getBasesForOwner(ownerKind, ownerId)
     return list
 end
 
+local PLAYER_BASE_NAME_MAX_CODEPOINTS = 32
+
+local function trimPlayerBaseName(value)
+    return value:gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function utf8CodepointCount(value)
+    local count, index = 0, 1
+    local length = #value
+    while index <= length do
+        local first = string.byte(value, index)
+        local second = string.byte(value, index + 1)
+        local third = string.byte(value, index + 2)
+        local fourth = string.byte(value, index + 3)
+        local width
+        if first <= 0x7F then
+            width = 1
+        elseif first >= 0xC2 and first <= 0xDF
+            and second ~= nil and second >= 0x80 and second <= 0xBF then
+            width = 2
+        elseif first == 0xE0 and second ~= nil and second >= 0xA0 and second <= 0xBF
+            and third ~= nil and third >= 0x80 and third <= 0xBF then
+            width = 3
+        elseif ((first >= 0xE1 and first <= 0xEC) or (first >= 0xEE and first <= 0xEF))
+            and second ~= nil and second >= 0x80 and second <= 0xBF
+            and third ~= nil and third >= 0x80 and third <= 0xBF then
+            width = 3
+        elseif first == 0xED and second ~= nil and second >= 0x80 and second <= 0x9F
+            and third ~= nil and third >= 0x80 and third <= 0xBF then
+            width = 3
+        elseif first == 0xF0 and second ~= nil and second >= 0x90 and second <= 0xBF
+            and third ~= nil and third >= 0x80 and third <= 0xBF
+            and fourth ~= nil and fourth >= 0x80 and fourth <= 0xBF then
+            width = 4
+        elseif first >= 0xF1 and first <= 0xF3
+            and second ~= nil and second >= 0x80 and second <= 0xBF
+            and third ~= nil and third >= 0x80 and third <= 0xBF
+            and fourth ~= nil and fourth >= 0x80 and fourth <= 0xBF then
+            width = 4
+        elseif first == 0xF4 and second ~= nil and second >= 0x80 and second <= 0x8F
+            and third ~= nil and third >= 0x80 and third <= 0xBF
+            and fourth ~= nil and fourth >= 0x80 and fourth <= 0xBF then
+            width = 4
+        else
+            return nil
+        end
+        count = count + 1
+        if count > PLAYER_BASE_NAME_MAX_CODEPOINTS then return count end
+        index = index + width
+    end
+    return count
+end
+
+local function playerBaseNameKey(value)
+    -- ASCII case folding is deterministic in Lua 5.1/Kahlua and leaves UTF-8
+    -- bytes untouched. Non-ASCII names still reject exact duplicates.
+    return (value:gsub("[A-Z]", function(letter)
+        return string.char(string.byte(letter) + 32)
+    end))
+end
+
+function KnoxPersistence.renamePlayerBase(baseId, playerId, requestedName)
+    if type(baseId) ~= "string" or baseId == ""
+        or type(playerId) ~= "string" or playerId == "" then
+        return nil, "invalid_owner_or_base"
+    end
+    local base = KnoxPersistence.getBase(baseId)
+    if base == nil then return nil, "invalid_base" end
+    if base.ownerKind ~= "player" or base.ownerId ~= playerId then
+        return nil, "not_player_owned"
+    end
+    if type(requestedName) ~= "string" then return nil, "invalid_name" end
+
+    local name = trimPlayerBaseName(requestedName)
+    if name == "" then return nil, "blank_name" end
+    if string.find(name, "[%z\1-\31\127]") ~= nil then
+        return nil, "invalid_name"
+    end
+    local length = utf8CodepointCount(name)
+    if length == nil then return nil, "invalid_name_encoding" end
+    if length > PLAYER_BASE_NAME_MAX_CODEPOINTS then return nil, "name_too_long" end
+
+    local nameKey = playerBaseNameKey(name)
+    for _, other in ipairs(KnoxPersistence.getBasesForOwner("player", playerId)) do
+        if other ~= nil and other.id ~= baseId and type(other.name) == "string" then
+            local otherName = trimPlayerBaseName(other.name)
+            if otherName ~= "" and playerBaseNameKey(otherName) == nameKey then
+                return nil, "duplicate_name"
+            end
+        end
+    end
+
+    if base.name == name then return base, "unchanged" end
+    base.name = name
+    return base, "renamed"
+end
+
 -- Automated QA may create faction safehouses in a disposable save. Remove
 -- only bases whose entire membership is made of Knox developer fixtures; a
 -- real faction or player base can never satisfy this boundary.
@@ -5725,6 +6042,9 @@ function KnoxPersistence.removeDeveloperFactionBase(factionId, baseId)
         end)
     end
     data.bases[baseId] = nil
+    for _, survivorId in ipairs(faction.memberIds or {}) do
+        KnoxPersistence.clearFactionResidentBed(survivorId, factionId, baseId)
+    end
     if faction.homeBaseId == baseId then faction.homeBaseId = nil end
     faction.engineSafehouseId = nil
     faction.engineSafehouseOwner = nil
@@ -6025,6 +6345,72 @@ function KnoxPersistence.setBaseStoragePolicy(baseId, reference, category, depot
     return policy, "saved"
 end
 
+-- Filter policies extend the same real-container record used by legacy
+-- single-role assignments.  Keeping storageRole/category as a stable primary
+-- category lets older readers and old-save migrations continue to function.
+function KnoxPersistence.setBaseStorageFilters(baseId, reference, filters)
+    local base = KnoxPersistence.getBase(baseId)
+    if base == nil or type(reference) ~= "table" or type(reference.key) ~= "string"
+        or type(filters) ~= "table" then
+        return nil, "invalid_container"
+    end
+    local validCategories = {
+        food=true, water=true, medical=true, weapons=true,
+        ammunition=true, tools=true, logs=true, general=true,
+        building=true, farming=true, clothing=true, junk=true,
+    }
+    local normalized = {}
+    for category, enabled in pairs(filters) do
+        local nativeCategory = type(category) == "string"
+            and string.match(category, "^display:([%w_%-]+)$") or nil
+        if enabled == true and (validCategories[category] == true
+            or (nativeCategory ~= nil and #nativeCategory <= 64)) then
+            normalized[category] = true
+        end
+    end
+    local hasNormalizedFilter = false
+    for _ in pairs(normalized) do
+        hasNormalizedFilter = true
+        break
+    end
+    if not hasNormalizedFilter then return nil, "empty_storage_filters" end
+    if normalized.general then
+        normalized = { general = true }
+    end
+    local order = { "food", "water", "medical", "weapons", "ammunition",
+        "tools", "logs", "building", "farming", "clothing", "junk", "general" }
+    local primary = nil
+    for _, category in ipairs(order) do
+        if normalized[category] then primary = category; break end
+    end
+    if primary == nil then
+        local nativeCategories = {}
+        for category in pairs(normalized) do nativeCategories[#nativeCategories + 1] = category end
+        table.sort(nativeCategories)
+        primary = nativeCategories[1]
+    end
+    local existing = (base.storage or {})[reference.key]
+    local policy = {
+        key = reference.key,
+        x = tonumber(reference.x), y = tonumber(reference.y), z = tonumber(reference.z) or 0,
+        objectIndex = tonumber(reference.objectIndex),
+        containerIndex = tonumber(reference.containerIndex) or 0,
+        containerType = tostring(reference.containerType or "container"),
+        category = primary, storageRole = primary, storageFilters = normalized,
+        storageFilterVersion = 1, depot = false, toolCupboard = false,
+        priority = KnoxPersistence.validStoragePriority(existing ~= nil and existing.priority)
+            or "normal",
+    }
+    local retained = {}
+    for key, value in pairs(base.storage or {}) do
+        if key ~= policy.key then retained[key] = value end
+    end
+    retained[policy.key] = policy
+    if base.toolCupboardKey == policy.key then base.toolCupboardKey = nil end
+    base.storage = retained
+    return policy, "saved"
+end
+
 function KnoxPersistence.removeBaseStoragePolicy(baseId, key)
     local base = KnoxPersistence.getBase(baseId)
     if base == nil or base.storage[key] == nil then
@@ -6274,6 +6660,7 @@ function KnoxPersistence.finishBaseTask(
     task.claimedAtHours = nil
     task.manual = nil
     task.auto = nil
+    if succeeded == true then task.manualOrder = nil end
     -- A completed routine should not be reclaimed by the same resident on the
     -- very next thought.  The short cooldown lets other residents claim work
     -- and gives the worker a natural idle/rest interval.  Depot sorting stays

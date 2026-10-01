@@ -5,6 +5,7 @@ require "ISUI/ISLabel"
 require "ISUI/ISComboBox"
 require "ISUI/ISScrollingListBox"
 require "ISUI/ISTickBox"
+require "ISUI/ISTextBox"
 require "KS_Persistence"
 require "KS_SurvivorViewModel"
 require "KS_BaseManager"
@@ -133,7 +134,7 @@ local SCHEDULE_TOOLS = {
     { key = "work", label = "Work" },
     { key = "patrol", label = "Patrol" },
     { key = "guard", label = "Guard" },
-    { key = "recreation", label = "Rec" },
+    { key = "recreation", label = "Leisure" },
     { key = "anything", label = "Free" },
 }
 local SCHEDULE_COLORS = {
@@ -145,10 +146,8 @@ local SCHEDULE_COLORS = {
     anything = { r = 0.42, g = 0.42, b = 0.42 },
 }
 
--- Work-priority columns and colors for the Crew tab: one column per work
--- group, click a cell to cycle Auto > 1 > 2 > 3 > 4 > Never. 1 is done
--- first. Declared up here (before every view) so all tab methods can see
--- them as upvalues; Lua resolves locals only forward in the chunk.
+-- One control per category already owned by the base task selector. Missing
+-- entries display Normal; active companions never have these controls enabled.
 local PRIORITY_COLUMNS = {
     { key = "guard", label = "Guard" },
     { key = "patrol", label = "Patrol" },
@@ -160,21 +159,69 @@ local PRIORITY_COLUMNS = {
     { key = "repair", label = "Repair" },
 }
 local PRIORITY_COLORS = {
-    auto = { r = 0.42, g = 0.42, b = 0.42 },
-    [1] = { r = 0.85, g = 0.30, b = 0.12 },
-    [2] = { r = 0.85, g = 0.52, b = 0.12 },
-    [3] = { r = 0.78, g = 0.68, b = 0.22 },
-    [4] = { r = 0.42, g = 0.52, b = 0.42 },
-    never = { r = 0.16, g = 0.16, b = 0.16 },
+    normal = { r = 0.42, g = 0.42, b = 0.42 },
+    high = { r = 0.85, g = 0.30, b = 0.12 },
+    low = { r = 0.78, g = 0.68, b = 0.22 },
+    disabled = { r = 0.16, g = 0.16, b = 0.16 },
 }
+local PRIORITY_STATE_LABELS = { high = "H", normal = "N", low = "L", disabled = "D" }
+local PRIORITY_STATE_NEXT = { high = "low", low = "disabled", disabled = "normal", normal = "high" }
+
+local function setPersistentButtonFill(button, color, alpha)
+    if button == nil or color == nil then return end
+    local fill = { r = color.r, g = color.g, b = color.b, a = alpha or 0.9 }
+    button.background = true
+    button.isBaseBackgroundVisible = true
+    button.backgroundColor = fill
+    button.backgroundColorMouseOver = {
+        r = fill.r, g = fill.g, b = fill.b, a = fill.a,
+    }
+    -- ISButton:setEnable restores this cached value every time the view is
+    -- refreshed. Keep it synchronized or the first/default color returns
+    -- after a paint or preference change.
+    button.backgroundColorEnabled = {
+        r = fill.r, g = fill.g, b = fill.b, a = fill.a,
+    }
+end
 
 local function currentScheduleHour()
+    -- Read the same authoritative PZ clock used by autonomy. The older
+    -- NightShelter helper falls back to noon when its optional global clock
+    -- is absent, which made this marker stick at 12 even at 17:00.
+    local gameTime
+    if getGameTime ~= nil then
+        local ok, value = pcall(getGameTime)
+        if ok then gameTime = value end
+    end
+    if gameTime == nil then
+        local gameTimeClass = rawget(_G, "GameTime")
+        if gameTimeClass ~= nil and gameTimeClass.getInstance ~= nil then
+            local ok, value = pcall(function() return gameTimeClass.getInstance() end)
+            if ok then gameTime = value end
+        end
+    end
+    if gameTime ~= nil and gameTime.getTimeOfDay ~= nil then
+        local ok, hour = pcall(function() return gameTime:getTimeOfDay() end)
+        hour = ok and tonumber(hour) or nil
+        if hour ~= nil then return hour % 24 end
+    end
+
     local shelter = rawget(_G, "KnoxNightShelter")
     if shelter ~= nil and shelter.currentHour ~= nil then
         local ok, hour = pcall(function() return shelter.currentHour() end)
-        if ok then return tonumber(hour) or 12 end
+        hour = ok and tonumber(hour) or nil
+        if hour ~= nil then return hour % 24 end
     end
-    return 12
+    return nil
+end
+
+local function responsiveControlColumns(availableWidth, count, minimumWidth, maximumColumns)
+    local available = math.max(1, tonumber(availableWidth) or 1)
+    local total = math.max(1, tonumber(count) or 1)
+    local minimum = math.max(1, tonumber(minimumWidth) or 1)
+    if available >= total * minimum + (total - 1) * 4 then return total end
+    local maxColumns = math.max(1, tonumber(maximumColumns) or total)
+    return math.max(1, math.min(maxColumns, math.floor((available + 4) / (minimum + 4))))
 end
 
 local function readableReason(value)
@@ -249,6 +296,8 @@ function BaseView:createChildren()
     ISPanelJoypad.createChildren(self)
     local y=UI_BORDER_SPACING
     self.basePicker=ISComboBox:new(UI_BORDER_SPACING,y,220,BUTTON_HGT,self,nil); self.basePicker:initialise(); self:addChild(self.basePicker)
+    self.renameBaseBtn=ISButton:new(self.basePicker:getRight()+6,y,88,BUTTON_HGT,"Rename",self,BaseView.onRenameBase)
+    self.renameBaseBtn:initialise(); self.renameBaseBtn.borderColor={r=0.7,g=0.7,b=0.7,a=0.5}; self:addChild(self.renameBaseBtn)
     y=y+BUTTON_HGT+4
     self.infoLabel=ISLabel:new(UI_BORDER_SPACING,y,BUTTON_HGT,"",1,1,1,1,UIFont.Small,true); self.infoLabel:initialise(); self:addChild(self.infoLabel)
     y=y+FONT_HGT_SMALL+4
@@ -293,16 +342,33 @@ function BaseView:createChildren()
     -- Hours and priorities moved to the Crew tab; the Base tab keeps
     -- boundary, areas, queue and storage.
     self.hintLabel=ISLabel:new(UI_BORDER_SPACING,y,BUTTON_HGT,"",0.62,0.62,0.60,1,UIFont.NewSmall,true); self.hintLabel:initialise(); self.hintLabel.name="Set hours and work priorities per survivor in the Crew tab."; self:addChild(self.hintLabel)
+    -- The fixed arrangement is taller than short/split-screen viewports.
+    -- Let the existing tab layout adapter scroll the whole page instead of
+    -- placing storage and its hint beyond the visible tab bounds.
+    self.knoxContentHeight=self.hintLabel:getBottom()+UI_BORDER_SPACING
+end
+function BaseView:onMouseWheel(delta)
+    -- Keep wheel input local to one bounded list.  The parent tab only moves
+    -- when the pointer is outside Work Areas, Task Queue, and Storage.
+    return UILayout.routeWheelToChildren(self, delta,
+        { self.zoneList, self.taskList, self.storageList })
 end
 function BaseView:drawZone(y,item,alt)
+    if not UILayout.listRowVisible(self, y, item) then return y+self.itemheight end
     local a=0.9; self:drawRectBorder(0,y,self:getWidth(),self.itemheight-1,a,0.28,0.28,0.28)
     if self.selected==item.index then self:drawRect(0,y,self:getWidth(),self.itemheight-1,0.28,0.45,0.42,0.36) end
     local color=ZONE_COLORS[item.item and item.item.type] or ZONE_COLORS.general
     self:drawRect(0,y,4,self.itemheight-1,0.9,color.r,color.g,color.b)
     drawListText(self, y, item, a); return y+self.itemheight
 end
-function BaseView:drawTask(y,item,alt) local a=0.9; self:drawRectBorder(0,y,self:getWidth(),self.itemheight-1,a,0.28,0.28,0.28); if self.selected==item.index then self:drawRect(0,y,self:getWidth(),self.itemheight-1,0.3,0.7,0.35,0.15) end; drawListText(self,y,item,a); return y+self.itemheight end
-function BaseView:drawStorage(y,item,alt) local a=0.9; self:drawRectBorder(0,y,self:getWidth(),self.itemheight-1,a,0.28,0.28,0.28); if self.selected==item.index then self:drawRect(0,y,self:getWidth(),self.itemheight-1,0.3,0.7,0.35,0.15) end; drawListText(self,y,item,a); return y+self.itemheight end
+function BaseView:drawTask(y,item,alt)
+    if not UILayout.listRowVisible(self, y, item) then return y+self.itemheight end
+    local a=0.9; self:drawRectBorder(0,y,self:getWidth(),self.itemheight-1,a,0.28,0.28,0.28); if self.selected==item.index then self:drawRect(0,y,self:getWidth(),self.itemheight-1,0.3,0.7,0.35,0.15) end; drawListText(self,y,item,a); return y+self.itemheight
+end
+function BaseView:drawStorage(y,item,alt)
+    if not UILayout.listRowVisible(self, y, item) then return y+self.itemheight end
+    local a=0.9; self:drawRectBorder(0,y,self:getWidth(),self.itemheight-1,a,0.28,0.28,0.28); if self.selected==item.index then self:drawRect(0,y,self:getWidth(),self.itemheight-1,0.3,0.7,0.35,0.15) end; drawListText(self,y,item,a); return y+self.itemheight
+end
 function BaseView:onAssignTask()
     local index=self.taskList.selected or 0; local entry=index>0 and self.taskList.items[index] or nil; local task=entry and entry.item or nil
     local residentId=self.residentIds and self.residentIds[self.residentPicker.selected or 0] or nil
@@ -345,35 +411,75 @@ function BaseView:onResumeTask()
         self:populate(self.playerNum)
     end
 end
-function BaseView:prerender()
-    ISPanelJoypad.prerender(self)
-    -- Multi-base picker is polled, not evented (combos here are read on
-    -- demand): a changed selection re-resolves every tab to that home.
-    local win = self:getWindow()
-    if win ~= nil and self.baseIds ~= nil and #self.baseIds > 1 then
-        local id = self.baseIds[self.basePicker.selected or 0]
-        if id ~= nil and win.knoxBaseId ~= id then
-            win.knoxBaseId = id
-            refreshAllViews(win)
-            return
-        end
-    end
-    if self.removeBtn and self.zoneList then
-        local item=self.zoneList.selected and self.zoneList.items[self.zoneList.selected] or nil
-        self.removeBtn:setEnable(item ~= nil and item.item ~= nil and item.item.id ~= nil)
-    end
-    local entry=self.taskList and self.taskList.selected and self.taskList.items[self.taskList.selected] or nil
-    local task=entry and entry.item or nil
-    if self.cancelTaskBtn then self.cancelTaskBtn:setEnable(task ~= nil and task.state ~= "claimed" and task.state ~= "cancelled") end
-    if self.resumeTaskBtn then self.resumeTaskBtn:setEnable(task ~= nil and task.state == "cancelled") end
-    if self.assignTaskBtn then self.assignTaskBtn:setEnable(task ~= nil and task.state == "queued" and self.residentIds ~= nil and #self.residentIds > 0) end
-    if self.residentPicker then self.residentPicker:setEnabled(task ~= nil and task.state == "queued" and self.residentIds ~= nil and #self.residentIds > 0) end
-end
 function BaseView:selectedBase(playerNum, pid)
     local win = self:getWindow()
     local baseId = notebookBaseId(win, playerNum, pid)
     if baseId == nil then return nil end
     return KnoxPersistence.getBase(baseId)
+end
+
+function BaseView:onRenameBase()
+    local win = self:getWindow()
+    local playerNum = win ~= nil and win.playerNum or self.playerNum
+    local player = playerNum ~= nil and getSpecificPlayer(playerNum) or nil
+    local playerId = player ~= nil and KnoxPersistence.ensurePlayerId(player) or nil
+    local base = playerId ~= nil and self:selectedBase(playerNum, playerId) or nil
+    if base == nil or base.ownerKind ~= "player" or base.ownerId ~= playerId then
+        KnoxActivityFeed.event("Select one of your bases before renaming it.")
+        return
+    end
+
+    local prompt = "Rename " .. tostring(base.name or "base") .. " (32 characters maximum):"
+    local modal = ISTextBox:new(0, 0, 360, 180, prompt, tostring(base.name or ""),
+        self, BaseView.onRenameBaseConfirm, playerNum)
+    modal:initialise()
+    modal:addToUIManager()
+    modal:setAlwaysOnTop(true)
+    modal.moveWithMouse = true
+    modal.knoxBaseId = base.id
+    modal.knoxPlayerId = playerId
+    modal.knoxPlayerNum = playerNum
+    if modal.centerOnScreen ~= nil then modal:centerOnScreen(playerNum) end
+end
+
+function BaseView:onRenameBaseConfirm(button)
+    if button == nil or button.internal ~= "OK" then return end
+    local modal = button.parent
+    if modal == nil or modal.knoxBaseId == nil or modal.knoxPlayerId == nil
+        or modal.entry == nil or modal.entry.getText == nil then
+        KnoxActivityFeed.event("Could not rename base: the name entry was unavailable.")
+        return
+    end
+
+    local base, result = KnoxPersistence.renamePlayerBase(
+        modal.knoxBaseId, modal.knoxPlayerId, modal.entry:getText())
+    if base == nil then
+        local messages = {
+            invalid_base = "that base no longer exists",
+            not_player_owned = "that base is not player-owned",
+            invalid_owner_or_base = "the selected base is invalid",
+            blank_name = "enter a name first",
+            invalid_name = "the name contains unsupported control characters",
+            invalid_name_encoding = "the name contains invalid text encoding",
+            name_too_long = "names can contain at most 32 characters",
+            duplicate_name = "another owned base already uses that name",
+        }
+        KnoxActivityFeed.event("Could not rename base: " .. tostring(messages[result] or result) .. ".")
+        return
+    end
+
+    local win = self:getWindow()
+    if win ~= nil then
+        -- Keep selected identity stable while every Notebook view rereads the
+        -- updated canonical base.name value.
+        win.knoxBaseId = base.id
+        refreshAllViews(win)
+    end
+    if result == "unchanged" then
+        KnoxActivityFeed.event("Base name is unchanged: " .. tostring(base.name) .. ".")
+    else
+        KnoxActivityFeed.event("Base renamed to " .. tostring(base.name) .. ".")
+    end
 end
 
 function BaseView:populate(playerNum)
@@ -393,6 +499,7 @@ function BaseView:populate(playerNum)
         end
     end
     self.basePicker:setVisible(#bases > 1)
+    self.renameBaseBtn:setEnable(base ~= nil and base.ownerKind == "player" and base.ownerId == pid)
     self.taskList:clear(); self.storageList:clear()
     self.residentIds = {}
     self.residentPicker:clear(); self.residentPicker.selected = 1
@@ -404,6 +511,7 @@ function BaseView:populate(playerNum)
         -- ISTickBox exposes `enable` directly in Build 42; setEnable belongs
         -- to ISButton only.
         self.showHighlights.enable=false; self.editBoundaryBtn:setEnable(false); self.addAreaBtn:setEnable(false); self.removeBtn:setEnable(false)
+        self.renameBaseBtn:setEnable(false)
         self.residentPicker:addOption("No residents")
         addRow(self.taskList,"none","No base"); addRow(self.storageList,"none","No base")
         self.taskHeading.name="No base"; self.storageLabel.name="No base"
@@ -500,12 +608,16 @@ function BaseView:populateWork(base)
     local stockState=settlement~=nil and settlement.stockKnown
         and (shortageCount>0 and (tostring(shortageCount).." shortage(s)") or "reserves covered")
         or "stock unavailable"
+    local filteredContainers = KnoxBaseStorage.policies(base) or {}
+    local usableContainers = KnoxBaseStorage.operationalPolicies ~= nil
+        and KnoxBaseStorage.operationalPolicies(base) or filteredContainers
     self.storageLabel.name=trimText(UIFont.Small,
-        "Storage: " .. tostring(#(KnoxBaseStorage.policies(base) or {}))
-        .. " assigned | " .. stockState, self.width-UI_BORDER_SPACING*2)
+        "Storage: " .. tostring(#filteredContainers) .. " filtered | "
+        .. tostring(#usableContainers) .. " usable containers | " .. stockState,
+        self.width-UI_BORDER_SPACING*2)
     local any=false
     local assigned = KnoxBaseStorage.policies(base)
-    if #assigned == 0 then addRow(self.storageList,"setup","Assign storage: right-click a container at home > Use for ...") end
+    if #assigned == 0 then addRow(self.storageList,"setup","Right-click any container inside this base to set item filters") end
     for _, policy in ipairs(assigned) do
         local resolved = KnoxBaseStorage.resolvePolicy(policy)
         local text = KnoxBaseStorage.label(policy) .. " [" .. KnoxBaseStorage.priorityLabel(policy) .. "]"
@@ -514,7 +626,7 @@ function BaseView:populateWork(base)
         if resolved == nil then text = text .. " — unavailable" end
         addRow(self.storageList,policy.key,text)
     end
-    addRow(self.storageList,"food-help","Right-click a container at home > Use for Food, Tools, ...")
+    addRow(self.storageList,"food-help","Residents route real items using each container's filters")
     local reserveByCategory={}
     for _,reserve in ipairs(settlement~=nil and settlement.reserves or {}) do reserveByCategory[reserve.category]=reserve end
     for _,cat in ipairs(KnoxBaseStorage.RESOURCE_CATEGORIES) do
@@ -536,21 +648,32 @@ end
 function BaseView:getWindow() return self:getParent():getParent() end
 function BaseView:onToggleHighlights(_, selected) KnoxBaseHighlights.setEnabled(self:getWindow().playerNum or self.playerNum or 0, selected == true) end
 function BaseView:onEditBoundary()
-    local win=self:getWindow(); local pl=getSpecificPlayer(win.playerNum); local pid=pl and KnoxPersistence.ensurePlayerId(pl) or nil; local base=pid and KnoxBaseManager.getForOwner("player", pid) or nil
+    local win=self:getWindow(); local pl=getSpecificPlayer(win.playerNum); local pid=pl and KnoxPersistence.ensurePlayerId(pl) or nil; local base=pid and self:selectedBase(win.playerNum, pid) or nil
     if base and pl and KnoxBaseTerritorySelector and KnoxBaseTerritorySelector.start(pl, base.id) then win:setVisible(false) end
 end
 function BaseView:onAddArea()
-    local win=self:getWindow(); local pl=getSpecificPlayer(win.playerNum); local pid=pl and KnoxPersistence.ensurePlayerId(pl) or nil; local base=pid and KnoxBaseManager.getForOwner("player", pid) or nil; local def=ZONE_TYPES[self.zonePicker.selected or 1]
+    local win=self:getWindow(); local pl=getSpecificPlayer(win.playerNum); local pid=pl and KnoxPersistence.ensurePlayerId(pl) or nil; local base=pid and self:selectedBase(win.playerNum, pid) or nil; local def=ZONE_TYPES[self.zonePicker.selected or 1]
     if base and pl and def and KnoxBaseZoneSelector and KnoxBaseZoneSelector.start(pl, base.id, def.kind, def.label) then win:setVisible(false) end
 end
 function BaseView:onRemove()
     local index=self.zoneList.selected or 0; local it=index>0 and self.zoneList.items[index] or nil
     if not it or not it.item or not it.item.id then return end
-    local win=self:getWindow(); local pl=getSpecificPlayer(win.playerNum); local pid=pl and KnoxPersistence.ensurePlayerId(pl) or nil; local base=pid and KnoxBaseManager.getForOwner("player", pid) or nil
+    local win=self:getWindow(); local pl=getSpecificPlayer(win.playerNum); local pid=pl and KnoxPersistence.ensurePlayerId(pl) or nil; local base=pid and self:selectedBase(win.playerNum, pid) or nil
     if base then local removed=KnoxPersistence.removeBaseZone(base.id, it.item.id); if removed then KnoxBaseHighlights.refresh(win.playerNum); KnoxActivityFeed.event("Work area removed."); self:populate(win.playerNum) end end
 end
 function BaseView:prerender()
     ISPanelJoypad.prerender(self)
+    -- Combos are polled here. Commit a validated owned base ID before the
+    -- shared views repopulate, so all base-scoped controls follow the picker.
+    local win = self:getWindow()
+    if win ~= nil and self.baseIds ~= nil and #self.baseIds > 1 then
+        local id = self.baseIds[self.basePicker.selected or 0]
+        if id ~= nil and win.knoxBaseId ~= id then
+            win.knoxBaseId = id
+            refreshAllViews(win)
+            return
+        end
+    end
     if self.removeBtn and self.zoneList then
         local item=self.zoneList.selected and self.zoneList.items[self.zoneList.selected] or nil
         self.removeBtn:setEnable(item ~= nil and item.item ~= nil and item.item.id ~= nil)
@@ -574,63 +697,107 @@ function CrewView:createChildren()
     self.partyList=ISScrollingListBox:new(UI_BORDER_SPACING,y,self.width-UI_BORDER_SPACING*2,BUTTON_HGT*2)
     self.partyList:initialise(); self.partyList:instantiate(); self.partyList.itemheight=BUTTON_HGT; self.partyList.font=UIFont.NewSmall; self.partyList.doDrawItem=self.drawEntry; self.partyList.drawBorder=true; self.partyList.joypadParent=self; self:addChild(self.partyList)
     y = self.partyList:getBottom() + 4
-    self.residentsLabel=ISLabel:new(UI_BORDER_SPACING,y,BUTTON_HGT,"Residents — living at base",1,1,1,1,UIFont.Small,true); self.residentsLabel:initialise(); self:addChild(self.residentsLabel)
+    self.residentsLabel=ISLabel:new(UI_BORDER_SPACING,y,BUTTON_HGT,"Base residents — select one to edit work and schedule",1,1,1,1,UIFont.Small,true); self.residentsLabel:initialise(); self:addChild(self.residentsLabel)
     y = y + FONT_HGT_SMALL + 2
     self.resList=ISScrollingListBox:new(UI_BORDER_SPACING,y,self.width-UI_BORDER_SPACING*2,BUTTON_HGT*3)
     self.resList:initialise(); self.resList:instantiate(); self.resList.itemheight=BUTTON_HGT; self.resList.font=UIFont.NewSmall; self.resList.doDrawItem=self.drawEntry; self.resList.drawBorder=true; self.resList.joypadParent=self; self:addChild(self.resList)
     y = self.resList:getBottom() + 6
-    self.priorityLabel=ISLabel:new(UI_BORDER_SPACING,y,BUTTON_HGT,"",1,1,1,1,UIFont.Small,true); self.priorityLabel:initialise(); self.priorityLabel.name="Work Priorities"; self:addChild(self.priorityLabel)
+    self.priorityLabel=ISLabel:new(UI_BORDER_SPACING,y,BUTTON_HGT,"",1,1,1,1,UIFont.Small,true); self.priorityLabel:initialise(); self.priorityLabel.name="Work preferences — High / Normal / Low / Disabled"; self:addChild(self.priorityLabel)
     y = y + FONT_HGT_SMALL + 4
-    local cellW = math.max(40, math.floor((self.width - UI_BORDER_SPACING * 2 - (#PRIORITY_COLUMNS - 1) * 4) / #PRIORITY_COLUMNS))
+    local availableW = math.max(1, self.width - UI_BORDER_SPACING * 2)
+    local priorityColumns = responsiveControlColumns(
+        availableW, #PRIORITY_COLUMNS, 40, 4)
+    local cellW = math.max(1, math.floor((availableW - (priorityColumns - 1) * 4) / priorityColumns))
     self.crewCells = {}
     for index, col in ipairs(PRIORITY_COLUMNS) do
-        local btn = ISButton:new(UI_BORDER_SPACING + (index - 1) * (cellW + 4), y, cellW, BUTTON_HGT,
-            col.label .. ":A", self, CrewView.onCrewPriorityCell)
-        btn:initialise(); btn.borderColor = { r = 0.7, g = 0.7, b = 0.7, a = 0.5 }; self:addChild(btn)
+        local slot = (index - 1) % priorityColumns
+        local row = math.floor((index - 1) / priorityColumns)
+        local btn = ISButton:new(UI_BORDER_SPACING + slot * (cellW + 4), y + row * (BUTTON_HGT + 2), cellW, BUTTON_HGT,
+            col.label .. ":N", self, CrewView.onCrewPriorityCell)
+        btn:initialise(); btn.background = true; btn.isBaseBackgroundVisible = true
+        btn.borderColor = { r = 0.7, g = 0.7, b = 0.7, a = 0.5 }; self:addChild(btn)
         btn.knoxGroup = col.key
         self.crewCells[col.key] = btn
     end
-    y = y + BUTTON_HGT + 6
+    y = y + math.ceil(#PRIORITY_COLUMNS / priorityColumns) * (BUTTON_HGT + 2) + 4
+    self.scheduleResidentLabel=ISLabel:new(UI_BORDER_SPACING,y,BUTTON_HGT,"",1,1,1,1,UIFont.Small,true); self.scheduleResidentLabel:initialise(); self:addChild(self.scheduleResidentLabel)
+    y = y + FONT_HGT_SMALL + 2
     self.scheduleLabel=ISLabel:new(UI_BORDER_SPACING,y,BUTTON_HGT,"",1,1,1,1,UIFont.Small,true); self.scheduleLabel:initialise(); self:addChild(self.scheduleLabel)
-    y = y + FONT_HGT_SMALL + 4
-    self.scheduleHowLabel=ISLabel:new(UI_BORDER_SPACING,y,BUTTON_HGT,"",0.62,0.62,0.60,1,UIFont.NewSmall,true); self.scheduleHowLabel:initialise(); self.scheduleHowLabel.name="1. Pick a tool.  2. Click hours to paint them.  3. Press Save Hours."; self:addChild(self.scheduleHowLabel)
     y = y + FONT_HGT_SMALL + 4
     -- Paint tools first (RimWorld order): pick one, then click hours.
     -- Selected tool gets the white border; it sticks until changed.
     self.scheduleTools = {}
-    local toolW = math.max(40, math.floor((self.width - UI_BORDER_SPACING * 2 - (#SCHEDULE_TOOLS - 1) * 4) / #SCHEDULE_TOOLS))
+    local toolColumns = responsiveControlColumns(
+        availableW, #SCHEDULE_TOOLS, 40, 3)
+    local toolW = math.max(1, math.floor((availableW - (toolColumns - 1) * 4) / toolColumns))
     for index, tool in ipairs(SCHEDULE_TOOLS) do
-        local btn = ISButton:new(UI_BORDER_SPACING + (index - 1) * (toolW + 4), y, toolW, BUTTON_HGT,
+        local slot = (index - 1) % toolColumns
+        local row = math.floor((index - 1) / toolColumns)
+        local btn = ISButton:new(UI_BORDER_SPACING + slot * (toolW + 4), y + row * (BUTTON_HGT + 2), toolW, BUTTON_HGT,
             tool.label, self, CrewView.onSelectTool)
         btn:initialise(); btn.borderColor = { r = 0.7, g = 0.7, b = 0.7, a = 0.5 }
         local color = SCHEDULE_COLORS[tool.key]
-        btn.backgroundColor = { r = color.r, g = color.g, b = color.b, a = 0.9 }
+        setPersistentButtonFill(btn, color, 0.9)
         btn.knoxTool = tool.key
         self:addChild(btn)
         self.scheduleTools[tool.key] = btn
     end
-    y = y + BUTTON_HGT + 4
+    y = y + math.ceil(#SCHEDULE_TOOLS / toolColumns) * (BUTTON_HGT + 2) + 4
     self.scheduleHourBtns = {}
-    local stripW = self.width - UI_BORDER_SPACING * 2
-    local hourW = math.max(20, math.floor((stripW - 11 * 2) / 12))
-    for row = 0, 1 do
-        for col = 0, 11 do
-            local hour = row * 12 + col
+    local hourColumns = responsiveControlColumns(availableW, 12, 28, 12)
+    local hourRows = math.ceil(24 / hourColumns)
+    local hourW = math.max(1, math.floor((availableW - (hourColumns - 1) * 2) / hourColumns))
+    for row = 0, hourRows - 1 do
+        for col = 0, hourColumns - 1 do
+            local hour = row * hourColumns + col
+            if hour < 24 then
             local btn = ISButton:new(UI_BORDER_SPACING + col * (hourW + 2), y + row * (BUTTON_HGT + 2),
                 hourW, BUTTON_HGT, string.format("%02d", hour), self, CrewView.onPaintHour)
-            btn:initialise(); btn.borderColor = { r = 0.7, g = 0.7, b = 0.7, a = 0.5 }
+            btn:initialise(); btn.background = true; btn.isBaseBackgroundVisible = true
+            btn.borderColor = { r = 0.7, g = 0.7, b = 0.7, a = 0.5 }
             btn.knoxHour = hour
+            -- Paint begins only on an hour cell. Hover painting follows the
+            -- held left-button stroke across adjacent cells; no capture is
+            -- taken, so Notebook scrolling and other controls keep ownership.
+            btn.onmousedown = function(target, pressedButton)
+                if target ~= nil then target:beginSchedulePaintStroke(pressedButton) end
+            end
+            btn.onmouseover = function(target, hoveredButton)
+                if target ~= nil then target:continueSchedulePaintStroke(hoveredButton) end
+            end
+            btn.onMouseUp = function(self, mouseX, mouseY)
+                ISButton.onMouseUp(self, mouseX, mouseY)
+                if self.target ~= nil then self.target:endSchedulePaintStroke() end
+            end
+            btn.onMouseUpOutside = function(self, mouseX, mouseY)
+                ISButton.onMouseUpOutside(self, mouseX, mouseY)
+                if self.target ~= nil then self.target:endSchedulePaintStroke() end
+            end
             self:addChild(btn)
             self.scheduleHourBtns[hour + 1] = btn
+            end
         end
     end
-    y = y + 2 * BUTTON_HGT + 2 + 6
+    y = y + hourRows * (BUTTON_HGT + 2) + 4
     self.saveScheduleBtn=ISButton:new(UI_BORDER_SPACING,y,110,BUTTON_HGT,"Save Hours",self,CrewView.onSaveSchedule); self.saveScheduleBtn:initialise(); self.saveScheduleBtn.borderColor={r=0.7,g=0.7,b=0.7,a=0.5}; self:addChild(self.saveScheduleBtn)
-    self.colonyPresetBtn=ISButton:new(self.saveScheduleBtn:getRight()+6,y,110,BUTTON_HGT,"Colony Day",self,CrewView.onPresetColony); self.colonyPresetBtn:initialise(); self.colonyPresetBtn.borderColor={r=0.7,g=0.7,b=0.7,a=0.5}; self:addChild(self.colonyPresetBtn)
-    self.nightPresetBtn=ISButton:new(self.colonyPresetBtn:getRight()+6,y,110,BUTTON_HGT,"Night Shift",self,CrewView.onPresetNight); self.nightPresetBtn:initialise(); self.nightPresetBtn.borderColor={r=0.7,g=0.7,b=0.7,a=0.5}; self:addChild(self.nightPresetBtn)
-    self.clearPresetBtn=ISButton:new(self.nightPresetBtn:getRight()+6,y,80,BUTTON_HGT,"Clear",self,CrewView.onPresetClear); self.clearPresetBtn:initialise(); self.clearPresetBtn.borderColor={r=0.7,g=0.7,b=0.7,a=0.5}; self:addChild(self.clearPresetBtn)
-    self.resetPrioritiesBtn=ISButton:new(self.clearPresetBtn:getRight()+6,y,120,BUTTON_HGT,"Auto Priorities",self,CrewView.onResetPriorities); self.resetPrioritiesBtn:initialise(); self.resetPrioritiesBtn.borderColor={r=0.7,g=0.7,b=0.7,a=0.5}; self:addChild(self.resetPrioritiesBtn)
-    y = y + BUTTON_HGT + 4
+    self.colonyPresetBtn=ISButton:new(0,y,110,BUTTON_HGT,"Colony Day",self,CrewView.onPresetColony); self.colonyPresetBtn:initialise(); self.colonyPresetBtn.borderColor={r=0.7,g=0.7,b=0.7,a=0.5}; self:addChild(self.colonyPresetBtn)
+    self.nightPresetBtn=ISButton:new(0,y,110,BUTTON_HGT,"Night Shift",self,CrewView.onPresetNight); self.nightPresetBtn:initialise(); self.nightPresetBtn.borderColor={r=0.7,g=0.7,b=0.7,a=0.5}; self:addChild(self.nightPresetBtn)
+    self.clearPresetBtn=ISButton:new(0,y,80,BUTTON_HGT,"Clear",self,CrewView.onPresetClear); self.clearPresetBtn:initialise(); self.clearPresetBtn.borderColor={r=0.7,g=0.7,b=0.7,a=0.5}; self:addChild(self.clearPresetBtn)
+    self.resetPrioritiesBtn=ISButton:new(0,y,120,BUTTON_HGT,"Normal Work",self,CrewView.onResetPriorities); self.resetPrioritiesBtn:initialise(); self.resetPrioritiesBtn.borderColor={r=0.7,g=0.7,b=0.7,a=0.5}; self:addChild(self.resetPrioritiesBtn)
+    local presetButtons = { self.saveScheduleBtn, self.colonyPresetBtn, self.nightPresetBtn,
+        self.clearPresetBtn, self.resetPrioritiesBtn }
+    local presetX, presetRow = 0, 0
+    for _, button in ipairs(presetButtons) do
+        local buttonW = math.min(button.width, availableW)
+        if presetX > 0 and presetX + buttonW > availableW then
+            presetX, presetRow = 0, presetRow + 1
+        end
+        button:setX(UI_BORDER_SPACING + presetX)
+        button:setY(y + presetRow * (BUTTON_HGT + 2))
+        button:setWidth(buttonW)
+        presetX = presetX + buttonW + 4
+    end
+    y = y + (presetRow + 1) * (BUTTON_HGT + 2) + 2
     self.scheduleStatus=ISLabel:new(UI_BORDER_SPACING,y,BUTTON_HGT,"",0.62,0.62,0.60,1,UIFont.NewSmall,true); self.scheduleStatus:initialise(); self:addChild(self.scheduleStatus)
     y = y + FONT_HGT_SMALL + 4
     self.viewBtn=ISButton:new(UI_BORDER_SPACING,y,95,BUTTON_HGT,"View Card",self,CrewView.onView); self.viewBtn:initialise(); self.viewBtn.borderColor={r=0.7,g=0.7,b=0.7,a=0.5}; self:addChild(self.viewBtn)
@@ -638,9 +805,28 @@ function CrewView:createChildren()
     self.sendHomeBtn=ISButton:new(self.joinPartyBtn:getRight()+6,y,120,BUTTON_HGT,"Send Party Home",self,CrewView.onSendHome); self.sendHomeBtn:initialise(); self.sendHomeBtn.borderColor={r=0.7,g=0.7,b=0.7,a=0.5}; self:addChild(self.sendHomeBtn)
     self.jobPicker=ISComboBox:new(self.sendHomeBtn:getRight()+6,y,125,BUTTON_HGT,self,nil); self.jobPicker:initialise(); for _,choice in ipairs(BASE_JOB_CHOICES) do self.jobPicker:addOption(choice.label) end; self.jobPicker.selected=1; self:addChild(self.jobPicker)
     self.setJobBtn=ISButton:new(self.jobPicker:getRight()+6,y,80,BUTTON_HGT,"Set Job",self,CrewView.onSetJob); self.setJobBtn:initialise(); self.setJobBtn.borderColor={r=0.7,g=0.7,b=0.7,a=0.5}; self:addChild(self.setJobBtn)
+    local actionButtons = { self.viewBtn, self.joinPartyBtn, self.sendHomeBtn,
+        self.jobPicker, self.setJobBtn }
+    local actionX, actionRow = 0, 0
+    for _, control in ipairs(actionButtons) do
+        local controlW = math.min(control.width, availableW)
+        if actionX > 0 and actionX + controlW > availableW then
+            actionX, actionRow = 0, actionRow + 1
+        end
+        control:setX(UI_BORDER_SPACING + actionX)
+        control:setY(y + actionRow * (BUTTON_HGT + 2))
+        control:setWidth(controlW)
+        actionX = actionX + controlW + 4
+    end
+    self.knoxContentHeight = y + (actionRow + 1) * (BUTTON_HGT + 2) + UI_BORDER_SPACING
 end
-function CrewView:drawEntry(y,item,alt) local a=0.9; self:drawRectBorder(0,y,self:getWidth(),self.itemheight-1,a,0.28,0.28,0.28); if self.selected==item.index then self:drawRect(0,y,self:getWidth(),self.itemheight-1,0.3,0.7,0.35,0.15) end; drawListText(self,y,item,a); return y+self.itemheight end
+function CrewView:drawEntry(y,item,alt)
+    if not UILayout.listRowVisible(self, y, item) then return y+self.itemheight end
+    local a=0.9; self:drawRectBorder(0,y,self:getWidth(),self.itemheight-1,a,0.28,0.28,0.28); if self.selected==item.index then self:drawRect(0,y,self:getWidth(),self.itemheight-1,0.3,0.7,0.35,0.15) end; drawListText(self,y,item,a); return y+self.itemheight
+end
 function CrewView:populate(playerNum)
+    local selectedId = self:selectedCrewId()
+    local selectedSource = self.crewSelSource
     self.playerNum=playerNum
     self.partyList:clear(); self.resList:clear()
     self.partyIds={}; self.residentIds={}
@@ -693,6 +879,7 @@ function CrewView:populate(playerNum)
         end
     end end
     if #self.residentIds==0 then addRow(self.resList,"none", base ~= nil and "No residents at this base" or "No home base yet"); end
+    self:restoreCrewSelection(selectedId, selectedSource)
     self:paintCrewDetail()
 end
 function CrewView:onView()
@@ -744,15 +931,11 @@ function CrewView:onSetJob()
     local base = baseId ~= nil and KnoxPersistence.getBase(baseId) or nil
     local choice=BASE_JOB_CHOICES[self.jobPicker.selected or 1]
     if id == nil or duty == nil or base == nil or duty.mode ~= "base" or duty.baseId ~= base.id or choice == nil then return end
-    local now=getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
-    -- Keep the notebook on the same canonical order boundary as the context
-    -- menu and party controls.  The companion service still validates that
-    -- this is a resident of the player's base, persists the preference, and
-    -- notifies the loaded controller; the notebook only owns presentation.
-    local changed = KnoxCompanionService.issueOrder(
-        player,
-        id,
-        choice.value
+    -- The notebook may be looking at a non-primary owned base. Pass that
+    -- selected base through the existing service boundary so validation and
+    -- persistence target the same resident context shown to the player.
+    local changed = KnoxCompanionService.setBaseJobPreference(
+        player, id, choice.value, base.id
     )
     if changed then
         KnoxActivityFeed.event("Base job preference set to " .. string.lower(choice.label) .. ".")
@@ -782,6 +965,34 @@ function CrewView:selectedCrewId()
     return nil
 end
 
+function CrewView:restoreCrewSelection(preferredId, preferredSource)
+    local partyIndex, residentIndex
+    if preferredId ~= nil and preferredSource == "party" then
+        for index, id in ipairs(self.partyIds or {}) do
+            if id == preferredId then partyIndex = index; break end
+        end
+    elseif preferredId ~= nil and preferredSource == "residents" then
+        for index, id in ipairs(self.residentIds or {}) do
+            if id == preferredId then residentIndex = index; break end
+        end
+    end
+    -- The resident roster is the context for work and schedule controls, so
+    -- use it as the useful first selection when opening the page.
+    if partyIndex == nil and residentIndex == nil then
+        if #(self.residentIds or {}) > 0 then
+            residentIndex = 1
+        elseif #(self.partyIds or {}) > 0 then
+            partyIndex = 1
+        end
+    end
+    self.partyList.selected = partyIndex or 0
+    self.resList.selected = residentIndex or 0
+    self.crewSelSource = partyIndex ~= nil and "party"
+        or (residentIndex ~= nil and "residents" or nil)
+    self.lastPartySel = self.partyList.selected
+    self.lastResSel = self.resList.selected
+end
+
 function CrewView:crewBase()
     local p = getSpecificPlayer(self.playerNum or 0)
     local pid = p ~= nil and KnoxPersistence.ensurePlayerId(p) or nil
@@ -795,7 +1006,8 @@ function CrewView:schedulePlayerAndBase()
     local playerNum = (win ~= nil and win.playerNum) or self.playerNum or 0
     local player = getSpecificPlayer(playerNum)
     local pid = player ~= nil and KnoxPersistence.ensurePlayerId(player) or nil
-    local base = pid ~= nil and KnoxBaseManager.getForOwner("player", pid) or nil
+    local baseId = notebookBaseId(win, playerNum, pid)
+    local base = baseId ~= nil and KnoxPersistence.getBase(baseId) or nil
     return player, base, playerNum
 end
 
@@ -818,18 +1030,21 @@ function CrewView:scheduleDraftFor(residentId)
 end
 
 function CrewView:paintScheduleStrip(draft)
-    local now = currentScheduleHour() % 24
+    local hourNow = currentScheduleHour()
+    local now = hourNow ~= nil and math.floor(hourNow) % 24 or nil
     for hour = 0, 23 do
         local btn = self.scheduleHourBtns ~= nil and self.scheduleHourBtns[hour + 1] or nil
         if btn ~= nil then
             local assignment = type(draft) == "table" and draft[hour + 1] or nil
             if SCHEDULE_COLORS[assignment] == nil then assignment = "anything" end
-            local color = SCHEDULE_COLORS[assignment]
-            btn.backgroundColor = { r = color.r, g = color.g, b = color.b, a = 0.85 }
-            if hour == now and draft ~= nil then
-                btn.borderColor = { r = 1, g = 1, b = 1, a = 0.95 }
+        local color = SCHEDULE_COLORS[assignment]
+            setPersistentButtonFill(btn, color, 0.85)
+            if now ~= nil and hour == now and draft ~= nil then
+                btn.borderColor = { r = 1, g = 0.86, b = 0.18, a = 1 }
+                btn:setTitle(string.format("%02d*", hour))
             else
                 btn.borderColor = { r = 0.7, g = 0.7, b = 0.7, a = 0.5 }
+                btn:setTitle(string.format("%02d", hour))
             end
             btn:setEnable(draft ~= nil)
         end
@@ -851,21 +1066,15 @@ function CrewView:paintCrewDetail()
     local resident = duty ~= nil and duty.mode == "base"
         and base ~= nil and duty.baseId == base.id
     -- Priority row for the selected survivor.
-    local map = id ~= nil and KnoxPersistence.getWorkPriorities ~= nil
-        and KnoxPersistence.getWorkPriorities(id) or nil
+    local map = id ~= nil and KnoxPersistence.getWorkPreferences ~= nil
+        and KnoxPersistence.getWorkPreferences(id) or nil
     for _, col in ipairs(PRIORITY_COLUMNS) do
         local btn = self.crewCells[col.key]
-        local value = map ~= nil and map[col.key] or nil
-        local title, color
-        if value == false then
-            title, color = "X", PRIORITY_COLORS.never
-        elseif type(value) == "number" and PRIORITY_COLORS[value] ~= nil then
-            title, color = tostring(value), PRIORITY_COLORS[value]
-        else
-            title, color = "A", PRIORITY_COLORS.auto
-        end
+        local value = map ~= nil and map[col.key] or "normal"
+        local title = PRIORITY_STATE_LABELS[value] or "N"
+        local color = PRIORITY_COLORS[value] or PRIORITY_COLORS.normal
         btn:setTitle(col.label .. ":" .. title)
-        btn.backgroundColor = { r = color.r, g = color.g, b = color.b, a = 0.9 }
+        setPersistentButtonFill(btn, color, 0.9)
         btn:setEnable(resident)
     end
     -- Schedule strip for the selected resident.
@@ -876,7 +1085,9 @@ function CrewView:paintCrewDetail()
     if id == nil then
         self.scheduleTool, self.scheduleToolFor = "sleep", nil
     elseif self.scheduleToolFor ~= id then
-        local shown = draft ~= nil and draft[(currentScheduleHour() % 24) + 1] or nil
+        local hourNow = currentScheduleHour()
+        local shown = draft ~= nil and hourNow ~= nil
+            and draft[(math.floor(hourNow) % 24) + 1] or nil
         if SCHEDULE_COLORS[shown] == nil then shown = "sleep" end
         self.scheduleTool, self.scheduleToolFor = shown, id
     end
@@ -891,28 +1102,33 @@ function CrewView:paintCrewDetail()
     end
     self:paintScheduleStrip(draft)
     if id == nil then
-        self.scheduleLabel.name = "Schedule — pick a tool, then click hours"
+        self.scheduleResidentLabel.name = "Resident: none selected"
+        self.scheduleLabel.name = "Select a base resident to edit a schedule."
         self.scheduleStatus.name = ""
     else
-        local hour = currentScheduleHour()
+        self.scheduleResidentLabel.name = trimText(UIFont.Small,
+            "Resident: " .. self:crewDisplayName(id),
+            self.width - UI_BORDER_SPACING * 2)
+        local hourNow = currentScheduleHour()
+        local hour = hourNow ~= nil and math.floor(hourNow) % 24 or nil
         local saved = KnoxPersistence.getDutySchedule ~= nil
             and KnoxPersistence.getDutySchedule(id) or nil
-        local assignment = KnoxPersistence.scheduleAssignmentFor ~= nil
-            and KnoxPersistence.scheduleAssignmentFor(saved, hour) or "anything"
+        local selectedTool = SCHEDULE_ASSIGNMENT_LABELS[self.scheduleTool] or "Sleep"
+        local assignment = draft ~= nil and hour ~= nil and draft[hour + 1] or nil
+        if assignment == nil and hour ~= nil then
+            assignment = KnoxPersistence.scheduleAssignmentFor ~= nil
+                and KnoxPersistence.scheduleAssignmentFor(saved, hour) or "anything"
+        end
+        local nowLabel = hour ~= nil
+            and ("NOW " .. string.format("%02d", hour) .. ": "
+                .. tostring(SCHEDULE_ASSIGNMENT_LABELS[assignment] or assignment))
+            or "IN-GAME TIME UNAVAILABLE"
         self.scheduleLabel.name = trimText(UIFont.Small,
-            "Schedule — " .. self:crewDisplayName(id) .. "  (Now: "
-            .. tostring(SCHEDULE_ASSIGNMENT_LABELS[assignment] or assignment) .. ")",
+            nowLabel .. "  |  Paint: " .. selectedTool,
             self.width - UI_BORDER_SPACING * 2)
         if not resident then
-            self.scheduleStatus.name = "Schedules and priorities apply to base residents."
+            self.scheduleStatus.name = "Schedules apply to base residents."
         else
-            local counts = KnoxPersistence.dutyHourCounts ~= nil
-                and KnoxPersistence.dutyHourCounts(draft) or {}
-            local parts = {}
-            for _, tool in ipairs(SCHEDULE_TOOLS) do
-                local n = tonumber(counts[tool.key]) or 0
-                if n > 0 then parts[#parts + 1] = tool.label .. " " .. n .. "h" end
-            end
             local source = saved
             local baseline = KnoxPersistence.dutyWindowsToHours ~= nil
                 and KnoxPersistence.dutyWindowsToHours(source) or {}
@@ -920,19 +1136,8 @@ function CrewView:paintCrewDetail()
             for h = 1, 24 do
                 if (draft or {})[h] ~= baseline[h] then dirty = true; break end
             end
-            local rotaNote = "Custom hours. "
-            if saved == nil then
-                rotaNote = dirty and "No hours saved yet — paint, then Save Hours. "
-                    or "No custom hours — works whenever needed. "
-            end
-            local status = workStatusFor(base, id) or {}
-            self.scheduleStatus.name = trimText(UIFont.NewSmall,
-                table.concat(parts, " · ") .. "  |  " .. rotaNote
-                .. (dirty and "Unsaved changes." or "Saved.") .. "  |  "
-                .. "Task: " .. tostring(status.state or "idle")
-                .. (status.taskType ~= nil and (" (" .. tostring(status.taskType) .. ")") or "")
-                .. "  |  Job: " .. tostring(duty.jobPreference or "auto"),
-                self.width - UI_BORDER_SPACING * 2)
+            self.scheduleStatus.name = dirty and "Unsaved changes — select Save Hours."
+                or (saved == nil and "Default schedule — Anything." or "Saved schedule.")
         end
     end
     -- Role picker follows the selected resident's stored preference.
@@ -950,28 +1155,29 @@ function CrewView:onCrewPriorityCell(button)
     local group = button ~= nil and button.knoxGroup or nil
     local residentId = self:selectedCrewId()
     if group == nil or residentId == nil then return end
-    local map = KnoxPersistence.getWorkPriorities ~= nil
-        and KnoxPersistence.getWorkPriorities(residentId) or {}
+    local map = KnoxPersistence.getWorkPreferences ~= nil
+        and KnoxPersistence.getWorkPreferences(residentId) or {}
     if type(map) ~= "table" then map = {} end
-    local current = map[group]
-    if current == nil then map[group] = 1
-    elseif current == 1 then map[group] = 2
-    elseif current == 2 then map[group] = 3
-    elseif current == 3 then map[group] = 4
-    elseif current == 4 then map[group] = false
-    else map[group] = nil end
+    local current = map[group] or "normal"
+    local nextState = PRIORITY_STATE_NEXT[current] or "high"
+    if nextState == "normal" then map[group] = nil else map[group] = nextState end
     local any = false
-    for _, value in pairs(map) do if value ~= nil then any = true; break end end
+    for _ in pairs(map) do any = true; break end
     local player = getSpecificPlayer(self.playerNum or 0)
     local service = rawget(_G, "KnoxCompanionService")
     local ok = false
-    if player ~= nil and service ~= nil and service.setBaseWorkPriorities ~= nil then
-        ok = service.setBaseWorkPriorities(player, residentId, any and map or nil)
+    local player, base = self:schedulePlayerAndBase()
+    if player ~= nil and base ~= nil and service ~= nil
+        and service.setBaseWorkPreferences ~= nil then
+        ok = service.setBaseWorkPreferences(
+            player, residentId, any and map or nil, base.id
+        )
     end
     if ok then
+        KnoxActivityFeed.event("Base work preference saved.")
         self:populate(self.playerNum or 0)
     else
-        KnoxActivityFeed.event("Could not set work priority.")
+        KnoxActivityFeed.event("Could not set work preference.")
     end
 end
 
@@ -981,31 +1187,74 @@ function CrewView:onResetPriorities()
     if player == nil or base == nil or residentId == nil then return end
     local service = rawget(_G, "KnoxCompanionService")
     local ok = false
-    if service ~= nil and service.setBaseWorkPriorities ~= nil then
-        ok = service.setBaseWorkPriorities(player, residentId, nil)
+    if service ~= nil and service.setBaseWorkPreferences ~= nil then
+        ok = service.setBaseWorkPreferences(player, residentId, nil, base.id)
     end
-    KnoxActivityFeed.event(ok and "Work priorities reset to automatic."
-        or "Could not reset work priorities.")
+    KnoxActivityFeed.event(ok and "Work preferences reset to Normal."
+        or "Could not reset work preferences.")
     if ok then self:populate(self.playerNum or 0) end
 end
 
 function CrewView:onSelectTool(button)
     local tool = button ~= nil and button.knoxTool or nil
     if SCHEDULE_COLORS[tool] == nil then return end
+    self:endSchedulePaintStroke()
     self.scheduleTool = tool
     self:paintCrewDetail()
 end
 
-function CrewView:onPaintHour(button)
+function CrewView:paintScheduleHour(button, residentId, tool)
     local hour = button ~= nil and tonumber(button.knoxHour) or nil
     if hour == nil or hour < 0 or hour > 23 then return end
-    local residentId = self:selectedCrewId()
+    residentId = residentId or self:selectedCrewId()
+    if residentId == nil or self:selectedCrewId() ~= residentId then return end
     local draft = self:scheduleDraftFor(residentId)
     if residentId == nil or draft == nil then return end
-    local tool = self.scheduleTool
+    tool = tool or self.scheduleTool
     if SCHEDULE_COLORS[tool] == nil then tool = "sleep" end
     draft[hour + 1] = tool
     self:paintCrewDetail()
+end
+
+function CrewView:beginSchedulePaintStroke(button)
+    if button == nil or button.knoxHour == nil then return end
+    local residentId = self:selectedCrewId()
+    if residentId == nil or self:scheduleDraftFor(residentId) == nil then return end
+    local tool = SCHEDULE_COLORS[self.scheduleTool] ~= nil and self.scheduleTool or "sleep"
+    self.schedulePaintStroke = { residentId = residentId, tool = tool }
+    self:paintScheduleHour(button, residentId, tool)
+end
+
+function CrewView:continueSchedulePaintStroke(button)
+    local stroke = self.schedulePaintStroke
+    if stroke == nil then return end
+    if self:selectedCrewId() ~= stroke.residentId then
+        self:endSchedulePaintStroke()
+        return
+    end
+    if button == nil or button.knoxHour == nil or button.mouseOver ~= true then
+        return
+    end
+    self:paintScheduleHour(button, stroke.residentId, stroke.tool)
+end
+
+function CrewView:endSchedulePaintStroke()
+    self.schedulePaintStroke = nil
+end
+
+function CrewView:onMouseWheel(delta)
+    -- A scroll gesture is never a schedule-paint gesture, even if the mouse
+    -- button is still held while the view is moving.
+    self:endSchedulePaintStroke()
+    local handler = ISPanelJoypad.onMouseWheel
+    if handler ~= nil then return handler(self, delta) end
+    return false
+end
+
+function CrewView:onPaintHour(button)
+    -- Keep click/joypad activation as a one-cell paint; mouse strokes use the
+    -- same authoritative draft mutation through begin/continue above.
+    self:paintScheduleHour(button)
 end
 
 function CrewView:paintPresetHours(hours)
@@ -1055,7 +1304,7 @@ function CrewView:onSaveSchedule()
     local service = rawget(_G, "KnoxCompanionService")
     local ok = false
     if service ~= nil and service.setBaseDutySchedule ~= nil then
-        ok = service.setBaseDutySchedule(player, residentId, windows)
+        ok = service.setBaseDutySchedule(player, residentId, windows, base.id)
     end
     KnoxActivityFeed.event(ok and "Schedule saved."
         or "Could not save schedule.")
@@ -1091,6 +1340,21 @@ function CrewView:new(x,y,w,h)
     return o
 end
 
+-- Window.refreshContent calls this after it has restored stable row identities.
+-- Keep the crew-specific source/selection cursor in sync before repainting;
+-- otherwise the rows can point at one resident while the controls still show
+-- the first resident selected during populate().
+function CrewView:onNotebookSelectionRestored(previousSource)
+    local id
+    if previousSource == "party" then
+        id = self.partyIds ~= nil and self.partyIds[self.partyList.selected or 0] or nil
+    elseif previousSource == "residents" then
+        id = self.residentIds ~= nil and self.residentIds[self.resList.selected or 0] or nil
+    end
+    self:restoreCrewSelection(id, previousSource)
+    self:paintCrewDetail()
+end
+
 -- Missions panel: away teams, durable survival orders, and unloaded crew.
 -- Survival orders placed from the Crew tab or radial land here with
 -- callbacks: back to the party, back to a base of your choice, or resume
@@ -1105,7 +1369,10 @@ function MissionsView:createChildren()
     self.toBaseBtn=ISButton:new(self.toPartyBtn:getRight()+6,self.list:getBottom()+UI_BORDER_SPACING,100,BUTTON_HGT,"To Base",self,MissionsView.onSupplyToBase); self.toBaseBtn:initialise(); self.toBaseBtn.borderColor={r=0.7,g=0.7,b=0.7,a=0.5}; self:addChild(self.toBaseBtn)
     self.resumeBtn=ISButton:new(self.toBaseBtn:getRight()+6,self.list:getBottom()+UI_BORDER_SPACING,120,BUTTON_HGT,"Resume Duty",self,MissionsView.onSupplyResume); self.resumeBtn:initialise(); self.resumeBtn.borderColor={r=0.7,g=0.7,b=0.7,a=0.5}; self:addChild(self.resumeBtn)
 end
-function MissionsView:drawEntry(y,item,alt) local a=0.9; self:drawRectBorder(0,y,self:getWidth(),self.itemheight-1,a,0.28,0.28,0.28); if self.selected==item.index then self:drawRect(0,y,self:getWidth(),self.itemheight-1,0.3,0.7,0.35,0.15) end; drawListText(self,y,item,a); return y+self.itemheight end
+function MissionsView:drawEntry(y,item,alt)
+    if not UILayout.listRowVisible(self, y, item) then return y+self.itemheight end
+    local a=0.9; self:drawRectBorder(0,y,self:getWidth(),self.itemheight-1,a,0.28,0.28,0.28); if self.selected==item.index then self:drawRect(0,y,self:getWidth(),self.itemheight-1,0.3,0.7,0.35,0.15) end; drawListText(self,y,item,a); return y+self.itemheight
+end
 function MissionsView:populate(playerNum)
     self.playerNum = playerNum
     self.list:clear()
@@ -1269,7 +1536,10 @@ function WorldView:createChildren()
     self.memberList:initialise(); self.memberList:instantiate(); self.memberList.itemheight=BUTTON_HGT; self.memberList.font=UIFont.NewSmall; self.memberList.doDrawItem=self.drawEntry; self.memberList.drawBorder=true; self:addChild(self.memberList)
     self.viewBtn=ISButton:new(UI_BORDER_SPACING,self.memberList:getBottom()+UI_BORDER_SPACING,110,BUTTON_HGT,"View Card",self,WorldView.onView); self.viewBtn:initialise(); self.viewBtn.borderColor={r=0.7,g=0.7,b=0.7,a=0.5}; self:addChild(self.viewBtn)
 end
-function WorldView:drawEntry(y,item,alt) local a=0.9; self:drawRectBorder(0,y,self:getWidth(),self.itemheight-1,a,0.28,0.28,0.28); if self.selected==item.index then self:drawRect(0,y,self:getWidth(),self.itemheight-1,0.3,0.7,0.35,0.15) end; drawListText(self,y,item,a); return y+self.itemheight end
+function WorldView:drawEntry(y,item,alt)
+    if not UILayout.listRowVisible(self, y, item) then return y+self.itemheight end
+    local a=0.9; self:drawRectBorder(0,y,self:getWidth(),self.itemheight-1,a,0.28,0.28,0.28); if self.selected==item.index then self:drawRect(0,y,self:getWidth(),self.itemheight-1,0.3,0.7,0.35,0.15) end; drawListText(self,y,item,a); return y+self.itemheight
+end
 
 -- Headcount that matters at a glance: total members, settled residents,
 -- and watch posts (guard/patrol roles) among them.
@@ -1582,8 +1852,8 @@ function Window:createChildren()
     self.panel:setAnchorRight(true); self.panel:setAnchorBottom(true); self:addChild(self.panel)
     -- ISTabPanel:addView adds the child and invokes createChildren once. Calling
     -- it here as well duplicates every label/list/button and breaks page layout.
-    self.baseView=BaseView:new(0, 8, self.panel.width, self.panel.height-8); self.baseView:initialise(); self.panel:addView("Base", self.baseView)
-    self.crewView=CrewView:new(0, 8, self.panel.width, self.panel.height-8); self.crewView:initialise(); self.panel:addView("Crew", self.crewView)
+    self.baseView=BaseView:new(0, 8, self.panel.width, self.panel.height-8); self.baseView:initialise(); self.panel:addView("Base & Work", self.baseView); UILayout.bindView(self.baseView)
+    self.crewView=CrewView:new(0, 8, self.panel.width, self.panel.height-8); self.crewView:initialise(); self.panel:addView("Crew & Schedule", self.crewView); UILayout.bindView(self.crewView)
     self.missionsView=MissionsView:new(0, 8, self.panel.width, self.panel.height-8); self.missionsView:initialise(); self.panel:addView("Missions", self.missionsView)
     self.worldView=WorldView:new(0, 8, self.panel.width, self.panel.height-8); self.worldView:initialise(); self.panel:addView("World", self.worldView)
 end
@@ -1592,6 +1862,7 @@ function Window:refreshContent()
     local view = self.panel and self.panel:getActiveView() or nil
     if view == nil or view.populate == nil then return end
     local saved = {}
+    local previousCrewSource = view.crewSelSource
     for _, field in ipairs({"list", "partyList", "resList", "memberList", "zoneList", "taskList", "storageList", "scheduleList"}) do
         local list = view[field]
         if list ~= nil then
@@ -1615,6 +1886,9 @@ function Window:refreshContent()
         for index, id in ipairs(view.residentIds or {}) do
             if id == resident then view.residentPicker.selected = index; break end
         end
+    end
+    if view.onNotebookSelectionRestored ~= nil then
+        view:onNotebookSelectionRestored(previousCrewSource)
     end
     self.refreshedView = view
     self.nextRefreshAt = getTimestampMs() + 2000

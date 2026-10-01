@@ -1,53 +1,130 @@
 # Sandbox settings
 
-Knox Survivors adds two pages to Project Zomboid's sandbox options.
+Knox Survivors exposes **52 settings across seven pages**. The pages follow a
+player task: core rules, population, world/factions, base work, companion
+controls, display, and developer tools. The option keys, types, defaults, and
+their `SandboxVars.KnoxSurvivors` storage names are unchanged except that the
+redundant `AllowCompanionPartyScavenging` control is retired. Moving an option
+between pages does not change its saved value.
 
-## Knox Survivors
+The old `AllowCompanionPartyScavenging` value is ignored. Companion Auto-Loot
+is the one in-game control for nearby pickup and the bounded party-food detour.
+It is saved per companion; turn it off for anyone who should not pick things
+up. Existing companions with no saved Auto-Loot preference remain enabled, as
+before. The food detour still requires settled Follow, nearby safe real food,
+and the existing threat/order/need checks. No base-resident or NPC-faction
+behavior is changed.
 
-- **Enable Knox Survivors** pauses the rebuild's gameplay entry points without deleting survivor save data.
-- **World Population** sets the persistent starting population and, normally, the living-survivor target across the entire map. The balanced playtest default is 48 and the supported range is 0–256.
-- **Disable Survivor Caps** is off by default. When enabled, the active-survivor and companion counts do not block activation or recruitment. World Population remains the starting count, but later arrivals may exceed it: at most one new identity per refill interval at an unused world location. Ownership, death, safe spawning, hostility, and group/faction rules still apply. The separate NPC faction-size limit remains in force so one faction cannot grow without bound. Larger active populations can reduce performance.
-- **Max Active Survivors** normally caps how many production survivors may be physically materialized at once. The balanced default is 16 and the supported range is 1–48. Disabling caps ignores this setting; the scheduler still builds at most two new bodies per population update instead of loading a whole settlement in one burst. This rate limit does not impose a total-body cap.
-- **Population Refill Days** defaults to five days. Set it to **0** for a finite starting population with no routine replacements or uncapped arrivals. Existing people remain, and separate Knox Events have their own controls. Re-enabling refill starts a full interval; missed arrivals never accumulate.
-- **Minimum Spawn Distance** defaults to 40 tiles and keeps first materialization away from local players and out of view. Saved survivors always restore at their exact recorded square once it is loaded.
-- **Companion Limit** controls how many active companions each local player may recruit.
-- **Follower Formation** selects **Paired** (default) or **Single File** behind the leader for companions and travelling groups. Single File is narrower and longer. These are preferred positions; native paths and blocked-tile recovery may break the formation.
-- **Follower Spacing** controls grid separation from 1–3 tiles per axis, default 1. Larger spacing places rear members farther behind. Neither setting controls combat positioning or vehicles.
-- **Survivor Encounter Distance** is effectively at least ten tiles beyond Minimum Spawn Distance, preserving a usable first-appearance band even when configured values overlap. Hidden, loaded, safe-square requirements still apply.
-- **Allow NPC Factions** controls new faction formation and base scouting. It remains enabled for the intended living-world loop. Existing factions remain intact when disabled.
-- **Enable Knox Events** is off by default. It controls dispatch and processing of scripted faction/named-world events; event records are preserved.
-- **Survivors Needed to Form a Faction** defaults to four (range 3-8). Smaller travelling groups remain informal, and reaching the number still does not bypass the existing shared-survival relationship requirement.
-- **Maximum NPC Faction Members** defaults to eight (range 3-24), with an effective minimum equal to Survivors Needed to Form a Faction. It limits future recruitment; lowering it never removes existing members or affects player-owned groups.
-- **Allow Hostile Survivor Encounters** controls threats and robberies between independent survivors. It remains enabled for the living-world loop.
-- **Allow NPC Driving** defaults off. When enabled, a companion can use **Take Driver Seat & Drive** while the player is a passenger in an already-running driveable vehicle. The driver seat must be free; the order uses a short loaded lane and releases controls at its target or if the lane becomes invalid.
-- **Allow Faction Raids** defaults off. Players may opt into the real-member raid system; the first possible raid defaults to day 14.
-- **Allow Survivor and Player Combat** remains enabled so hostile relationships can resolve naturally.
-- **Automatic NPC Base Work Areas** defaults on. Autonomous NPC factions receive practical guard, patrol, farming, wood, corpse, and storage defaults. Player bases remain manually configured through the Notebook.
-- **Show Companion HUD** controls the right-side companion panel.
-- **Show Survivor Activity Feed** controls the Knox message window. Speech bubbles still work.
-- **Initial Group Chance / Max Size / Count** seed starting-region cohorts (defaults 65% / 4 / 3); most starting identities remain solo.
-- **Activations Per Update** caps new body materialization per population pass (default 2) so the full target is reached over later passes, not one burst.
-- **Minimum Spawn Distance** (default 40) is also the hidden-square safety floor; **Survivor Encounter Distance** (default 280) stays at least ten tiles beyond it to preserve a first-appearance band.
-- **Base Reading / Base Cooking** (both default on) let idle residents collect, use, and return books and cook real meals through native actions.
-- **Cautious Travel** (default on) prefers safer routes; **Allow Survivor Door/Window Opening** (default on) gates traversal permissions.
-- **Survivor Aiming Assistance** (default Native Skills) changes automatic firearm commitment timing only — never skill, accuracy, ammo, or damage.
-- **Spawn With Spouse** (default off), **Survivor Nameplates + Distance** (on / 24), **Use Reputation** (on), **Allow Survivors Treat Player** (on) round out the player-facing surface.
-- Future direction (D-017, not yet implemented): named rarity modes (e.g. Lonely / Balanced / Lively) over these raw numbers, plus any user-expected sandbox settings and eventually a creator on the vanilla character creator with Knox additions. No setting will bypass identity ownership, native requirements, save safety, or evidence gates.
+`ToolCupboardCapacity` remains visible under **Bases & Work** as a legacy
+compatibility option because old marked Tool Cupboard assignments still read
+it. Current typed storage assignments use native container capacity. The
+classic right-click command setting also remains as an optional alternate
+order surface. It defaults off and does not change Auto-Loot or any other
+gameplay permission.
 
-Production population uses real Build 42 player starts and supplemental ground-floor building locations. Distant survivors retain virtual locations and nearby loaded survivors materialize only when safe. Dead origins remain reserved. Disabling caps never recycles dead identities or repeatedly spawns a batch after a long time skip. Re-enabling caps does not delete existing survivors or forcibly dismiss companions. With caps disabled, a starting population of zero can still receive later gradual arrivals.
+## General
 
-The balanced defaults are intended to make a survivor encounter plausible during ordinary exploration without placing NPCs around every corner. Forty-eight is a whole-map population, not a local count. The 16-body active cap is only a performance ceiling; it does not force 16 survivors to stay near the player. The shorter hidden spawn buffer improves the chance of crossing paths while still preventing visible pop-in, while the slower refill preserves the value of each death.
+| Setting | Purpose |
+|---|---|
+| Enable Knox Survivors | Master gameplay gate; disabling preserves saved survivors. |
+| Start with a Spouse | Creates one initial trusted companion for a new character. |
+| Survivors Continue After Player Death | Transfers the existing household to the next character; the spouse becomes a base resident and no second spouse is generated for the successor. |
 
-Sandbox defaults are copied into a save when its sandbox rules are created. Existing saves may retain their old values and should be adjusted manually or replaced with a new playtest save when validating this balance.
+## Population
 
-## Developer tools
+| Setting | Purpose |
+|---|---|
+| World Survivor Population | Persistent whole-map starting/target population. |
+| Population Refill Days | Days between replacement/new arrivals; `0` means no routine arrivals. |
+| Chance of Starting Survivor Groups | Chance for nearby starting identities to form a small group. |
+| Maximum Starting Group Size | Size limit for those initial groups. |
+| Maximum Starting Groups | Number of initial groups created. |
+| Disable Survivor Caps | Opts out of active-body and companion limits; may cost performance. |
+| Maximum Active Survivors | Normal limit for loaded survivor bodies. |
+| Survivors Loaded Per Update | Limits body creation per population update to avoid spikes. |
+| Minimum Survivor Spawn Distance | Hidden first-materialization distance from local players. |
+| Survivor Encounter Distance | Distance at which persisted survivors may materialize; effective value stays at least 10 tiles beyond the minimum spawn distance. |
 
-Developer tools are disabled by default. Enable **Knox Survivors - Developer Tools > Enable Developer Tools** before creating or loading the test save.
+## World & Factions
 
-Detailed developer diagnostics also default off. Turn them on only for a focused test that needs periodic controller and render snapshots; ordinary error reporting remains available without the periodic status dump.
+| Setting | Purpose |
+|---|---|
+| Cautious Everyday Travel | Chooses ordinary walking/crouching route behavior. |
+| Allow Autonomous Survivor Retreat | Gates new autonomous retreat admissions; does not disable combat or explicit orders. |
+| Automatic Zombie Engagement Distance | Range for automatic engagement of visible zombies. |
+| Allow NPC Factions | Allows new NPC faction formation; does not delete existing factions. |
+| Survivors Needed to Form a Faction | Minimum group size before faction promotion is considered. |
+| Maximum NPC Faction Members | Limits future faction recruitment; lowering it does not remove members. |
+| Allow Hostile Survivor Encounters | Allows independent survivors to threaten/rob each other. |
+| Allow Survivor and Player Combat | Allows hostile survivors and players to fight under existing hostility rules. |
+| Use Reputation for Recruiting | Makes relationship reputation part of recruitment eligibility. |
+| Enable Knox Events | Enables scripted faction/named-world event dispatch; off by default. |
+| Allow Faction Raids | Enables automatic real-member raids; off by default and depends on factions/hostility. |
+| First Possible Faction Raid Day | Earliest world day for an automatic raid. |
+| Faction Raid Check Interval | Minimum time between raid scheduling checks. |
 
-The automatic scenario can load one survivor, one companion, a two-person travel group, a three-person faction, or a faction that immediately starts using the normal base-scouting behavior. Leave it on **None** to spawn scenarios manually.
+## Bases & Work
 
-With developer tools enabled, right-click the world and open **Knox Survivors - Developer Tools**. The menu separates persistent survivor-population presets from one-click combat presets. Combat presets cover survivor, travel-group, faction, and stress-test fights; they report results automatically and can write a detailed combat snapshot to `console.txt`. Cleanup removes only zombies created by the active combat preset.
+| Setting | Purpose |
+|---|---|
+| Automatic NPC Base Work Areas | Creates practical default areas at autonomous NPC faction bases; player bases remain manually configured. |
+| Survivors Cook at Base | Enables supported real-resource cooking tasks. |
+| Survivors Read at Base | Enables supported book reading/recreation at base. |
+| Legacy Tool Cupboard Capacity | Compatibility for old marked cupboards only; does not set capacity on current typed storage. |
 
-Every test survivor receives an isolated, save-persistent `ks-dev-*` identity. Each automatic scenario keeps its own identities, so changing scenarios cannot accidentally recruit or regroup somebody left over from a different test. Spawning a scenario is therefore a real persistence test, not a disposable visual prop. Destructive tests remain behind their own off-by-default option.
+## Companions & Orders
+
+| Setting | Purpose |
+|---|---|
+| Companion Limit | Maximum active companions per local player. |
+| Follower Formation | Preferred paired or single-file formation. |
+| Follower Spacing | Preferred distance between follower positions. |
+| Allow Survivors to Open Doors and Windows | Allows owned survivors to open closed doors/windows while routing. |
+| Survivors Bandage Their Player | Allows safe, nearby owned survivors to treat a bleeding player when eligible. |
+| Use Gestures When Giving Orders | Enables rate-limited acknowledgement/movement gestures. |
+| Show Knox Orders in Emote Radial | Adds Knox actions to the vanilla emote radial; on by default. Off leaves vanilla radial actions intact. |
+| Show Knox Orders in Right-Click Menus | Alternate command surface, off by default. When off, Knox order menus do not appear in right-click menus, even if the radial integration is unavailable. When on, survivor and party context menus are available. This does not change the F interaction prompt or care/inventory controls. |
+| Allow NPC Driving (Experimental) | Enables the bounded companion driving order; Build 42 vehicle behavior remains live-pending. |
+| NPC Driving Speed Limit | Speed cap for the experimental driver. |
+| Survivor Aiming Assistance | Changes commitment/aim settling only; native skill still owns accuracy and effectiveness. |
+
+## Interface
+
+| Setting | Purpose |
+|---|---|
+| Show Companion HUD | Displays the companion status panel. |
+| Show Survivor Activity Feed | Displays the Knox activity window; hiding it does not stop event recording. |
+| Show Survivor Speech | Displays survivor speech bubbles/lines. |
+| Show Survivor Names | Displays visible survivor nameplates. |
+| Survivor Name Distance | Maximum nameplate distance; line of sight is still required. |
+
+## Developer Tools
+
+| Setting | Purpose |
+|---|---|
+| Enable Developer Tools | Enables manual developer context-menu actions; off by default. |
+| Automatic Test Scenario | Optional persistent developer population preset; `None` is the default. |
+| Test Spawn Distance | Minimum placement distance for developer-spawned actors. |
+| Allow Destructive Tests | Explicitly allows test actions that alter the area. Keep off on saves you care about. |
+| Log Developer Diagnostics | Enables verbose developer status output; normal errors are separate. |
+| Ignore Job Tool and Resource Requirements | Developer cheat that can provide real items for supported jobs. It can leave those items in the world; keep off during ordinary resource-loop play. |
+
+## Compatibility and save behavior
+
+Sandbox defaults are stored with the save when its rules are created. The
+following retired values can still exist in older `SandboxVars` data but no
+longer create controls or change runtime behavior:
+
+- `AllowCompanionPartyScavenging`: retired; the in-game per-companion Auto-Loot
+  policy now owns this behavior.
+- `AutomatedQAMode`: retired with the in-game QA runner.
+
+No save is rewritten and no keys are renamed. `ToolCupboardCapacity` remains
+active for legacy Tool Cupboard markers, while `ShowLegacyContextCommands`
+remains an active presentation preference. New controls or system-wide
+presets are not implied by this cleanup.
+
+Project Zomboid-native movement, actions, combat, item transfer, driving,
+rendering, and persistence remain subject to the live acceptance recorded in
+`docs/DEVELOPMENT_TESTING.md`; settings registration and offline tests do not
+prove those engine behaviors.

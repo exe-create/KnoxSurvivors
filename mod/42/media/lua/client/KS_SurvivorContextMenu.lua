@@ -14,6 +14,7 @@ require "KS_CompanionInventory"
 require "KS_Settings"
 require "KS_TradeUI"
 require "KS_OrderCatalog"
+pcall(require, "KS_SurvivorInteractionUI")
 if rawget(_G, "KnoxOrderCatalog") == nil then
     _G.KnoxOrderCatalog = { label = function(_, _, fallback) return fallback or "Order" end }
 end
@@ -83,27 +84,47 @@ local function feedOrder(ok, reason, action)
     end
 end
 
--- Classic right-click Follow/Hold/Relax/Auto-Loot entries. Shown when the
--- player opts in via sandbox, or automatically when no radial UI exists to
--- command through (radial mod conflict, API change, headless test). The
--- emote radial is the default path everywhere else.
+-- Right-click orders are an explicit alternate input mode. Never silently
+-- restore them when the radial API is unavailable: the player's saved choice
+-- controls this surface for the whole save.
 local function legacyCommandsVisible()
     local settings = rawget(_G, "KnoxSettings")
     if settings ~= nil and settings.showLegacyContextCommands ~= nil then
         local ok, enabled = pcall(function()
             return settings.showLegacyContextCommands()
         end)
-        if ok and enabled == true then return true end
+        return ok and enabled == true
     end
-    if rawget(_G, "ISEmoteRadialMenu") == nil then return true end
-    local radial = rawget(_G, "KnoxRadialOrders")
-    if radial == nil or radial.isInstalled == nil then return true end
-    local ok, installed = pcall(function() return radial.isInstalled() end)
-    return not (ok and installed == true)
+    return false
 end
 
 local function onTalk(_, playerNum, survivorId)
     runService(playerNum, KnoxCompanionService.talk, survivorId)
+end
+
+local function onOpenInteraction(_, playerNum, survivorId)
+    local player = getSpecificPlayer(playerNum)
+    local interaction = rawget(_G, "KnoxSurvivorInteractionUI")
+    if player == nil or interaction == nil or interaction.open == nil then return end
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    local character = runtime ~= nil and runtime.getCharacter ~= nil
+        and runtime.getCharacter(survivorId) or nil
+    if character == nil then return end
+    local name = "Survivor"
+    local model = rawget(_G, "KnoxSurvivorViewModel")
+    local view = model ~= nil and model.getSurvivor ~= nil
+        and model.getSurvivor(survivorId, playerNum) or nil
+    if view ~= nil and view.displayName ~= nil and tostring(view.displayName) ~= "" then
+        name = tostring(view.displayName)
+    end
+    local ok, opened = pcall(interaction.open, playerNum,
+        { id = survivorId, character = character, name = name }, player)
+    if not ok or opened ~= true then
+        local feed = rawget(_G, "KnoxActivityFeed")
+        if feed ~= nil and feed.event ~= nil then
+            feed.event("Could not open survivor interaction.")
+        end
+    end
 end
 
 local function onAskNeeds(_, playerNum, survivorId)
@@ -267,6 +288,28 @@ local function onWeaponPreference(_, playerNum, survivorId, preference)
     end, survivorId)
 end
 
+local function onAutoEquipment(_, playerNum, survivorId, allowed)
+    local ok, reason = runService(playerNum, function(player, id)
+        return KnoxCompanionService.setAutoEquipment(player, id, allowed)
+    end, survivorId)
+    feedOrder(ok, reason, "automatic equipment")
+end
+
+local function addAutoEquipmentMenu(parent, playerNum, survivorId)
+    local root = parent:addOption("Automatic Equipment Upgrades", nil, nil)
+    local submenu = ISContextMenu:getNew(parent)
+    parent:addSubMenu(root, submenu)
+    local policies = KnoxPersistence.getSurvivorPolicies ~= nil
+        and (KnoxPersistence.getSurvivorPolicies(survivorId) or {}) or {}
+    local enabled = policies.autoEquipment ~= false
+    for _, choice in ipairs({ { "Upgrade Better Gear Automatically", true },
+        { "Keep Current Equipment", false } }) do
+        local option = submenu:addOption(choice[1], SurvivorContextMenu,
+            onAutoEquipment, playerNum, survivorId, choice[2])
+        submenu:setOptionChecked(option, enabled == choice[2])
+    end
+end
+
 local function onClimbing(_, playerNum, survivorId, allowed)
     local ok, reason = runService(playerNum, function(player, id)
         return KnoxCompanionService.issueOrder(player, id,
@@ -290,21 +333,31 @@ local function onUnstick(_, playerNum, survivorId)
 end
 
 local function onBoardPlayerVehicle(_, playerNum, survivorId)
-    runService(playerNum, function(player, id)
+    local ok, reason = runService(playerNum, function(player, id)
         return KnoxCompanionService.issueOrder(player, id, "enter_vehicle")
     end, survivorId)
+    feedOrder(ok, reason, "enter vehicle")
 end
 
 local function onDriveAhead(_, playerNum, survivorId)
-    runService(playerNum, function(player, id)
+    local ok, reason = runService(playerNum, function(player, id)
         return KnoxCompanionService.issueOrder(player, id, "drive_ahead")
     end, survivorId)
+    feedOrder(ok, reason, "take driver seat")
+end
+
+local function onDriveNearestVehicle(_, playerNum, survivorId)
+    local ok, reason = runService(playerNum, function(player, id)
+        return KnoxCompanionService.issueOrder(player, id, "drive_nearest_vehicle")
+    end, survivorId)
+    feedOrder(ok, reason, "drive nearest vehicle")
 end
 
 local function onExitVehicle(_, playerNum, survivorId)
-    runService(playerNum, function(player, id)
+    local ok, reason = runService(playerNum, function(player, id)
         return KnoxCompanionService.issueOrder(player, id, "exit_vehicle")
     end, survivorId)
+    feedOrder(ok, reason, "exit vehicle")
 end
 
 local function pointDirective(kind, square)
@@ -504,53 +557,8 @@ function SurvivorContextMenu.populate(menu, playerNum, survivorId)
 
     local distance = distanceToPlayer(player, survivorId)
     local closeEnough = distance ~= nil and distance <= CONVERSATION_DISTANCE
-    local hostile = playerId ~= nil and KnoxPersistence.isSurvivorHostileToPlayer(survivorId, playerId)
-    local uiMenus = rawget(_G, "ISContextMenu") ~= nil
-    local talkMenu = menu
-    if uiMenus then
-        local talkRoot = menu:addOption("Talk", nil, nil)
-        talkMenu = ISContextMenu:getNew(menu)
-        menu:addSubMenu(talkRoot, talkMenu)
-    end
-    local talkLabel = hostile and "Talk (hostile)" or (closeEnough and "Talk to Survivor" or "Talk (too far away)")
-    local talk = talkMenu:addOption(talkLabel, SurvivorContextMenu, onTalk, playerNum, survivorId)
-    if not closeEnough or hostile then
-        unavailable(talk)
-    end
-    local needsLabel = closeEnough and "Ask About Needs" or "Ask About Needs (too far away)"
-    local needs = talkMenu:addOption(needsLabel, SurvivorContextMenu, onAskNeeds, playerNum, survivorId)
-    if not closeEnough or hostile then unavailable(needs) end
-    -- Sims-style social menu: friendly acts build trust, hostile acts risk
-    -- the relationship. Same distance/hostility gating as Talk itself.
-    local socials = {
-        { "Tell Joke", "joke" },
-        { "Compliment", "compliment" },
-        { "Make Funny Face", "funny_face" },
-        { "Insult", "insult" },
-        { "Slap", "slap" },
-    }
-    for _, entry in ipairs(socials) do
-        local label = closeEnough and entry[1] or (entry[1] .. " (too far away)")
-        if hostile then label = entry[1] .. " (hostile)" end
-        local option = talkMenu:addOption(label, SurvivorContextMenu,
-            onSocialAct, playerNum, survivorId, entry[2])
-        if not closeEnough or hostile then unavailable(option) end
-    end
 
     if not owned then
-        if affiliation.kind ~= "player" then
-            local enabled = closeEnough and not hostile and not isClient() and not isServer()
-            local label = hostile and "Trade (hostile)" or (closeEnough and "Trade" or "Trade (too far away)")
-            if isClient() or isServer() then label = "Trade (single-player only)" end
-            local trade = menu:addOption(label, SurvivorContextMenu, onTrade, playerNum, survivorId)
-            if not enabled then unavailable(trade) end
-            local giftLabel = hostile and "Give Item (hostile)"
-                or (closeEnough and "Give Item" or "Give Item (too far away)")
-            if isClient() or isServer() then giftLabel = "Give Item (single-player only)" end
-            local gift = menu:addOption(giftLabel, SurvivorContextMenu, onGiveItem, playerNum, survivorId)
-            if not enabled then unavailable(gift) end
-        end
-        addRecruitOption(menu, player, survivorId, closeEnough)
         return true
     end
 
@@ -583,8 +591,6 @@ function SurvivorContextMenu.populate(menu, playerNum, survivorId)
         -- Base residents can be temporarily activated as companions. Keep that
         -- transition explicit in the menu so it is not confused with the
         -- ordinary Follow command, which is already owned by companions.
-        menu:addOption(KnoxOrderCatalog.label("follow"), SurvivorContextMenu,
-            onFollow, playerNum, survivorId)
         local residentCareMenu = menu
         if uiMenus then
             local careRoot = menu:addOption("Care", nil, nil)
@@ -605,9 +611,13 @@ function SurvivorContextMenu.populate(menu, playerNum, survivorId)
         local medical = residentCareMenu:addOption(medicalLabel, SurvivorContextMenu,
             onMedicalCheck, playerNum, survivorId)
         if not closeEnough then unavailable(medical) end
+        if legacyCommandsVisible() then
+        menu:addOption(KnoxOrderCatalog.label("follow"), SurvivorContextMenu,
+            onFollow, playerNum, survivorId)
         local orders = menu:addOption("Orders", nil, nil)
         local ordersMenu = ISContextMenu:getNew(menu)
         menu:addSubMenu(orders, ordersMenu)
+        addAutoEquipmentMenu(ordersMenu, playerNum, survivorId)
         local jobs = ordersMenu:addOption("Base Work Orders", nil, nil)
         local jobsMenu = ISContextMenu:getNew(ordersMenu)
         ordersMenu:addSubMenu(jobs, jobsMenu)
@@ -643,25 +653,19 @@ function SurvivorContextMenu.populate(menu, playerNum, survivorId)
             lootRunsMenu:setOptionChecked(option,
                 (duty.allowLootRuns == true) == choice[2])
         end
+        end
     elseif duty.mode == "companion" then
+        if legacyCommandsVisible() then
         local orders = menu:addOption("Orders", nil, nil)
         local ordersMenu = ISContextMenu:getNew(menu)
         menu:addSubMenu(orders, ordersMenu)
-        -- Follow/Hold/Relax live on the emote radial by default; the classic
-        -- entries return via sandbox opt-in or automatically when no radial
-        -- UI exists. Everything the radial cannot do stays here regardless.
-        if legacyCommandsVisible() then
-            local follow = ordersMenu:addOption(KnoxOrderCatalog.label("follow"), SurvivorContextMenu, onFollow, playerNum, survivorId)
-            local hold = ordersMenu:addOption(KnoxOrderCatalog.label("hold"), SurvivorContextMenu, onHold, playerNum, survivorId)
-            local relax = ordersMenu:addOption(duty.order == "relax" and "Stop Relaxing" or KnoxOrderCatalog.label("relax"),
-                SurvivorContextMenu, duty.order == "relax" and onFollow or onRelax, playerNum, survivorId)
-            ordersMenu:setOptionChecked(follow, duty.order == "follow")
-            ordersMenu:setOptionChecked(hold, duty.order == "hold")
-            ordersMenu:setOptionChecked(relax, duty.order == "relax")
-        else
-            local radialHint = ordersMenu:addOption("Follow/Hold/Relax: use the emote radial", nil, nil)
-            radialHint.notAvailable = true
-        end
+        local follow = ordersMenu:addOption(KnoxOrderCatalog.label("follow"), SurvivorContextMenu, onFollow, playerNum, survivorId)
+        local hold = ordersMenu:addOption(KnoxOrderCatalog.label("hold"), SurvivorContextMenu, onHold, playerNum, survivorId)
+        local relax = ordersMenu:addOption(duty.order == "relax" and "Stop Relaxing" or KnoxOrderCatalog.label("relax"),
+            SurvivorContextMenu, duty.order == "relax" and onFollow or onRelax, playerNum, survivorId)
+        ordersMenu:setOptionChecked(follow, duty.order == "follow")
+        ordersMenu:setOptionChecked(hold, duty.order == "hold")
+        ordersMenu:setOptionChecked(relax, duty.order == "relax")
         local resume = ordersMenu:addOption(KnoxOrderCatalog.label("resume_normal_duty"), SurvivorContextMenu,
             onResumeNormalDuty, playerNum, survivorId)
         resume.notAvailable = duty.directive == nil
@@ -686,6 +690,9 @@ function SurvivorContextMenu.populate(menu, playerNum, survivorId)
                 and player:getVehicle():isDriver(player) then
                 drive.notAvailable = true
             end
+        else
+            ordersMenu:addOption(KnoxOrderCatalog.label("drive_nearest_vehicle"),
+                SurvivorContextMenu, onDriveNearestVehicle, playerNum, survivorId)
         end
         local tacticsRoot = ordersMenu:addOption("Tactics & Behavior", nil, nil)
         local tacticsMenu = ISContextMenu:getNew(ordersMenu)
@@ -724,6 +731,7 @@ function SurvivorContextMenu.populate(menu, playerNum, survivorId)
                 onWeaponPreference, playerNum, survivorId, choice[2])
             weaponMenu:setOptionChecked(option, (weaponPolicies.weaponPreference or "auto") == choice[2])
         end
+        addAutoEquipmentMenu(tacticsMenu, playerNum, survivorId)
         local climbRoot = tacticsMenu:addOption("Vaulting and Climbing", nil, nil)
         local climbMenu = ISContextMenu:getNew(tacticsMenu)
         tacticsMenu:addSubMenu(climbRoot, climbMenu)
@@ -752,7 +760,7 @@ function SurvivorContextMenu.populate(menu, playerNum, survivorId)
         end
         tacticsMenu:addOption("Unstick Survivor", SurvivorContextMenu,
             onUnstick, playerNum, survivorId)
-        if legacyCommandsVisible() then
+        do
             local lootRoot = ordersMenu:addOption("Auto-Loot", nil, nil)
             local lootMenu = ISContextMenu:getNew(ordersMenu)
             ordersMenu:addSubMenu(lootRoot, lootMenu)
@@ -799,8 +807,11 @@ function SurvivorContextMenu.populate(menu, playerNum, survivorId)
                 survivorId
             )
         end
+        end
     end
-    menu:addOption(KnoxOrderCatalog.label("dismiss"), SurvivorContextMenu, onDismiss, playerNum, survivorId)
+    if legacyCommandsVisible() then
+        menu:addOption(KnoxOrderCatalog.label("dismiss"), SurvivorContextMenu, onDismiss, playerNum, survivorId)
+    end
     return true
 end
 

@@ -1,6 +1,8 @@
 require "Vehicles/TimedActions/ISPathFindAction"
 require "Vehicles/TimedActions/ISEnterVehicle"
 require "Vehicles/TimedActions/ISExitVehicle"
+require "Vehicles/TimedActions/ISUnlockVehicleDoor"
+require "Vehicles/TimedActions/ISOpenVehicleDoor"
 require "Vehicles/TimedActions/ISCloseVehicleDoor"
 require "KS_Settings"
 require "KS_VehicleNavigation"
@@ -22,6 +24,36 @@ local ACTION_TIMEOUT_MS = 45000
 local DRIVER_DISTANCE = 18
 local DRIVER_STOP_DISTANCE = 2.5
 local DRIVER_TIMEOUT_MS = 180000
+local PLAYER_SYNC_DISTANCE_SQUARED = 30 * 30
+
+local function sameFloorAndNear(character, vehicle, maxDistanceSquared)
+    if character == nil or vehicle == nil or character.getCurrentSquare == nil
+        or vehicle.getSquare == nil then return false end
+    local actorSquare, vehicleSquare = character:getCurrentSquare(), vehicle:getSquare()
+    if actorSquare == nil or vehicleSquare == nil
+        or actorSquare:getZ() ~= vehicleSquare:getZ() then return false end
+    local dx, dy = character:getX() - vehicle:getX(), character:getY() - vehicle:getY()
+    return dx * dx + dy * dy <= (maxDistanceSquared or PLAYER_SYNC_DISTANCE_SQUARED)
+end
+
+local function loadedVehicles()
+    local cell = getCell ~= nil and getCell() or nil
+    local list = cell ~= nil and cell.getVehicles ~= nil and cell:getVehicles() or nil
+    local result = {}
+    if list == nil then return result end
+    if list.iterator ~= nil then
+        local iterator = list:iterator()
+        while iterator:hasNext() do result[#result + 1] = iterator:next() end
+    elseif list.size ~= nil and list.get ~= nil then
+        for index = 0, list:size() - 1 do result[#result + 1] = list:get(index) end
+    end
+    return result
+end
+
+local function distanceSquaredToVehicle(character, vehicle)
+    local dx, dy = character:getX() - vehicle:getX(), character:getY() - vehicle:getY()
+    return dx * dx + dy * dy
+end
 
 local function resetDriverControls(run, character)
     local vehicle = run ~= nil and run.vehicle or nil
@@ -59,6 +91,26 @@ local function health(character)
     return ok and tonumber(value) or nil
 end
 
+local function setBoardingPace(character, request, enabled)
+    if character == nil or request == nil or request.runToVehicle ~= true
+        or character.setRunning == nil then return end
+    if enabled then
+        local wasRunning = false
+        if character.isRunning ~= nil then
+            local ok, value = pcall(function() return character:isRunning() end)
+            wasRunning = ok and value == true
+        end
+        request.wasRunning = wasRunning
+        local ok = pcall(function() character:setRunning(true) end)
+        request.paceApplied = ok
+    elseif request.paceApplied then
+        -- Restore the native movement flag at every boarding teardown. This
+        -- makes the jog a temporary pathing preference, not an autonomy owner.
+        pcall(function() character:setRunning(request.wasRunning == true) end)
+        request.paceApplied = false
+    end
+end
+
 -- Settle one driver run's committed passenger roster: pending leases cancel
 -- at once instead of waiting out the action timeout, and seated passengers
 -- get the existing native exit (which refuses a moving vehicle itself).
@@ -73,14 +125,18 @@ local function rollbackRoster(character, run)
         -- passenger sweep: on arrival they stay seated until an explicit
         -- order moves them, and the run simply ends beneath them.
         if member ~= nil and member ~= character then
-            local aboard = member.getVehicle ~= nil and member:getVehicle() ~= nil
-                and (run.vehicle == nil or member:getVehicle() == run.vehicle)
-            if aboard then
-                -- A refused exit (moving vehicle, missing action) must not
-                -- strand the rider lease-free: mark them for the bounded
-                -- stationary retry in tick() below instead of inventing an exit.
-                if not CompanionVehicles.exit(member) and member:getVehicle() ~= nil then
-                    awaitingExit[member] = { vehicle = run.vehicle, tries = 0 }
+            local memberVehicle = member.getVehicle ~= nil and member:getVehicle() or nil
+            if memberVehicle ~= nil then
+                -- A stale roster must not cancel a newer vehicle run or queue
+                -- an exit from a different car. Only the exact committed
+                -- vehicle is owned by this driver's rollback.
+                if run.vehicle ~= nil and memberVehicle == run.vehicle then
+                    -- A refused exit (moving vehicle, missing action) must not
+                    -- strand the rider lease-free: mark them for the bounded
+                    -- stationary retry in tick() below instead of inventing an exit.
+                    if not CompanionVehicles.exit(member) and member:getVehicle() == run.vehicle then
+                        awaitingExit[member] = { vehicle = run.vehicle, tries = 0 }
+                    end
                 end
             else
                 CompanionVehicles.cancel(member)
@@ -133,6 +189,7 @@ function CompanionVehicles.cancel(character, keepPassengers)
         return
     end
     pending[character] = nil
+    setBoardingPace(character, request, false)
     local queue = ISTimedActionQueue.queues[character]
     if queue ~= nil then
         for _, action in ipairs(queue.queue) do
@@ -155,11 +212,16 @@ function CompanionVehicles.isBusy(character)
         CompanionVehicles.cancel(character)
         return false, "interrupted"
     end
+    if request.runToVehicle and character.getVehicle ~= nil
+        and character:getVehicle() == request.vehicle then
+        setBoardingPace(character, request, false)
+    end
     local queue = ISTimedActionQueue.queues[character]
     for _, action in ipairs(queue ~= nil and queue.queue or {}) do
         if request.actions[action] then return true end
     end
     pending[character] = nil
+    setBoardingPace(character, request, false)
     return false
 end
 
@@ -183,14 +245,16 @@ local function reserved(vehicle, seat, character)
     return false
 end
 
-local function queueActions(character, vehicle, seat, actions)
+local function queueActions(character, vehicle, seat, actions, options)
     local runtime = rawget(_G, "KnoxSurvivorRuntime")
     local id = runtime ~= nil and runtime.idForCharacter(character) or nil
     if id == nil or runtime.prepareVehicle == nil or not runtime.prepareVehicle(id) then
         return false, "survivor_busy"
     end
     local request = { vehicle = vehicle, seat = seat,
-        deadline = getTimestampMs() + ACTION_TIMEOUT_MS, health = health(character), actions = {} }
+        deadline = getTimestampMs() + ACTION_TIMEOUT_MS, health = health(character), actions = {},
+        runToVehicle = options ~= nil and options.runToVehicle == true }
+    if request.runToVehicle then setBoardingPace(character, request, true) end
     for _, action in ipairs(actions) do request.actions[action] = true end
     pending[character] = request
     local ok, queued = pcall(function()
@@ -226,14 +290,47 @@ local function usablePassengerSeat(character, vehicle, seat)
     if vehicle.isEnterBlocked ~= nil and vehicle:isEnterBlocked(character, seat) then
         return false
     end
+    -- A locked door does not make an installed seat unavailable. Vanilla's
+    -- ISVehicleMenu queues native unlock/open actions before entering; board()
+    -- mirrors that flow and lets the real action/key state decide the result.
+    return true
+end
+
+local function appendDoorEntryActions(character, vehicle, seat, actions)
     local doorPart = vehicle:getPassengerDoor(seat)
     local door = doorPart ~= nil and doorPart:getDoor() or nil
-    -- Never bypass a locked passenger door. A missing physical door is valid
-    -- for open vehicles and vanilla's enter action handles that case itself.
-    if door ~= nil and door:isLocked() then
-        return false
+    local hasDoorItem = doorPart ~= nil and doorPart.getInventoryItem ~= nil
+        and doorPart:getInventoryItem() ~= nil
+    if door == nil or not hasDoorItem then
+        actions[#actions + 1] = assert(ISEnterVehicle:new(character, vehicle, seat))
+        return
     end
-    return true
+
+    if door:isLocked() then
+        local keyOnDoor = vehicle.isKeyIsOnDoor ~= nil and vehicle:isKeyIsOnDoor()
+            and vehicle.getCurrentKey ~= nil and vehicle:getCurrentKey() or nil
+        if keyOnDoor ~= nil and character.getInventory ~= nil
+            and vehicle.setKeyIsOnDoor ~= nil and vehicle.setCurrentKey ~= nil then
+            vehicle:setKeyIsOnDoor(false)
+            vehicle:setCurrentKey(nil)
+            character:getInventory():AddItem(keyOnDoor)
+            if isClient ~= nil and isClient() and sendClientCommand ~= nil then
+                sendClientCommand(character, "vehicle", "removeKeyFromDoor",
+                    { vehicle = vehicle:getId() })
+            end
+        else
+            assert(ISUnlockVehicleDoor ~= nil, "native vehicle unlock action unavailable")
+            actions[#actions + 1] = assert(ISUnlockVehicleDoor:new(character, doorPart))
+        end
+    end
+    if not door:isOpen() then
+        assert(ISOpenVehicleDoor ~= nil, "native vehicle door action unavailable")
+        actions[#actions + 1] = assert(ISOpenVehicleDoor:new(character, vehicle, doorPart))
+    end
+    actions[#actions + 1] = assert(ISEnterVehicle:new(character, vehicle, seat))
+    if ISCloseVehicleDoor ~= nil then
+        actions[#actions + 1] = assert(ISCloseVehicleDoor:new(character, vehicle, doorPart))
+    end
 end
 
 local function usableDriverSeat(character, vehicle)
@@ -297,19 +394,144 @@ function CompanionVehicles.board(character, vehicle)
     -- A missing path must not leave a sparse array that silently skips entry.
     local built, actions = pcall(function()
         local path = assert(ISPathFindAction:pathToVehicleSeat(character, vehicle, seat))
-        local enter = assert(ISEnterVehicle:new(character, vehicle, seat))
-        local result = { path, enter }
-        local doorPart = vehicle:getPassengerDoor(seat)
-        if doorPart ~= nil and doorPart:getDoor() ~= nil and doorPart:getDoor():isOpen()
-            and ISCloseVehicleDoor ~= nil then
-            result[#result + 1] = assert(ISCloseVehicleDoor:new(character, vehicle, doorPart))
-        end
+        local result = { path }
+        appendDoorEntryActions(character, vehicle, seat, result)
         return result
     end)
     if not built then return false, "vehicle_action_failed" end
-    local queued, reason = queueActions(character, vehicle, seat, actions)
+    local queued, reason = queueActions(character, vehicle, seat, actions,
+        { runToVehicle = true })
     if not queued then return false, reason end
     return true, "boarding_seat=" .. tostring(seat)
+end
+
+-- Complete the player-entered-vehicle transition for the already-filtered
+-- Follow roster supplied by CompanionService. Native actions and leases stay
+-- here; held, ordered, base-duty, and non-party survivors never enter this path.
+function CompanionVehicles.syncPlayerEntered(player, members)
+    local vehicle = player ~= nil and player:getVehicle() or nil
+    if vehicle == nil or vehicle:getSquare() == nil then
+        return false, "player_not_in_vehicle"
+    end
+    if math.abs(vehicle:getCurrentSpeedKmHour()) > 1 then
+        return false, "vehicle_moving"
+    end
+    members = type(members) == "table" and members or {}
+    local playerDriving = vehicle.isDriver ~= nil and vehicle:isDriver(player)
+    local driver = vehicle:getDriver()
+    local assignedDriver = nil
+
+    -- When the player chose a passenger seat and this parked vehicle has no
+    -- driver, let one nearby Follow companion take the native driver path if
+    -- Experimental NPC Driving is enabled. If that safe admission fails, that
+    -- survivor can still take a passenger seat below.
+    local settings = rawget(_G, "KnoxSettings")
+    local mayDrive = not playerDriving and driver == nil and settings ~= nil
+        and settings.enableExperimentalNpcDriving ~= nil
+        and settings.enableExperimentalNpcDriving()
+    if mayDrive then
+        local candidates = {}
+        for index, member in ipairs(members) do
+            if member ~= nil and member ~= player and member:getVehicle() == nil
+                and sameFloorAndNear(member, vehicle) then
+                candidates[#candidates + 1] = {
+                    character = member, distance = distanceSquaredToVehicle(member, vehicle),
+                    order = index,
+                }
+            end
+        end
+        table.sort(candidates, function(first, second)
+            if first.distance == second.distance then return first.order < second.order end
+            return first.distance < second.distance
+        end)
+        for _, candidate in ipairs(candidates) do
+            local member = candidate.character
+            local started = CompanionVehicles.driveAhead(member, vehicle)
+            if started then
+                assignedDriver = member
+                break
+            end
+        end
+    end
+
+    local boarded, rejected = 0, {}
+    for _, member in ipairs(members) do
+        if member ~= nil and member ~= player and member ~= assignedDriver
+            and member:getVehicle() == nil and sameFloorAndNear(member, vehicle) then
+            local started, reason = CompanionVehicles.board(member, vehicle)
+            if started then boarded = boarded + 1
+            else rejected[#rejected + 1] = tostring(reason or "vehicle_action_failed") end
+        end
+    end
+    return true, { vehicle = vehicle, boarded = boarded,
+        driver = assignedDriver, rejected = rejected }
+end
+
+function CompanionVehicles.exitAfterPlayer(character, vehicle)
+    if character == nil or vehicle == nil or character:getVehicle() ~= vehicle then
+        return false, "vehicle_changed"
+    end
+    local success, reason = CompanionVehicles.exit(character)
+    if not success and reason == "vehicle_moving" and character:getVehicle() == vehicle then
+        awaitingExit[character] = { vehicle = vehicle, tries = 0 }
+        return false, "exit_waiting_for_stop"
+    end
+    return success, reason
+end
+
+function CompanionVehicles.syncPlayerExited(player, vehicle, members)
+    if player == nil or vehicle == nil then return false, "vehicle_unavailable" end
+    members = type(members) == "table" and members or {}
+    local exited, cancelled, rejected = 0, 0, {}
+    for _, member in ipairs(members) do
+        if member ~= nil and member ~= player then
+            if member:getVehicle() == vehicle then
+                local success, reason = CompanionVehicles.exitAfterPlayer(member, vehicle)
+                if success then exited = exited + 1
+                else rejected[#rejected + 1] = tostring(reason or "vehicle_action_failed") end
+            else
+                local request = pending[member]
+                if request ~= nil and request.vehicle == vehicle then
+                    CompanionVehicles.cancel(member)
+                    cancelled = cancelled + 1
+                end
+            end
+        end
+    end
+    return true, { vehicle = vehicle, exited = exited,
+        cancelled = cancelled, rejected = rejected }
+end
+
+function CompanionVehicles.driveNearest(character, maxDistance)
+    if KnoxSettings == nil or KnoxSettings.enableExperimentalNpcDriving == nil
+        or not KnoxSettings.enableExperimentalNpcDriving() then
+        return false, "npc_driving_disabled"
+    end
+    if character == nil or character.getCurrentSquare == nil
+        or character:getCurrentSquare() == nil then return false, "vehicle_origin_unavailable" end
+    local limit = (tonumber(maxDistance) or 30)
+    local limitSquared = limit * limit
+    local candidates = {}
+    for _, vehicle in ipairs(loadedVehicles()) do
+        if sameFloorAndNear(character, vehicle, limitSquared) then
+            candidates[#candidates + 1] = {
+                vehicle = vehicle, distance = distanceSquaredToVehicle(character, vehicle),
+            }
+        end
+    end
+    table.sort(candidates, function(first, second)
+        if first.distance == second.distance then
+            return tostring(first.vehicle) < tostring(second.vehicle)
+        end
+        return first.distance < second.distance
+    end)
+    local lastReason = "no_usable_vehicle_nearby"
+    for _, candidate in ipairs(candidates) do
+        local started, reason = CompanionVehicles.driveAhead(character, candidate.vehicle)
+        if started then return true, "driving_nearest_vehicle", candidate.vehicle end
+        lastReason = reason or lastReason
+    end
+    return false, lastReason
 end
 
 function CompanionVehicles.exit(character)

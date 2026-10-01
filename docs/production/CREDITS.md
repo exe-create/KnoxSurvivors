@@ -28,4 +28,4 @@ This file is the release-prep source for attribution. `COLLABORATION.md` holds t
 
 ## Translators and collaborators
 
-No additional contributor identity is promoted here until it is confirmed in `COLLABORATION.md` with the preferred credit wording and permission/status.
+- **badbhop (Allan Christian)** — Brazilian Portuguese localization contributor and maintainer of the community PT-BR translation project. Native integration into Knox Survivors remains pending review and merge.

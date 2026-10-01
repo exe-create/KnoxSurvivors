@@ -6,7 +6,7 @@ require "KS_Settings"
 require "KS_SurvivorNotebook"
 require "KS_OrderCatalog"
 -- Optional radial bridge: fail-closed and dormant when the vanilla radial API
--- is absent. Never affects the context menus below.
+-- is absent. Context order menus are separately controlled by their Sandbox option.
 pcall(require, "KS_RadialOrders")
 if rawget(_G, "KnoxOrderCatalog") == nil then
     _G.KnoxOrderCatalog = { label = function(_, fallback) return fallback or "Order" end }
@@ -20,6 +20,12 @@ end
 
 local PartyCommands = rawget(_G, "KnoxPartyCommands") or {}
 _G.KnoxPartyCommands = PartyCommands
+
+local function contextOrdersEnabled()
+    if KnoxSettings == nil or KnoxSettings.showLegacyContextCommands == nil then return false end
+    local ok, enabled = pcall(KnoxSettings.showLegacyContextCommands)
+    return ok and enabled == true
+end
 
 local function firstSquare(worldObjects)
     for _, object in ipairs(worldObjects or {}) do
@@ -128,6 +134,10 @@ function PartyCommands.weaponPreferenceAll(_, playerNum, preference)
     KnoxCompanionService.issueOrderAll(player(playerNum), "weapon_preference", { preference = preference })
 end
 
+function PartyCommands.autoEquipmentAll(_, playerNum, allowed)
+    KnoxCompanionService.setAutoEquipmentAll(player(playerNum), allowed)
+end
+
 function PartyCommands.directiveAll(_, playerNum, directive)
     if directive ~= nil then
         local ok, changed = KnoxCompanionService.issueOrderAll(
@@ -137,6 +147,20 @@ function PartyCommands.directiveAll(_, playerNum, directive)
             KnoxActivityFeed.event("Party order failed: no companion could take it.")
         end
     end
+end
+
+function PartyCommands.destinationAll(_, playerNum, directive)
+    if directive == nil then return end
+    local ok, count, reason = KnoxCompanionService.issueOrderAll(
+        player(playerNum), "go_to", directive
+    )
+    if not ok then
+        KnoxActivityFeed.event("Party destination failed: " .. tostring(reason or "unavailable") .. ".")
+    end
+end
+
+function PartyCommands.cancelPartyDestination(_, playerNum)
+    KnoxCompanionService.cancelPartyDestination(player(playerNum))
 end
 
 function PartyCommands.basePreferenceAll(_, playerNum, preference)
@@ -154,12 +178,19 @@ function PartyCommands.openActivity()
     KnoxActivityFeed.show()
 end
 
+function PartyCommands.toggleActivity()
+    if KnoxActivityFeed ~= nil and KnoxActivityFeed.toggle ~= nil then
+        KnoxActivityFeed.toggle()
+    end
+end
+
 function PartyCommands.openNotebook(_, playerNum)
     KnoxSurvivorNotebook.show(playerNum)
 end
 
 local function populate(menu, playerNum, square)
     local actor = player(playerNum)
+    if contextOrdersEnabled() then
     local common = {}
     for index, id in ipairs(KnoxCompanionService.getCompanionIds(actor)) do
         local duty = KnoxPersistence.getSurvivorDuty(id) or {}
@@ -171,7 +202,8 @@ local function populate(menu, playerNum, square)
         end
         local values = { order = duty.order or "follow", stance = duty.combatStance or "defensive",
             climbing = policies.allowClimbing ~= false, doors = doors ~= false,
-            weapon = policies.weaponPreference or "auto" }
+            weapon = policies.weaponPreference or "auto",
+            autoEquipment = policies.autoEquipment ~= false }
         for key, value in pairs(values) do
             if index == 1 then common[key] = value
             elseif common[key] ~= value then common[key] = nil end
@@ -188,9 +220,14 @@ local function populate(menu, playerNum, square)
     ordersMenu:setOptionChecked(follow, common.order == "follow")
     ordersMenu:setOptionChecked(hold, common.order == "hold")
     ordersMenu:setOptionChecked(relax, common.order == "relax")
+    local cancelDestination = ordersMenu:addOption("Cancel Party Destination", PartyCommands,
+        PartyCommands.cancelPartyDestination, playerNum)
+    local hasPartyDestination = KnoxCompanionService.hasPartyDestination ~= nil
+        and KnoxCompanionService.hasPartyDestination(actor) or false
+    cancelDestination.notAvailable = not hasPartyDestination
     local resume = ordersMenu:addOption(KnoxOrderCatalog.label("resume_normal_duty"), PartyCommands,
         PartyCommands.clearDirectiveAll, playerNum)
-    local hasDirective = false
+    local hasDirective = hasPartyDestination
     for _, id in ipairs(KnoxCompanionService.getCompanionIds(actor)) do
         local duty = KnoxPersistence.getSurvivorDuty(id) or {}
         if duty.directive ~= nil then hasDirective = true break end
@@ -291,11 +328,20 @@ local function populate(menu, playerNum, square)
             PartyCommands.weaponPreferenceAll, playerNum, choice[2])
         weaponMenu:setOptionChecked(option, common.weapon == choice[2])
     end
+    local equipment = tacticsMenu:addOption("Automatic Equipment Upgrades", nil, nil)
+    local equipmentMenu = ISContextMenu:getNew(tacticsMenu)
+    tacticsMenu:addSubMenu(equipment, equipmentMenu)
+    for _, choice in ipairs({ { "Upgrade Better Gear Automatically", true },
+        { "Keep Current Equipment", false } }) do
+        local option = equipmentMenu:addOption(choice[1], PartyCommands,
+            PartyCommands.autoEquipmentAll, playerNum, choice[2])
+        equipmentMenu:setOptionChecked(option, common.autoEquipment == choice[2])
+    end
     if square ~= nil then
         local location = menu:addOption("Orders for This Location", nil, nil)
         local locationMenu = ISContextMenu:getNew(menu)
         menu:addSubMenu(location, locationMenu)
-        locationMenu:addOption(catalogLabel("move_party", "Move Party Here"), PartyCommands, PartyCommands.directiveAll,
+        locationMenu:addOption(catalogLabel("move_party", "Move Party Here"), PartyCommands, PartyCommands.destinationAll,
             playerNum, pointDirective("go_to", square))
         locationMenu:addOption(catalogLabel("guard_location", "Guard This Location"), PartyCommands, PartyCommands.directiveAll,
             playerNum, pointDirective("guard", square))
@@ -324,7 +370,13 @@ local function populate(menu, playerNum, square)
         survivalMenu:addOption(KnoxOrderCatalog.label("clean_inventory"), PartyCommands,
             PartyCommands.directiveAll, playerNum, areaDirective("clean_inventory", square, 12))
     end
-    menu:addOption("Show Activity Feed", PartyCommands, PartyCommands.openActivity)
+    end
+    if KnoxSettings ~= nil and KnoxSettings.showActivityFeed ~= nil
+        and KnoxSettings.showActivityFeed() then
+        menu:addOption(KnoxActivityFeed ~= nil and KnoxActivityFeed.isVisible ~= nil
+            and KnoxActivityFeed.isVisible() and "Hide Activity Feed"
+            or "Show Activity Feed", PartyCommands, PartyCommands.toggleActivity)
+    end
     local manageRoot = menu:addOption("Manage", nil, nil)
     local manageMenu = ISContextMenu:getNew(menu)
     menu:addSubMenu(manageRoot, manageMenu)
@@ -350,7 +402,7 @@ function PartyCommands.openMenu(playerNum, x, y, square)
 end
 
 local function onFillWorldObjectContextMenu(playerNum, context, worldObjects, test)
-    if not KnoxSettings.enabled() then
+    if not KnoxSettings.enabled() or not contextOrdersEnabled() then
         return
     end
     local actor = player(playerNum)

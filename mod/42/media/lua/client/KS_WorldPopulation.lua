@@ -56,6 +56,29 @@ local function hasMaterializableVirtualLocation(state)
     return type(state) == "table" and VIRTUAL_LOCATION_ACTIVITIES[state.activity] == true
 end
 
+local function ownedPlayerCompanionOwner(id)
+    local duty = KnoxPersistence.getSurvivorDuty ~= nil
+        and KnoxPersistence.getSurvivorDuty(id) or nil
+    local affiliation = KnoxPersistence.getSurvivorAffiliation ~= nil
+        and KnoxPersistence.getSurvivorAffiliation(id) or nil
+    if duty ~= nil and duty.mode == "companion"
+        and type(duty.ownerId) == "string" and duty.ownerId ~= ""
+        and affiliation ~= nil and affiliation.kind == "player"
+        and affiliation.ownerId == duty.ownerId then
+        return duty.ownerId, duty
+    end
+    return nil, duty
+end
+
+local function isOwnedPlayerCompanion(id)
+    return ownedPlayerCompanionOwner(id) ~= nil
+end
+
+local function isOwnedPlayerFollower(id)
+    local ownerId, duty = ownedPlayerCompanionOwner(id)
+    return duty ~= nil and duty.order == "follow" and ownerId or nil
+end
+
 local function finite(value)
     value = tonumber(value)
     return value ~= nil and value == value and value > -math.huge and value < math.huge
@@ -1185,6 +1208,34 @@ local function ringOffsets(radius, rotation)
     return rotated
 end
 
+-- When a player explicitly has an owned survivor following, the old virtual
+-- floor may no longer be streamed (or may have no safe tile). Rejoin the same
+-- persistent person beside that owner using a real loaded square on the
+-- owner's current floor. This is a last resort after the saved location, not
+-- a general relocation rule for independent survivors, Hold, or base duty.
+local function safeFollowerSquare(players, id, ownerId)
+    local rotation = stableHash(id .. ":follow-return")
+    for _, player in ipairs(players or {}) do
+        local playerId = KnoxPersistence.ensurePlayerId ~= nil
+            and KnoxPersistence.ensurePlayerId(player) or nil
+        local anchor = playerId == ownerId and playerSquare(player) or nil
+        if anchor ~= nil then
+            local z = math.floor(tonumber(anchor:getZ()) or 0)
+            for radius = 1, FIRST_SPAWN_SEARCH_RADIUS do
+                for _, offset in ipairs(ringOffsets(radius, rotation)) do
+                    local square = getCell():getGridSquare(
+                        math.floor(anchor:getX()) + offset.x,
+                        math.floor(anchor:getY()) + offset.y,
+                        z
+                    )
+                    if safeStandable(square) then return square end
+                end
+            end
+        end
+    end
+    return nil
+end
+
 local function withinMaximumDistance(square, players, maximumDistance)
     if maximumDistance == nil then
         return true, WorldPopulation.nearestPlayerDistanceSquared(square, players)
@@ -1291,11 +1342,18 @@ local function materializeVirtualLocation(id, bridge, record, players, maximumDi
         return record, nil, nil, nil, "outside_activation_distance"
     end
     local selected = nil
+    -- Returning player-owned companions must be allowed to rematerialize at
+    -- their real logical position even when the player can see it. Requiring
+    -- an unseen square here can strand an owned survivor in hibernation while
+    -- the player is standing beside the saved map location. Independent
+    -- population still uses hidden placement to avoid visible spawn-in.
+    local allowVisible = isOwnedPlayerCompanion(id)
     local rotation = stableHash(id .. ":virtual:" .. tostring(x) .. ":" .. tostring(y))
     for radius = 0, FIRST_SPAWN_SEARCH_RADIUS do
         for _, offset in ipairs(ringOffsets(radius, rotation)) do
             local square = getCell():getGridSquare(x + offset.x, y + offset.y, z)
-            if safeStandable(square) and not visibleToAnyPlayer(square, players) then
+            if safeStandable(square)
+                and (allowVisible or not visibleToAnyPlayer(square, players)) then
                 selected = square
                 break
             end
@@ -1303,7 +1361,20 @@ local function materializeVirtualLocation(id, bridge, record, players, maximumDi
         if selected ~= nil then break end
     end
     if selected == nil then
-        return record, nil, nil, nil, "virtual_square_not_loaded_or_visible"
+        local followerOwnerId = isOwnedPlayerFollower(id)
+        if followerOwnerId ~= nil then
+            selected = safeFollowerSquare(players, id, followerOwnerId)
+            if selected ~= nil then
+                print("[KnoxSurvivors][WorldPopulation] activation-fallback id="
+                    .. tostring(id) .. " reason=follow_owner_saved_square_unavailable from="
+                    .. tostring(x) .. "," .. tostring(y) .. "," .. tostring(z)
+                    .. " to=" .. tostring(selected:getX()) .. ","
+                    .. tostring(selected:getY()) .. "," .. tostring(selected:getZ()))
+            end
+        end
+        if selected == nil then
+            return record, nil, nil, nil, "virtual_square_not_loaded_or_visible"
+        end
     end
     if bridge.relocateNpcRecord == nil then
         return record, nil, nil, nil, "record_relocator_unavailable"
@@ -1550,6 +1621,10 @@ function WorldPopulation.activationCandidates(bridge, activeIds, limit, options)
                 candidates[#candidates + 1] = candidate
             else
                 rejected[result] = (rejected[result] or 0) + 1
+                if isOwnedPlayerCompanion(id) then
+                    print("[KnoxSurvivors][WorldPopulation] activation-deferred id="
+                        .. tostring(id) .. " reason=" .. tostring(result))
+                end
             end
         end
     end

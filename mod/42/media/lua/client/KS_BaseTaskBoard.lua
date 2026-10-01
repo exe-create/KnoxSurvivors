@@ -116,6 +116,49 @@ function TaskBoard.claimBest(baseId, survivorId, preference)
     return nil, "no_eligible_task"
 end
 
+-- Continue targets created by an explicit player order without enabling
+-- autonomous work. Every target still passes capability checks and the same
+-- atomic persistence claim as other tasks.
+function TaskBoard.claimBestManualOrder(baseId, survivorId)
+    local base = KnoxPersistence.getBase(baseId)
+    if base == nil then return nil, "base_unavailable" end
+    local now = worldAge()
+    local candidates = {}
+    for _, task in pairs(base.tasks or {}) do
+        if task ~= nil and task.manualOrder == true then
+            if task.state == "blocked" and now >= (tonumber(task.retryAtHours) or 0)
+                and KnoxPersistence.requeueBaseTask ~= nil then
+                KnoxPersistence.requeueBaseTask(baseId, task.id, now)
+            end
+            if task.state == "queued" then
+                candidates[#candidates + 1] = task
+            end
+        end
+    end
+    table.sort(candidates, function(first, second)
+        local firstPriority = tonumber(first.priority) or 0
+        local secondPriority = tonumber(second.priority) or 0
+        if firstPriority == secondPriority then
+            return tostring(first.id) < tostring(second.id)
+        end
+        return firstPriority > secondPriority
+    end)
+    for _, task in ipairs(candidates) do
+        if KnoxBaseManager.canPerformTask(survivorId, baseId, task) then
+            local claimed, result = KnoxPersistence.claimBaseTask(
+                baseId, task.id, survivorId, now
+            )
+            if claimed ~= nil and result == "claimed" then
+                claimed.manual = true
+                claimed.auto = nil
+                claimed.manualOrder = true
+                return claimed, result
+            end
+        end
+    end
+    return nil, "no_eligible_order_task"
+end
+
 -- Player-directed assignment uses the same atomic persistence boundary as
 -- automatic work selection.  The notebook may choose a concrete queued task,
 -- but it must not bypass base ownership, resident eligibility, skill gates, or

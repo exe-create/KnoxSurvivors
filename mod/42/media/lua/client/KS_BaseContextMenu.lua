@@ -8,9 +8,22 @@ require "KS_BaseZoneSelector"
 require "KS_SurvivorAutonomy"
 require "KS_BaseBarricades"
 require "KS_BaseTaskBoard"
+require "KS_BaseStorageFilterUI"
 
 local BaseContextMenu = rawget(_G, "KnoxBaseContextMenu") or {}
 _G.KnoxBaseContextMenu = BaseContextMenu
+
+local function hasEntries(value)
+    if type(value) ~= "table" then return false end
+    for _ in pairs(value) do return true end
+    return false
+end
+
+local function contextOrdersEnabled()
+    if KnoxSettings == nil or KnoxSettings.showLegacyContextCommands == nil then return false end
+    local ok, enabled = pcall(KnoxSettings.showLegacyContextCommands)
+    return ok and enabled == true
+end
 
 
 local function firstSquare(worldobjects)
@@ -23,9 +36,10 @@ local function firstSquare(worldobjects)
     return nil
 end
 
-local function containerObjects(worldobjects, base)
+local function containerObjects(worldobjects, bases)
     local found = {}
     local seen = {}
+    if bases ~= nil and bases.id ~= nil then bases = { bases } end
     for _, object in ipairs(worldobjects or {}) do
         local square = object ~= nil and object.getSquare ~= nil and object:getSquare() or nil
         local count = object ~= nil and object.getContainerCount ~= nil
@@ -33,10 +47,18 @@ local function containerObjects(worldobjects, base)
             or 0
         -- worldobjects often contains the same IsoObject twice (multi-square
         -- crates, object + inventory proxy). Dedupe so crates get one menu.
-        if square ~= nil and count > 0 and KnoxBaseManager.containsSquare(base, square)
-            and seen[object] == nil then
+        local ownerBase = nil
+        if square ~= nil and count > 0 then
+            for _, base in ipairs(bases or {}) do
+                if base ~= nil and KnoxBaseManager.containsSquare(base, square) then
+                    ownerBase = base
+                    break
+                end
+            end
+        end
+        if ownerBase ~= nil and seen[object] == nil then
             seen[object] = true
-            found[#found + 1] = object
+            found[#found + 1] = { object = object, base = ownerBase }
         end
     end
     return found
@@ -99,6 +121,53 @@ function BaseContextMenu.setStorage(baseId, object, containerIndex, category)
     end
 end
 
+function BaseContextMenu.toggleStorageFilter(baseId, object, containerIndex, category)
+    local base = KnoxBaseManager.get(baseId)
+    if base == nil or object == nil
+        or not KnoxBaseManager.containsSquare(base, object:getSquare()) then
+        KnoxActivityFeed.event("Could not update storage filters: container is outside this base.")
+        return
+    end
+    local reference = base ~= nil
+        and KnoxBaseManager.containerReference(object, containerIndex, baseId) or nil
+    if reference == nil then
+        KnoxActivityFeed.event("Could not update storage filters: container is unavailable.")
+        return
+    end
+    local current = base.storage ~= nil and base.storage[reference.key] or nil
+    local filters = KnoxBaseStorage.filtersForPolicy(current)
+    if category == "general" then
+        filters = filters.general and {} or { general = true }
+    else
+        filters.general = nil
+        filters[category] = not filters[category] or nil
+    end
+    if not hasEntries(filters) then
+        if current ~= nil then
+            BaseContextMenu.removeStorage(baseId, reference.key, object, containerIndex)
+        else
+            KnoxActivityFeed.event("Storage filters cleared.")
+        end
+        return
+    end
+    local policy, result = KnoxBaseManager.setStorageFilters(
+        baseId, object, filters, containerIndex)
+    if policy ~= nil then
+        KnoxActivityFeed.event("Storage filters: " .. KnoxBaseStorage.label(policy) .. ".")
+        if KnoxBaseHighlights ~= nil then KnoxBaseHighlights.refresh() end
+    else
+        KnoxActivityFeed.event("Could not update storage filters: " .. tostring(result) .. ".")
+    end
+end
+
+function BaseContextMenu.openStorageFilters(baseId, object, containerIndex, playerNum)
+    if KnoxBaseStorageFilterUI == nil then
+        KnoxActivityFeed.event("Container filter window is unavailable.")
+        return
+    end
+    KnoxBaseStorageFilterUI.open(baseId, object, containerIndex, playerNum)
+end
+
 function BaseContextMenu.setStoragePriority(baseId, key, priority)
     local ok, result = KnoxPersistence.setBaseStoragePriority(baseId, key, priority)
     if ok then
@@ -110,29 +179,47 @@ function BaseContextMenu.setStoragePriority(baseId, key, priority)
 end
 
 function BaseContextMenu.removeStorage(baseId, key, object, containerIndex)
-    -- Restore the world container title before dropping the assignment.
+    -- Resolve the exact assigned compartment before dropping its canonical
+    -- policy. Native capacity/ModData cleanup is only committed if persistence
+    -- accepts removal; a rejected removal must leave the live store unchanged.
     local base = KnoxBaseManager.get(baseId)
     local policy = base ~= nil and base.storage ~= nil and base.storage[key] or nil
-    if policy ~= nil and KnoxBaseStorage ~= nil and KnoxBaseStorage.clearContainerName ~= nil then
-        local container = nil
-        if object ~= nil and object.getContainerByIndex ~= nil then
+    local resolved = nil
+    if policy ~= nil and KnoxBaseStorage ~= nil and KnoxBaseStorage.resolvePolicy ~= nil then
+        resolved = KnoxBaseStorage.resolvePolicy(policy, true)
+    end
+    local success, reason = KnoxPersistence.removeBaseStoragePolicy(baseId, key)
+    local restoreResult = nil
+    if success and policy ~= nil then
+        local cleanupObject = resolved ~= nil and resolved.object or object
+        local container = resolved ~= nil and resolved.container or nil
+        if container == nil and object ~= nil and object.getContainerByIndex ~= nil then
             local ok, direct = pcall(function()
                 return object:getContainerByIndex(tonumber(containerIndex) or 0)
             end)
             if ok then container = direct end
         end
-        if container ~= nil then
-            KnoxBaseStorage.clearContainerName(policy, container)
-        else
-            local resolved, _ = KnoxBaseStorage.resolvePolicy(policy)
-            if resolved ~= nil then
-                KnoxBaseStorage.clearContainerName(policy, resolved.container)
+        if KnoxToolCupboard ~= nil and KnoxToolCupboard.clearInfinite ~= nil
+            and cleanupObject ~= nil and container ~= nil then
+            local restored, restoreReason = KnoxToolCupboard.clearInfinite(
+                cleanupObject, container, key, policy.containerIndex or containerIndex
+            )
+            if not restored or restoreReason == "original_capacity_unknown" then
+                restoreResult = restoreReason
             end
+        else
+            restoreResult = "container_unavailable"
+        end
+        if container ~= nil and KnoxBaseStorage ~= nil
+            and KnoxBaseStorage.clearContainerName ~= nil then
+            KnoxBaseStorage.clearContainerName(policy, container)
         end
     end
-    local success, reason = KnoxPersistence.removeBaseStoragePolicy(baseId, key)
-    KnoxActivityFeed.event(success and "Storage assignment removed. Contents stay here."
-        or ("Could not remove storage: " .. tostring(reason)))
+    local message = success and (restoreResult == nil
+        and "Storage assignment removed. Contents stay here."
+        or "Storage assignment removed, but native capacity restoration could not be confirmed.")
+        or ("Could not remove storage: " .. tostring(reason))
+    KnoxActivityFeed.event(message)
     if success and KnoxBaseHighlights ~= nil then KnoxBaseHighlights.refresh() end
 end
 
@@ -456,6 +543,12 @@ function BaseContextMenu.orderBarricadeHere(player, base, square)
             }, 98)
         end
         if task ~= nil then
+            -- Every window in this player order must remain eligible after the
+            -- first assignment, even when autonomous base jobs are disabled.
+            if task.state == "queued" then
+                task.manualOrder = true
+                task.auto = nil
+            end
             queued = queued + 1
             if assigned == nil then
                 assigned = assignTaskToBestResident(player, base, task)
@@ -482,24 +575,23 @@ function BaseContextMenu.burnCorpsesHere(player, base, square)
     KnoxActivityFeed.event("Mark a Corpse Drop Area instead: full piles burn automatically.")
 end
 
-local function addStorageMenu(parent, base, object)
-    local storageOptions = {
-        { key = "food", label = "Food & Drink" },
-        { key = "water", label = "Water" },
-        { key = "medical", label = "Medical" },
-        { key = "weapons", label = "Weapons" },
-        { key = "ammunition", label = "Ammunition" },
-        { key = "tools", label = "Tools" },
-        { key = "logs", label = "Logs & Lumber" },
-        { key = "general", label = "General Storage" },
-        { key = "building", label = "Materials" },
-        { key = "farming", label = "Farming" },
-        { key = "clothing", label = "Clothing" },
-        { key = "junk", label = "Junk" },
-    }
+local function addStorageMenu(parent, base, object, playerNum)
     local count = object:getContainerCount()
+    -- Most world objects expose one usable container. Put the requested filter
+    -- editor directly on the first right-click menu for that common case;
+    -- only multi-compartment objects need an intermediate selector.
+    if count == 1 then
+        local container = object:getContainerByIndex(0)
+        local kind = container ~= nil and string.lower(tostring(container:getType() or "")) or ""
+        local unusable = kind == "corpse" or kind:find("water", 1, true) ~= nil
+            or kind:find("rain", 1, true) ~= nil
+        local option = parent:addOption("Set Filters…", base.id,
+            BaseContextMenu.openStorageFilters, object, 0, playerNum)
+        option.notAvailable = unusable
+        return
+    end
     local objectOption = parent:addOption(
-        count > 1 and "Set Storage Containers" or "Set Storage",
+        "Set Container Filters",
         object,
         nil
     )
@@ -522,9 +614,9 @@ local function addStorageMenu(parent, base, object)
             local reference = KnoxBaseManager.containerReference(object, containerIndex, base.id)
             local policy = reference ~= nil and base.storage ~= nil and base.storage[reference.key] or nil
             if policy ~= nil then
-                local status = targetMenu:addOption("Assigned: " .. KnoxBaseStorage.label(policy), nil, nil)
+                local status = targetMenu:addOption("Filters: " .. KnoxBaseStorage.label(policy), nil, nil)
                 status.notAvailable = true
-                targetMenu:addOption("Stop Using for " .. KnoxBaseStorage.label(policy), base.id,
+                targetMenu:addOption("Clear Container Filters", base.id,
                     BaseContextMenu.removeStorage, policy.key, object, containerIndex)
                 -- RimWorld-style priority: Critical shelves fill first, Low
                 -- last. Current level is checked; changing it re-ranks every
@@ -545,11 +637,9 @@ local function addStorageMenu(parent, base, object)
             local kind = string.lower(tostring(container:getType() or ""))
             local unusable = kind == "corpse" or kind:find("water", 1, true) ~= nil
                 or kind:find("rain", 1, true) ~= nil
-            for _, storageOption in ipairs(storageOptions) do
-                local option = targetMenu:addOption("Use for " .. storageOption.label, base.id,
-                    BaseContextMenu.setStorage, object, containerIndex, storageOption.key)
-                option.notAvailable = unusable
-            end
+            local filtersOption = targetMenu:addOption("Set Filters…", base.id,
+                BaseContextMenu.openStorageFilters, object, containerIndex, playerNum)
+            filtersOption.notAvailable = unusable
         end
     end
 end
@@ -571,7 +661,9 @@ function BaseContextMenu.onFill(playerNum, context, worldobjects, test)
     end
     local playerId = KnoxPersistence.ensurePlayerId(player)
     local base = KnoxBaseManager.getForOwner("player", playerId)
-    local containers = base ~= nil and containerObjects(worldobjects, base) or {}
+    local ownedBases = KnoxPersistence.getBasesForOwner ~= nil
+        and KnoxPersistence.getBasesForOwner("player", playerId) or (base ~= nil and { base } or {})
+    local containers = #ownedBases > 0 and containerObjects(worldobjects, ownedBases) or {}
     local clickedBuildingId = buildingId(square)
     local canEstablish = base == nil and clickedBuildingId ~= nil
     local canMove = base ~= nil and clickedBuildingId ~= nil
@@ -611,13 +703,15 @@ function BaseContextMenu.onFill(playerNum, context, worldobjects, test)
     end
     if base ~= nil then
         menu:addOption("Open Base Management", BaseContextMenu, BaseContextMenu.openSetup, playerNum)
-        local ordersOption = menu:addOption("Resident Orders", nil, nil)
-        local ordersMenu = ISContextMenu:getNew(menu)
-        menu:addSubMenu(ordersOption, ordersMenu)
-        ordersMenu:addOption("Scout Here", player,
-            BaseContextMenu.dispatchScout, base, square)
-        ordersMenu:addOption("Barricade Building Windows", player,
-            BaseContextMenu.orderBarricadeHere, base, square)
+        if contextOrdersEnabled() then
+            local ordersOption = menu:addOption("Resident Orders", nil, nil)
+            local ordersMenu = ISContextMenu:getNew(menu)
+            menu:addSubMenu(ordersOption, ordersMenu)
+            ordersMenu:addOption("Scout Here", player,
+                BaseContextMenu.dispatchScout, base, square)
+            ordersMenu:addOption("Barricade Building Windows", player,
+                BaseContextMenu.orderBarricadeHere, base, square)
+        end
         -- Door locks at base/safehouse.
         for _, object in ipairs(worldobjects or {}) do
             local isDoor = false
@@ -636,8 +730,10 @@ function BaseContextMenu.onFill(playerNum, context, worldobjects, test)
             end
         end
     end
-    for _, object in ipairs(containers) do
-        addStorageMenu(menu, base, object)
+    -- Storage filter access is a direct world-object action by design: players
+    -- should not need to discover and open the broader Knox submenu first.
+    for _, entry in ipairs(containers) do
+        addStorageMenu(context, entry.base, entry.object, playerNum)
     end
     addBedMenu(menu, base, player, playerId, worldobjects)
 end

@@ -79,6 +79,11 @@ local function canBandage(item)
     return item ~= nil and safe(function() return item:isCanBandage() end, false)
 end
 
+function Looting.isMedicalSupply(item)
+    local fullType = itemType(item)
+    return canBandage(item) or (fullType ~= nil and MEDICAL_TYPES[fullType] == true)
+end
+
 local function safeFood(item)
     return safe(function() return KnoxSurvivorNeeds.isSafeFood(item) end, false)
 end
@@ -341,19 +346,22 @@ local function applySelectedFacts(facts, item)
     if fullType ~= nil then facts.fullTypes[fullType] = true end
 end
 
-function Looting.plan(character, container, maximumItems, forGroup)
+function Looting.plan(character, container, maximumItems, forGroup, options)
     if character == nil or container == nil then
         return {}
     end
     local groupMode = forGroup == true
+    local foodOnly = type(options) == "table" and options.foodOnly == true
     local facts = inventoryFacts(character)
     local candidates = {}
     local items = container:getItems()
     for index = 0, items:size() - 1 do
         local item = items:get(index)
-        local score, reason = candidateScore(character, facts, item, groupMode)
-        if score ~= nil then
-            candidates[#candidates + 1] = { item = item, score = score, reason = reason }
+        if not foodOnly or safeFood(item) then
+            local score, reason = candidateScore(character, facts, item, groupMode)
+            if score ~= nil then
+                candidates[#candidates + 1] = { item = item, score = score, reason = reason }
+            end
         end
     end
     table.sort(candidates, function(first, second)

@@ -41,9 +41,9 @@ This is the private production ledger for translators, compatibility partners, e
 
 | Language | Contributor / team | Source / fork | Official or community | Permission / notes | Public credit |
 |---|---|---|---|---|---|
-| PT-BR (Brazilian Portuguese) | babhop (GitHub: `badbhop`) | Standalone injector: `badbhop/KnoxSurvivors_PTBR` (v1.0 zip); future fork/PR to `exe-create/KnoxSurvivors` | Community standalone now; official integration only after owner review/merge | Standalone must disclose unofficial status (recorded in its README); no mod source merged; owner performs native `getText()` integration | Pending — awaiting preferred credit name |
+| PT-BR (Brazilian Portuguese) | badbhop (Allan Christian; GitHub: `badbhop`) | Standalone injector: `badbhop/KnoxSurvivors_PTBR` (v1.0 zip); fork/PR to `exe-create/KnoxSurvivors` | Community standalone now; official integration only after owner review/merge | Standalone must disclose unofficial status (recorded in its README); no mod source merged; owner performs native `getText()` integration | Approved — `badbhop (Allan Christian)`, PT-BR localization contributor |
 
-### COLLAB-PTBR — babhop (PT-BR translator)
+### COLLAB-PTBR — badbhop (Allan Christian, PT-BR translator)
 
 - Contact reference: Discord `babhop`; GitHub `badbhop`; standalone repo `badbhop/KnoxSurvivors_PTBR`
 - Relationship: translator
@@ -52,7 +52,7 @@ This is the private production ledger for translators, compatibility partners, e
 - Current status: active
 - Official or community work: community standalone (Phase 1 injector); official native integration deferred to Phase 2 after owner review/merge
 - Permission/license boundary: owner approved the standalone community addon with explicit unofficial-status disclosure; owner performs all main-mod edits; translator owns Portuguese strings and testing. No main-mod source merged as of 2026-09-28.
-- Public credit wording: pending — owner requested GitHub username, preferred credit name, and repo/release link on 2026-09-28; no reply recorded yet
+- Public credit wording: approved — `badbhop (Allan Christian)`, PT-BR localization contributor; native integration remains pending owner review and merge
 - Canonical tasks/bugs: none (localization support work is owner-side future scope; hardcoded-string reports arrive via the pending-items catalog, not `BUGS.md`)
 - Files/package location: `KS_PTBR_Injetor.lua` + `sandbox.json` (v1.0 zip at the standalone repo, verified 2026-09-28: repo live with README carrying the temporary-project disclaimer, Issues channel open with 0 issues, 4 commits; install targets Workshop content `108600/3749727604`); pending-items reports per component folder with `.txt` + screenshots/clips; overflow list `KS_Text_Overflow_PTBR.txt` expected at handoff
 
@@ -91,24 +91,24 @@ This is the private production ledger for translators, compatibility partners, e
 - [x] build/version and compatibility context recorded (current Knox version; Build 42)
 - [ ] delivered files preserved or linked (v1.0 zip linked; full catalog + overflow list pending)
 - [ ] review task/bug linked (none yet — create on catalog arrival if code changes needed)
-- [ ] public credit wording confirmed (pending preferred credit name)
+- [x] public credit wording confirmed (`badbhop (Allan Christian)`, PT-BR localization contributor)
 - [ ] integration/release status recorded (not integrated; community-only)
 
 #### Joint plan (both sides may propose edits via fork PR)
 
 Agreed 2026-09-24 through 2026-09-28. Either side may propose changes to this plan; owner approves.
 
-**Phase 1 — Standalone coverage (babhop leads, owner unblocked).**
-- babhop keeps extending the injector (v1.0 action layer done; v2.0 management layer next; v3.0 immersion last), testing with Sandbox dev tools, keeping zero-LUA-error stability.
-- babhop does NOT refactor main-mod code; tricky strings go to the catalog with version, location, screenshot, EN source + PT-BR proposal.
-- babhop keeps the unofficial-status disclosure in README/release notes and distributes via the GitHub zip.
-- Owner does nothing blocking here; merges stay slow during the refactor, nothing on babhop's side is blocked by that.
+**Phase 1 — Standalone coverage (badbhop leads, owner unblocked).**
+- badbhop keeps extending the injector (v1.0 action layer done; v2.0 management layer next; v3.0 immersion last), testing with Sandbox dev tools, keeping zero-LUA-error stability.
+- badbhop does NOT refactor main-mod code; tricky strings go to the catalog with version, location, screenshot, EN source + PT-BR proposal.
+- badbhop keeps the unofficial-status disclosure in README/release notes and distributes via the GitHub zip.
+- Owner does nothing blocking here; merges stay slow during the refactor, nothing on badbhop's side is blocked by that.
 - Done when: management + immersion layers are covered as far as injection can reach, catalog + overflow list are complete, v1.0+ zip is public.
 
-**Phase 2 — Native integration (owner leads, babhop supports).**
-- babhop sends one package: Translation `.txt` dictionary, pending-items catalog per component folder, overflow list, clips/screenshots, plus GitHub username + preferred credit name + repo link.
+**Phase 2 — Native integration (owner leads, badbhop supports).**
+- badbhop sends one package: Translation `.txt` dictionary, pending-items catalog per component folder, overflow list, clips/screenshots, plus GitHub username + preferred credit name + repo link.
 - Owner creates one review task, then implements in order: (a) render-time `getText()` for headers/tabs; (b) `labelKey` storage + render resolution + exact-match migration for the 8 default zone labels, player renames untouched; (c) container loosening from measured longest strings; (d) `Translate/PTBR/` file from the dictionary.
-- babhop tests the integrated build and reports breakage against the same catalog format.
+- badbhop tests the integrated build and reports breakage against the same catalog format.
 - Done when: PT-BR renders natively without the injector, saves migrate cleanly, credit is published in `CREDITS.md`.
 
 **Standing rules.**

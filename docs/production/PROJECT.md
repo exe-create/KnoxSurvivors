@@ -103,7 +103,7 @@ keep synchronized; it is not required to edit code or continue development.
 - Codex/OpenCode may work normally from the repository without ModForge running,
   using the same task IDs, evidence rules and Git review path.
 - ModForge keeps roadmap, tasks, bugs, decisions, design intake, documentation map, collaboration ledger, evidence state and handoffs aligned when it is active.
-- Codex/Astra is the primary engineering authority for difficult architecture-sensitive implementation, expansion, debugging and broad release-hardening work.
+- The assigned Codex Boss is the engineering authority for implementation, expansion, debugging and release hardening; Luna is the normal Boss, and Sol/Astra require the escalation or explicit owner assignment in `AGENTS.md` and `AI_WORKFLOW.md`.
 - OpenCode is the budget-engineering authority for confirmed bugs, support work, focused implementation, cleanup and compatibility/collaboration support.
 - Live acceptance is tracked evidence and a release gate, not a universal blocker for independent mechanics. The project may continue bounded development while a live scenario remains open, provided the unverified boundary is recorded honestly.
 - Project Zomboid's real APIs, native systems, assets, items, actions, resources and runtime state are preferred. Reverse-engineering notes and reusable Zomboid modding references may be consolidated later as a knowledge/documentation project; they are not a current milestone priority.

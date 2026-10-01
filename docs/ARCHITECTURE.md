@@ -51,6 +51,9 @@ Ground AI waits during that lease and while seated. Expiry, injury, queue remova
 retirement and world reset release transient ownership. Persistent companion duty
 remains authoritative, so it resumes after disembarking. Seats/actions are never
 serialized into Knox identity data, and no driver behavior is implied by this path.
+An autonomous driver's committed passenger roster is scoped to that exact vehicle
+run: abort cleanup cancels an unseated member or exits a member still in that run's
+vehicle, but cannot cancel or control a member who has moved to another vehicle.
 
 1. **Identity model** — stable IDs and persistent human state independent of a loaded engine object.
 2. **World representation** — an `IsoPlayer` created only while its cell is active.
@@ -263,6 +266,25 @@ action or wakes the survivor through `SleepingEvent.wakeUp`, then exposes the un
 Hold, group-travel, or roaming role after danger ends. Sitting remains native endurance recovery;
 fatigue uses `SleepingEvent.setPlayerFallAsleep` without local-player fades or time-control writes.
 
+Carried drinking candidates must expose a readable native taint state. A verified clean water
+source is eligible normally; verified tainted water retains the existing critical-thirst fallback
+only. Missing taint metadata, a failed `Fluid.TaintedWater` inspection, or a non-boolean result is
+unknown water and is rejected. It must never silently become clean water because the vanilla drink
+action can apply sickness/poison from that same fluid marker.
+
+Loaded thirsty base residents may also select a direct-drink native water object through the
+existing supply search and movement state. Search is limited to the same-floor 12-tile loaded
+area and, for player-owned bases or faction/base camps, to the current owned boundary. The shared
+Needs owner checks `hasFluid`, positive native fluid amount, and a readable boolean
+`isTaintedWater()` result. Existing transient autonomy reservations lease the exact object while
+the resident approaches; orders, group objectives, threats, higher-priority needs, and native
+movement/action outcomes remain authoritative. Vanilla `ISTakeWaterAction` owns drinking and
+fluid/thirst changes. Knox reports completion only when the real thirst and source amount both
+decrease; emptying the source is valid, but an unchanged source or stat is not. Full inventory is
+not bypassed. This is loaded-only behavior: no offscreen water source or persistent water claim is
+created. Bottle filling and use by unowned/field companions remain outside this slice. Build 42
+thirst, sickness, depletion, movement, and reload results remain live-unverified.
+
 ## Confirmed 42.20 engine surface
 
 Inspection of the installed `projectzomboid.jar` confirms:
@@ -332,7 +354,11 @@ Retreat remains part of this same small decision layer rather than a tactical pl
 or three nearby zombies per nearby ally interrupts combat, chooses a standable direction weighted
 away from the closest pressure, and starts one ordinary Java movement request. Short-lived group
 plans keep loaded members moving roughly together. Two safe scans end retreat and expose the
-durable Follow/Hold/travel order to the normal decision loop again.
+durable Follow/Hold/travel order to the normal decision loop again. Base residents may use the
+same threat admission and movement owner: their current task claim is suspended across danger,
+and active supply-run intent/carried delivery remains durable for the existing return/deposit
+path. A direct player companion remains excluded from autonomous retreat. This does not create a
+base-specific combat or retreat controller.
 
 ## Off-slot firearm integration
 
@@ -370,6 +396,21 @@ returns a distinct fallback result and the controller switches to melee without 
 threat on the unreachable-target cooldown. Dead targets, weapon changes, terminal attacks, and
 explicit resets clear ranged intent and the temporary route through the same combat teardown used
 by melee.
+
+`KS_SurvivorAutonomyController` owns a bounded firearm-encounter state machine on top of these
+native boundaries; it never becomes a second combat scheduler. A ready firearm commits the
+encounter to the ranged class for its current exact target until a real invalidation (weapon
+removed/broken/empty, no compatible ammo, or a close/overwhelming threat). The bounded
+reload-preparation budget is keyed to the exact prepared weapon identity and target, so a finished
+encounter cannot strand a later reload with a stale clock. Consecutive native ranged
+`COMBAT_FAILED` results (failed approach/pursuit) are bounded; at the threshold the encounter
+releases firearm ownership through the existing melee-fallback owner while keeping a still-valid
+target eligible. Melee fallback is idempotent when melee is already held and prefers the exact
+carried item identity. Every terminal boundary — target drop, retarget, kill, failure, close/ranged
+fallback, weapon-preference change, directive abandon, controller error, detach recovery, flee, and
+shutdown — clears the transient firearm state through `clearFirearmCombatState()` without touching
+native queues or persistent directives. Player-facing weapon preference, aiming assistance, and
+native skill/accuracy/damage/ammunition remain exactly as documented above.
 
 The shell's LOS override must remain disabled because off-slot `IsoPlayer.updateLOS()`
 writes into a real local player's render channel. A scheduled Lua awareness adapter restores
@@ -531,8 +572,10 @@ Persistent travel groups additionally keep one validated `objective` copied from
 leader's autonomous `lifeIntent`. This is shared context, not shared movement ownership: the leader
 still owns the real destination request and other members use the existing formation/follow path.
 Only the current leader can replace the objective, an unchanged objective does not churn revisions,
-and leadership replacement clears it. While an entire group is hibernated, a coordinate-bearing
-objective moves the cohort through the existing coarse travel ledger; arrival changes both the
+and leadership replacement clears the objective and any persisted leader directive. Save
+normalization applies the same invalidation when it repairs a missing or invalid leader. While an
+entire group is hibernated, a coordinate-bearing objective moves the cohort through the existing
+coarse travel ledger; arrival changes both the
 leader and group intent to `reassess` before ordinary itinerary selection can resume. Thus unload
 does not split one purposeful trip into unrelated per-member decisions or restore an obsolete live
 path request.
@@ -617,6 +660,45 @@ returns to the primary order. Header commands use the same service as individual
 context menus. NPC travel groups and factions reject any survivor whose affiliation or duty
 is player-owned, including stale pending meetings.
 
+The player-party **Move Party Here** command is a session-scoped shared destination intent
+owned by `KS_CompanionService`, not a persisted player-group record. It snapshots currently
+eligible companions in primary Follow duty with no individual directive; Hold, Relax, Guard,
+base assignment, and other individual orders remain authoritative exclusions. Each
+participant receives the same destination through `syncController` and then routes through
+that survivor's existing autonomy/movement owner. A later individual order removes only
+that companion from the shared order. A new party movement/search order, Follow/Hold/Relax,
+Return to Base, Resume Normal Duty, or explicit cancellation supersedes the shared intent.
+Needs, combat/threat, traversal, native actions and recovery remain above it; the same active
+intent is offered again through normal controller arbitration after temporary interruption.
+Each survivor is considered arrived only on the same floor within 1.5 tiles of the selected
+square. The one-hour world-age expiry, arrival completion, cancellation and invalid/empty
+roster clear the runtime record. A dismissed, dead, reassigned or otherwise ineligible
+participant is removed from that command; no new companion inherits it after selection.
+The player remains the party authority and anchor; no companion is elected as group leader.
+Player-anchored runtime slots are implemented separately under D-026. No NPC faction/travel-group objective is read or written. Because current player-scoped
+persistence has no shared order lifecycle compatible with individual order cancellation and
+controller sync, the destination deliberately does not survive save/reload.
+
+The player-party cohesion projection is runtime-only and is derived from the same recruited
+companion roster. `KS_CompanionService` assigns stable per-session slots to Follow-eligible
+companions and smooths the party heading from meaningful player movement; facing changes
+while stationary do not rotate slots. Hold/Relax, individual directives, base duty, death,
+dismissal and ownership changes remove only the affected survivor. The player remains the
+normal anchor; short-lived spatial fallback may use the player's last finite loaded square
+during a brief missing-square interval, but never promotes a companion to leader. The
+controller uses its existing formation target and native movement path. Its player-only
+fallback compresses into a small set of standable nearby squares when a preferred slot is
+blocked or leased. These position leases use the autonomy system's shared transient
+reservation table and release through existing controller cleanup; no second scheduler is
+introduced. NPC `GROUP_FOLLOW` target calculation and leader projection remain unchanged.
+
+While a shared destination is active, eligible companions receive distinct loaded staging
+tiles within its canonical 1.5-tile arrival area when available. Reaching a staging tile does
+not itself complete the order: `KS_CompanionService` verifies the same-floor live character
+position against the original destination. A member that arrives waits loosely at its leased
+tile until the other still-eligible participants arrive; cancellation, supersession, expiry,
+roster loss, or completion releases it back to normal player-anchored Follow arbitration.
+
 Follow reuses the existing staggered slot structure rather than targeting the player's
 occupied square. Slots are refreshed on a bounded cadence and a route is replaced only when
 the slot changes by a meaningful distance or floor; pace-only changes update the active Java
@@ -697,6 +779,15 @@ The shared task board chooses by persisted priority and filters each resident ag
 trait, recipe, and real assigned-storage item requirements. This prevents renewable farming or tree work
 from starving security and cleanup, while also preventing a resident without the exact tools
 or materials from claiming a task another resident prepared.
+
+Automatic shortage runs share this settlement boundary. Player-owned base
+residents require their persisted per-resident loot-run permission. For a
+faction-owned base, an ordinary autonomous resident whose persisted faction ID
+matches the base owner may be elected for that base's actual loaded-storage
+shortage through the existing supply planner and receipt-gated run/deposit
+owner. Explicit specialization, tasks, events, away work, and active generic
+group-sortie leases remain respected. The group-sortie query is read-only; it
+does not become a second task or mission owner.
 
 Player territory is also sent to the Java traversal runtime as a protected structure area.
 Friendly and neutral survivors may still use doors and try an unlocked window, but they
@@ -1258,3 +1349,20 @@ and complete/blocked. A future loaded-world executor must explicitly materialize
 the existing survivor record, reuse the normal autonomy and inventory-transfer
 owners, and return the shell through the same capture/removal boundary. No
 separate collector may create items or bodies outside that contract.
+
+### Hibernation removal refusal and same-shell recovery
+
+`KS_SurvivorAutonomy.hibernateDistantWorldSurvivors` remains the loaded-shell
+teardown coordinator; `KS_UnloadedSurvival` owns the durable stored/loaded
+ledger transition; `KS_SurvivorAutonomyController` owns resumption of that
+same controller after transient native ownership has been released. If native
+removal refuses and the bridge still returns the controller's exact body, the
+coordinator must commit `rollbackStored` before returning the controller to
+`IDLE`. The controller is not ticked while the ledger remains hibernated.
+A failed rollback remains a recovery-pending loaded shell and retries ledger
+reconciliation only; it must not repeat shutdown/removal or enter unloaded
+simulation. If the bridge confirms the body absent, the already-committed
+hibernation can complete and the existing activation path later restores the
+same canonical identity. This boundary creates no second lifecycle manager or
+replacement body. See BUG-KS-058 and its focused regression/Build 42 acceptance
+in WORK_QUEUE.md and DEVELOPMENT_TESTING.md.

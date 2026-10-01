@@ -1,44 +1,59 @@
 # Development testing
 
-## Unattended QA vertical slice
+## In-game testing
 
-Use a disposable save. In Sandbox settings enable **Enable Developer Tools**
-and **Run Automated Knox QA**, leave the automatic developer scenario set to
-**None**, load the save, and leave the game running. The automatic entry point
-runs only the first controlled vertical slice:
+There is no in-game Automated QA menu or automatic QA run. The prior save
+arming flow was retired because it was confusing and did not help ordinary
+playtesting. Existing saves may retain an `AutomatedQAMode` SandboxVars value;
+the option is no longer registered and Knox no longer reads it.
 
-- `QA-START-001` records Build/save/mod/runtime readiness.
-- `QA-ENCOUNTER-001` creates one `ks-dev-*` native survivor fixture and records
-  identity, origin, body, square, group/faction state, and run ownership.
-- `QA-RECRUIT-001` observes recruitment eligibility without changing trust,
-  affiliation, group membership, or companion ownership.
-- `QA-CHECKPOINT-001` writes a per-scenario checkpoint.
-- `QA-CLEANUP-001` removes that run's fixture and verifies no owned body remains.
+For gameplay checks, launch Build 42 normally with Knox Survivors enabled and
+follow one short replay from the active bug/work item. Record what you expected
+and what the survivor actually did. Offline checks do not prove native movement,
+actions, combat, rendering, inventory, or save/reload behavior. Existing manual
+Developer Tools (spawn, combat scenarios, and diagnostics) are separate from the
+retired QA runner and remain available when enabled.
 
-Each result is `PASS`, `FAIL`, `BLOCKED`, `SKIPPED`, or `HARNESS_ERROR`, and
-includes a run ID and evidence type. `HARNESS_ERROR` means the runner,
-checkpoint, or cleanup path failed; it is not evidence of a gameplay defect.
-The fixture is not proof of natural encounter frequency, social progression,
-recruitment feel, visual presentation, combat, movement, persistence, or normal
-world safety. Those remain separate live checks.
+## Offline verification
 
-The slice never removes ordinary zombies, survivors, animals, items, or world
-objects. If it cannot create a valid native fixture, it records `BLOCKED` with
-the native reason. It still needs a disposable save because cleanup retires a
-temporary persistent developer identity.
-
-The slice prints results and checkpoints to Project Zomboid `DebugLog.txt`.
-Parse the newest log after the run with:
+Run the focused `tools/test-*.lua` regression for the changed subsystem, then:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tools/parse-live-qa.ps1
+./tools/verify.ps1 -SkipJava
+git diff --check
 ```
 
-The JSON report is written to `build/live-qa/latest.json` and includes run
-metadata, results, evidence types, and checkpoints. A missing native fixture is
-`BLOCKED`; unexpected runner exceptions, timeouts, or cleanup failures are
-`HARNESS_ERROR`. The older broad scenario inventory is retained in source for
-future migration, but it is not run by this vertical-slice entry point.
+The QA manifest/coordinator/save-isolation/parser code is retained only for
+existing offline harness regressions; it is not required or loaded by gameplay.
+Tests under `tools/` are ignored by Git policy and provide local-only evidence.
+
+## Archived in-game QA harness evidence (not active)
+
+### Stale Developer QA payload — 2026-09-30
+
+The latest available debug log (`Zomboid/Logs/2026-09-30_21-40_DebugLog.txt`,
+events through 22:07) ran Build 42.21 with the older QA protocol: its START line
+contains `save_is_disposable=true` and lacks `saveIdentitySource` and
+`manifestVersion`. Hash comparison showed the loaded local/Workshop QA file did
+not match the current repository version. That run reported a Kahlua
+`Index 200 out of bounds for length 200` load error, then
+`KnoxAutonomyController.new` was unavailable during `QA-ENCOUNTER-001`;
+encounter ended `HARNESS_ERROR`, recruitment was skipped, and later controller
+registration errors repeated. Do not count that run as a test of the current
+manual arming path. The current source and located staged Lua files compiled
+with the installed Build 42 Kahlua compiler outside the game's debug loader;
+that does not reproduce or clear a debug-mode issue. Refresh local staging
+before the next launch and capture a new log. Do not run the legacy
+`save_is_disposable=true` QA path on an ordinary save.
+
+These local tests validate manifest shape, dependency blocking, exception and
+timeout status handling, run IDs, ownership refusal, partial fixture registry,
+ordinary-world safety, the no-mutation base fixture gate, and report parsing.
+The existing base-task board, material requirement, claim cleanup, retry, and
+native-action lifecycle regressions remain the offline task-owner evidence;
+they do not enable a live QA fixture. `tools/` tests are ignored by Git
+policy and therefore are local-only evidence unless separately staged by the
+owner. None of these tests proves Project Zomboid native behavior.
 
 For a symptom outside that automated slice, use Developer Tools > Diagnostics >
 **Write Survivor Status to Log** while the relevant survivor is loaded. The
@@ -127,6 +142,133 @@ Record leader/follower IDs, order/revision/deadline, controller state, and the
 relevant movement evidence for each step. This is live acceptance only; offline fixtures do not prove native
 route, action, or cancellation behavior.
 
+## Player companion shared destination — Build 42 acceptance
+
+Use a disposable save with at least two player-owned companions. Right-click
+loaded standable ground and choose **Knox Survivors → Orders for This Location
+→ Move Party Here**. Confirm the activity feed reports the number of eligible
+companions and each eligible survivor begins through its own controller. Only
+companions in primary Follow duty with no individual directive participate;
+Hold, Relax, Guard, base duty, and other explicit individual commands remain
+authoritative. A newly recruited companion after selection must not inherit the
+active destination.
+
+Interrupt one destination route with combat/threat, urgent hunger/thirst or
+injury, a native door/fence traversal, and recovery. Verify those owners retain
+the body and that the same destination resumes through the existing controller
+after each temporary interruption. Issue an individual order during party travel
+and verify only that companion leaves the shared command. Issue a new party
+movement/order and verify it supersedes the destination. Use **Knox Survivors →
+Orders → Cancel Party Destination** and verify all remaining shared routes are
+released through normal controller arbitration.
+
+Arrival tolerance is same-floor within 1.5 tiles of the selected square. Verify
+the feed reports completion only after every still-eligible participant is
+physically inside tolerance; a successful route result outside tolerance is not
+arrival. The intent expires after one in-game hour. Invalid/non-standable or
+missing selected ground must be rejected. Dismissal, death or reassignment
+removes that participant; if none remain, the order clears. The player remains
+the party authority and existing Follow anchor. No companion route leader is
+elected, so NPC-style leader succession is not part of this slice.
+
+The active destination is runtime-only and must be absent after save/reload; it
+must not be described as restored. Offline regressions exercise validation,
+dispatch, arbitration, expiry, roster pruning and session reset only. They do
+not prove rendered UI, native pathing, physical arrival, interruption timing or
+save/reload behavior in Build 42.
+
+## Firearm stabilization — Build 42 acceptance (BUG-KS-029)
+
+Disposable save, one recruited survivor carrying a usable melee weapon, a pistol,
+a compatible magazine, and compatible loose rounds. Set the survivor's weapon
+preference to **Prefer Ranged**, then produce a real hostile encounter.
+
+Record, before and after each step, the exact weapon full type and item id, the
+magazine/chamber/loose-round counts, the native aiming/reload/attack state, the
+target identity/health/floor, and the controller state/decision:
+
+1. survivor acquires the target and equips the exact carried pistol;
+2. native reload/rack completes once (no repeated queue requests);
+3. the native attack hook fires and the engine plays sound/animation;
+4. real ammunition decreases by the native amount and no ammo is fabricated;
+5. zombie health/damage changes through native ballistics;
+6. target death clears target, attack, reload, and reservation ownership;
+7. a second target is acquired without stale state;
+8. exhausting compatible ammo falls back to the carried melee weapon once;
+9. a point-blank threat falls back to melee without a reload loop;
+10. a blocked ranged approach falls back to melee without a loop and stays
+    eligible (no false unreachable-target cooldown);
+11. combat interruption by urgent needs, traversal, a vehicle, or a new order
+    resumes afterward without a stale attack/reload action;
+12. changing weapon preference mid-combat and mid-reload cancels the native
+    preparation once and preserves Follow/Hold/Guard;
+13. save/reload preserves the persisted preference and truthful weapon/ammo state;
+14. party formation and an active Move Party Here destination resume after combat.
+
+Also keep the existing one-zombie and small-group native combat acceptance debt
+from `BUG-KS-009`/`BUG-KS-012`, and the hostile `firearm_duel` plus
+allied/neutral bystander safety check. Offline hook telemetry is not proof of a
+shot, damage, or ammo change; only native observation counts.
+
+## Player-party cohesion / formation — Build 42 acceptance
+
+Use a disposable save with at least three recruited player companions. Keep two
+on Follow and assign one Hold; only the Follow pair should participate. Right-
+click **Move Party Here**, then walk at ordinary speed, run, sprint, turn in
+place, make a sharp turn, and stop. Verify the player remains the anchor,
+individual identities retain stable slots across direction and roster changes,
+companions spread outdoors rather than stack, and route requests do not churn on
+stationary facing changes. Recruit and dismiss members during travel; later
+recruits must not join the active destination snapshot, and remaining slot
+owners must not reshuffle.
+
+Repeat beside a narrow door, open/closed doorway, fence, window, stairs, corner
+and a crowded passage. Verify a blocked preferred slot compresses to a distinct
+nearby standable square; only the companion entering traversal owns its native
+action; other followers do not request the same tile; those who have crossed
+wait/regroup without oscillating; post-landing slot evaluation resumes promptly.
+Introduce one blocked route and a severe separation: confirm bounded retry,
+walk/run/sprint catch-up, no teleportation or route spam, and movement failure
+streak reset after a real successful recovery.
+
+Interrupt followers with combat/retreat, urgent food/water/medical needs, a
+native timed action, Hold/Guard or another individual directive, vehicle
+boarding, unload/detach, and dismissal/death. Each higher owner must retain
+control; invalid members release their transient slot leases; eligible companions
+reacquire player-relative formation through normal controller arbitration.
+Make the player climb/vault, enter a moving vehicle, briefly lose a loaded
+square, then recover. The player remains anchor; any last-position fallback is
+brief, loaded and standable, with no companion promotion or persistent leader.
+
+During **Move Party Here**, verify each Follow-eligible participant stages at a
+distinct tile within the existing 1.5-tile final area when available. Arrived
+companions wait loosely while others route. Cancellation, a superseding order,
+Hold/individual directive, expiry, death/dismissal, and player death must release
+only the appropriate transient reservations and preserve D-025 membership and
+completion rules. A native route success outside the selected point's tolerance
+must not count as arrival. Save/reload must intentionally clear the
+session-scoped destination and formation slots; this package does not add
+persistence.
+
+Offline regressions prove deterministic projection, target leases, arbitration
+and cleanup only. They do not establish Build 42 pathfinding, native traversal,
+animations, real arrival, or rendered activity/status behavior.
+
+## Loaded group membership-removal refresh — 2026-09-29
+
+In a disposable Build 42 save, load a three-member travel group and let all
+three controllers complete one formation projection. Remove or kill the leader
+while the relationship coordinator is inside its normal 60-tick assignment
+interval. On the next coordinator tick, verify the canonical successor is
+projected as leader, the remaining follower targets that successor with the
+correct slot/member list, and the removed survivor no longer owns group
+formation. Observe native route handling separately: this change refreshes
+controller projections but deliberately does not cancel or issue movement.
+Confirm danger, needs, current traversal, and timed actions retain arbitration;
+then save/reload and verify identity, membership, successor, and follower
+behavior remain coherent. Offline coverage proves only the transient refresh
+handoff and controller projection, not Build 42 movement or persistence.
+
 ## Deferred base-task resume replay - 2026-09-14
 
 Give a resident a claimed base job, interrupt it with danger or a failed supply
@@ -149,6 +291,21 @@ resident continues the route without attacking it. Place a real zombie close to
 the carrier: the resident should release the corpse, flee or defend against the
 immediate threat, and retain the haul task for later resumption. Confirm the
 carrier never enters the visible pickup, swing, loot, and pickup loop.
+
+## Autonomous retreat Sandbox option — Build 42 acceptance
+
+Use a disposable save and compare `Allow Autonomous Survivor Retreat` enabled
+and disabled. For each setting, exercise an independent survivor, a base
+resident, a faction resident, and an autonomous group member. Present one
+zombie and then an overwhelming group with a real viable escape route. Enabled
+should retain the existing bounded admission policy; disabled should prevent a
+new autonomous retreat without disabling threat detection, combat, or ordinary
+group movement. Direct player companions must continue to obey Follow/Hold and
+must not begin autonomous retreat under either setting. Interrupt a real base
+task and supply run with retreat while enabled, then verify task/claim and
+delivery resumption, and save/reload during recovery. Offline tests do not
+prove native combat, movement, escape-lane selection, formation cohesion, or
+save/reload behavior.
 
 ## Blocked base-job supply replay - 2026-09-14
 
@@ -404,6 +561,34 @@ storage; Developer Tools > Base & Job Tests can stock real materials for testing
 
 All six are pending live acceptance; Lua tests verify control flow and invariants,
 not the visual animation, stairs, doors or driving behavior inside the game.
+
+### Typed storage capacity restore — Build 42 acceptance (BUG-KS-039)
+
+On a disposable save, record the native `getCapacity()` and contents of two
+compartments on one furniture object (for example a fridge/freezer). Assign a
+typed storage role to each and verify the assigned compartments use only the
+installed Build 42 native capacity ceiling. Remove one assignment through its
+normal context-menu entry: its original capacity and all real contents must
+remain/restored, while the sibling assignment keeps its own capacity marker and
+limit. Remove the final assignment and verify its original capacity is restored
+and the active assignment marker is gone. Repeat after save/reload and, where
+two valid owned bases can reference the same native compartment, remove each
+policy in turn; the capacity must remain raised until the last policy is
+removed. No item should move or disappear solely due to a capacity restore.
+
+`ToolCupboardCapacity` is a legacy setting for old Tool Cupboard records only;
+it does not configure current typed storage. Offline tests verify the lease and
+ModData control flow, not native capacity persistence or item preservation.
+
+Also check an old typed assignment without an original-capacity snapshot: its
+removal must leave the current capacity unchanged and report unconfirmed
+restoration, rather than inventing an original. If a native setter rejects an
+observed original (including a value created by another mod), rollback metadata
+must remain and the UI must not claim confirmed restoration. Rejected policy
+removal must leave capacity/name unchanged; identity lookup must not reapply
+assignment effects. Local fixtures reproduce silent setter rejection and
+rejected removal against the pre-Astra snapshot, but native acceptance still
+requires this replay.
 
 ## Base-job supply entry recovery - 2026-09-28
 
@@ -838,8 +1023,14 @@ the following behavior is not yet called live-verified:
     should change from Follow/Hold to the current directive while either is active.
 12. Close the activity feed with X, then reopen it through the `SQUAD` header menu. Speech
     must show the speaker name plus a stable party/group/faction label and color.
-13. Use `Set Home Base Boundary`, choose two opposite corners around the house and yard,
-    and confirm the territory persists. Residents must navigate every floor normally.
+13. On a disposable save, record the Build 42 version, mod root, base ID, and
+    current bounds. Use `Set Home Base Boundary` to select one asymmetric area
+    in both corner orders. Record clicked world squares, draft highlight,
+    confirmation dimensions, persisted min/max bounds, and reopened state.
+    Check all four edges and adjacent tiles for ownership, then save/reload and
+    compare again. Residents must navigate every floor normally. The current
+    owner supports one axis-aligned rectangle across floors; a disconnected
+    area is a model limit, not a polygon/union acceptance expectation.
     Friendly survivors may open ordinary entries but must not smash player-base windows
     or attack its locked doors.
 14. Open the Survivor Notebook from the party header and verify Party, Home Base,
@@ -1067,6 +1258,40 @@ there are no more seats. Then use **Orders → Exit Vehicle** while stopped and 
 normal exit animation. Do not save/reload this slice as vehicle-seat restoration is not yet
 implemented; no error, detached-shell hibernation, or change to vehicle keys/engine state is
 acceptable while a companion is seated.
+
+## Vehicle/driving stabilization acceptance — BUG-KS-030
+
+Use a disposable Build 42 save. Record the stable survivor IDs, inventory,
+orders, group membership, vehicle ID, seat/driver identity, native engine/fuel/
+condition/lock/occupancy/towing accessor values, admission reason, movement
+result, and vehicle controls at each transition.
+
+1. Compare engine off/on, empty fuel, damaged/non-driveable, locked driver door,
+   blocked/occupied seat, player-near/occupied vehicle, towing, and one valid
+   fueled vehicle. Rejected candidates must not queue boarding or take controls.
+2. Exercise passenger entry/exit and explicit driver admission with the player
+   in seat zero. Fill passenger seats and confirm overflow members remain
+   unleased. Try group orders before boarding, during boarding, and while
+   riding; a real destination drive must use the current native route owner.
+3. Interrupt boarding/driving with threat, critical need, duty/order change,
+   injury, player driver takeover, engine/vehicle unavailability, and a blocked
+   or destroyed vehicle. Confirm only the exact run roster is settled, native
+   controls are released safely, and other cars/runs remain untouched.
+4. Verify arrival/abort passenger exits, including a moving-car refusal followed
+   by stationary retry. Verify no duplicate body, lost survivor, item loss, or
+   stale order/group identity after unload/rematerialization.
+5. Separately save/reload while occupied. Vehicle-seat restoration is not
+   currently implemented: treat this as a limitation probe, record what Build
+   42 restores, and check for identity/inventory/order/group corruption. Do not
+   claim occupied-seat restoration as supported unless a later implementation
+   adds and validates it.
+6. For multi-car/group travel, test each real driver run and convoy spacing
+   separately; native part consumption from Materials is another acceptance
+   gate.
+
+Offline `test-vehicle-driver.lua` now covers stale-roster cleanup while a member
+has begun a separate run in another vehicle. It does not prove any native seat,
+route, physics, control, persistence, or streaming behavior above.
 
 ## Known limits
 
@@ -1299,3 +1524,1005 @@ unless those native outcomes separately occurred. Offline coverage is in
 `test-human-encounters.lua`, `test-offscreen-stories.lua`,
 `test-offscreen-recount.lua`, and `test-relationship-coherence.lua`; these
 fixtures do not prove native encounter timing, persistence, speech, or UI.
+
+For a successful faction recruitment, let a loaded faction leader complete the
+join encounter with an eligible independent. Verify the canonical faction and
+travel-group roster both contain the same survivor, faction affiliation and
+home-base duty are correct, and the survivor receives the existing runtime
+duty update. On the next group-coordination pass verify the persisted leader
+and current formation are reflected without duplicate membership. Save/reload
+and confirm the same identity, group, faction, base duty, and leadership remain.
+The offline faction-persistence fixture also exercises a rejected lifecycle
+admission and confirms it cannot leave partial group/faction/alliance state;
+native encounter, movement, and save/reload remain live-only.
+
+For the offscreen-to-loaded handoff, preserve a disposable pair with a real
+offscreen `pendingMeet` in both canonical survivor ledgers, then bring both
+survivors into loaded contact. Interrupt the first approach with immediate
+danger or an explicit activity change; confirm neither ledger loses the intent
+and no completed memory/disposition is invented. After the interruption clears,
+allow the same pair to meet again and finalize the forced outcome. Confirm both
+matching intents clear only after acceptance, the expected real loaded result
+occurs, and memory/dialogue appear after save/reload. Repeat with an intent older
+than 72 game hours and confirm it no longer forces an encounter. Combat, robbery
+transfer, native approach, and save/reload remain separate evidence; an
+offscreen `rob` intent does not prove successful theft.
+
+### Faction-owned base shortage response
+
+In a disposable Build 42 save, establish a faction-owned base with an assigned
+real-storage shortage and at least one ordinary resident whose persisted
+faction ID matches the base. Include a specialized resident, a wrong-faction
+resident, and an active generic group-sortie pair where practical. Confirm the
+matching available resident is elected only for the base's actual shortage,
+while specialized/wrong-faction residents and current sortie owners are not
+double assigned. Observe real item pickup, return, native deposit, shortage
+reassessment, and save/reload while returning with supplies. Player-owned base
+residents must retain the existing explicit loot-run opt-in rule. Offline
+`test-base-auto-scavenge.lua` and `test-group-scavenge.lua` cover election
+eligibility and sortie exclusion; supply planner/routing fixtures cover the
+existing offline-owned path. They do not prove native faction scheduling,
+movement, transfer/capacity, reassessment, or save/reload.
+
+### Base resident threat retreat and duty resumption
+
+In a disposable Build 42 save, start with one base resident on a real claimed
+work task and another carrying a real shortage item on an active return run.
+First expose healthy equipped residents to one zombie and a small group; confirm
+they hold/fight under the existing thresholds when danger is not overwhelming.
+Then expose a resident with immediate overwhelming pressure and a genuinely
+viable escape lane. Confirm one native retreat route starts, ordinary work
+action/transfer reservations are interrupted, the same task claim or durable
+supply run remains owned, and the resident does not return until the existing
+safe-scan rule clears. Verify the task resumes through base arbitration or the
+carrier returns to native storage, receives confirmed deposit, and triggers
+shortage reassessment. Repeat while a faction pair is on a group sortie to
+confirm both members respond coherently without duplicate route requests or a
+stale outing. Save/reload once during a supply-bearing retreat and compare
+identity, active run, carried item and duty. Offline
+`test-combat-intelligence.lua` covers admission/claim/lease preservation and
+safe-scan boundaries; it does not prove native pathing, combat, item transfer,
+group cohesion, or persistence.
+
+### Automatic equipment preference
+
+On a disposable Build 42 save, inspect a player-owned companion and a
+player-owned base resident with a clearly inferior equipped weapon and better
+real weapon/clothing/bag items in inventory. Verify the default-enabled policy
+upgrades only through the existing native owned-item actions while idle and
+after a real loot transfer. Disable automatic upgrades, repeat both cases, and
+confirm the current equipment remains unchanged. Then explicitly equip an item
+through inventory controls and enter combat requiring a suitable weapon; those
+paths must still work while automatic upgrades are disabled. Re-enable the
+policy and save/reload; verify it persists and the normal automatic reevaluation
+resumes. Offline coverage in `test-weapon-preferences.lua`,
+`test-companion-sync-cache.lua`, and `test-equipment-intelligence.lua` proves
+the policy default, persistence representation, sync, and gate under fixtures;
+it does not prove native equip/wear, inventory action ownership, combat, or
+save/reload.
+## Owned-survivor map grouping — BUG-KS-021
+
+On a disposable Build 42 save, open the world map with one owned survivor and
+verify the existing individual marker. Move a second owned survivor within 20
+world tiles on the same floor and confirm one grouped marker shows both names
+and that one is loaded/unloaded as appropriate. Move them beyond 20 tiles and
+confirm individual markers return; repeat across floors to confirm those stay
+separate. Move survivors while the map is open and verify groups recompute.
+Change ownership, unload/rematerialize, save/reload, and kill a survivor;
+confirm stale groups disappear or rebuild from current authoritative locations,
+persisted logical coordinates are distinguished from loaded positions, and
+death evidence stays an individual marker. Check an owner with
+no valid coordinates receives only the unavailable-location notice, with no
+marker at a fabricated position. Confirm native map projection, zoom/pan,
+right-click tools, and marker text remain usable. The current owned-marker
+overlay has no click-to-open individual detail path; names remain visible on
+the grouped label and no new click owner is introduced here. Offline tests do
+not establish native projection, appearance, hit testing, or save/reload
+behavior.
+
+## Base-work preferences — BUG-KS-023
+
+In a disposable Build 42 save, select a player-owned base resident in the
+Survivor Notebook Crew tab. Confirm each currently selector-backed group
+(guard, patrol, repair, cooking, farming, woodwork, barricade, and hauling)
+shows and cycles High, Normal, Low, Disabled. Confirm active companions have no
+effective preference controls while on companion duty. Compare two otherwise
+equal queued real tasks with different categories under each preference and
+confirm High wins an equal choice, Normal is the default, Low remains eligible
+but loses equal choices, and Disabled blocks a new autonomous selection.
+Confirm materially higher-priority/urgent work, needs, danger/combat, explicit
+player task assignments, traversal, and an active supply delivery retain their
+existing arbitration and are not suppressed by preferences.
+
+Start an ambient organizer native action, change Hauling to Disabled, and
+confirm the action and its item/container reservations finish or fail through
+their existing owner without being cancelled by the preference change; verify
+no new organizer round begins afterward. Assign a recruited companion to base
+duty and confirm its saved preference now affects the base selector, then
+return it to companion duty and confirm ordinary follow/hold/directive behavior
+remains unchanged. Save/reload with non-Normal preferences and confirm the
+states persist. Confirm an older save with no map reads as Normal and old
+1–4/false values migrate safely. Offline preference, selector, task-board,
+companion/base conversion, organizer, needs, and persistence tests do not prove
+the rendered Notebook UI, native work action, live interruption/resumption, or
+Build 42 save/reload.
+
+## Active companion party food scavenging — KS-PROD-008
+
+Offline scope is implemented: the existing per-companion in-game Auto-Loot
+permission admits one safe-food pickup for a player-owned companion only when
+settled in Follow with no actionable need, threat,
+combat, active supply, or explicit directive. The loaded, same-floor search is
+limited to 12 tiles from both actors; the player movement leash is 3 tiles.
+The existing controller, loot planner, transient item/container reservations,
+native route/transfer actions, and exact inventory receipt own the loop. An
+unfinished route releases its leases and returns to ordinary Follow if the
+player moves, the anchor becomes unusable, a need interrupts, or Auto-Loot is
+disabled in game. Changing Auto-Loot does not cancel an already queued native
+transfer; it counts only after the exact item appears in the companion's
+inventory. Combat or a direct order may interrupt through the existing owner.
+The item stays with the companion. No work intent or claim is persisted, so
+reload restores normal autonomy. The old `AllowCompanionPartyScavenging`
+Sandbox key is retired and ignored; missing per-companion Auto-Loot values
+retain their existing enabled default. Focused
+coverage lives in ignored local `tools/test-autonomy-formation.lua`,
+`tools/test-survivor-looting.lua`, and `tools/test-sandbox-settings.lua`.
+
+Build 42 acceptance remains open. On a disposable save, enable Auto-Loot for
+one owned companion in game, leave it in Follow with the player
+stationary, and place one safe food item in a loaded same-floor container
+within 12 tiles of both. Confirm one real item transfers into companion
+inventory, no extra items are taken, and the companion returns to formation.
+Repeat with unsafe/no food, full inventory capacity, and inaccessible
+containers; there must be no false success or wandering. Move the player more
+than three tiles during approach, trigger an urgent need and a zombie threat,
+issue a direct order, traverse a door/window, and start destination travel;
+confirm existing owners interrupt or outrank the unfinished route and leases
+are released. Turn Auto-Loot off during approach (route should cancel) and
+during a native transfer (the action may finish, with exact receipt required).
+While the transfer is queued, issue a direct order and confirm it takes
+ownership through directive interruption and releases its lease.
+Repeat disabled, with NPC faction residents, with a base-resident companion,
+and after save/reload. Native movement, transfer timing, item weight/capacity,
+and save/reload are not proven by offline fixtures. Water, woodcutting, base
+work, offscreen work, and companion-to-player delivery are outside this slice.
+The retired Sandbox key is ignored; vary only each companion's in-game Auto-Loot
+permission during this replay.
+
+## Staged base-life / Notebook stabilization — BUG-KS-013
+
+The 2026-09-29 staged Build 42 observation reported residents mostly idle or
+relocating without useful work and Work/Schedule controls without an obvious
+result. Offline fixes now route Notebook writes to the selected owned base and
+keep the selected resident's details synchronized after refresh. This replay
+checks those UI connections before the existing full-day acceptance; it does
+not treat the offline base-life tests as proof of native work.
+
+### Short Notebook context/save replay
+
+1. Use a disposable save with two player-owned bases and at least one living
+   resident assigned to the non-primary base. Open the Notebook, select that
+   base, then open **Crew & Schedule** and select its resident.
+2. Confirm the resident name is shown, work controls are enabled, and the
+   current schedule/task summary belongs to that resident. Leave the page open
+   through at least two automatic refreshes; the selected row and detail must
+   stay aligned.
+3. Change one work category, paint a schedule window, save it, close the
+   Notebook, and reopen it. Confirm the save feedback appeared and both values
+   reappear for the same resident/base. Repeat with the primary base and verify
+   an active companion or foreign/non-resident row cannot change those values.
+4. Change the selected resident to a second base resident and wait for refresh;
+   verify the controls change to that resident and do not silently write the
+   previous resident.
+
+### Schedule color and input replay — KS-PROD-008 Slice J
+
+For one player-owned base resident, open **Crew & Schedule** and confirm the
+resident name, `NOW` hour/assignment, selected paint tool, and short save status
+are visible without the former instructional paragraph. Select **Work**, paint
+two hours, then select **Patrol** and repaint one of them. Each cell should
+change immediately to the corresponding color while keeping its 24-hour label;
+the real current hour should have the yellow outline and `*`. Save, wait for
+the saved status, close/reopen the Notebook, and confirm colors/assignments
+return for the same resident. Switch residents and verify the name/current
+assignment follows selection. Check mouse and joypad operation at normal and
+small/split-screen resolutions with enlarged UI fonts; scroll to all controls.
+Confirm active companions/non-base records cannot edit a base schedule and
+that work/duty behavior did not change. Offline tests cover drawing, transforms,
+owner routing, and layout decisions, not Build 42 rendering or device input.
+
+### Full-day base-life replay
+
+With two or more player base residents in a safe loaded base, leave the Notebook
+through one in-game day. Record each resident's identity, assigned base,
+schedule, current visible activity, and periodic **Write Survivor Status to
+Log** snapshot. Provide the real prerequisites for at least one supported job;
+verify task discovery/claim, route start, native action, authoritative result,
+cleanup, and next arbitration. Repeat with missing material or unreachable
+work and verify an honest blocked/deferred state. Interrupt one active job with
+an urgent need or threat and confirm normal resumption/reassessment. At the
+first mismatch between the UI, persisted duty, runtime decision, task claim,
+movement, native action, and verified world result, capture that exact snapshot
+and only the corresponding short DebugLog slice. Native pathing/actions,
+visible productivity, and full-day behavior remain live acceptance.
+
+### Generic loot receipt honesty — Build 42 acceptance (`BUG-KS-015`)
+
+On a disposable save, order one survivor to loot a container with one clothing,
+medicine, or weapon item. Record the exact item identity and inventory count
+before the action; verify the native transfer, resulting inventory receipt, and
+completion message agree. Repeat with the transfer refused and with a multi-item
+selection where only one item transfers. Refusal/partial receipt must not report
+`loot-complete`; it must report a bounded failure, release item/container
+reservations, cool the source, and permit later arbitration without duplicating
+or deleting any real item. Save/reload after a successful and a failed attempt.
+Offline tests exercise receipt logic and cleanup only; native queue acceptance,
+inventory mutation, timing, and save/reload remain unverified.
+
+### BUG-KS-040 companion startup exception replay
+
+After the corrected local mod is staged, load the same save and let an owned
+companion settle into follow with a threat map present (one nearby zombie is
+sufficient). Check the first 2–3 seconds of the new DebugLog for
+`controller_tick`/`think` exceptions; confirm threat awareness still blocks
+optional party scavenging. Exercise reservation release once and confirm no
+exception or stale threat lease. Record game build, loaded mod root, and exact
+log timestamp. The prior failure was recorded twice at frames 166 and 196 in
+`2026-09-30_02-40_DebugLog.txt`; offline checks do not close this replay.
+
+### BUG-KS-041 Notebook work-preference click replay
+
+After staging the corrected source, open **Crew & Schedule** for a player-owned
+base resident and click a work category through High, Low, Disabled, and Normal.
+Confirm each click gives the expected saved feedback without a Lua exception,
+the same resident and selected base remain active, and the value is still
+correct after closing and reopening the Notebook. Repeat once after changing
+resident selection. Capture only the short DebugLog slice around any failure.
+The prior failure was `Object tried to call nil` in `onCrewPriorityCell` at
+frame 1875 of `2026-09-30_02-48_DebugLog.txt`, called from vanilla
+`ISButton.onMouseUp`; the offline regression now runs this callback with global
+`next` unavailable. Passing this UI replay does not close BUG-KS-013: separately
+verify one real supplied base task, one missing-resource case, and full-day
+resident activity through native movement/action and reassessment.
+
+### BUG-KS-042 selected outpost Notebook acceptance
+
+With at least a home base and Outpost 2 owned by the same player, open Base &
+Work and select Outpost 2. Verify the label and displayed work areas, queue,
+residents, and storage all belong to Outpost 2. Edit a boundary, add a work
+area, and remove that work area; each operation must target Outpost 2 and leave
+the home base unchanged. Switch back to Home and verify its data is unchanged.
+Close/reopen the Notebook, then save/reload and repeat the selection check.
+The offline fixture executes the actual picker and area-action callbacks and
+proves selected-ID routing only; it does not prove Build 42 combo rendering,
+input, screen refresh, or persistence behavior.
+
+### BUG-KS-043 appliance power-loss cooking acceptance
+
+In a disposable base, test a powered non-microwave stove/oven with a valid
+real ingredient and record appliance power, temperature, item identity, action
+queue, and task result. Remove power before selection, then repeat after a
+cooking task has been selected but before its native heat action begins. A
+cold unpowered appliance must not be newly selected or report cooking success;
+the real ingredient and task claims must remain truthful through failure and
+reassessment. Check a stove with positive residual heat and a fuel-backed
+appliance separately: the offline guard preserves current heat, but native fuel
+semantics are unknown and must not be inferred. Repeat across save/reload and
+confirm no stale task or fabricated cooked item. The offline regression proves
+only the existing eligibility predicate for powered, hot, and cold/unpowered
+fixtures; it does not prove native appliance behavior.
+
+### BUG-KS-044 constrained Base & Work viewport acceptance
+
+Open the Notebook in a short-height or split-screen viewport, then repeat with
+an enlarged UI font. On Base & Work, use mouse wheel and joypad navigation to
+reach the storage list, lower controls, and final hint. Verify the tab clips
+scrolled content at its viewport, each zone/task/storage list scrolls within
+its own box, and no controls overlap another section. Resize/reopen and confirm
+the content extent remains reachable. Also inspect schedule-hour colors and
+labels independently. Offline coverage checks the measured content extent and
+existing scroll adapter only; actual Build 42 rendering/input remains open.
+
+### Speech Arrow input-pass-through acceptance
+
+With a nearby off-screen survivor speaking, test right-click/world interaction
+and aiming outside the Activity Feed while an arrow is visible, then over the
+Feed itself. Repeat with several simultaneous arrows, after indicator expiry,
+and with the Feed visible and hidden. Record whether the Feed or Arrow consumed
+the input. Offline source and `test-speech-indicators.lua` verify the overlay
+requests no mouse events and has no input handlers; only Build 42 can establish
+UI-manager propagation and overlap behavior.
+
+### Player-owned base/outpost rename — KS-PROD-008 Slice H
+
+On a disposable Build 42 save with one home and at least one outpost, open Base
+& Work, rename Home, then select and rename the outpost. Test leading/trailing
+spaces, blank input, a duplicate owned name, and a 33-character name. Confirm
+success/error feedback, the selected base remains selected, its displayed name
+updates immediately, and the other base remains unchanged. Cancel the dialog
+and verify it does not mutate data. Close/reopen the Notebook and save/reload;
+confirm both names persist and all base IDs, territories, work areas, tasks,
+storage assignments, residents, and duties remain unchanged. Confirm faction
+bases do not expose the player rename action. Offline coverage exercises the
+actual persistence validator and Notebook callbacks with a text-entry fixture;
+it does not prove Build 42 dialog rendering/input or native save/reload.
+
+### BUG-KS-046 — drinking candidate taint-state acceptance
+
+On a disposable Build 42 save, test a real clean bottle, a real tainted bottle,
+and a mod/custom fluid whose taint inspection is unavailable. At ordinary thirst,
+only verified clean water should be selected. At critical thirst, the existing
+policy may select known tainted water and the native action must apply its real
+sickness/poison effect. An uninspectable fluid must never be consumed. Confirm
+real thirst reduction, remaining fluid quantity, and a partially consumed bottle
+across save/reload. Offline fixtures cover classification and decision only;
+they do not emulate the native timed action or fluid persistence.
+
+The latest owner test did not complete this clean/tainted/unknown-water matrix;
+native behavior remains provisionally unconfirmed/live-pending.
+
+### KS-PROD-008 Slice K — loaded native water-object drinking
+
+Offline `test-survivor-needs.lua` and `test-autonomy-water-source.lua` cover
+known clean water; tainted water at ordinary versus critical thirst; unknown
+taint; empty source rejection and depletion-to-zero completion; source within
+12 tiles/same floor versus beyond range; base/camp boundary; unreachable
+approach; source contention; explicit follow interruption; native queue/full
+inventory refusal; source reservation release; and the required joint real
+thirst/source result check. They use fixtures and do not prove PZ behavior.
+
+Build 42 replay, using disposable saves and real sinks, rain collectors or
+another vanilla water object:
+
+1. Place a player-owned base resident and a faction/base resident inside their
+   respective base/camp boundary. Give each urgent thirst, no carried water,
+   and a reachable known-clean native source within 12 tiles on the same floor.
+   Verify it selects the source, reaches an adjacent tile, uses the native
+   drink action, thirst falls, and the source amount decreases.
+2. Repeat with a source outside 12 tiles, on another floor, outside the owned
+   boundary, unloaded, empty, and uninspectable. Each must be ignored without
+   drinking or changing source/thirst state.
+3. At ordinary thirst, verify known-tainted source is rejected. At critical
+   thirst, verify vanilla action may drink it and record actual native
+   sickness/poison consequences. Do not call a mock or selection result a pass.
+4. Test carried bottle, assigned base-storage bottle, and a searchable loaded
+   world container with water item to ensure these existing real-item paths
+   still precede/follow the new source path correctly. Bottle filling from an
+   object is not included.
+5. Test full inventory and native action refusal. Confirm no items are dropped,
+   transferred, fabricated, or removed by Knox; source lease releases and the
+   failure/backoff is truthful.
+6. Interrupt approach and action with a zombie, explicit order, group travel,
+   and a higher-priority injury. Confirm water reservation cleanup and normal
+   arbitration/task resumption.
+7. Use two residents targeting one source: the exact transient lease must
+   prevent duplicate simultaneous targeting, expire through cleanup, and never
+   persist. Save/reload with partially consumed native source and survivor
+   identity/thirst; verify native state and normal need reassessment.
+
+No Build 42 replay was performed in the implementation session. Native
+`ISTakeWaterAction`, source depletion, actual thirst and sickness effects,
+full-inventory refusal, movement/reachability, contention, and save/reload
+remain live-pending. The implementation does not consume map water offscreen or
+write fluid/thirst values. Bottle filling is a separate later package.
+
+### Couch/table stand-up recovery — `BUG-KS-013` adjacent live report
+
+Use a disposable Build 42 save in a safe loaded room. Place a couch with a
+table directly in its forward exit area, plus nearby alternative clear tiles.
+Record the resident's exact square and furniture object before sitting. Allow
+the native sit/rest action to begin and complete, then observe one ordinary
+stand-up and one threat interruption; repeat the interruption case with an
+explicit player order. Check whether the engine stands the resident into the
+table, whether Knox reports a state/route failure, and whether the resident can
+recover through normal native movement without clipping or teleporting. Repeat
+with adjacent tiles blocked, no valid nearby exit, a wall/door edge, and a
+counter or other furniture instead of the table. Save/reload once while seated
+and once after recovery; confirm identity, orders, duties, needs, and rest-spot
+reservation cleanup. Capture before/after XYZ, sitting state, controller
+state/decision/failure, and only the short DebugLog slice for the attempted
+stand. Source review found no Knox-owned stand-position logic; do not classify
+this as fixed unless reproduction identifies a Knox continuation failure.
+
+### Filtered ground-storage design gate — no placement implementation yet
+
+The existing `KnoxInventoryActions.queueDrop` path creates an `ItemContainer`
+of type `floor` and delegates to native `ISInventoryTransferAction`. In the
+locally installed Build 42 script, `getNotFullFloorSquare()` checks the actor's
+current square and then neighboring squares; `transferItem()` uses the selected
+square. `updateInventoryCleanup` verifies source removal and that
+`item:getWorldItem()` is non-nil, but not exact destination-square identity or
+an inverse rollback. The existing drop path is not evidence that zone
+placement is safe.
+
+Proposed smallest slice, still requiring native API confirmation and an approved
+work item:
+
+- Limit the first version to player-owned bases/outposts. Persist each bounded
+  rectangular zone under its canonical base ID, one floor per zone, and enforce
+  the existing base-territory boundary at selection and transfer time. No
+  shared or inferred cross-base destination.
+- One zone has one existing storage category. Reuse
+  `KnoxBaseStorage.classifyItem`; it returns one canonical category and gives
+  Tools precedence over Weapons. Unknown/miscellaneous items match General
+  only. Do not introduce custom overlapping item predicates.
+- Reject overlapping ground-storage rectangles to keep one deterministic
+  destination owner. Existing exclusive work areas remain non-overlapping;
+  decide whether guard/patrol overlays may share the rectangle only after
+  checking player clarity and controller behavior.
+- Preserve the current assigned-container ranking, typed overflow and General
+  fallback first. Ground placement is considered only if no currently valid
+  assigned container accepts the real item. Among ground zones, exact category
+  precedes General; then use configured zone priority, distance, and stable
+  zone ID as deterministic tie-breakers. A zone's priority must not make it
+  outrank an eligible real container.
+- Cap the first placement zone at 256 squares. Move only one already-carried
+  real item per work cycle; do not scan or collect loose world items in this
+  slice. The roadmap's 32 candidate/10-minute scan caps apply only if a later,
+  separately scoped loose-item collection slice is approved. These are proposed
+  limits, not measured Build 42 performance.
+- Keep ground items as native world items. A resident must reach a valid loaded
+  tile in the owning zone; native transfer must prove the exact item instance
+  at the exact destination square. Refusal/interruption must either leave the
+  item with its prior owner or use a proven native return transfer before
+  claiming recovery. No abstract counts, item recreation, teleport, or
+  `worldItem`-only receipt.
+- Revalidate selected base ID, territory, zone revision/bounds, item owner,
+  filter, reservations, and destination immediately before action. Relocation
+  or zone removal must use existing persistence/task cleanup; no separate
+marker, zone, or item ledger.
+
+Before coding, verify Build 42 floor-container lookup, target-square transfer,
+item identity/receipt and rollback under success, refusal, partial transfer,
+capacity/blocked square, and interruption. Live acceptance must also cover
+same-base and multi-base/outpost routing, zone edits/removal, filter overlap,
+save/reload, and UI clarity. A later loose-world-item collection feature must
+separately test its search scan caps, reserved/job-required-item exclusions,
+pickup receipt, and retry. Existing assigned-container storage remains the
+only implemented destination until this evidence and an implementation owner
+are approved.
+
+## 2026-09-30 interaction shortcut and schedule-stroke acceptance
+
+### Nearby survivor interaction
+
+Use a disposable Build 42 save with one visible survivor at normal conversation
+range. Confirm the prompt displays the configured Knox key (F by default), the
+panel opens without an `ISUI3DModel:setState` Lua error, and a key remapped in
+Options → Controls is both displayed and honored. Confirm the native Interact
+and controller/context route remains usable. Repeat while aiming, in a vehicle,
+outside range, with a modal open, and while another UI owns the pointer; none
+should open the panel. With the prompt visible, test left/right click, aiming,
+normal world interaction, and Activity Feed overlap. The prompt must not capture
+input; the panel must retain its ordinary mouse/joypad behavior. Check for no
+repeat portrait exception in the short DebugLog slice. F shares the default
+vehicle-headlight key; verify its existing behavior while inside a vehicle.
+
+### Crew & Schedule paint gesture
+
+Select a named base resident and record the selected paint tool. Click one hour,
+then hold left mouse on another cell and drag across at least three cells. Only
+visited cells should receive the selected color/state; release stops painting.
+Repeat after changing the tool, with a scroll gesture during a held stroke, and
+release outside the hour grid. Change selected resident before starting the
+next stroke and confirm saved/draft values remain separate. Save, close/reopen
+Notebook, and verify the colors/state persist. Repeat at the smallest supported
+viewport/enlarged UI scale and with joypad navigation; wheel scrolling and
+unrelated controls must remain usable. Offline tests do not establish native
+color rendering or event propagation.
+
+## 2026-09-30 multi-window and away-from-base acceptance
+
+### Ordered barricade sequence (BUG-KS-020)
+
+Offline continuation coverage lives in ignored/local
+`tools/test-manual-barricade-order.lua`: it exercises automatic jobs disabled,
+per-target claims, second-target selection, retry deadline, cancellation, and
+ineligible ordinary work. This does not prove persisted task serialization or
+Build 42 action continuation; the replay below remains required.
+
+On a disposable owned base containing two unbarricaded windows in one building,
+set autonomous jobs off, right-click the building and order barricading. Record queued task IDs, target
+coordinates, resident, claim, carried/planned hammer/planks/nails. Allow the
+first vanilla action to finish; verify its actual world result, claim cleanup,
+and selection of the second target without a duplicate task or repeated first
+opening. Verify the explicit order continues through the existing task board
+despite autonomous jobs being disabled. Cancel a queued later window in the
+Notebook and confirm it is skipped; interrupt with danger/order and confirm the
+same claim resumes; trigger one bounded failure and verify its retry deadline
+before retry; then save/reload while another target is queued and confirm the
+remaining manual-order task is still eligible. Repeat with windows on multiple
+floors if `findTargetsInBuilding` returns them, no materials, and a target
+secured by the player during travel. No task should report success without
+native verification. Offline coverage proves task-board continuation only,
+not native work or save behavior. Metal-sheet installation has only a partial
+validation branch in the barricade adapter; no metal work task or result receipt
+is implemented. Verify the installed Build 42 metal-action contract and target
+result separately before scoping that feature.
+
+### Base-life farming failure capture (BUG-KS-013)
+
+Use one isolated assigned farming tile and one resident shell. Record resident
+ID/body type, base and schedule, zone bounds, task ID/type/target, persisted
+claim owner, carried real tool/seed/water, `ISTimedActionQueue` and character
+action queue before/after, and the plant's `CFarmingSystem` Lua-object state.
+Exercise plow, seed, and water separately; compare an equivalent action by the
+local player. A drained action queue is not a result: record whether the native
+plant state actually changed. Correlate `receiveGlobalObjects: player is null`
+messages with the exact action but do not assume causality. Then run one
+supplied non-farming task and one missing-resource task; trace selection,
+claim, route, action, failure/retry, and reassessment. Verify failed work is
+shown as blocked with its reason, claims are released/backed off correctly, and
+the resident chooses another valid activity. This is a live/native replay; the
+offline tests do not prove Build 42 farming support on `KnoxIsoPlayerShell`.
+
+Source audit note (2026-09-30): Knox has no registration or invocation of
+`receiveGlobalObjects`; its farming module reads the farming singleton and
+queues vanilla actions. The warning is therefore not currently attributable to
+a Knox callback. On replay, capture the exact local-player versus survivor-shell
+action and global-object warning timing alongside native crop state. Do not add
+a guard or count a drained action queue as success without identifying a
+Knox-owned divergence.
+
+### Metal-sheet barricade readiness (deferred feature)
+
+The installed Build 42 `ISBarricadeAction.lua` exposes metal mode through
+`ISBarricadeAction:new(character, targetObject, true, false)`. It requires an
+unbarricaded `BarricadeAble`, equipped `BlowTorch` and `SheetMetal`; its native
+completion path consumes the sheet, attaches it with `addMetal`, and transmits
+the barricade. The base timed action resets its queue on stop. Knox currently
+queues wood mode and verifies plank count, so a Knox metal-work regression does
+not yet exist. Before implementation, settle whether the player-facing task is
+metal barricading of eligible openings or a narrower target policy. Then test
+real tool/sheet acquisition, claim/reservation cleanup, native result
+verification, interruption, unavailable target/material, retry, and
+save/reload in Build 42. This source inspection establishes the script contract,
+not live survivor-shell execution or resource synchronization.
+
+### Natural behavior away from a base
+
+Record each survivor's identity/type, location/floor, group/faction, player
+order, needs/moodles, threat, formation, route/state, active task, and recent
+activity. Observe one independent/group survivor and one player companion away
+from base in a safe loaded area, then repeat with danger, an urgent need, and an
+explicit order. Distinguish purposeful roam/exploration, follower/relax duty,
+needs or recovery pauses, and native movement stalls. Do not use animation alone
+as evidence of useful behavior. If the same no-progress state repeats, capture
+the smallest correlated DebugLog slice and current status before changing
+arbitration.
+
+### 2026-09-30 interaction/UI stabilization replay
+
+On a disposable Build 42 save, verify the nearby prompt is minimal, legible,
+translucent, explicitly says `Press F to talk to [name]` (and reflects a
+remapped binding), and does not overlap
+vanilla panels or capture world input. Open the shared interaction panel, use
+Talk, and confirm ordinary wandering is suppressed while the conversation is
+open; close it and confirm normal arbitration resumes. Repeat with trade open,
+then test threat, urgent need, native action, cancellation, and moving out of
+range. Existing conversation/trade range thresholds were not changed.
+
+Show and hide the Activity Feed with its close control, existing context-menu
+toggle, and `ShowActivityFeed` Sandbox option. Confirm the seven most recent
+events are still available after hiding/reopening, hidden display does not
+block world input, and errors continue to reach logs. With Knox enabled, toggle
+`ShowRadialOrders` and confirm only Knox slices disappear/reappear; vanilla
+emotes remain, and `ShowLegacyContextCommands` continues independently. Use
+mouse and joypad. Verify the Notebook remains accessible from Base management
+and Party management; a global vanilla sidebar button remains deferred pending
+a supported integration point. For storage, capture the exact clicked object
+and every visible menu label if duplicate assignment choices remain; test the
+Knox container path across compartments and General/typed categories without
+removing legacy settings or saved assignments.
+
+Offline regressions: `test-activity-feed.lua`, `test-radial-orders.lua`,
+`test-sandbox-settings.lua`, `test-social-interaction-ui.lua`,
+`test-player-conversation.lua`, `test-speech-indicators.lua`,
+`test-base-storage-menu.lua`, and
+`test-order-menu-callbacks.lua`. The exact current-tree full gate passed 113
+Lua sources, 190 scripts, 303 checks, 0 failures (`-SkipJava`); Java was
+skipped. These UI mocks do not prove Build 42 rendering, mouse/joypad
+propagation, native movement, interaction range, or save compatibility. The
+focused scripts are under ignored `tools/` and are local-only Git evidence.
+
+### KS-PROD-011 manual arming and read-only coverage — 2026-09-30
+
+Focused Developer Tools, read-only snapshot, save-isolation, coordinator,
+manifest, automated-QA, and PowerShell 7 parser tests passed. The exact
+current-tree `tools/verify.ps1 -SkipJava` result and `git diff --check` are
+recorded in the production work queue and QA contract. Tests under `tools/` are
+ignored by Git and provide local-only evidence. No Build 42 run, Java check,
+staging, or Workshop upload was performed. Developer Tools rendering/input,
+save identity stability, one-run arming and report output, external disposable
+save restore/discard, and all native scenarios remain unverified.
+
+### KS-PROD-011 / BUG-KS-053 — Build 42 Debug Mode loader retest
+
+The latest log showed the game loaded the local Workshop development root at
+`C:\Users\Gary\Zomboid\Workshop\KnoxSurvivors\Contents\mods\KnoxSurvivors\42`.
+Its legacy QA START line (`save_is_disposable=true`) predates the current
+save-identity coordinator. The same launch hit Kahlua's 200-local ceiling;
+`KnoxAutonomyController.new` then remained unavailable. Source review found
+exactly 200 top-level locals in that controller and one unused helper. The
+helper is removed and the source has a regression guard requiring fewer than
+200. Updated files were staged to the exact active root and to the separate
+local-mod root; both match the repository payload by hash, with the two
+intentional Workshop Java agent files preserved.
+
+On the next fresh game launch, verify the first Knox QA START line has
+`saveIdentitySource=core.getGameSaveWorld` and `manifestVersion=2`, and that
+there is no Kahlua local-index error or `KnoxAutonomyController.new` exception.
+If either appears, stop before testing gameplay and preserve the complete
+first-error stack slice. Then check the Developer Tools QA submenu on an
+ordinary save: it should show `ORDINARY_SAVE`, keep arming unavailable, and
+allow only read-only snapshots. Disposable-save arm/start acceptance remains a
+separate subsequent replay. Native Debug Mode acceptance is still open.
+
+The next Debug Mode log (`2026-09-30_23-18_DebugLog.txt`) still showed
+`Index 200 out of bounds for length 200` after the controller had been reduced
+to 199 locals. That initial reduction was insufficient. The current source
+moves ten constants to the existing `Controller.TUNING` table, leaving 189
+module locals; the focused guard permits at most 190. The same run's QA START
+used the current manifest v2 from the Workshop development root, but reported
+`saveIdentity=unavailable`; it correctly blocked `QA-ENCOUNTER-001`. Save
+identity unavailability is separate from the compiler failure and remains an
+open native timing/API question. Recheck both only after restarting with the
+new 189-local payload.
+
+The 23:49 log was written before the next source reduction: its Workshop
+controller was staged at 23:42 with 189 module locals, while the repository
+controller was updated at 23:58. The current controller has 153 top-level
+locals, guarded at 160, and its 127-file payload has been recopied and
+SHA-256-checked in both the local and active Workshop development paths. Offline
+focused checks and full verification pass (116 Lua, 197 regression scripts,
+313 checks, 0 failures). `tools/` regressions are ignored/local-only. For the
+next replay, start Build 42 fresh, then inspect the new DebugLog for (1) no
+`Index 200 out of bounds`, (2) no `KnoxAutonomyController.new` error, and (3)
+the current manifest-v2 QA START line. Stop there if either startup error
+remains; save identity and disposable-save arming are separate gates.
+
+
+### BUG-KS-053 — Kahlua controller registration replay (2026-10-01 update)
+
+The 00:25 owner run is the current failure baseline: verify the game loads the
+exact staged `KS_SurvivorAutonomyController.lua` hash, then inspect only the
+first exception after Lua startup. It showed two Kahlua local-index-200
+exceptions in `LexState.new_localvar` and the consequent nil constructor at
+`KS_SurvivorAutonomy.lua:309`, even though staged and repository hashes matched.
+The source now splits base-task action/result handling into
+`Controller:updateBaseTaskAction`; offline lifecycle tests exercise the delegated
+path. For the next test, launch Debug Mode once and confirm both error signatures
+are absent and controller registration proceeds. Save identity/arming is a separate
+QA gate; do not run destructive scenarios until the owner has prepared and armed
+a disposable save.
+
+
+**BUG-KS-053 replay result (2026-10-01):** the owner restarted Build 42 with the
+newly staged controller and reported the startup errors gone. This closes only
+the startup-loader check for that replay. QA save identity, one-run arming, and
+any encounter or gameplay scenario still require their own evidence.
+
+
+### 2026-10-01 — QA runner retirement
+
+The runtime coordinator and QA-only probe modules were moved to
+`dev/qa-harness`, outside the game-loaded mod tree. In-game save arming and its
+Sandbox setting are retired. The offline QA harness regressions remain local
+developer tests; they do not represent a game menu or require owner setup.
+
+
+Removal verification (2026-10-01): 14 offline QA fixture files compile from
+`dev/qa-harness`; focused removal checks pass. The full verifier passed 102 Lua
+sources, 197 regression scripts, 299 checks, 0 failures. Both local and Workshop
+development `mod/42` payloads match the repository's 109 files by SHA-256.
+Tests in ignored `tools/` remain local-only evidence.
+
+### BUG-KS-054 — Sandbox options parser replay
+
+The corrected source removes unsupported `--` comment lines from `mod/42/media/sandbox-options.txt`; the focused regression requires the Sandbox definition to contain no such comment lines. In Build 42, restart after staging, open the Knox Survivors Sandbox section, and confirm the seven organized pages and their options appear. Check `console.txt` for absence of `CustomSandboxOptions.readFile` / `unknown block type "--"`. A successful parser replay confirms menu availability only; then separately test Auto-Loot behavior and legacy-save compatibility.
+
+
+### BUG-KS-030 — player and companion vehicle replay (Build 42 pending)
+
+Use a disposable/currently safe save and one owned Follow companion close to a
+parked, unlocked vehicle with enough seats. First turn Experimental NPC Driving
+off: enter as driver and confirm the companion tries a passenger seat; stop and
+exit and confirm the companion tries to exit. Repeat entering as passenger and
+confirm the companion uses a passenger seat when no opted-in driver is available.
+With the setting on and a running, fueled, unlocked vehicle whose driver seat is
+free, enter as passenger and confirm one nearby follower attempts the driver
+seat through vanilla actions. On foot, use the companion Orders menu’s “Drive
+Nearest Vehicle” and confirm it chooses the nearest loaded usable car, reports a
+clear refusal for disabled driving/no usable car, and does not force entry or
+create movement. Test no free seats, held/directed companions, distant/floor
+separation, threat interruption, leaving before boarding completes, a moving
+vehicle, manual get-in/get-out/drive commands, and save/reload identity, roster,
+inventory, and orders. Confirm no duplicate survivor bodies. Native animation,
+seat assignment, vehicle physics, event timing, control release, and persistence
+remain human/live required.
+
+The latest available unarmed-combat log is not a stomp-damage replay: it records
+combat admission and changing zombie targets but no attack/hit receipts. For the
+owner’s low-damage report, separately record one stomp sequence against a
+knocked-down zombie with the survivor identity, target health before/after,
+combat action evidence, and elapsed time; do not treat combat-start logs as
+proof of hit or damage.
+
+#### BUG-KS-030 locked-seat follow-up
+
+Repeat the player/Follow-companion vehicle test with a parked vehicle whose
+passenger door is locked. Observe whether the companion queues and completes
+Build 42's native unlock/open/enter/close sequence. If the survivor lacks the
+actual key/access, confirm entry is refused cleanly and no passenger lease or
+false “boarded” result remains. Also test an unlocked door, a door-open vehicle,
+all seats physically occupied, and a removed seat; distinguish each failure
+from “no free passenger seat.” The offline test only verifies the action queue
+shape, not the game’s native authorization, item transfer, animation, or result.
+
+#### BUG-KS-030 / BUG-KS-041 / BUG-KS-048 — boarding pace and schedule controls
+
+After staging, open Crew & Schedule for a player-owned base resident. Click a
+work-preference cell once and cycle it through High, Low, Disabled, and Normal;
+confirm the value changes and no `normalizeWorkPreferences` exception appears.
+Select Work or another schedule tool and click/drag across several hour cells.
+Confirm each fill changes immediately, the current-hour gold outline/star stays
+independent of the fill, Save Hours reports success, and closing/reopening keeps
+the assignments. A party companion with no base duty remains outside the
+preference controls; assign base duty first to test that transition.
+
+Then place a Follow companion beside the player's parked vehicle and enter as
+driver. Observe whether the companion jogs through the native seat approach and
+returns to normal pace after entering. Repeat with cancellation or an
+unavailable seat and confirm the prior movement pace is restored. This replay
+is required because offline checks cannot prove native movement speed, button
+rendering, or persistence.
+
+Offline result (2026-10-01): the preference normalizer now works with global
+`next` absent, schedule and preference buttons enable the vanilla button fill,
+and the boarding lease restores the prior native running state. Six focused
+work-preference/Notebook/vehicle scripts passed; full verification passed 102
+Lua files, 197 scripts, 299 checks, 0 failures. `deployDev` and source/local/
+Workshop SHA-256 parity passed (113 source files; two generated agent files are
+intentional Workshop extras). This result does not replace the Build 42 replay.
+
+Schedule current-hour follow-up: In a live save at 17:00, open Crew & Schedule for a base resident and verify hour 17, not 12, carries the gold current-hour marker. Paint two distinct hour blocks, click Save Hours and confirm its saved feedback, close and reopen the Notebook, and verify both cell colors remain. Offline evidence: `currentScheduleHour` prefers Build 42 `getGameTime()`, falls back to `GameTime.getInstance()`, and returns nil rather than a false noon when the clock cannot be read; 24-hour persistence conversion is separately round-trip tested. This replay remains required for actual ISButton rendering and save/reopen integration.
+
+Schedule color retention replay: Choose a tool with a distinct color, paint an hour, move focus away and back (or wait for the Notebook refresh), and confirm the assignment color remains. Repeat for a base-work preference cell. Then click Save Hours, close/reopen the Notebook, and confirm the painted assignments remain. The source defect was a stale `ISButton.backgroundColorEnabled` snapshot restored by the native `setEnable()` call; the Notebook now synchronizes visible, hover, and restore-cache colors. Offline test coverage simulates that native cache behavior; Build 42 appearance and durable save/reopen remain mandatory live checks.
+
+Interaction UI replay: Approach a visible survivor and confirm the transparent, text-only prompt says `Press F to talk to [name]`. Turn to aim and confirm the prompt hides while aiming; stop aiming and verify F opens the same nearby target. Repeat while the survivor faces away but remains visible to the player. In the Neutral tab, independent ungrouped survivors may show Trade/Give/Recruit when service rules allow; player companions, faction members, and grouped survivors should not show those entries. Mouse input and native/controller Interact remain usable. Offline tests cover asymmetric sight, matching aim gates, prompt drawing no rectangles/borders, and action filtering. Build 42 visual/input confirmation remains required.
+# Survivor command-surface replay — KS-PROD-008 Slice G
+
+In a disposable Build 42 save, leave **Show Knox Orders in Emote Radial** on
+and **Show Knox Orders in Right-Click Menus** off (the defaults). Open the
+vanilla emote radial beside an owned companion. Navigate Party, Followers,
+Residents, and Nearby Survivors; test category opening/back with mouse and
+joypad. Confirm follower Movement, Survival, Tactics/permissions, Vehicles,
+Gear/Pickup, and Formation; resident Work Preference, Survival/More Supplies,
+Resident Policies, Recall, and Cancel Supply Order; nearby Interact opens the
+same panel as F. The survivor right-click menu should not add an `Interact
+(F)` duplicate or Knox order commands. F remains the talk key; the right-click
+choice does not itself open the panel.
+
+With the context option still off, confirm Knox order menus are absent from
+survivor, party, resident, clicked-location, and map-driving right-click
+surfaces even if radial integration is unavailable. F, Care/View, base
+management, storage assignment, and ordinary target interactions should remain.
+Then turn the radial option off and context option on; confirm the vanilla
+radial remains usable and the right-click order path returns. Turn both off
+and confirm both Knox order surfaces are absent. Map point driving orders are
+available only through the opted-in context/map route; the emote radial does
+not select arbitrary clicked coordinates.
+
+For the nearby interaction panel, confirm Trade/Give/Recruit only appear when
+the existing relationship, ownership, and mode eligibility allows them.
+Offline tests cover dispatch ownership, scope gates, page navigation,
+settings independence, and context hiding. Build 42 visual/input, joypad,
+and native action acceptance is still required.
+
+### Starting spouse, survivor search, zombie pursuit, power and UI scrolling — 2026-10-01
+
+On two genuinely fresh saves with **Start with a Spouse** enabled, compare the
+spouse name/personality/traits. Reload one save and confirm the same spouse and
+identity remain. Then kill the player and create the next character twice: with
+**Survivors Continue After Player Death** enabled, confirm the existing spouse
+is now a base resident and no second spouse appears; with continuation off,
+confirm a genuinely new character follows the normal Start with a Spouse rule.
+
+For item orders, put one real valid medicine, essential tool, weapon upgrade,
+clothing item, and ammunition type in searchable nearby containers. Issue each
+matching order separately and compare exact inventory identities/counts before
+and after; repeat with unavailable items, full inventory, interruption, and a
+retry. Do not count a log/function return as a transfer receipt.
+
+For zombie pursuit, compare one ordinary sprinting zombie against the player
+and a stationary survivor at the same range/line of sight, with no alternate
+target; record target identity, pursuit speed, and behavior after obstruction.
+For power, separately test grid power, generator on/off/fuel exhaustion, a
+native light switch, television, powered cooking appliance, and gas pump after
+grid failure. Record native state and actual item/fuel result before changing
+Knox code.
+
+For scroll isolation, scroll each Notebook tab to a distinct offset, switch
+between tabs, then scroll over Base & Work's Storage, Tasks, and page whitespace.
+Repeat at narrow resolution and in every other Knox panel with lists. Record
+which viewport and scroll thumb move. Offline structure has separate view
+objects; the owner's reported Build 42 wheel behavior remains unresolved.
+
+The 2026-10-01 screenshot displayed `Storage: 1 assigned`, which is not the
+current Notebook text (`filtered | usable containers`). Current source files
+have since been copied to the subscribed Workshop folder, but it still contains
+11 obsolete QA/probe Lua files. Fully exit the game, disable the Workshop
+duplicate, enable the clean local `KnoxSurvivors` mod, and restart before
+judging the new scroll fix. Check
+the displayed storage summary first; if it still says `assigned`, stop because
+the test loaded the stale copy. Then scroll Work Areas, Tasks, Storage, and page
+whitespace separately, including a narrow viewport.
+
+The arrow overlay is now explicitly non-capturing after UI registration, with
+mouse callbacks returning false. With the current local copy, test right-click,
+aiming, and normal world interaction at several screen positions while an
+arrow is visible. Repeat with Activity Feed visible and hidden, then after the
+arrow expires. Offline tests verify the configured pass-through boundary only;
+native UI-manager behavior still needs this replay.
+
+### Sleep orders, faction bed assignment, sprinter pursuit, storage filters
+
+In Build 42, keep a Follow companion under a non-urgent follow order until the
+existing fatigue threshold starts sleep. Confirm the survivor reaches the
+best available assigned/native bed, actually sleeps, and retains the follow
+order for after waking. Repeat with no bed, an occupied bed, a threat during
+approach/sleep, a base resident with an assigned bed, and a faction leader plus
+member with beds on different floors. Save/reload and unload/rematerialize at
+least one survivor; record bed coordinates, duty/order, fatigue, native action,
+and actual asleep state. Offline tests only prove arbitration, persisted bed
+references, and loaded-bed selection conditions.
+
+For the sprinter report, use one sprinting zombie and compare a stationary
+survivor with the player at the same distance and line of sight, ensuring no
+alternate target is nearby. Record native target identity, pursuit speed,
+obstruction response, and whether a player target changes pursuit. Knox does
+not force target selection or sprint speed. Container filters and filtered
+ground zones have no live acceptance yet: do not test a four-corner layout as
+implemented functionality; it remains a design request gated on exact native
+square placement, item receipt, and safe rollback.
+
+### Base & Work scroll containment and container filters — Slice L
+
+In Build 42, open Base & Work and scroll while the pointer is over Work Areas,
+Task Queue, and Storage separately. Confirm each list moves inside its own box
+without moving a sibling section; scroll over page whitespace and confirm only
+the page moves. Repeat in a narrow/split-screen viewport, at larger UI scale,
+after switching tabs, and with joypad navigation.
+
+Right-click a real fridge, toolbox/crate, and ordinary container inside Home,
+then repeat in Outpost 2. Choose **Set Filters…** and confirm the large list
+shows vanilla item `DisplayCategory` checkboxes, Knox convenience categories,
+and General Storage. For a single-compartment container, confirm `Set Filters…` is a first-level right-click action; for multi-compartment objects choose the intended compartment first. Select several categories, save, reopen, and verify the
+selection and base context survived. Try a filter with a translated native
+category and one without a translation. Put matching and nonmatching real
+items in the container; verify deposits, supply/need retrieval, task-material
+fetch, and chest-to-chest organizing obey the saved filters. Then leave another
+eligible container unconfigured: confirm NPCs use matching filters first and
+use this real container only as fallback, without Knox changing its name or
+capacity. Confirm the organizer moves a real misplaced item toward a matching
+filtered container, one item at a time, and does not shuffle between unfiltered
+chests. Existing mismatching contents should remain in place after filters
+change. Fill or block a destination and verify honest fallback/failure behavior.
+Load an older one-role-storage save and confirm existing contents/records remain
+until edited. Record item identity/count, filter state, base ID,
+claim/reservation, native action result, capacity, and before/after contents.
+These are live requirements; offline fixtures do not prove UI rendering,
+joypad focus, native transfer, persistence, or capacity behavior.
+
+The 2026-10-01 clarification build was staged with `deployDev` after the
+offline gates. All 110 source `mod/42` files match both the local mod and
+Workshop `Contents` by SHA-256; Workshop has two generated Knox agent files
+extra. This was staging only; no Steam upload or live test occurred.
+
+Do not use the organizer replay as proof that survivors clean floors, remove
+trash, or clean a whole house. No house-cleaning order/free-time activity is
+implemented yet. Ground `Storage Zone` placement remains deferred until exact
+native target-square placement, item receipt, and inverse rollback are proven.
+
+### Container filter click/save and survivor continuity — BUG-KS-056
+In Build 42, right-click one real container inside an owned base and select
+`Set Filters…`; select one category, save, reopen, then clear it and reopen.
+Check that no Lua exception appears and that the filter label persists. Separately
+record the player's squad IDs and a base resident in the Notebook before leaving
+the area; after re-entering/reloading, compare the visible roster with the
+smallest DebugLog slice showing `population status`, `population-activated`, and
+any `population-activation-failed` records. Do not infer lost identity from
+missing nearby bodies alone; offscreen survivors may be outside the activation
+band.
+
+### Survivor needs and faction scheduled sleep — BUG-KS-057
+
+In Build 42, set an NPC faction-base resident's duty schedule to Sleep and let
+the sleep window begin. Confirm the resident routes to its assigned reachable
+bed when available and enters native sleep; then repeat with an unavailable bed
+to observe the supported fallback. Interrupt with a nearby threat and confirm
+native wake/recovery plus duty resumption. Save/reload during the sequence and
+check identity, faction membership, duty, and bed assignment. Compare with an
+independent survivor at night, a traveling group leader/follower, a camp member,
+and a player-owned base resident to ensure only the faction scheduled-sleep
+route changed. Record actual hunger, thirst, fatigue, inventory supplies,
+native sleep/action state, task/order, and post-reload state. Offline tests do
+not prove native pathing, bed occupancy, animation, interruption, or persistence.
+
+### Hibernation teardown refusal recovery — BUG-KS-058
+
+Use an isolated Build 42 save only if a supported way exists to make native
+`removeNpc` refusal safe and reproducible; do not induce failure by damaging a
+player's only save. Record canonical survivor ID, runtime/native identity,
+ledger status/revision, lifecycle state, square, controller state, and the
+`hibernate-remove-failed`/rollback diagnostics. Confirm a failed removal keeps
+the same body, rolls `hibernated` back to `loaded`, and returns the controller
+to ordinary arbitration without spawning or registering a second body. Confirm
+that a failed persistence rollback stays pending and does not repeat native
+removal. Then test normal hibernation, same-ID rematerialization at the saved
+logical position, and save/menu boundaries with inventory/equipment, needs,
+orders, group/faction membership, and identity continuity. Compare the exact
+native body count before and after. Offline fixtures do not prove Build 42
+bridge teardown, saved body continuity, or duplicate-body absence.
+
+### Resident rematerialization, storage filters, and radial — BUG-KS-059/060/061
+
+In a copied/test save, record the survivor's canonical ID, party/base duty,
+identity, inventory, group/faction membership, and visible native body count.
+Load the save and inspect the same survivor in Notebook/map. If the map shows a
+logical location but no body, use the existing owner UI to recall a player-owned
+base resident to the party; do not create a replacement identity. Confirm the
+same ID obtains one native body, then compare inventory, orders, group/faction,
+and identity. Capture population activation lines only as supplemental
+diagnostics, not as proof that the player observed a body.
+
+For the current `playtest01` reproduction, Stacy Byrd is `ks-world-4`. The
+11:47 save still shows player-1 Follow ownership and hibernated/sleeping state
+at x=1468,y=7310,z=1 (z=0 is ground level; z=1 is the level above). The
+offline fallback now preserves the saved position when a safe square exists;
+otherwise an explicit Follow companion can restore within four tiles of its
+owning player on a safe, loaded square on the player's current floor. Stage the
+current source to the test copies and load `playtest01`. Leave Stacy on Follow.
+Confirm one real body appears near the owner, same name/identity and inventory
+remain, Follow persists, and there is no duplicate. Confirm the log reports
+`activation-fallback id=ks-world-4` and then normal population activation. If
+still missing, provide the new per-ID activation line and state whether the
+player was on ground level or upstairs. A visible map entry alone does not
+prove body materialization. Hold, independent survivors, and base residents do
+not use this fallback; assigned-base recovery is not yet implemented.
+
+Right-click a real single-compartment container inside an owned base and
+confirm **Set Filters…** is visible directly in the world-object menu (not
+hidden in the Knox submenu). For a multi-compartment object, open the direct
+**Set Container Filters** submenu and choose the intended compartment. Open
+the large editor; toggle two vanilla categories on and one back off. Confirm
+the green filled check state changes immediately, save, close, reopen, and
+confirm the same checks and saved label. Repeat in Home and Outpost 2. Confirm
+General Storage retains its existing exclusive all-items semantics and does
+not erase other categories silently until selected.
+
+Open the vanilla emote radial with all owned companions offscreen/stored. Confirm
+Knox Orders and Party Orders remain present; verify individual Followers stay
+hidden until a companion body is nearby, then confirm an individual command
+still uses the normal order owner. Live appearance, input, save/reload, native
+rematerialization, and no-duplicate-body behavior remain human-required.
+
+Player-facing acceptance: an absent owned survivor must return as the same
+person with one body and preserved inventory/orders/membership; container
+filters must be easy to find, show each checked category, allow multiple
+categories, and persist across reopening; party-wide radial orders must remain
+available for stored/offscreen companions without exposing individual commands
+for unloaded bodies. Do not interpret an offline pass as confirmation of any
+of these native UI or lifecycle outcomes.
+
+### Kahlua event-update error and resident-to-party status — BUG-KS-062
+
+After installing the staged build, start the same save and open Debug Mode.
+Confirm the repeated `Object tried to call nil in emptyList` errors no longer
+appear during the first minute. In the Notebook, select the same base resident,
+assign her to Party once, and verify her order reads **Following**. Her activity
+may read **Sleeping** only while her saved/offscreen sleep state is active; once
+awake/materialized it should update from the live controller. Confirm she
+materializes as the same identity with one body. Record the row's order,
+activity, needs/sleep state, and body visibility separately; the prior log did
+not correlate a specific survivor's sleep state to the reported row.

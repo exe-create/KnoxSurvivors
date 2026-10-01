@@ -7,6 +7,7 @@ require "Util/AdjacentFreeTileFinder"
 
 local Storage = rawget(_G, "KnoxBaseStorage") or {}
 _G.KnoxBaseStorage = Storage
+local loadedContainerCache = {}
 
 local MEDICAL_TYPES = {
     ["Base.AlcoholWipes"] = true,
@@ -90,9 +91,47 @@ local function safeBoolean(object, method, ...)
     return success and value == true or nil
 end
 
-function Storage.resolvePolicy(policy)
+function Storage.resolvePolicy(policy, readOnly)
     if policy == nil or getCell == nil or getCell() == nil then
         return nil, "cell_unavailable"
+    end
+    -- Automatically discovered containers are transient candidates, never
+    -- persisted policies. Revalidate their native identity and base bounds,
+    -- and deliberately skip policy naming/capacity side effects.
+    if policy.transientContainer == true then
+        local object = policy.object
+        local square = object ~= nil and object.getSquare ~= nil
+            and object:getSquare() or nil
+        local area = policy.base ~= nil
+            and (policy.base.territory or policy.base.home) or nil
+        local maxX = area ~= nil and (area.maxX
+            or (area.minX + (area.width or 1) - 1)) or nil
+        local maxY = area ~= nil and (area.maxY
+            or (area.minY + (area.height or 1) - 1)) or nil
+        if square == nil or area == nil
+            or square:getX() ~= policy.x or square:getY() ~= policy.y
+            or square:getZ() ~= policy.z
+            or square:getX() < area.minX or square:getX() > maxX
+            or square:getY() < area.minY or square:getY() > maxY
+            or (area.allFloors ~= true and square:getZ() ~= (area.z or 0)) then
+            return nil, "transient_container_moved"
+        end
+        local container = object.getContainerByIndex ~= nil
+            and object:getContainerByIndex(policy.containerIndex) or nil
+        if container == nil or container ~= policy.container
+            or (container.isExistYet ~= nil and not container:isExistYet()) then
+            return nil, "transient_container_unavailable"
+        end
+        local objects = square.getObjects ~= nil and square:getObjects() or nil
+        local present = false
+        if objects ~= nil then
+            for index = 0, objects:size() - 1 do
+                if objects:get(index) == object then present = true; break end
+            end
+        end
+        if not present then return nil, "transient_object_missing" end
+        return { policy = policy, square = square, object = object,
+            container = container }, "resolved"
     end
     local square = getCell():getGridSquare(
         tonumber(policy.x) or 0,
@@ -122,6 +161,8 @@ function Storage.resolvePolicy(policy)
                 local actualType = tostring(container:getType() or "container")
                 local expectedType = tostring(policy.containerType or actualType)
                 if expectedType == actualType or expectedType == "container" then
+                    if readOnly ~= true then
+                    local legacyToolCupboardApplied = false
                     if policy.toolCupboard == true and object.getModData ~= nil
                         and container.getCapacity ~= nil and container.setCapacity ~= nil then
                         local data = object:getModData()
@@ -133,17 +174,23 @@ function Storage.resolvePolicy(policy)
                     if policy.toolCupboard == true and KnoxToolCupboard ~= nil
                         and KnoxToolCupboard.apply(object, container, policy.key) then
                         policy.toolCupboard = true
+                        legacyToolCupboardApplied = true
                     end
-                    -- Assigned storage areas have infinite weight: set native
-                    -- max for display and mark infinite for Lua/native bypasses.
-                    if KnoxToolCupboard ~= nil and KnoxToolCupboard.applyInfinite ~= nil then
+                    -- Legacy cupboard records keep their configured capacity.
+                    -- Current typed storage temporarily uses the Build 42
+                    -- native limit and records the original value for removal.
+                    if not legacyToolCupboardApplied and KnoxToolCupboard ~= nil
+                        and KnoxToolCupboard.applyInfinite ~= nil then
                         pcall(function()
-                            KnoxToolCupboard.applyInfinite(object, container, policy.key)
+                            KnoxToolCupboard.applyInfinite(
+                                object, container, policy.key, containerIndex
+                            )
                         end)
                     end
                     -- Keep the world container title in sync with its assigned
                     -- storage type so the loot window shows organization.
                     Storage.syncContainerName(policy, container)
+                    end
                     return {
                         policy = policy,
                         square = square,
@@ -217,6 +264,108 @@ function Storage.policies(base)
     return result
 end
 
+local function storageArea(base)
+    return base ~= nil and (base.territory or base.home) or nil
+end
+
+local function loadedContainerCacheKey(base, area)
+    return table.concat({ tostring(base.id), tostring(area.minX), tostring(area.minY),
+        tostring(area.maxX), tostring(area.maxY), tostring(area.z),
+        tostring(area.allFloors) }, ":")
+end
+
+-- Discover real containers in loaded base squares without assigning them,
+-- changing their names/capacity, or persisting a second storage ledger.
+-- Configured policies are returned first; these transient entries are fallback
+-- candidates only and are revalidated before any native transfer is queued.
+function Storage.operationalPolicies(base)
+    local result, seen = {}, {}
+    for _, policy in ipairs(Storage.policies(base)) do
+        local resolved = Storage.resolvePolicy(policy, true)
+        if resolved ~= nil then
+            result[#result + 1] = policy
+            seen[resolved.object] = seen[resolved.object] or {}
+            seen[resolved.object][tonumber(policy.containerIndex) or 0] = true
+        end
+    end
+    local area = storageArea(base)
+    local cell = getCell ~= nil and getCell() or nil
+    if area == nil or cell == nil or cell.getGridSquare == nil then return result end
+    local minX, minY = tonumber(area.minX), tonumber(area.minY)
+    local maxX = tonumber(area.maxX) or (minX and minX + (tonumber(area.width) or 1) - 1)
+    local maxY = tonumber(area.maxY) or (minY and minY + (tonumber(area.height) or 1) - 1)
+    if minX == nil or minY == nil or maxX == nil or maxY == nil then return result end
+    local cacheKey = loadedContainerCacheKey(base, area)
+    local now = type(getTimestampMs) == "function" and getTimestampMs() or nil
+    local cached = now ~= nil and loadedContainerCache[cacheKey] or nil
+    local found = cached ~= nil and now - cached.at < 10000 and cached.entries or nil
+    if found == nil then
+        found = {}
+        local firstZ, lastZ = tonumber(area.minZ), tonumber(area.maxZ)
+        if firstZ == nil or lastZ == nil then
+            if area.allFloors == true then
+                -- Build 42 loaded building levels, including basement floors.
+                firstZ, lastZ = -1, 7
+                local homeZ = tonumber(base.home ~= nil and base.home.z)
+                if homeZ ~= nil then firstZ, lastZ = math.min(firstZ, homeZ), math.max(lastZ, homeZ) end
+            else
+                firstZ = tonumber(area.z) or tonumber(base.home ~= nil and base.home.z) or 0
+                lastZ = firstZ
+            end
+        end
+        for z = firstZ, lastZ do
+            for x = minX, maxX do
+                for y = minY, maxY do
+                    local square = cell:getGridSquare(x, y, z)
+                    local objects = square ~= nil and square.getObjects ~= nil
+                        and square:getObjects() or nil
+                    if objects ~= nil then
+                        for objectIndex = 0, objects:size() - 1 do
+                            local object = objects:get(objectIndex)
+                            local count = object ~= nil and object.getContainerCount ~= nil
+                                and object:getContainerCount() or 0
+                            for containerIndex = 0, count - 1 do
+                                local container = object:getContainerByIndex(containerIndex)
+                                local kind = string.lower(tostring(container ~= nil
+                                    and container:getType() or ""))
+                                if container ~= nil and container:isExistYet()
+                                    and kind ~= "corpse" and kind ~= "floor"
+                                    and kind:find("water", 1, true) == nil
+                                    and kind:find("rain", 1, true) == nil then
+                                    found[#found + 1] = {
+                                        object = object, container = container,
+                                        containerIndex = containerIndex, square = square,
+                                        objectIndex = object:getObjectIndex(),
+                                    }
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        if now ~= nil then loadedContainerCache[cacheKey] = { at = now, entries = found } end
+    end
+    for _, entry in ipairs(found) do
+        local containerIndex = tonumber(entry.containerIndex) or 0
+        if not (seen[entry.object] ~= nil and seen[entry.object][containerIndex]) then
+            local kind = string.lower(tostring(entry.container:getType() or "container"))
+            local policy = {
+                key = table.concat({ "unassigned", tostring(base.id), tostring(entry.square:getX()),
+                    tostring(entry.square:getY()), tostring(entry.square:getZ()),
+                    tostring(entry.objectIndex), tostring(containerIndex), tostring(entry.object),
+                    tostring(entry.container) }, ":"),
+                x = entry.square:getX(), y = entry.square:getY(), z = entry.square:getZ(),
+                objectIndex = entry.objectIndex, containerIndex = containerIndex,
+                containerType = kind, transientContainer = true, base = base,
+                object = entry.object, container = entry.container,
+            }
+            result[#result + 1] = policy
+        end
+    end
+    return result
+end
+
 -- Transient, read-only migration for pre-typed-storage saves. Returns a
 -- food-role view of a legacy record when it still resolves to a loaded
 -- fridge/freezer, else nil. Never mutates the persisted record.
@@ -256,15 +405,123 @@ function Storage.mainPolicy(base)
     return nil
 end
 
-function Storage.label(policy)    local role = policy ~= nil and policy.storageRole or "supplies"
-    local labels = {
+local STORAGE_FILTER_LABELS = {
         supplies = "Main Supplies", food = "Food & Drink", water = "Water",
         medical = "Medical", weapons = "Weapons", ammunition = "Ammunition",
         tools = "Tools", logs = "Logs & Lumber", general = "General Storage",
         building = "Materials", farming = "Farming",
         clothing = "Clothing", junk = "Junk",
-    }
-    return labels[role] or "Storage"
+}
+local STORAGE_FILTER_ORDER = {
+    "food", "water", "medical", "weapons", "ammunition", "tools",
+    "logs", "building", "farming", "clothing", "junk", "general",
+}
+
+local function nativeFilterCategory(key)
+    if type(key) ~= "string" or string.sub(key, 1, 8) ~= "display:" then return nil end
+    local category = string.sub(key, 9)
+    if category == "" or #category > 64 or not string.match(category, "^[%w_%-]+$") then
+        return nil
+    end
+    return category
+end
+
+function Storage.isValidFilterCategory(category)
+    return STORAGE_FILTER_LABELS[category] ~= nil or nativeFilterCategory(category) ~= nil
+end
+
+function Storage.filtersForPolicy(policy)
+    if policy == nil then return {} end
+    if policy.storageFilterVersion == 1 and type(policy.storageFilters) == "table" then
+        local result = {}
+        for _, category in ipairs(STORAGE_FILTER_ORDER) do
+            if policy.storageFilters[category] == true then result[category] = true end
+        end
+        for category, enabled in pairs(policy.storageFilters) do
+            if enabled == true and nativeFilterCategory(category) ~= nil then
+                result[category] = true
+            end
+        end
+        return result
+    end
+    local role = policy.storageRole or policy.category or "supplies"
+    if role == "supplies" or role == "depot" then role = "general" end
+    return STORAGE_FILTER_LABELS[role] ~= nil and { [role] = true } or {}
+end
+
+function Storage.filterLabel(category)
+    local nativeCategory = nativeFilterCategory(category)
+    if nativeCategory ~= nil then return nativeCategory end
+    return STORAGE_FILTER_LABELS[category] or "Storage"
+end
+
+function Storage.label(policy)
+    if policy ~= nil and policy.storageFilterVersion ~= 1
+        and (policy.storageRole == "supplies" or policy.category == "depot") then
+        return "Main Supplies"
+    end
+    local filters = Storage.filtersForPolicy(policy)
+    local labels = {}
+    for _, category in ipairs(STORAGE_FILTER_ORDER) do
+        if filters[category] then labels[#labels + 1] = STORAGE_FILTER_LABELS[category] end
+    end
+    local native = {}
+    for category in pairs(filters) do
+        if nativeFilterCategory(category) ~= nil then native[#native + 1] = category end
+    end
+    table.sort(native)
+    for _, category in ipairs(native) do labels[#labels + 1] = Storage.filterLabel(category) end
+    if #labels == 0 then return "Storage" end
+    return table.concat(labels, " + ")
+end
+
+local function filteredCategoryMatchesDeposit(item, category)
+    if category == "food" then
+        local isFood = safeBoolean(item, "IsFood") == true
+        if not isFood and item.getDisplayCategory ~= nil then
+            local ok, value = pcall(item.getDisplayCategory, item)
+            isFood = ok and value == "Food"
+        end
+        return isFood or KnoxSurvivorNeeds.isWaterItem(item, false)
+    end
+    return Storage.matchesCategory(item, category)
+end
+
+function Storage.filterAllowsItem(policy, item)
+    if policy == nil or item == nil then return false end
+    if policy.storageFilterVersion ~= 1 then return true end
+    local filters = Storage.filtersForPolicy(policy)
+    if filters.general then return true end
+    for _, category in ipairs(STORAGE_FILTER_ORDER) do
+        if filters[category] and filteredCategoryMatchesDeposit(item, category) then
+            return true
+        end
+    end
+    local displayCategory = ""
+    if item.getDisplayCategory ~= nil then
+        local ok, value = pcall(item.getDisplayCategory, item)
+        if ok then displayCategory = tostring(value or "") end
+    end
+    for category, enabled in pairs(filters) do
+        local nativeCategory = nativeFilterCategory(category)
+        if enabled == true and nativeCategory ~= nil and displayCategory == nativeCategory then
+            return true
+        end
+    end
+    return false
+end
+
+function Storage.filterAllowsKind(policy, kind)
+    if policy == nil then return false end
+    if policy.storageFilterVersion ~= 1 then return true end
+    local filters = Storage.filtersForPolicy(policy)
+    if filters.general == true or filters[kind] == true
+        or (kind == "water" and filters.food == true)
+    then return true end
+    for category, enabled in pairs(filters) do
+        if enabled == true and nativeFilterCategory(category) ~= nil then return true end
+    end
+    return false
 end
 
 -- RimWorld-style priority rank for deposit ordering. Lower sorts first:
@@ -290,6 +547,16 @@ end
 
 function Storage.acceptsDeposit(policy, item)
     if policy == nil or item == nil then return false end
+    if policy.storageFilterVersion == 1 then
+        local filters = Storage.filtersForPolicy(policy)
+        for _, category in ipairs(STORAGE_FILTER_ORDER) do
+            if filters[category] and (category == "general"
+                or filteredCategoryMatchesDeposit(item, category)) then
+                return true
+            end
+        end
+        return Storage.filterAllowsItem(policy, item)
+    end
     if policy.storageRole == "supplies" then return true end
     -- Raw ingredients belong in the kitchen too; edibility is checked separately
     -- when choosing a meal. Keep unsafe food out of the ready-to-eat stock count.
@@ -466,11 +733,13 @@ end
 function Storage.findSurvivalSupply(base, character, kind)
     if kind ~= "food" and kind ~= "water" then return nil, "invalid_kind" end
     for _, policy in ipairs(orderedPoliciesByDistance(base, character)) do
-        local resolved = Storage.resolvePolicy(policy)
+        local resolved = Storage.filterAllowsKind(policy, kind)
+            and Storage.resolvePolicy(policy) or nil
         if resolved ~= nil then
             local found = nil
             walkContainerItems(resolved.container, function(candidate, sourceContainer)
-                if found == nil and survivalKind(candidate) == kind then
+                if found == nil and survivalKind(candidate) == kind
+                    and Storage.filterAllowsItem(policy, candidate) then
                     found = {
                         kind = kind,
                         item = candidate,
@@ -617,7 +886,7 @@ local function findDeposit(base, character, item, trip, excluded, ticks, policyK
     local origin = character ~= nil and character:getCurrentSquare() or nil
     if base == nil or origin == nil then return nil, "no_owned_storage" end
     local candidates = {}
-    for _, policy in ipairs(Storage.policies(base)) do
+    for _, policy in ipairs(Storage.operationalPolicies(base)) do
         local dx, dy = (tonumber(policy.x) or math.huge) - origin:getX(),
             (tonumber(policy.y) or math.huge) - origin:getY()
         local category = tostring(policy.category or "general")
@@ -628,15 +897,17 @@ local function findDeposit(base, character, item, trip, excluded, ticks, policyK
         -- stores (food, water, medical) are the last resort so the kitchen
         -- and the medicine cabinet stay clean while any other shelf exists.
         local role = tostring(policy.storageRole or "")
-        local exact = Storage.acceptsDeposit(policy, item)
-        local overflow = not exact
+        local unassigned = policy.transientContainer == true
+        local exact = not unassigned and Storage.acceptsDeposit(policy, item)
+        local overflow = not unassigned and not exact and policy.storageFilterVersion ~= 1
             and (role ~= "food" and role ~= "water" and role ~= "medical")
-        local lastResort = not exact and not overflow
+        local lastResort = not unassigned and not exact and not overflow
+            and policy.storageFilterVersion ~= 1
         if (floorDifference == 0 or (trip and floorDifference <= 2))
             and dx * dx + dy * dy <= (trip and 128 * 128 or 2)
             and (policyKey == nil or policy.key == policyKey)
             and (excluded == nil or (excluded[policy.key] or 0) <= (ticks or 0))
-            and (exact or overflow or lastResort) then
+            and (exact or overflow or lastResort or unassigned) then
             local resolved = Storage.resolvePolicy(policy)
             if resolved ~= nil and hasRoom(resolved.container, item, character)
                 and safeBoolean(resolved.container, "isItemAllowed", item) == true then
@@ -651,13 +922,15 @@ local function findDeposit(base, character, item, trip, excluded, ticks, policyK
                 if clear then
                     resolved.approach = approach
                     local classified = Storage.classifyItem(item)
-                    local exactCategory = policy.storageRole == classified
+                    local exactCategory = policy.storageFilterVersion == 1
+                        and exact or policy.storageRole == classified
                         or (policy.storageRole == "food" and Storage.acceptsDeposit(policy, item))
                     -- RimWorld order: highest-priority valid shelf first,
                     -- then exact-type matches, then distance. A critical
                     -- overflow shelf beats a normal exact one by design.
                     resolved.priorityRank = Storage.priorityRank(policy)
-                    resolved.preference = exactCategory and 0
+                    resolved.preference = unassigned and 4
+                        or exactCategory and 0
                         or policy.storageRole == "supplies" and 1
                         or exact and 2
                         or overflow and 3 or 4
@@ -672,8 +945,8 @@ local function findDeposit(base, character, item, trip, excluded, ticks, policyK
         end
     end
     table.sort(candidates, function(a, b)
-        if a.priorityRank ~= b.priorityRank then return a.priorityRank < b.priorityRank end
         if a.preference ~= b.preference then return a.preference < b.preference end
+        if a.priorityRank ~= b.priorityRank then return a.priorityRank < b.priorityRank end
         if a.distance ~= b.distance then return a.distance < b.distance end
         return a.policy.key < b.policy.key
     end)
@@ -720,7 +993,7 @@ end
 -- Sorts assigned policies by distance to the worker so withdrawals favor near
 -- containers instead of key order.
 orderedPoliciesByDistance = function(base, character)
-    local policies = Storage.policies(base)
+    local policies = Storage.operationalPolicies(base)
     local origin = character ~= nil and character.getCurrentSquare ~= nil
         and character:getCurrentSquare() or nil
     if origin == nil then return policies end
@@ -759,6 +1032,7 @@ local function findRequiredTransferReal(base, character, requirements)
                         local found = nil
                         walkContainerItems(resolved.container, function(item, sourceContainer)
                             if found == nil and fullType(item) == tostring(itemType)
+                                and Storage.filterAllowsItem(policy, item)
                                 and KnoxBaseSupplyPlanner.matchesRequirement(item, requirements) then
                                 found = {
                                     sourcePolicy = policy,
@@ -797,20 +1071,19 @@ function Storage.findFetchTransfer(base, character, requirements)
     return findRequiredTransferReal(base, character, requirements)
 end
 
--- Discovery may inspect assigned, loaded storage to name a concrete requirement.
+-- Discovery may inspect loaded base containers to name a concrete requirement.
 -- The normal transfer action still owns moving the selected item to the resident.
 -- Uses closest-relative ordering so multiple storages do not cause cross-base walks.
 function Storage.findItemType(base, predicate, character)
     if type(predicate) ~= "function" then return nil end
-    local policies = character ~= nil and orderedPoliciesByDistance(base, character)
-        or Storage.policies(base)
+    local policies = orderedPoliciesByDistance(base, character)
     for _, policy in ipairs(policies) do
         local resolved = Storage.resolvePolicy(policy)
         local found = nil
         walkContainerItems(resolved ~= nil and resolved.container or nil, function(item)
             if found == nil then
                 local success, matches = pcall(predicate, item)
-                if success and matches == true then
+                if success and matches == true and Storage.filterAllowsItem(policy, item) then
                     found = item
                 end
             end
@@ -834,13 +1107,14 @@ function Storage.requirementsAvailable(base, character, requirements)
         local remaining = math.max(0, math.floor(tonumber(required) or 0))
             - KnoxBaseSupplyPlanner.inventoryCount(inventory, itemType, requirements)
         if remaining > 0 then
-            for _, policy in ipairs(Storage.policies(base)) do
+            for _, policy in ipairs(orderedPoliciesByDistance(base, character)) do
                 if policyCanSupply(policy, tostring(itemType)) then
                     local resolved = Storage.resolvePolicy(policy)
                     if resolved ~= nil then
                         walkContainerItems(resolved.container, function(item)
                             if remaining <= 0 then return end
                             if fullType(item) == tostring(itemType)
+                                and Storage.filterAllowsItem(policy, item)
                                 and KnoxBaseSupplyPlanner.matchesRequirement(item, requirements) then
                                 remaining = remaining - itemQuantity(item)
                             end

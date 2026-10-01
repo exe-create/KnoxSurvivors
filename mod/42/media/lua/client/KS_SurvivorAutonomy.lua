@@ -52,9 +52,11 @@ local GATE_KEY = "multi_survival_autonomy_v1"
 local FACTION_BASE_GATE_KEY = "faction_base_scouting_v1"
 
 local controllers = {}
+local hibernateRollbackPending = {}
 local reservations = {
     threats = {}, items = {}, containers = {}, restSpots = {}, campPositions = {},
     supportRecipients = {}, supportItems = {}, ambientSpots = {},
+    playerFormationTargets = {}, partyDestinationTargets = {},
 }
 local ticks = 0
 local populationReady = false
@@ -281,6 +283,48 @@ local function removeActiveId(id)
     activeIds = retained
 end
 
+-- A runtime entry is not proof that a native body still exists. If the bridge
+-- confirms an ordinary active shell is gone, retaining its ID here makes the
+-- population scan skip it forever. Drop only that stale runtime projection;
+-- the canonical record and identity remain untouched for the normal restore
+-- path. Transitional detach and hibernation rollback owners keep their lease.
+local function releaseMissingActiveBodies(bridge)
+    if bridge == nil or bridge.getNpcCharacter == nil then return 0 end
+    local missing = {}
+    for _, id in ipairs(activeIds) do
+        if controllers[id] ~= nil and hibernateRollbackPending[id] == nil then
+            local lifecycle = KnoxSurvivorRuntime.getLifecycleState ~= nil
+                and KnoxSurvivorRuntime.getLifecycleState(id) or nil
+            local transitional = lifecycle == "detached_transient"
+                or lifecycle == "detached_grace"
+                or lifecycle == "detached_stale"
+                or lifecycle == "hibernating"
+            if not transitional then
+                local ok, character = pcall(bridge.getNpcCharacter, bridge, id)
+                if ok and character == nil then missing[#missing + 1] = id end
+            end
+        end
+    end
+    for _, id in ipairs(missing) do
+        local controller = controllers[id]
+        -- Do not shutdown/capture a shell the bridge has already lost. Requeue
+        -- its durable base claim so another resident can take the real task.
+        local duty = KnoxPersistence.getSurvivorDuty(id)
+        if duty ~= nil and duty.mode == "base" and duty.baseId ~= nil
+            and KnoxPersistence.requeueBaseTasksForSurvivor ~= nil then
+            KnoxPersistence.requeueBaseTasksForSurvivor(
+                id, duty.baseId, "native_body_missing")
+        end
+        pcall(KnoxSurvivorRuntime.unregister, id, controller)
+        controllers[id] = nil
+        removeActiveId(id)
+        print(TAG .. " id=" .. tostring(id)
+            .. " state=STALE_RUNTIME_RELEASED evidence=bridge_body_absent"
+            .. " canonical_record=preserved")
+    end
+    return #missing
+end
+
 local function registerController(bridge, id, character, result)
     if character == nil then
         return false, "character_unavailable"
@@ -461,6 +505,20 @@ local function retireDeadSurvivor(bridge, id, controller)
             if feed ~= nil and feed.survivorDied ~= nil then
                 pcall(feed.survivorDied, id, controller.character)
             end
+        end
+    end
+    local affiliation = KnoxPersistence.getSurvivorAffiliation ~= nil
+        and KnoxPersistence.getSurvivorAffiliation(id) or nil
+    local companionService = rawget(_G, "KnoxCompanionService")
+    if affiliation ~= nil and affiliation.kind == "player"
+        and companionService ~= nil then
+        -- The canonical death write above makes this identity ineligible. Let
+        -- the existing player-order owner prune it from its runtime snapshot.
+        if companionService.removePlayerPartyFormationMember ~= nil then
+            companionService.removePlayerPartyFormationMember(affiliation.ownerId, id)
+        end
+        if companionService.getPartyDestination ~= nil then
+            companionService.getPartyDestination(affiliation.ownerId)
         end
     end
     pcall(function()
@@ -715,10 +773,63 @@ end
 local function hibernateDistantWorldSurvivors(bridge, players)
     local world = activeWorldLookup()
     local hibernate = {}
+    -- A committed stored snapshot plus a body still owned by the bridge is an
+    -- incomplete native teardown, not an offscreen survivor. Retry only the
+    -- ledger rollback; never repeat shutdown/remove against a contradictory
+    -- live shell, and never create a replacement body.
+    for id, pending in pairs(hibernateRollbackPending) do
+        local controller = pending.controller
+        local okCharacter, liveCharacter = pcall(function()
+            return bridge:getNpcCharacter(id)
+        end)
+        if okCharacter and liveCharacter == nil then
+            if controllers[id] == controller then
+                KnoxSurvivorRuntime.unregister(id, controller)
+                controllers[id] = nil
+                removeActiveId(id)
+            end
+            hibernateRollbackPending[id] = nil
+            print(TAG .. " id=" .. tostring(id)
+                .. " hibernate-remove-retry=body_absent state=HIBERNATED")
+        elseif okCharacter and controller ~= nil
+            and liveCharacter == controller.character then
+            local now = getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
+            local rollbackCallOk, rolledBack, rollbackEvidence = pcall(function()
+                return KnoxUnloadedSurvival.rollbackStored(id, now)
+            end)
+            if rollbackCallOk and rolledBack == true
+                and controllers[id] == controller
+                and controller.resumeAfterHibernateRollback ~= nil then
+                local resumeCallOk, resumed, resumeEvidence = pcall(function()
+                    return controller:resumeAfterHibernateRollback(
+                        ticks, pending.reason
+                    )
+                end)
+                if resumeCallOk and resumed == true then
+                    KnoxSurvivorRuntime.setLifecycleState(id,
+                        pending.reason == "detached" and "detached_stale" or "active")
+                    hibernateRollbackPending[id] = nil
+                    print(TAG .. " id=" .. tostring(id)
+                        .. " hibernate-remove-retry=ledger_rollback result=loaded"
+                        .. " controller=IDLE reason=" .. tostring(pending.reason))
+                else
+                    print(TAG .. " id=" .. tostring(id)
+                        .. " hibernate-recovery-resume-failed=" .. tostring(resumeEvidence))
+                end
+            else
+                print(TAG .. " id=" .. tostring(id)
+                    .. " hibernate-recovery-rollback-pending="
+                    .. tostring(rollbackCallOk and rollbackEvidence or rolledBack))
+            end
+        else
+            print(TAG .. " id=" .. tostring(id)
+                .. " hibernate-recovery-pending=body_identity_unconfirmed")
+        end
+    end
     for _, id in ipairs(activeIds) do
         local controller = controllers[id]
         local duty = KnoxPersistence.getSurvivorDuty(id) or {}
-        if controller ~= nil then
+        if controller ~= nil and hibernateRollbackPending[id] == nil then
             local character = controller.character
             -- Passenger shells are owned by the live vehicle. Treating their
             -- transient world square as a detached body would capture/remove a
@@ -843,7 +954,8 @@ local function hibernateDistantWorldSurvivors(bridge, players)
                     .. " result=" .. tostring(markResult))
             else
                 local removed = tostring(bridge:removeNpc(entry.id))
-                local registryStillActive = bridge:getNpcCharacter(entry.id) ~= nil
+                local liveCharacter = bridge:getNpcCharacter(entry.id)
+                local registryStillActive = liveCharacter ~= nil
                 if not registryStillActive then
                     KnoxSurvivorRuntime.unregister(entry.id, entry.controller)
                     controllers[entry.id] = nil
@@ -855,19 +967,42 @@ local function hibernateDistantWorldSurvivors(bridge, players)
                         .. " saved=true"
                         .. " remove=" .. tostring(removed))
                 else
-                    -- The bridge still owns a body, so restore the ledger's loaded
-                    -- snapshot before retrying removal. This prevents an active
-                    -- shell from being advanced by the unloaded scheduler.
-                    local recovered, recoveryEvidence = pcall(function()
-                        return entry.controller:shutdown()
+                    -- The bridge still owns this exact shell. Restore loaded
+                    -- ledger ownership first; only then let its existing
+                    -- controller arbitrate again. If persistence refuses, hold
+                    -- the pair here and retry rollback alone on a later pass.
+                    local now = getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
+                    local rollbackCallOk, rolledBack, rollbackEvidence = pcall(function()
+                        return KnoxUnloadedSurvival.rollbackStored(entry.id, now)
                     end)
-                    entry.controller.state = "STOPPED"
-                    KnoxSurvivorRuntime.setLifecycleState(entry.id,
-                        entry.reason == "detached" and "detached_stale" or "active")
+                    local resumed, resumeEvidence = false, "rollback_not_committed"
+                    if rollbackCallOk and rolledBack == true
+                        and liveCharacter == entry.controller.character then
+                        local resumeCallOk, resumeResult, resumeDetail = pcall(function()
+                            return entry.controller:resumeAfterHibernateRollback(
+                                ticks, entry.reason
+                            )
+                        end)
+                        resumed = resumeCallOk and resumeResult == true
+                        resumeEvidence = resumeCallOk and resumeDetail or resumeResult
+                    end
+                    if resumed then
+                        KnoxSurvivorRuntime.setLifecycleState(entry.id,
+                            entry.reason == "detached" and "detached_stale" or "active")
+                    else
+                        hibernateRollbackPending[entry.id] = {
+                            controller = entry.controller,
+                            reason = entry.reason,
+                        }
+                        KnoxSurvivorRuntime.setLifecycleState(entry.id,
+                            "hibernate_recovery_pending")
+                    end
                     print(TAG .. " id=" .. entry.id
                         .. " hibernate-remove-failed reason=" .. tostring(entry.reason)
                         .. " result=" .. removed
-                        .. " recovery=" .. tostring(recovered and recoveryEvidence or false))
+                        .. " rollback=" .. tostring(rollbackCallOk and rollbackEvidence or rolledBack)
+                        .. " resumed=" .. tostring(resumed)
+                        .. " resumeEvidence=" .. tostring(resumeEvidence))
                 end
             end
         else
@@ -936,6 +1071,7 @@ local function activateWorldCandidate(bridge, candidate)
 end
 
 local function reconcileWorldPopulation(bridge)
+    releaseMissingActiveBodies(bridge)
     local players = currentPlayers()
     for _, player in ipairs(players) do
         if KnoxSpouseStart.update(player, function(id, square, record)
@@ -1270,9 +1406,11 @@ local function onGameStart()
     detachedGrace = {}
     controllers = {}
     KnoxSurvivorRuntime.clear()
+    hibernateRollbackPending = {}
     reservations = {
         threats = {}, items = {}, containers = {}, restSpots = {}, campPositions = {},
         supportRecipients = {}, supportItems = {}, ambientSpots = {},
+        playerFormationTargets = {}, partyDestinationTargets = {},
     }
     KnoxSurvivorRelationships.resetRuntime()
     if KnoxSurvivorDialogue ~= nil and KnoxSurvivorDialogue.resetRuntime ~= nil then
@@ -1323,6 +1461,17 @@ local function onMainMenuEnter()
         retireDeadControllers(bridge)
     end
     for id, controller in pairs(controllers) do
+        local pending = hibernateRollbackPending[id]
+        if pending ~= nil then
+            local now = getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
+            local ok, rolledBack, evidence = pcall(function()
+                return KnoxUnloadedSurvival.rollbackStored(id, now)
+            end)
+            print(TAG .. " id=" .. tostring(id)
+                .. " hibernate-rollback-save-boundary="
+                .. tostring(ok and rolledBack == true)
+                .. " evidence=" .. tostring(ok and evidence or rolledBack))
+        end
         controller:shutdown()
         KnoxSurvivorRuntime.unregister(id, controller)
     end
@@ -1330,6 +1479,7 @@ local function onMainMenuEnter()
     KnoxSurvivorRuntime.clear()
     controllers = {}
     activeIds = {}
+    hibernateRollbackPending = {}
     detachedGrace = {}
     recentlyDetached = {}
     stop()
@@ -1426,7 +1576,7 @@ Events.OnMainMenuEnter.Add(onMainMenuEnter)
 Events.OnCreatePlayer.Add(onCreatePlayer)
 Events.OnPlayerDeath.Add(onPlayerDeath)
 
-function Autonomy.spawnDeveloperScenario(player, scenario)
+function Autonomy.spawnDeveloperScenario(player, scenario, qaOwnership)
     if not KnoxSettings.developerToolsEnabled() then
         return false, "developer_tools_disabled"
     end
@@ -1442,14 +1592,27 @@ function Autonomy.spawnDeveloperScenario(player, scenario)
     for _ = 1, count do
         local id = KnoxPersistence.allocateDeveloperSurvivorId()
         ids[#ids + 1] = id
+        if qaOwnership ~= nil then
+            if type(qaOwnership) ~= "table"
+                or type(qaOwnership.runId) ~= "string"
+                or type(qaOwnership.ownerToken) ~= "string"
+                or KnoxPersistence.tagDeveloperQaFixture == nil then
+                return false, "invalid_qa_ownership", table.concat(ids, ",")
+            end
+            local tagged, tagResult = KnoxPersistence.tagDeveloperQaFixture(
+                id, qaOwnership.runId, qaOwnership.ownerToken, qaOwnership.scenarioId)
+            if not tagged then
+                return false, "qa_fixture_tag_failed:" .. tostring(tagResult), table.concat(ids, ",")
+            end
+        end
     end
     local ready, result = ensurePopulation(bridge, player, ids)
     if not ready then
-        return false, result
+        return false, result, table.concat(ids, ",")
     end
     local configured, configureResult = configureScenario(player, scenario, ids)
     if not configured then
-        return false, configureResult
+        return false, configureResult, table.concat(ids, ",")
     end
     for _, id in ipairs(ids) do
         scenarioIds[#scenarioIds + 1] = id
@@ -1462,11 +1625,16 @@ end
 -- QA runs several real native fixtures in one save; without this ownership
 -- boundary an earlier faction can fight, claim a shelter, or occupy a doorway
 -- while a later traversal/job case is being measured.
-function Autonomy.cleanupDeveloperScenario(ids, reason)
+function Autonomy.cleanupDeveloperScenario(ids, reason, qaOwnership)
     if not KnoxSettings.developerToolsEnabled() then
         return false, "developer_tools_disabled"
     end
     if type(ids) ~= "table" then return false, "invalid_ids" end
+    if qaOwnership ~= nil and (type(qaOwnership) ~= "table"
+        or type(qaOwnership.runId) ~= "string" or qaOwnership.runId == ""
+        or type(qaOwnership.ownerToken) ~= "string" or qaOwnership.ownerToken == "") then
+        return false, "invalid_qa_owner"
+    end
     local bridge = rawget(_G, "KnoxJavaBridge")
     if bridge == nil then return false, "bridge_unavailable" end
     local removed, failures = 0, {}
@@ -1475,6 +1643,13 @@ function Autonomy.cleanupDeveloperScenario(ids, reason)
     for _, id in ipairs(ids) do
         if type(id) ~= "string" or string.find(id, "ks-dev-", 1, true) ~= 1 then
             failures[#failures + 1] = tostring(id) .. ":not_developer_survivor"
+        elseif qaOwnership ~= nil and (KnoxPersistence.getDeveloperQaFixtureOwner == nil
+            or (function()
+                local owner = KnoxPersistence.getDeveloperQaFixtureOwner(id)
+                return owner == nil or owner.runId ~= qaOwnership.runId
+                    or owner.ownerToken ~= qaOwnership.ownerToken
+            end)()) then
+            failures[#failures + 1] = id .. ":qa_owner_mismatch"
         else
             local controller = controllers[id]
             if controller ~= nil then
@@ -1489,22 +1664,46 @@ function Autonomy.cleanupDeveloperScenario(ids, reason)
                 and encoded ~= "NONE_ACTIVE") then
                 failures[#failures + 1] = id .. ":remove=" .. encoded
             else
-                KnoxSurvivorRuntime.unregister(id, controller)
-                controllers[id] = nil
-                removeActiveId(id)
-                for index = #scenarioIds, 1, -1 do
-                    if scenarioIds[index] == id then table.remove(scenarioIds, index) end
+                local bodyOk, remainingBody = pcall(function()
+                    return bridge:getNpcCharacter(id)
+                end)
+                if not bodyOk or remainingBody ~= nil then
+                    failures[#failures + 1] = id .. ":native_body_remains_or_unverifiable"
+                else
+                    KnoxSurvivorRuntime.unregister(id, controller)
+                    controllers[id] = nil
+                    removeActiveId(id)
+                    for index = #scenarioIds, 1, -1 do
+                        if scenarioIds[index] == id then table.remove(scenarioIds, index) end
+                    end
+                    local marked = KnoxPersistence.markSurvivorDead(
+                        id,
+                        now,
+                        "developer_fixture_cleanup:" .. tostring(reason or "complete")
+                    )
+                    if not marked then
+                        failures[#failures + 1] = id .. ":persistence_retirement_failed"
+                    else
+                        if qaOwnership ~= nil
+                            and KnoxPersistence.clearDeveloperQaFixtureOwner ~= nil then
+                            local cleared = KnoxPersistence.clearDeveloperQaFixtureOwner(
+                                id, qaOwnership.runId, qaOwnership.ownerToken)
+                            if not cleared then
+                                failures[#failures + 1] = id .. ":qa_owner_clear_failed"
+                            else
+                                removed = removed + 1
+                            end
+                        else
+                            removed = removed + 1
+                        end
+                    end
                 end
-                KnoxPersistence.markSurvivorDead(
-                    id,
-                    now,
-                    "developer_fixture_cleanup:" .. tostring(reason or "complete")
-                )
-                removed = removed + 1
             end
         end
     end
-    if KnoxPersistence.purgeDeveloperQaBases ~= nil then
+    -- QA-scoped cleanup cannot purge other developer factions or bases. Legacy
+    -- manual scenarios retain their previous opt-in developer cleanup behavior.
+    if qaOwnership == nil and KnoxPersistence.purgeDeveloperQaBases ~= nil then
         pcall(KnoxPersistence.purgeDeveloperQaBases)
     end
     return #failures == 0,
@@ -1730,5 +1929,9 @@ function Autonomy.status()
         worldPopulation = KnoxPersistence.getPopulationState(),
     }
 end
+
+-- Narrow lifecycle test seam; production invokes the same reconciliation
+-- before candidate selection.
+Autonomy.releaseMissingActiveBodies = releaseMissingActiveBodies
 
 return Autonomy

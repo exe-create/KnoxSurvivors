@@ -276,6 +276,9 @@ Support player and NPC faction bases with:
 - work zones;
 - multiple assigned Project Zomboid containers with typed storage categories,
   including General Storage fallback and multiple containers per category;
+- player-configured per-container allow-filters, including several categories
+  on one real container; the explicit General Storage filter is an exclusive
+  catch-all;
 - resources;
 - jobs/tasks;
 - defenses.
@@ -304,6 +307,14 @@ Work areas should support where applicable:
 - Repair.
 
 Typed storage policies are separate from work areas and remain the canonical storage model.
+Container filters are saved on that same per-container policy and are honored
+by existing deposit, organizer, task-material, food/water retrieval, and
+log-processing routes. Legacy single-role records keep their former behavior
+until edited; filter-versioned records are strict. Editing filters never ejects
+existing items that do not match. Container discovery, native item transfer,
+reservations, capacity restoration, and result verification stay with their
+existing owners. Filtered ground placement is not included; exact native target
+square receipt and rollback remain required first.
 
 ## Base Jobs
 

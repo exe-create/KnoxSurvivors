@@ -254,7 +254,13 @@ function Woodcutting.findTask(base, character, eligible)
         if storage ~= nil and storage.policies ~= nil and storage.resolvePolicy ~= nil then
             local candidates = {}
             for _, policy in ipairs(storage.policies(base)) do
-                if policy.storageRole == "logs" or policy.storageRole == "building" then
+                local filters = storage.filtersForPolicy ~= nil
+                    and storage.filtersForPolicy(policy) or nil
+                local eligible = policy.storageFilterVersion == 1 and filters ~= nil
+                    and filters.logs == true
+                    or policy.storageFilterVersion ~= 1
+                        and (policy.storageRole == "logs" or policy.storageRole == "building")
+                if eligible then
                     candidates[#candidates + 1] = policy
                 end
             end

@@ -85,7 +85,9 @@ local function point(value)
 end
 
 local function emptyList(value)
-    return type(value) == "table" and next(value) == nil
+    if type(value) ~= "table" then return false end
+    for _ in pairs(value) do return false end
+    return true
 end
 
 local function allocateEventId(state)
@@ -895,7 +897,7 @@ function KnoxEvents.maintain(hours, budget)
             -- Retain its roster/owners for the dispatcher's actual return cleanup.
             local recovered = type(event) == "table" and event or {}
             local deployed = not terminal(recovered) and recovered.phase ~= "scheduled"
-                and type(recovered.memberIds) == "table" and next(recovered.memberIds) ~= nil
+                and type(recovered.memberIds) == "table" and not emptyList(recovered.memberIds)
             recovered.id, recovered.phase = id, deployed and "withdrawing" or "failed"
             recovered.revision, recovered.lastChangedAtHours = 1, hours
             recovered.deadlineHours, recovered.reason = hours, "invalid_event_record"

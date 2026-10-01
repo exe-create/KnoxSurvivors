@@ -6,7 +6,7 @@ purpose: canonical verification and release contract
 
 # Knox Survivors — QA and release contract
 
-Updated: 2026-09-29
+Updated: 2026-10-01
 
 ## Evidence levels
 
@@ -20,26 +20,51 @@ Use these states consistently:
 
 Never skip from “implemented” to “release ready.”
 
-## Automated in-game QA vertical slice
+## QA tooling status — in-game runner retired
 
-The opt-in Build 42 QA entry point currently runs only `QA-START-001` through
-`QA-CLEANUP-001`: readiness, one QA-owned native survivor fixture, recruitment
-eligibility observation, checkpoints, and owned-fixture cleanup. It records a
-unique run ID, save/build/mod/runtime metadata, evidence type, and one of
-`PASS`, `FAIL`, `BLOCKED`, `SKIPPED`, or `HARNESS_ERROR` for every scenario.
+The in-game `KS_AutomatedQA` startup coordinator, Developer Tools submenu,
+save-arming flow, and `AutomatedQAMode` Sandbox option have been retired at the
+owner's request. Normal gameplay no longer loads QA scenarios or asks the owner
+to prepare a disposable save. Existing Sandbox saves may retain the old key; it
+is no longer registered or read.
 
-`HARNESS_ERROR` identifies a coordinator, checkpoint, timeout, or cleanup
-failure and must not be converted into a gameplay failure without separate
-evidence. `BLOCKED` identifies an unavailable native fixture or prerequisite.
-The fixture does not prove natural population frequency, social progression,
-visual correctness, combat, movement, persistence, or player experience. Those
-remain human-observed live acceptance checks. Run only in a disposable save;
-the slice removes only its own `ks-dev-*` fixture and never clears ordinary
-world entities.
+`KS_QAManifest.lua`, `KS_AutomatedQA.lua`, the save-isolation and base-task
+adapters, and the PowerShell report parser remain in the repository for direct
+offline regression coverage only. They are not part of the playable runtime
+path. The destructive legacy runner remains inactive.
+
+Use ordinary Build 42 play for native acceptance and
+`tools/verify.ps1 -SkipJava` for offline source/regression checks. Human playtests must name the
+specific survivor action and expected result; offline tests never establish
+native or release readiness.
 
 ## Current release gate
 
 The exact Survivors source candidate `e93ed2655470212a6e78305171ccff63f7893c58` passed the full offline and native payload gates on 2026-09-29. Steam publication/download parity and live Build 42 acceptance remain open; the matching KnoxBridge alpha8 menu review gate is not yet live-verified. The public Knox Survivors Workshop item currently reports a Steam removal and still contains old Setup.cmd/option-2 instructions. GitHub's latest KnoxBridge release remains alpha5. Do not claim release parity until the existing items are updated and verified publicly.
+
+The current worktree is dirty relative to `e93ed26` and contains later gameplay
+changes. The offline and payload evidence above remains scoped to that exact
+candidate; it does not verify the current dirty worktree. A fresh full exact-tree
+gate including Java and candidate/payload review is required before using these
+additions in a release candidate. No live Build 42 claims are implied.
+
+On 2026-09-30, the current dirty worktree passed the Lua-only
+`tools/verify.ps1 -SkipJava` gate (112 sources, 182 regression scripts, 294
+checks, 0 failed) and `git diff --check`. Java/build/payload gates have not been
+rerun on this dirty tree; the `e93ed26` Java/native-payload results remain
+scoped to that earlier candidate.
+
+Later, on 2026-09-30, `gradlew.bat deployDev` completed successfully for the
+current worktree. All 124 files under `mod/` match the deployed local mod at
+`C:\Users\Gary\Zomboid\mods\KnoxSurvivors` and the Workshop `Contents` payload;
+the Workshop payload additionally contains the generated Java agent and its
+checksum. The current source gate passed 113 Lua sources, 189 regression
+scripts, 302 checks, 0 failures; Java was skipped. This stages the current
+candidate for local testing but does not prove the game loaded it. The existing
+Workshop item 3749727604 still displays Steam's removal notice, so no update was
+uploaded: re-uploading cannot restore availability and must not be used to
+bypass the removal. Use the staged local mod for testing; resolve the item
+status through Steam Support before another Workshop publication attempt.
 
 ### Focused/offline gate
 
@@ -229,3 +254,39 @@ Do not keep creating dated release-readiness files. Update `CURRENT_STATE.md`, t
 ## Release decision
 
 Only the project owner decides publication. AI agents may summarize evidence and blockers, but they do not publish, upload or change public promises without explicit approval.
+
+The 2026-09-30 22:39 debug log supersedes the earlier provisional “stale local
+payload” diagnosis. Build 42 actually loaded the Workshop development path
+recorded in BUG-KS-053, where the QA START line was legacy and the autonomy
+controller failed to register after a Kahlua 200-local compiler overflow. The
+unused controller helper has now been removed and source staged to that exact
+path; the fresh Debug Mode startup replay is still required. The QA arming
+workflow is not accepted until current save-identity/manifest metadata appears
+in a new report.
+
+A subsequent 2026-09-30 Build 42.21 run loaded the current QA manifest v2 from
+the Workshop development path but still hit the Kahlua limit after the first
+reduction to 199 locals. That attempt is recorded as insufficient. The
+controller now has 189 module-scope locals after moving ten tuning values to
+its existing `Controller.TUNING` table; the test guards a 190 maximum. The log
+also reports `saveIdentity=unavailable`, which blocks encounter QA but is a
+separate issue from compilation. Both game paths now contain the current
+127-file source payload. Retest fresh startup; do not claim success before the
+new log confirms controller registration.
+
+
+### 2026-10-01 — owner-retired in-game QA surface
+
+The in-game runner and save-arming UI are removed from the packaged mod after
+the owner reported that the workflow was confusing and not useful. QA-only Lua
+modules were moved outside `mod/42/media/lua`; only the offline regression suite
+loads them directly. This does not change native gameplay acceptance, which is
+performed by ordinary player replays. No automated QA scenario is active in the
+game.
+
+
+Removal verification (2026-10-01): offline harness/menu/Sandbox regressions
+passed; full verifier passed 102 packaged Lua files, 197 regression scripts,
+299 checks, 0 failures. All 109 `mod/42` files hash-match local and Workshop
+development staging; no QA `.lua` remains under the game-loaded client directory.
+Public Workshop upload and gameplay acceptance were not performed.

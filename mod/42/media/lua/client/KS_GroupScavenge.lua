@@ -212,6 +212,21 @@ function Parties.ownsController(id, controller, controllers)
     return lease ~= nil and (lease.leaderId == id or lease.followerId == id)
 end
 
+-- Read-only reservation query for other base-life selectors. A supply run
+-- must not elect someone already committed to this generic settlement outing.
+function Parties.ownsSurvivor(id)
+    if type(id) ~= "string" or id == "" or not isDay() then return false end
+    local nowHours = worldAgeHours()
+    for _, lease in pairs(leasesBySettlement) do
+        if type(lease) == "table"
+            and (tonumber(lease.untilHours) or 0) > nowHours
+            and (lease.leaderId == id or lease.followerId == id) then
+            return true
+        end
+    end
+    return false
+end
+
 function Parties.coordinate(controllers, activeIds, ticks)
     local nowHours = worldAgeHours()
     local day = isDay()

@@ -8,6 +8,36 @@ purpose: NPC-system design direction derived from owner research and current Kno
 
 Updated: 2026-09-28
 
+## 2026-09-30 Workshop reference review — player expectations only
+
+The public description for the historical *Superb Survivors!* Workshop item
+describes a player expectation set: survivors seek basic necessities and
+shelter, can be approached/recruited, accept orders, perform recognizable base
+roles, and may be hostile. This is useful as a reminder that NPCs need to be
+findable, understandable, and visibly useful; it is not a Knox implementation
+specification. The page identifies the item as Build 41, single-player, work in
+progress, and currently incompatible/removed from the Workshop. Its removal
+notice does not state a reason, so no legal or moderation conclusion is drawn.
+
+Against current Knox authorities, the underlying identity, encounters,
+relationships, group/faction membership, orders, base work, real storage,
+combat, persistence, and offscreen continuity owners already exist. Their main
+unfinished product question is whether they produce a clear, observable native
+outcome in the live game: especially BUG-KS-013's base day and BUG-KS-015's
+real loot/receipt/resupply replay. Recruitment, group behavior, hostile
+encounters, and UI clarity likewise remain acceptance- or issue-specific; the
+old description is not evidence that Knox lacks those systems. Keep quests,
+scripted raids, and broad feature parity out of scope unless separately
+approved against Knox's existing rules. Nearby owned-survivor map grouping is
+already implemented offline under BUG-KS-021; faction-base markers remain
+deferred under BUG-KS-022.
+
+This comparison uses the public description only as high-level player-facing
+reference. No source code, assets, text, data structures, or interface layout
+from the old item are used or reproduced. Project Zomboid remains the technical
+foundation, and Knox's own owners and acceptance evidence remain authoritative.
+Reference: [Steam Workshop item 1905148104](https://steamcommunity.com/sharedfiles/filedetails/?id=1905148104).
+
 ## Core rule
 
 > **A Knox survivor is another Project Zomboid survivor controlled by AI, not a colony-game pawn.**
@@ -360,6 +390,17 @@ Must never: off-slot lighting writes, invented hits/damage/kills, friendly-fire 
 
 Acceptance: controlled 1v1 hold, small-group hold, overwhelming-group retreat through a viable lane and recovery — all with native health/ammo/position evidence. Validation: zombie-awareness/combat-intelligence/formation focused tests, then live duel + bystander + save/reload replay.
 
+Owner proposal for a later retreat-policy design (not approved for implementation
+in this pass): confidence should weigh health/injuries, armor/equipment,
+weapons/ammunition, strength/fitness/skills, personal and group strength,
+whether the player fights or flees, prior combat success/survival, recent
+injuries/failures, morale, needs/moodles, surprise/preparation, encirclement,
+choke points/escape routes, and group cohesion, with only a bounded random
+factor. Keep BUG-KS-012's current bounded retreat policy stable until this
+multi-factor design has an explicit owner decision, behavior table, and live
+acceptance plan. Do not turn the proposal into independent roll modifiers or a
+second combat owner.
+
 ### 8. Needs, health, inventory, equipment
 
 Should feel like bodies with limits — hunger, thirst, fatigue, endurance, injury, capacity — solved with real things, not bars that fill themselves.
@@ -424,7 +465,7 @@ Automatic families (`KS_BaseJobs.lua:27`): `guard, patrol, barricade, farm_water
 
 Task lifecycle (single owner per step): discovery queues executable families → `TaskBoard.queue` validates type via catalog → `claimBest` defers to `BaseJobs.selectEligibleTask` then atomic `claimBaseTask` → resident checks exact requirements against carried + loaded assigned containers (`Planner.missingRequirements`) → collects one transfer at a time via native off-slot action → travels → runs vanilla action → verifies real change (plank count, crop state, log consumed, trough amount, object health) → releases claim → history/memory update. Blocked/streamed-out storage blocks the task; nothing becomes an implicit pool. Stale targets fail with a specific reason and never act on a substituted object index.
 
-Selection (`KS_BaseJobs.lua:889`): explicit preference first pass, fallback pass second; work-group priorities (`Auto/1–4/Never`) score `(5-n)*10` per owning group with `Never` as veto-but-other-owner-may-allow; capability/skill affinity is a bounded tie-break (`level*2`, cap 12: Woodwork, Mechanics, Axe, Farming, Aiming, Strength, Cooking); `Needs.priorityBonus` adjusts persisted priority; `lastClaimedBy −18` plus recency decay prevents monopoly; queue order breaks residual ties. Eligibility (`canPerformTask`: duty, presence, capability, recipe, real-stock) stays authoritative over preference.
+Selection (`KS_BaseJobs.lua:889`): explicit role preference keeps its first/fallback passes; the sparse player-base work map exposes High/Normal/Low/Disabled only for the existing guard, patrol, repair, cooking, farming, woodwork, barricade, and hauling groups. High/Normal/Low break otherwise equal selector scores; Disabled excludes an automatic task only when every owning group is disabled. Missing values mean Normal; legacy 1/2/3/4/false migrate to High/Normal/Low/Low/Disabled. Capability/skill affinity remains bounded (`level*2`, cap 12: Woodwork, Mechanics, Axe, Farming, Aiming, Strength, Cooking); `Needs.priorityBonus` adjusts task priority; `lastClaimedBy −18` plus recency decay prevents monopoly; queue order breaks remaining ties. Eligibility (`canPerformTask`: duty, presence, capability, recipe, real-stock) stays authoritative. Active companions do not use this selector; their saved map is dormant until base assignment.
 
 Duty schedule (RimWorld-style, PZ-native): persisted windows in `KS_Persistence.lua:2647` (default sleep 22–6, work 8–12/13–18, recreation 12–13/18–20, anything else); 24-hour strip transforms are UI-only, windows stay the sole authority; `scheduleAssignment` (`KS_BaseJobs.lua:804`) returns `sleep/recreation/work/anything` (plus guard/patrol assignments); sleep/recreation are no-work windows honored as rest; `anything`/missing/non-base duty preserves historical behavior. NPC groups/factions get the default clock lazily once. Player edits go through `CompanionService.setBaseDutySchedule` validation.
 
@@ -432,7 +473,7 @@ Zones vs storage: work areas (`farming, cooking, woodcutting, log_processing, gu
 
 Group jobs: `KS_GroupScavenge.lua:1` sends idle pairs (≥3 members, 2-hr lease, day only, dissolve at nightfall) through normal exploration + formation; loot is real container transfers; lease table is loaded-only. Away-team executor persists participants/objective/destination/ETA/result with the blocked-ledger ownership rules in `BUG-KS-024`.
 
-Prioritize for Codex (dependency order, maps to `KS-PROD-008` steps 5→2→9): (1) one supplied job end-to-end with real change + save/reload; (2) claim/release/fairness with no monopoly or leak; (3) needs-bonus honesty (unknown ≠ shortage); (4) schedule windows honored without starving security/cleanup; (5) shortage → mission → return → deposit → memory chain via planner + group scavenge + organizer; (6) two-worker/crew replays (corpse pair, wood pair, barricade pair) before any new job family. Narrow selector/priority/schedule fixes → OpenCode; new planners, cross-system arbitration, persistence changes → Codex. `BUG-KS-023` stays a feature candidate: ranked multi-role profiles and new work groups need product scoping, never a colony priority grid by stealth.
+Prioritize for Codex (dependency order, maps to `KS-PROD-008` steps 5→2→9): (1) one supplied job end-to-end with real change + save/reload; (2) claim/release/fairness with no monopoly or leak; (3) needs-bonus honesty (unknown ≠ shortage); (4) schedule windows honored without starving security/cleanup; (5) shortage → mission → return → deposit → memory chain via planner + group scavenge + organizer; (6) two-worker/crew replays (corpse pair, wood pair, barricade pair) before any new job family. The approved BUG-KS-023 four-state base-resident preference slice is implemented in the existing selector; Build 42 UI, execution, interruption, and save/reload remain acceptance. New planners, cross-system arbitration, persistence changes, broader categories, and ranked multi-role profiles remain separately scoped work. Never add a colony grid by stealth.
 
 ### 11. Companions, orders, HUD, Card, Notebook
 
@@ -763,7 +804,8 @@ Codex rules:
 - **One owner per boundary:** identity/persistence (`KS_Persistence.lua` + Java records), brains (`KS_SurvivorAutonomyController.lua`), movement (Java traversal + cohesion), combat (awareness/threat/firearm), storage (`KS_BaseStorage.lua`), jobs (`KS_BaseJobs.lua` + `KS_BaseTaskBoard.lua` + `KS_BaseNeeds.lua` + `KS_BaseSupplyPlanner.lua`), companions (`KS_CompanionService.lua` + catalog/signals), social/groups/factions (relationship + group/faction records), off-screen (unloaded ledger + storylets + traces + event runtime), population (`KS_WorldPopulation.lua`). Connect through these owners; never add a parallel controller, ledger, or simulation.
 - **Must stay retired:** central "Main Supplies" + container sorting (`KS_OrderCatalog.lua:72`, `KS_Persistence.lua:5896`, `KS_BaseStorage.lua:864`, `KS_BaseJobs.lua:1102`, `KS_SurvivorAutonomyController.lua:11985`, `KS_BaseManager.lua:311`); animal care (`KS_Persistence.lua:414`, `KS_BaseJobs.lua:9`); construction/defense areas (`KS_Persistence.lua:396`); Base Setup window (removed; Notebook via `KS_BaseContextMenu.lua:316` is canonical); legacy right-click orders stay opt-in/off (`KS_Settings.lua:275`).
 - **Legacy shims to preserve:** `LEGACY_TASK_TYPES`/`LEGACY_ORDER_ALIASES` + canonical normalization and stale-record cancellation (`KS_Persistence.lua:77`); legacy fridge policy (`KS_BaseStorage.lua:223`); task aliases (`KS_OrderCatalog.lua:86`); label normalization (`KS_BaseJobs.lua:789`). They are save compatibility, not extension points.
-- **Dormant by design (do not "finish" unprompted):** `KS_AutomatedQA.lua` full coordinator (`FULL_STEPS`, `advanceStep` unreachable — mode is always `vertical_slice`); `KS_*Probe.lua` harnesses + `KS_AutomatedJobMatrix`; orphan menu/helpers with zero callers (e.g. unwired `KS_BaseContextMenu.lua:298` territory/zone entries marked Retired). Deletable candidates, not features. `FEATURE_AUDIT.md` Goals 13/14/15 still list retired paths as active — that file is non-authoritative history; do not follow it over current retirement entries.
+- **QA tooling boundary (KS-PROD-011 / D-033):** The manifest, coordinator, and parser remain offline regression fixtures only; the in-game QA runner and save-arming UI were retired. Their presence in source does not imply playable survivor behavior or live coverage. Gameplay acceptance comes from ordinary Build 42 replays with explicit expected outcomes.
+- **Dormant by design (do not "finish" unprompted):** orphan menu/helpers with zero callers (e.g. unwired `KS_BaseContextMenu.lua:298` territory/zone entries marked Retired). Deletable candidates, not features. `FEATURE_AUDIT.md` Goals 13/14/15 still list retired paths as active — that file is non-authoritative history; do not follow it over current retirement entries.
 - **Experimental until gated:** NPC driving (off, `KS_Settings.lua:20`), faction raids (off, `:30`), Knox events (off, `:26`), away-team dispatch, dev QA modes. No promises without their acceptance gates (`D-004`, `QA_RELEASE.md`).
 - **Evidence discipline:** offline doubles prove control flow only. Engine behaviour (animation, pathing, damage, transfer, UI render, streaming, save) needs disposable-save Build 42 live replay with the exact scenario in `QA_RELEASE.md` / `DEVELOPMENT_TESTING.md`. Record counts, revision, runtime path, and remaining gaps honestly.
 
@@ -774,7 +816,7 @@ Use this order when `WORK_QUEUE.md` / `BUGS.md` leave room for judgment. It does
 1. Lifecycle/identity safety (`KS-PROD-008` step 1; `BUG-KS-008`, `BUG-KS-024`): no duplicates, no lost orders/inventory, blocked-ledger recovery. Nothing else outranks this.
 2. Loaded job correctness (`KS-PROD-008` step 5): one supplied guard/patrol/barricade/farm/chop/saw/corpse/repair/cook job with real tool/material, native action, verified world change, claim release, save/reload intact.
 3. Storage honesty (`BUG-KS-015`, `BUG-KS-016`): typed deposit + General fallback + overflow; organizer never steals reserved loads; planner never invents stock.
-4. Scheduling fairness (`BUG-KS-013`, `BUG-KS-023` as candidate): preference → work-group priority → skill tie-break → needs bonus → anti-monopoly; sleep/recreation honored; security/cleanup never starved.
+4. Scheduling fairness (`BUG-KS-013`, `BUG-KS-023`): existing one-job election retains task priority, capability, security coverage, fairness and anti-monopoly; player work preferences only affect otherwise equal eligible choices; sleep/recreation remain honored and security/cleanup must not be starved.
 5. Unloaded parity (`BUG-KS-024`, `BUG-KS-001`, `BUG-KS-002`): needs/travel/rest/storylet/trace behaviour matches loaded intent with retryable materialization and no fabricated outcomes.
 6. Movement/combat polish (`BUG-KS-011`, `BUG-KS-012`, `BUG-KS-028`, `BUG-KS-029`): follow cadence, retreat admission, firearm stabilization — only after 1–5 are stable.
 7. Expansion only with owner approval: richer multi-role profiles, new work groups, ground-item zones, generic mission planner, memory ledger with decay/gossip. Each needs a bounded work item with scope, acceptance, validation, and one owner. Never a colony grid or second simulation by stealth.
@@ -792,3 +834,27 @@ This note is design authority, not a task list. Codex/OpenCode must still work f
 5. Record offline evidence in the owning task/bug; leave every engine-bound behaviour as live-unverified with the exact replay in `QA_RELEASE.md` / `DEVELOPMENT_TESTING.md`.
 6. Update `CURRENT_STATE.md` position, `WORK_QUEUE.md`/`BUGS.md` state, and `DECISIONS.md` only when a settled choice changed — never a new parallel plan document.
 7. Escalate by boundary: narrow reproducible defect → OpenCode; persistence/identity/lifecycle/cross-system → Codex; vision/architecture/evidence/release risk → Boss/owner. Follow `AI_WORKFLOW.md` escalation ladder.
+
+## Retreat policy design and acceptance — D-031
+
+The next retreat-policy design uses a survivor-specific comparison between
+fighting risk and retreat risk, while preserving the existing controller as the
+sole admission owner and Project Zomboid as the combat/movement authority. The
+assessment should account for condition/injury, protection/equipment, actual
+weapon/ammo, capability/fitness, group strength/cohesion, threat count/type,
+surprise, escape lanes/chokes, recent combat experience, player conduct, morale,
+and current moodles. Missing values are neutral/unknown. Bounded randomness is
+a stable tie-break only; it cannot overturn clear danger or an unsafe escape.
+
+| Test case | Expected behavior |
+|---|---|
+| Healthy, armed, prepared against one ordinary threat | Fight/hold; no arbitrary flee |
+| Injured/bleeding or unarmed against a dangerous group with a clear lane | Retreat if the real lane is safer; later resume the durable role |
+| Strong cohesive group against a small threat | Fight/hold without scattering |
+| Surrounded or no safe exit | No fictitious retreat; bounded defensive recovery |
+| Surprise/player fighting or withdrawing | May affect close decisions, never override explicit orders or clear lethal risk |
+| Recent failure, morale/moodles, equivalent close tie | Bounded stable difference; no per-tick reroll or oscillation |
+
+D-031 is design-only. The current BUG-KS-012 retreat owner and thresholds
+remain unchanged pending a separately approved implementation package and
+native combat/pathing replay.

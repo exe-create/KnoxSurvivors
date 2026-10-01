@@ -55,6 +55,46 @@ function Layout.bindView(view)
     Layout.fitView(view)
 end
 
+-- Base & Work embeds native scrolling lists inside a page scroller. Native UI
+-- dispatch already gives the hovered list its wheel event. If that event then
+-- bubbles to the page, consume it here; forwarding it to the list again causes
+-- a second scroll step and makes adjacent sections appear to move together.
+function Layout.routeWheelToChildren(view, delta, children)
+    local mouseX = type(getMouseX) == "function" and getMouseX() or nil
+    local mouseY = type(getMouseY) == "function" and getMouseY() or nil
+    if mouseX ~= nil and mouseY ~= nil then
+        for _, child in ipairs(children or {}) do
+            if child ~= nil and child.onMouseWheel ~= nil
+                and child.getAbsoluteX ~= nil and child.getAbsoluteY ~= nil then
+                local x = mouseX - child:getAbsoluteX()
+                local y = mouseY - child:getAbsoluteY()
+                if x >= 0 and y >= 0 and x < child:getWidth()
+                    and y < child:getHeight() then
+                    -- The child owns its native wheel event. The page only
+                    -- suppresses the bubbled copy; never invoke it twice.
+                    return true, child
+                end
+            end
+        end
+    end
+    if view ~= nil and view.setYScroll ~= nil and view.getYScroll ~= nil then
+        view:setYScroll(view:getYScroll() - delta * 30)
+        return true, nil
+    end
+    return false, nil
+end
+
+-- ISScrollingListBox's default doDrawItem skips rows outside its viewport.
+-- Custom Knox row callbacks replace that method, so they must preserve the
+-- same visibility check while still returning the row's full next-Y value.
+function Layout.listRowVisible(list, y, item)
+    if list == nil or item == nil then return false end
+    local height = tonumber(list.itemheight) or tonumber(item.height) or 0
+    local scroll = list.getYScroll ~= nil and (list:getYScroll() or 0) or 0
+    local rowY = y + scroll
+    return not (rowY + height < 0 or rowY >= (tonumber(list.height) or 0))
+end
+
 -- Wrap the footer using measured labels; reserve its full height below the list.
 function Layout.residentFooter(view, spacing, buttonHeight)
     local controls = {view.viewBtn, view.joinPartyBtn, view.sendHomeBtn, view.jobPicker, view.setJobBtn}

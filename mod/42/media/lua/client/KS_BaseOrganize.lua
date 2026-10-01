@@ -42,15 +42,19 @@ local function itemIdentity(item)
     return nil
 end
 
--- Best shelf for an item among loaded assigned policies, ranked exactly
+-- Best shelf for an item among loaded filtered policies, ranked exactly
 -- like deposits (priority, exactness, distance). Returns the policy key.
 local function bestPolicyFor(base, character, item, excludeKey)
     if base == nil or character == nil or item == nil then return nil end
     local origin = call(character, "getCurrentSquare", nil)
     if origin == nil then return nil end
     local best, bestRank, bestExact, bestDistance = nil, nil, nil, nil
-    for _, policy in ipairs(KnoxBaseStorage.policies(base)) do
-        if policy.key ~= excludeKey and KnoxBaseStorage.acceptsDeposit(policy, item) then
+    for _, policy in ipairs(KnoxBaseStorage.operationalPolicies(base)) do
+        -- An automatically discovered container is only a deposit fallback.
+        -- Organizing should move misplaced items toward an explicit filter,
+        -- never shuffle them between otherwise-unfiltered chests.
+        if policy.key ~= excludeKey and policy.transientContainer ~= true
+            and KnoxBaseStorage.acceptsDeposit(policy, item) then
             local rank = KnoxBaseStorage.priorityRank ~= nil
                 and KnoxBaseStorage.priorityRank(policy) or 2
             local exact = KnoxBaseStorage.classifyItem ~= nil
@@ -68,7 +72,7 @@ local function bestPolicyFor(base, character, item, excludeKey)
     return best
 end
 
--- One organize round: scan nearby assigned shelves for an item whose best
+-- One organize round: scan nearby loaded base containers for an item whose best
 -- shelf is meaningfully better. Meaningful means a strictly higher
 -- priority tier, or a misplaced item (its shelf rejects it) moving to a
 -- shelf that accepts it. Equal-tier shuffles never qualify, so settled
@@ -81,7 +85,7 @@ function Organize.find(base, character, available, reserved)
     if origin == nil then return nil, "organize_unavailable" end
     local oz = origin:getZ()
     local inspected = 0
-    for _, policy in ipairs(KnoxBaseStorage.policies(base)) do
+    for _, policy in ipairs(KnoxBaseStorage.operationalPolicies(base)) do
         local dx = (tonumber(policy.x) or math.huge) - origin:getX()
         local dy = (tonumber(policy.y) or math.huge) - origin:getY()
         if (tonumber(policy.z) or 0) == oz and dx * dx + dy * dy <= SCAN_RADIUS * SCAN_RADIUS then
@@ -99,7 +103,8 @@ function Organize.find(base, character, available, reserved)
                         if item ~= nil and identity ~= nil and not favorite
                             and (available == nil or available(item))
                             and (reserved == nil or not reserved(item)) then
-                            local misplaced = not KnoxBaseStorage.acceptsDeposit(policy, item)
+                            local misplaced = policy.transientContainer == true
+                                or not KnoxBaseStorage.acceptsDeposit(policy, item)
                             local best = bestPolicyFor(base, character, item, policy.key)
                             if best ~= nil then
                                 local srcRank = KnoxBaseStorage.priorityRank ~= nil
@@ -208,8 +213,8 @@ function Organize.step(plan, character, base, bridge, id, ticks)
         -- Re-resolve the destination at drop time: shelves fill, unload, or
         -- get reassigned while walking. A stale plan re-plans, never forces.
         local store = nil
-        if KnoxBaseStorage.policies ~= nil then
-            for _, policy in ipairs(KnoxBaseStorage.policies(base)) do
+        if KnoxBaseStorage.operationalPolicies ~= nil then
+            for _, policy in ipairs(KnoxBaseStorage.operationalPolicies(base)) do
                 if policy.key == plan.destinationPolicy.key then
                     local resolved = KnoxBaseStorage.resolvePolicy(policy)
                     if resolved ~= nil then store = resolved end

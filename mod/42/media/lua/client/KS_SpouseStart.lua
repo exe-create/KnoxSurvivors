@@ -3,6 +3,31 @@ require "KS_Persistence"
 local SpouseStart = {}
 KnoxSpouseStart = SpouseStart
 
+local function allocateSpouseId(playerId)
+    local random = rawget(_G, "ZombRand")
+    for attempt = 1, 16 do
+        local salt
+        if type(random) == "function" then
+            local ok, value = pcall(random, 1000000000)
+            if ok then salt = tonumber(value) end
+        end
+        if salt == nil and math.random ~= nil then
+            salt = math.random(0, 999999999)
+        end
+        if salt == nil then salt = attempt end
+        local id = "ks-spouse-" .. tostring(playerId) .. "-" .. tostring(math.floor(salt))
+        if KnoxPersistence.getRecord(id) == nil then return id end
+    end
+    -- Keep collisions impossible even if the engine RNG repeats a value.
+    local suffix = 1
+    local id = "ks-spouse-" .. tostring(playerId) .. "-fallback-" .. tostring(suffix)
+    while KnoxPersistence.getRecord(id) ~= nil do
+        suffix = suffix + 1
+        id = "ks-spouse-" .. tostring(playerId) .. "-fallback-" .. tostring(suffix)
+    end
+    return id
+end
+
 function SpouseStart.update(player, activate)
     if player == nil or player:getCurrentSquare() == nil or player:isDead() then return false end
     local playerId = KnoxPersistence.ensurePlayerId(player)
@@ -14,7 +39,10 @@ function SpouseStart.update(player, activate)
             data.spouseStart = { status = "skipped" }
             return false
         end
-        data.spouseStart = { status = "pending", id = "ks-spouse-" .. playerId }
+        -- Personality and other stable identity traits derive from this ID.
+        -- A one-time saved random suffix gives new-save spouses variation;
+        -- retries and reloads keep the reserved identity unchanged.
+        data.spouseStart = { status = "pending", id = allocateSpouseId(playerId) }
     end
     local start = data.spouseStart
     if start.status ~= "pending" or not KnoxSettings.spawnWithSpouse() then return false end
