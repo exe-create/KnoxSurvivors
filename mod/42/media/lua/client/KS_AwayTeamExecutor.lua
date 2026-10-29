@@ -40,12 +40,15 @@ function Executor.beginCollection(teamId, now)
     return nil, "not_collectible"
 end
 
-local function itemInInventory(character, item)
-    if character == nil or item == nil then return false end
-    local inventory = character:getInventory()
-    if inventory == nil or inventory.contains == nil then return false end
-    local ok, present = pcall(inventory.contains, inventory, item)
-    return ok and present == true
+local function itemReceived(supply, character, item)
+    if character == nil or item == nil or supply.container == nil then return false end
+    local ok, received = pcall(function()
+        local inventory = character:getInventory()
+        return inventory ~= nil and supply.container ~= inventory
+            and supply.container:contains(item) == false
+            and inventory:contains(item) == true and item:getContainer() == inventory
+    end)
+    return ok and received == true
 end
 
 local function itemType(item)
@@ -70,7 +73,7 @@ function Executor.transferredItemTypes(supply, character)
         -- Two real items may share a full type. Deduplicate by object identity
         -- so a mission records every item actually moved, while repeated
         -- references to the same object cannot inflate the result.
-        if fullType ~= nil and itemInInventory(character, item) and not seenItems[item] then
+        if fullType ~= nil and itemReceived(supply, character, item) and not seenItems[item] then
             seenItems[item] = true
             types[#types + 1] = fullType
         end
@@ -80,6 +83,10 @@ end
 
 function Executor.recordCollection(teamId, survivorId, supply, character, now)
     local itemTypes = Executor.transferredItemTypes(supply, character)
+    if type(supply) == "table" and (supply.item ~= nil
+        or type(supply.items) == "table" and #supply.items > 0) and #itemTypes == 0 then
+        return nil, "collection_transfer_not_received"
+    end
     return KnoxPersistence.recordAwayTeamCollection(
         teamId, survivorId, itemTypes, now
     )

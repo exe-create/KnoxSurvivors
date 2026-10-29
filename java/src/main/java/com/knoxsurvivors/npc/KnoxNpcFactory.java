@@ -154,44 +154,6 @@ final class KnoxNpcFactory {
         }
     }
 
-    static void moveToRangeFrom(
-        KnoxNpc npc,
-        Object target,
-        Object approachSquare,
-        float desiredRange
-    ) throws ReflectiveOperationException {
-        requireClass(approachSquare, GRID_SQUARE_CLASS, "approach square");
-        Object body = npc.getBody();
-        float targetX = ((Number) invoke(target, "getX")).floatValue();
-        float targetY = ((Number) invoke(target, "getY")).floatValue();
-        float targetZ = ((Number) invoke(target, "getZ")).floatValue();
-        float referenceX = ((Number) invoke(approachSquare, "getX")).floatValue() + 0.5f;
-        float referenceY = ((Number) invoke(approachSquare, "getY")).floatValue() + 0.5f;
-        float directionX = referenceX - targetX;
-        float directionY = referenceY - targetY;
-        float length = (float) Math.sqrt(directionX * directionX + directionY * directionY);
-        if (length <= 0.001f) {
-            directionX = ((Number) invoke(body, "getX")).floatValue() - targetX;
-            directionY = ((Number) invoke(body, "getY")).floatValue() - targetY;
-            length = (float) Math.sqrt(directionX * directionX + directionY * directionY);
-        }
-        if (length <= 0.001f) {
-            throw new IllegalArgumentException("Cannot determine a safe combat approach direction");
-        }
-        float destinationX = targetX + directionX / length * desiredRange;
-        float destinationY = targetY + directionY / length * desiredRange;
-        invoke(
-            body,
-            "pathToLocationF",
-            float.class,
-            float.class,
-            float.class,
-            destinationX,
-            destinationY,
-            targetZ
-        );
-    }
-
     static void moveToRangeFromCurrentSide(
         KnoxNpc npc,
         Object target,
@@ -285,8 +247,21 @@ final class KnoxNpcFactory {
 
     static String tickMovement(KnoxNpc npc, float remainingDistance, String pace)
         throws ReflectiveOperationException {
-        closeOpenedDoorBehind(npc);
         Object body = npc.getBody();
+        String nativeState = (String) invoke(body, "getCurrentStateName");
+        completeNativeWindowOpening(npc, body, nativeState);
+        // Build 42's isClimbing flag is not the action-context owner of fence,
+        // wall and window traversal. Observe both native states before touching
+        // the route: even a reached node must wait for the crossing to finish.
+        if (KnoxTraversalPolicy.nativeTraversalBusy(
+            (Boolean) invoke(body, "isClimbing"),
+            nativeState,
+            (String) invoke(body, "getCurrentActionContextStateName")
+        )) {
+            npc.setMovementTraversalState("CLIMBING");
+            return "Transition:CLIMBING";
+        }
+        closeOpenedDoorBehind(npc);
         Object pathfinder = invoke(body, "getPathFindBehavior2");
 
         if (npc.movementArea != null && !npc.movementArea.allowsPosition(
@@ -314,11 +289,57 @@ final class KnoxNpcFactory {
         return state;
     }
 
+    static boolean hasNativeTraversalOwner(KnoxNpc npc) throws ReflectiveOperationException {
+        Object body = npc.getBody();
+        return KnoxTraversalPolicy.nativeTraversalBusy(
+            (Boolean) invoke(body, "isClimbing"),
+            (String) invoke(body, "getCurrentStateName"),
+            (String) invoke(body, "getCurrentActionContextStateName")
+        );
+    }
+
+    static void observeNativeAction(KnoxNpc npc) throws ReflectiveOperationException {
+        Object body = npc.getBody();
+        completeNativeWindowOpening(npc, body, (String) invoke(body, "getCurrentStateName"));
+    }
+
+    /** Complete only the native-success world step omitted for off-slot players.
+     * Native animation, locking and movement remain owned by OpenWindowState.
+     */
+    private static void completeNativeWindowOpening(KnoxNpc npc, Object body, String nativeState)
+        throws ReflectiveOperationException {
+        Object window = npc.getTraversalInteractionTarget();
+        if (window == null || !"OPEN_ATTEMPTED".equals(npc.getTraversalInteractionStage())
+            || nativeState == null || !nativeState.contains("OpenWindowState")) {
+            return;
+        }
+        // A native success token can outlive actor death/detachment for a
+        // teardown frame. It cannot authorize a world effect without the
+        // same live, loaded character still owning the opening action.
+        if ((Boolean) invoke(body, "isDead") || invoke(body, "getCurrentSquare") == null) return;
+        String receipt = String.valueOf(invoke(body, "getVariableString", String.class, "StopAfterAnimLooped"));
+        if (!"success".equalsIgnoreCase(receipt)) return;
+        Class<?> openingState = classFor(body, "zombie.ai.states.OpenWindowState");
+        Object key = openingState.getField("WINDOW").get(null);
+        Object nativeWindow = invoke(body, "get", classFor(body, "zombie.ai.State$Param"), key);
+        if (nativeWindow != window || ((Number) invoke(window, "getObjectIndex")).intValue() == -1) return;
+        if (!(Boolean) invoke(window, "IsOpen")) {
+            invoke(window, "ToggleWindow", classFor(body, "zombie.characters.IsoGameCharacter"), body);
+        }
+        if ((Boolean) invoke(window, "IsOpen")) {
+            npc.setTraversalInteractionStage("OPEN_COMPLETED");
+            npc.setMovementTraversalState("COMPLETED_WINDOW_OPEN");
+        } else {
+            // Do not retry a native world mutation every tick or report success.
+            // Let the native state exit; the existing route then rejects the edge.
+            npc.setTraversalInteractionStage("OPEN_COMPLETION_FAILED");
+        }
+    }
+
     /**
-     * Close-behind for base doors, camp tents and any doorway the NPC opened
-     * itself. Fires once the body is more than two tiles from the door
-     * square; doors already open before we touched them are never recorded,
-     * so player-arranged entrances stay exactly as found.
+     * Close only a self-opened door after crossing its original edge, while
+     * still in native interaction reach. Leave occupied doorways open; never
+     * chase a stale door or close one remotely after the actor has walked on.
      */
     static void closeOpenedDoorBehind(KnoxNpc npc) {
         if (!npc.hasOpenedDoor()) {
@@ -326,28 +347,90 @@ final class KnoxNpcFactory {
         }
         try {
             Object body = npc.getBody();
-            float x = ((Number) invoke(body, "getX")).floatValue();
-            float y = ((Number) invoke(body, "getY")).floatValue();
-            float dx = x - (npc.getOpenedDoorX() + 0.5f);
-            float dy = y - (npc.getOpenedDoorY() + 0.5f);
-            if (dx * dx + dy * dy <= 4.0f) {
+            if (hasNativeTraversalOwner(npc)) return;
+            Object door = npc.getOpenedDoor();
+            Object square = invoke(door, "getSquare");
+            Object current = invoke(body, "getCurrentSquare");
+            boolean north = (Boolean) invoke(door, "getNorth");
+            if (square == null || current == null
+                || ((Number) invoke(door, "getObjectIndex")).intValue() == -1
+                || (Boolean) invoke(door, "isDestroyed") || !(Boolean) invoke(door, "IsOpen")
+                || (Boolean) invoke(door, "isBarricaded") || (Boolean) invoke(body, "isDead")
+                || north != npc.getOpenedDoorNorth()
+                || ((Number) invoke(square, "getX")).intValue() != npc.getOpenedDoorX()
+                || ((Number) invoke(square, "getY")).intValue() != npc.getOpenedDoorY()
+                || ((Number) invoke(square, "getZ")).intValue() != npc.getOpenedDoorZ()
+                || ((Number) invoke(body, "getZ")).floatValue() != npc.getOpenedDoorZ()
+                || !(Boolean) invoke(door, "isAdjacentToSquare",
+                    classFor(body, "zombie.iso.IsoGridSquare"), current)) {
+                npc.clearOpenedDoor();
                 return;
             }
-            Object door = npc.getOpenedDoor();
-            boolean open = (Boolean) invoke(door, "IsOpen");
-            boolean barricaded = (Boolean) invoke(door, "isBarricaded");
-            if (open && !barricaded) {
-                invoke(
-                    door,
-                    "ToggleDoor",
-                    classFor(body, "zombie.characters.IsoGameCharacter"),
-                    body
-                );
+            Class<?> direction = classFor(body, "zombie.iso.IsoDirections");
+            Object other = invoke(square, "getAdjacentSquare", direction,
+                direction.getField(north ? "N" : "W").get(null));
+            // Both squares must still be loaded. Restrict automatic closing to
+            // the two actual edge tiles, even if native reach permits diagonals.
+            if (other == null || (current != square && current != other)) {
+                npc.clearOpenedDoor();
+                return;
             }
+            boolean positiveSide = current == square;
+            if (positiveSide == npc.getOpenedDoorFromPositiveSide()) return;
+            float axis = ((Number) invoke(body, north ? "getY" : "getX")).floatValue();
+            int edge = north ? npc.getOpenedDoorY() : npc.getOpenedDoorX();
+            // Reach the landing tile's center before swinging the door behind
+            // the actor; crossing a square boundary alone is not clearance.
+            if (!Float.isFinite(axis)) { npc.clearOpenedDoor(); return; }
+            if (positiveSide ? axis < edge + 0.5f : axis > edge - 0.5f) return;
+            if ((Boolean) invoke(door, "isObstructed")
+                || doorwayHasOtherOccupants(square, body) || doorwayHasOtherOccupants(other, body)) return;
+            invoke(door, "ToggleDoor", classFor(body, "zombie.characters.IsoGameCharacter"), body);
         } catch (Throwable ignored) {
             // Stale, streamed-out or destroyed door: drop the record either way.
         }
         npc.clearOpenedDoor();
+    }
+
+    private static boolean doorwayHasOtherOccupants(Object square, Object body)
+        throws ReflectiveOperationException {
+        for (Object occupant : (java.util.Collection<?>) invoke(square, "getMovingObjects")) {
+            if (occupant != body) return true;
+        }
+        return false;
+    }
+
+    /** Shared native opening boundary for route edges and Lua recovery. */
+    static String openNativeDoor(KnoxNpc npc, Object door) throws ReflectiveOperationException {
+        Object body = npc.getBody();
+        if (door == null || !classFor(body, "zombie.iso.objects.IsoDoor").isInstance(door)) {
+            return "FAILED_INVALID_DOOR";
+        }
+        if (hasNativeTraversalOwner(npc)) return "DOOR_DEFERRED NATIVE_ACTION";
+        Object current = invoke(body, "getCurrentSquare");
+        Object square = invoke(door, "getSquare");
+        if (current == null || square == null || (Boolean) invoke(body, "isDead")
+            || ((Number) invoke(door, "getObjectIndex")).intValue() == -1
+            || (Boolean) invoke(door, "isDestroyed")
+            || ((Number) invoke(body, "getZ")).floatValue() != ((Number) invoke(square, "getZ")).intValue()
+            || !(Boolean) invoke(door, "isAdjacentToSquare", classFor(body, "zombie.iso.IsoGridSquare"), current)) {
+            return "FAILED_DOOR_OUT_OF_REACH";
+        }
+        boolean open = (Boolean) invoke(door, "IsOpen");
+        if (open) return "CLEAR";
+        if ((Boolean) invoke(door, "isBarricaded")) return "FAILED_BARRICADED_DOOR";
+        if (!npc.isDoorWindowOpeningAllowed()) return "FAILED_DOOR_OPENING_DISABLED";
+        npc.useTraversalInteractionTarget(door);
+        invoke(door, "ToggleDoor", classFor(body, "zombie.characters.IsoGameCharacter"), body);
+        if (!(Boolean) invoke(door, "IsOpen")) return "FAILED_LOCKED_DOOR";
+        // Only an observed closed -> open transition grants a close-behind receipt.
+        boolean north = (Boolean) invoke(door, "getNorth");
+        Object openedSquare = invoke(door, "getSquare");
+        int x = ((Number) invoke(openedSquare, "getX")).intValue();
+        int y = ((Number) invoke(openedSquare, "getY")).intValue();
+        npc.rememberOpenedDoor(door, x, y, ((Number) invoke(openedSquare, "getZ")).intValue(), north,
+            ((Number) invoke(body, north ? "getY" : "getX")).floatValue() >= (north ? y : x));
+        return "OPENING_DOOR";
     }
 
     static String describeLive(KnoxNpc npc) throws ReflectiveOperationException {
@@ -597,10 +680,6 @@ final class KnoxNpcFactory {
 
     private static String handleRouteTransition(KnoxNpc npc, Object body, float[] node)
         throws ReflectiveOperationException {
-        if ((Boolean) invoke(body, "isClimbing")) {
-            return "CLIMBING";
-        }
-
         Object currentSquare = invoke(body, "getCurrentSquare");
         Object cell = invoke(body, "getCell");
         if (currentSquare == null || cell == null) {
@@ -693,29 +772,7 @@ final class KnoxNpcFactory {
             if ((Boolean) invoke(body, "shouldBeTurning")) {
                 return "TURNING_TO_DOOR";
             }
-            invoke(
-                door,
-                "ToggleDoor",
-                classFor(body, "zombie.characters.IsoGameCharacter"),
-                body
-            );
-            boolean nowOpen = (Boolean) invoke(door, "IsOpen");
-            if (nowOpen && !open) {
-                // We opened a closed door ourselves: remember it so the
-                // movement tick can close it behind us once we walk on.
-                try {
-                    Object doorSquare = invoke(door, "getSquare");
-                    npc.rememberOpenedDoor(
-                        door,
-                        ((Number) invoke(doorSquare, "getX")).intValue(),
-                        ((Number) invoke(doorSquare, "getY")).intValue(),
-                        ((Number) invoke(doorSquare, "getZ")).intValue()
-                    );
-                } catch (Throwable ignored) {
-                    npc.clearOpenedDoor();
-                }
-            }
-            return nowOpen ? "OPENING_DOOR" : "FAILED_LOCKED_DOOR";
+            return openNativeDoor(npc, door);
         }
 
         if (window != null) {
@@ -725,26 +782,6 @@ final class KnoxNpcFactory {
             npc.useTraversalInteractionTarget(window);
             String characterState = String.valueOf(invoke(body, "getCurrentStateName"));
             if (characterState.contains("OpenWindowState")) {
-                String completion = String.valueOf(
-                    invoke(body, "getVariableString", String.class, "StopAfterAnimLooped")
-                );
-                boolean open = (Boolean) invoke(window, "IsOpen");
-                if ("success".equalsIgnoreCase(completion) && !open) {
-                    // OpenWindowState only toggles the world object for a local player.
-                    // Preserve the engine animation outcome, then complete that omitted
-                    // world-state step without assigning this NPC a local-player slot.
-                    invoke(
-                        window,
-                        "ToggleWindow",
-                        classFor(body, "zombie.characters.IsoGameCharacter"),
-                        body
-                    );
-                    if (!(Boolean) invoke(window, "IsOpen")) {
-                        return "FAILED_WINDOW_OPEN_COMPLETION";
-                    }
-                    npc.setTraversalInteractionStage("OPEN_COMPLETED");
-                    return "COMPLETED_WINDOW_OPEN";
-                }
                 return "OPENING_WINDOW";
             }
             if (characterState.contains("SmashWindowState")) {
@@ -860,7 +897,7 @@ final class KnoxNpcFactory {
                 return "FAILED_CLIMBING_DISABLED";
             }
             // The native vault transition is asynchronous.  A second route
-            // tick can arrive before IsoPlayer reports isClimbing(), and
+            // tick can arrive before the native climb state starts, and
             // issuing climbOverFence again in that gap restarts the animation
             // or leaves the body pressed against the edge until the route
             // watchdog reports FailedStuck.  Keep one request per edge and
@@ -868,8 +905,7 @@ final class KnoxNpcFactory {
             // native climb.  A successful crossing changes currentSquare and
             // releases this interaction through useTraversalInteractionTarget.
             if ("CLIMB_ATTEMPTED".equals(npc.getTraversalInteractionStage())) {
-                return (Boolean) invoke(body, "isClimbing")
-                    ? "CLIMBING" : "ManualRoute";
+                return "ManualRoute";
             }
             // isHoppableTo reports a fence-like edge, but does not guarantee
             // that this survivor can vault it. Use Build 42's player-aware
@@ -926,8 +962,7 @@ final class KnoxNpcFactory {
             // fence vault. Do not enqueue a second climb while the first one
             // is still resolving.
             if ("CLIMB_ATTEMPTED".equals(npc.getTraversalInteractionStage())) {
-                return (Boolean) invoke(body, "isClimbing")
-                    ? "CLIMBING" : "ManualRoute";
+                return "ManualRoute";
             }
             // IsoPlayer.canClimbOverWall rejects sprinting before checking the
             // wall. Release approach input first, just as a player must stop

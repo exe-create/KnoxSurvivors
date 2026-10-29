@@ -158,6 +158,30 @@ end
 -- Called only when the canonical living record transitions to dead, before
 -- corpse teardown can detach its body. Corpse cleanup retries do not repeat it.
 function ActivityFeed.survivorDied(id, character)
+    local witnessed = false
+    if character ~= nil and getSpecificPlayer ~= nil then
+        for index = 0, math.max(0, (getNumActivePlayers ~= nil and getNumActivePlayers() or 1)-1) do
+            local ok, seen = pcall(function() return getSpecificPlayer(index):CanSee(character) == true end)
+            if ok and seen then
+                witnessed = true
+                -- The lifecycle event is real evidence for this witness, even
+                -- when no journal/card has ever been opened this session.
+                if KnoxPersistence.rememberObserverKnowledge ~= nil then
+                    local observerId = KnoxPersistence.ensurePlayerId(getSpecificPlayer(index))
+                    local known = KnoxPersistence.getObserverKnowledge(observerId,id)
+                    local value = known ~= nil and known.seen ~= nil and known.seen.value or {}
+                    value.alive, value.activity = false, "Dead (witnessed)"
+                    local sq = character:getCurrentSquare()
+                    if sq ~= nil then
+                        value.position = {x=sq:getX(),y=sq:getY(),z=sq:getZ()}
+                        value.deathEvidence = {x=sq:getX(),y=sq:getY(),z=sq:getZ(),locationSource="observed"}
+                    end
+                    KnoxPersistence.rememberObserverKnowledge(observerId,id,"seen",value,getGameTime():getWorldAgeHours())
+                end
+            end
+        end
+    end
+    if not witnessed then return end
     local _, _, name = SurvivorNames.resolve(id, KnoxPersistence.getSurvivorIdentity(id), character)
     addLine(name .. " has passed away.", "<RGB:0.88,0.55,0.48>")
 end
@@ -173,6 +197,19 @@ function ActivityFeed.speak(character, text)
             character:addLineChatElement(tostring(text), 1.0, 1.0, 1.0)
         end)
     end
+    -- Native overhead chat keeps its own presentation rules. The global feed
+    -- and direction marker must not transcribe speech no local player heard.
+    local heard = false
+    local bridge = rawget(_G, "KnoxJavaBridge")
+    if character ~= nil and bridge ~= nil and getSpecificPlayer ~= nil then
+        for index = 0, math.max(0, (getNumActivePlayers ~= nil and getNumActivePlayers() or 1) - 1) do
+            local ok, audible = pcall(function()
+                return bridge:canHearOrder(character, getSpecificPlayer(index))
+            end)
+            if ok and audible == true then heard = true; break end
+        end
+    end
+    if not heard then return end
     local groupLabel, colour = speakerContext(character)
     -- Close-but-offscreen voices get a screen-edge arrow (track them down)
     -- and a distance tag; distant lines stay feed-only.

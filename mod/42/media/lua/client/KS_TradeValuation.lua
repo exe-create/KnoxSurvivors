@@ -198,6 +198,9 @@ end
 local function relationContext(player, id)
     local persistence, runtime = rawget(_G, "KnoxPersistence"), rawget(_G, "KnoxSurvivorRuntime")
     if persistence == nil or runtime == nil or not persistence.isSurvivorAlive(id) then return nil, "not_alive" end
+    if runtime.canInteract ~= nil and not runtime.canInteract(id) then
+        return nil, "survivor_unavailable"
+    end
     local localPlayer = false
     if rawget(_G, "getSpecificPlayer") ~= nil then
         local count = 4

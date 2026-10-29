@@ -57,16 +57,25 @@ local function foodIn(container, predicate, depth)
     end
 end
 
-function Cooking.hasReadyMeal(base)
+local function policyAllowsItem(policy,item,itemAvailable)
+    return (itemAvailable==nil or itemAvailable(item)==true)
+        and (KnoxBaseStorage.filterAllowsItem==nil
+            or KnoxBaseStorage.filterAllowsItem(policy,item)==true)
+end
+
+function Cooking.hasReadyMeal(base,itemAvailable)
     for _,policy in ipairs(KnoxBaseStorage.policies(base)) do
         local store=KnoxBaseStorage.resolvePolicy(policy)
-        if store~=nil and foodIn(store.container,KnoxSurvivorNeeds.isSafeFood,0)~=nil then return true end
+        if store~=nil and foodIn(store.container,function(item)
+            return KnoxSurvivorNeeds.isSafeFood(item) and policyAllowsItem(policy,item,itemAvailable)
+        end,0)~=nil then return true end
     end
     return false
 end
 
-local function foodSource(base,character)
-    local predicate=function(item) return owners[item]==nil and Cooking.canCook(item) end
+local function foodSource(base,character,itemAvailable)
+    local predicate=function(item) return owners[item]==nil and Cooking.canCook(item)
+        and (itemAvailable==nil or itemAvailable(item)==true) end
     local item,source=foodIn(character:getInventory(),predicate,0)
     if item~=nil then return {item=item,container=source} end
     local origin=character:getCurrentSquare()
@@ -76,7 +85,9 @@ local function foodSource(base,character)
                 + ((tonumber(policy.y) or math.huge)-origin:getY())^2<=32*32 then
             local store=KnoxBaseStorage.resolvePolicy(policy)
             if store~=nil then
-                item,source=foodIn(store.container,predicate,0)
+                item,source=foodIn(store.container,function(candidate)
+                    return predicate(candidate) and policyAllowsItem(policy,candidate,itemAvailable)
+                end,0)
                 if item~=nil then return {item=item,container=source,square=store.square,policy=policy.key} end
             end
         end
@@ -144,13 +155,13 @@ local function allowed(base,square,zoneId)
     return KnoxBaseManager~=nil and KnoxBaseManager.containsSquare(base,square)
 end
 
-function Cooking.findTask(base,character)
+function Cooking.findTask(base,character,itemAvailable)
     if not enabled() or base==nil or character==nil or getCell==nil or getCell()==nil then return nil,"cooking_unavailable" end
     local origin=character:getCurrentSquare()
     if origin==nil then return nil,"cooking_unavailable" end
     local now=getTimestampMs~=nil and tonumber(getTimestampMs()) or nil
     if now~=nil and nextScan[base]~=nil and now<nextScan[base] then return nil,"kitchen_scan_cooldown" end
-    local source=foodSource(base,character)
+    local source=foodSource(base,character,itemAvailable)
     local regions={}
     local hasCookingArea=false
     for _,zone in pairs(base.zones or {}) do
@@ -189,7 +200,8 @@ function Cooking.findTask(base,character)
                             object:getModData().KnoxCooking=nil
                             mark=nil
                         end
-                        if (recovered~=nil and (Cooking.canCook(recovered) or KnoxSurvivorNeeds.isSafeFood(recovered)))
+                        if (recovered~=nil and (itemAvailable==nil or itemAvailable(recovered)==true)
+                            and (Cooking.canCook(recovered) or KnoxSurvivorNeeds.isSafeFood(recovered)))
                             or (source~=nil and empty and not object:Activated() and mark==nil) then
                             return {id="cook:"..tostring(base.id),action="cook",x=x,y=y,z=square:getZ(),
                                 objectIndex=object:getObjectIndex(),spriteName=call(call(object,"getSprite",nil),"getName",""),
@@ -221,11 +233,15 @@ function Cooking.resolveTaskSquare(base,target,character)
     return object~=nil and AdjacentFreeTileFinder.Find(object:getSquare(),character) or nil
 end
 
-function Cooking.begin(base,target,character,id)
+function Cooking.begin(base,target,character,id,itemAvailable)
     local object=resolve(base,target)
     if object==nil or owners[object]~=nil then return nil,"cooking_appliance_unavailable" end
     local recovered=markedItem(object,base)
-    local source=recovered~=nil and {item=recovered,container=object:getContainer()} or foodSource(base,character)
+    if recovered~=nil and itemAvailable~=nil and itemAvailable(recovered)~=true then
+        return nil,"cooking_ingredient_reserved"
+    end
+    local source=recovered~=nil and {item=recovered,container=object:getContainer()}
+        or foodSource(base,character,itemAvailable)
     if source==nil or owners[source.item]~=nil then return nil,"cooking_ingredient_unavailable" end
     if recovered==nil and (object:Activated() or not object:getContainer():getItems():isEmpty()
         or object:getModData().KnoxCooking~=nil) then return nil,"cooking_appliance_in_use" end
@@ -323,6 +339,7 @@ function Cooking.step(plan,character,base,bridge,ticks)
     end
     local queue=ISTimedActionQueue.getTimedActionQueue(character)
     if not character:getCharacterActions():isEmpty()
+        or (type(queue.queue)=="table" and #queue.queue>0)
         or (plan.action~=nil and queue:indexOf(plan.action)~=-1) then return "working" end
     if plan.phase=="transfer" then
         if not plan.destination:contains(plan.item) then return "failed","cooking_transfer_not_completed" end
@@ -335,7 +352,9 @@ function Cooking.step(plan,character,base,bridge,ticks)
                 if policy.key==plan.source.policy then
                     local store=KnoxBaseStorage.resolvePolicy(policy)
                     if store~=nil then
-                        local _,source=foodIn(store.container,function(item) return item==plan.item end,0)
+                        local _,source=foodIn(store.container,function(item)
+                            return item==plan.item and policyAllowsItem(policy,item,nil)
+                        end,0)
                         actualSource=source
                     end
                 end
@@ -378,8 +397,13 @@ function Cooking.step(plan,character,base,bridge,ticks)
             if now-plan.heatStarted>2 then return "failed","cooking_heat_timeout" end
             local action=HeatAction:new(character,object)
             action.plan=plan
-            ISTimedActionQueue.add(action)
-            if queue:indexOf(action)==-1 then return "failed","cooking_heat_action_not_queued" end
+            -- begin may complete synchronously. Admission is the registered
+            -- native queue return, not continued action membership.
+            local admittedQueue=ISTimedActionQueue.add(action)
+            if admittedQueue==nil or ISTimedActionQueue.queues==nil
+                or admittedQueue~=ISTimedActionQueue.queues[character] then
+                return "failed","cooking_heat_action_not_queued"
+            end
             plan.action=action
         end
         return "working"

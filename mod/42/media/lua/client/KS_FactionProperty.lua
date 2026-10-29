@@ -21,10 +21,9 @@ local function localPlayerId(character)
     return nil
 end
 
-local function theftContext(action)
+local function theftContext(action, playerId)
     if action == nil or action.character == nil or action.srcContainer == nil
         or action.destContainer == nil then return nil end
-    local playerId = localPlayerId(action.character)
     if playerId == nil or action.destContainer.isInCharacterInventory == nil
         or not action.destContainer:isInCharacterInventory(action.character) then
         return nil
@@ -42,18 +41,44 @@ local function theftContext(action)
     return base ~= nil and { playerId = playerId, baseId = base.id } or nil
 end
 
+-- A transferred bag carries its contents into the same explicit allocation.
+-- Native inventories are trees; bound malformed/cyclic containers defensively.
+local function clearCommunalAllocation(item, seen, depth)
+    if item == nil or seen[item] or depth > 32 then return end
+    seen[item] = true
+    if item.getModData ~= nil then
+        local ok, data = pcall(function() return item:getModData() end)
+        if ok and data ~= nil then data.KnoxBaseProvision = nil end
+    end
+    local ok, inventory = pcall(function() return item:getInventory() end)
+    if not ok or inventory == nil then return end
+    local items = inventory:getItems()
+    for index = 0, items:size() - 1 do
+        clearCommunalAllocation(items:get(index), seen, depth + 1)
+    end
+end
+
 -- Build 42 performs authoritative inventory transfers locally in singleplayer.
 -- Multiplayer completion is server-owned, so do not create a client-only
 -- diplomacy change from a packet that may still be rejected by the server.
 if ISInventoryTransferAction ~= nil and ISInventoryTransferAction.transferItem ~= nil then
-    local nativeTransferItem = ISInventoryTransferAction.transferItem
+    Property._nativeTransferItem = Property._nativeTransferItem or ISInventoryTransferAction.transferItem
+    local nativeTransferItem = Property._nativeTransferItem
     function ISInventoryTransferAction:transferItem(item)
-        local context = not (isClient ~= nil and isClient()) and theftContext(self) or nil
+        local playerId = not (isClient ~= nil and isClient()) and localPlayerId(self.character) or nil
+        local context = playerId ~= nil and theftContext(self, playerId) or nil
+        local source, destination = self.srcContainer, self.destContainer
+        local wasPresent = playerId ~= nil and item ~= nil and source ~= nil and source:contains(item)
         local result = nativeTransferItem(self, item)
         -- A failed transfer leaves the item in its source. Escalate only after
         -- the stock action really completed, including batched transfers.
-        if context ~= nil and item ~= nil and self.srcContainer ~= nil
-            and not self.srcContainer:contains(item) then
+        local received = self.item or item
+        if wasPresent and not source:contains(item) and received ~= nil
+            and destination:contains(received) then
+            -- An explicit player allocation supersedes an earlier base withdrawal.
+            -- Clear only on a native receipt, never on refusal or a repeated callback.
+            clearCommunalAllocation(received, {}, 0)
+            if context == nil then return result end
             local relation, status = KnoxPersistence.recordPlayerFactionTheft(
                 context.playerId, context.baseId, worldAge()
             )

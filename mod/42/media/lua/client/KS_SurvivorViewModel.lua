@@ -5,41 +5,14 @@ require "KS_SurvivorNeeds"
 require "KS_SurvivorRuntime"
 require "KS_OrderCatalog"
 local SurvivorNames = require "KS_SurvivorNames"
-local OffscreenStories = require "KS_OffscreenStories"
 
 local ViewModel = rawget(_G, "KnoxSurvivorViewModel") or {}
 _G.KnoxSurvivorViewModel = ViewModel
 
-local MEMORY_LABELS = {
-    meet = "Met another survivor",
-    close_call = "Survived a close call",
-    rest = "Found a quiet moment",
-    haunt = "Returned to familiar ground",
-    weather = "Endured bad weather",
-    cache = "Remembered a possible cache",
-    ride = "Caught a ride",
-    scar = "Returned to a remembered place",
-}
-
-local function recentHistoryFor(id)
-    if OffscreenStories == nil or OffscreenStories.recentHistoryFor == nil then return {} end
-    local ok, history = pcall(OffscreenStories.recentHistoryFor, id, 3)
-    if not ok or type(history) ~= "table" then return {} end
-    for _, entry in ipairs(history) do
-        local label = MEMORY_LABELS[tostring(entry.kind or "")]
-        if entry.kind == "meet" then
-            label = entry.outcome == "joined" and "Joined another survivor"
-                or ((entry.outcome == "declined" or entry.outcome == "parted")
-                    and "Parted ways with a survivor")
-                or (entry.outcome == "hostile" and "Hostile encounter"
-                    or "Met another survivor")
-        end
-        entry.label = label or "Survived offscreen"
-    end
-    return history
-end
 
 local ACTIVITY_LABELS = {
+    regroup_last_contact = "Returning to last contact",
+    awaiting_player_contact = "Waiting at last contact", regroup_route_blocked = "Regrouping route blocked",
     reading = "Reading",
     eating = "Eating", drinking = "Drinking", sleeping = "Sleeping",
     washing = "Washing", reloading = "Reloading",
@@ -62,8 +35,18 @@ local ACTIVITY_LABELS = {
     patrolling = "Patrolling",
     collecting_job_supplies = "Collecting job supplies",
     waiting_for_materials = "Waiting for materials",
+    waiting_for_food = "Waiting for food", waiting_for_water = "Waiting for water",
+    waiting_for_medical = "Waiting for medical supplies",
     sorting_inventory = "Sorting inventory",
     storing_supplies = "Storing supplies",
+    seeking_base_supplies = "Looking for base supplies",
+    collecting_base_supplies = "Collecting base supplies",
+    on_supply_run = "On a supply run",
+    returning_with_base_supplies = "Returning with base supplies",
+    returning_from_supply_run = "Returning from supply run",
+    storing_base_supplies = "Storing base supplies",
+    taking_base_supplies_to_storage = "Taking base supplies to storage",
+    waiting_to_store_base_supplies = "Waiting to store base supplies",
     looting = "Looting",
     searching = "Searching",
     seeking_supplies = "Looking for supplies",
@@ -133,29 +116,6 @@ local function liveCharacter(id)
     return squareOk and square ~= nil and character or nil
 end
 
-local function physicalState(character, id)
-    local fallback = {
-        hunger = 0,
-        thirst = 0,
-        fatigue = 0,
-        endurance = 1,
-        bleedingParts = 0,
-        health = 100,
-    }
-    if character == nil then
-        local stored = KnoxPersistence.getUnloadedSurvivalState ~= nil
-            and KnoxPersistence.getUnloadedSurvivalState(id) or nil
-        local known = type(stored) == "table" and stored.pendingMaterialization ~= true
-        return known and stored or fallback, known
-    end
-    local success, state = pcall(function()
-        return KnoxSurvivorNeeds.snapshot(character)
-    end)
-    if success and type(state) == "table" then
-        return state, true
-    end
-    return fallback, false
-end
 
 local function weaponName(character)
     if character == nil then
@@ -361,44 +321,17 @@ local function runtimeActivity(id)
     return ACTIVITY_LABELS[tostring(snapshot.activity or "")]
 end
 
--- True when any body part carries a zombie bite. Native BodyDamage owns
--- infection and turning; this only surfaces it so a doomed survivor reads
--- as Bitten! in the HUD and card instead of merely Hurt.
-local function isBitten(character, state)
-    if character == nil or character.getBodyDamage == nil then return false end
-    -- Cheap gate: a bite always costs at least some health or blood. Full
-    -- health with no bleeding skips the per-part scan every refresh.
-    if state ~= nil and (tonumber(state.health) or 0) >= 99.999
-        and (tonumber(state.bleedingParts) or 0) <= 0 then
-        return false
-    end
-    local ok, damage = pcall(function() return character:getBodyDamage() end)
-    if not ok or damage == nil or damage.getBodyParts == nil then return false end
-    local okParts, parts = pcall(function() return damage:getBodyParts() end)
-    if not okParts or parts == nil then return false end
-    local okSize, count = pcall(function() return parts:size() end)
-    for index = 0, (okSize and tonumber(count) or 0) - 1 do
-        local okPart, part = pcall(function() return parts:get(index) end)
-        if okPart and part ~= nil and part.isBitten ~= nil then
-            local okBite, bite = pcall(function() return part:isBitten() end)
-            if okBite and bite == true then return true end
-        end
-    end
-    return false
-end
-
-local function needSummary(state, available, alive, includeLivePain, bitten)
-    if not alive then return nil end
+local function needSummary(state, available)
     if not available then return "Condition unavailable" end
     local labels = {}
     local thresholds = KnoxSurvivorNeeds.thresholds
     -- A bite is‐the death sentence: surface it first, ahead of bleeding.
-    if bitten == true then labels[#labels + 1] = "Bitten!" end
+    if state.bitten == true then labels[#labels + 1] = "Bitten!" end
     if (tonumber(state.bleedingParts) or 0) > 0 then labels[#labels + 1] = "Bleeding" end
     if (tonumber(state.bleedingParts) or 0) == 0 and (tonumber(state.health) or 100) < 75 then
         labels[#labels + 1] = "Hurt"
     end
-    if includeLivePain and tonumber(state.pain) ~= nil and tonumber(state.pain) > 0 then
+    if tonumber(state.pain) ~= nil and tonumber(state.pain) > 0 then
         labels[#labels + 1] = "Pain"
     end
     if (tonumber(state.thirst) or 0) >= 0.90 then labels[#labels + 1] = "Dehydrated"
@@ -474,6 +407,13 @@ function ViewModel.resolveLiveCharacter(id)
     return liveCharacter(id)
 end
 
+-- Preserve the existing card's trust bands without exposing a private score.
+local function trustLabelFor(relationship)
+    local trust = relationship ~= nil and tonumber(relationship.trust) or nil
+    if trust == nil or trust ~= trust then return "Unknown" end
+    return trust >= 70 and "Trusting" or (trust >= 40 and "Cautious" or "Wary")
+end
+
 function ViewModel.getSurvivor(id, playerNum)
     if type(id) ~= "string" or id == "" then
         return nil
@@ -482,7 +422,13 @@ function ViewModel.getSurvivor(id, playerNum)
     local playerIndex = tonumber(playerNum)
     if playerIndex == nil then return nil end
     local player = getSpecificPlayer(playerIndex)
-    local character = liveCharacter(id)
+    local body = liveCharacter(id)
+    local visible, direct = pcall(function() return body ~= nil and player:CanSee(body) == true end)
+    local character = visible and direct and body or nil
+    local observerId = existingPlayerId(player)
+    local known = observerId ~= nil and KnoxPersistence.getObserverKnowledge ~= nil
+        and KnoxPersistence.getObserverKnowledge(observerId, id) or nil
+    local report = known ~= nil and known.report or nil
     local affiliation = KnoxPersistence.getSurvivorAffiliation(id) or {
         kind = "independent",
     }
@@ -490,10 +436,14 @@ function ViewModel.getSurvivor(id, playerNum)
         mode = "autonomous",
         order = "survive",
     }
-    local state, vitalsAvailable = physicalState(character, id)
+    -- Precise needs are self-reported, never inferred from a hidden simulation
+    -- snapshot or from merely opening a notebook.
+    local state = report ~= nil and report.value.state or {health=100, hunger=0, thirst=0,
+        fatigue=0, endurance=1, bleedingParts=0}
+    local vitalsAvailable = report ~= nil and type(report.value.state) == "table"
     local forename, surname, displayName = identityFor(id, character)
     local distance, sameLevel = playerDistance(player, character)
-    local currentActivity = runtimeActivity(id)
+    local currentActivity = character ~= nil and runtimeActivity(id) or nil
     local identity = KnoxPersistence.getSurvivorIdentity(id) or {}
     local nowHours = worldAgeHours()
     local ageYears = tonumber(identity.ageYears) or liveNumber(character, "getAge")
@@ -510,33 +460,28 @@ function ViewModel.getSurvivor(id, playerNum)
     local spouseStart = playerData ~= nil and playerData.KnoxSurvivors ~= nil
         and playerData.KnoxSurvivors.spouseStart or nil
     local capabilities = KnoxPersistence.getSurvivorCapabilities(id) or {}
-    local lifeIntent = KnoxPersistence.getSurvivorLifeIntent ~= nil
-        and KnoxPersistence.getSurvivorLifeIntent(id) or nil
+    local lifeIntent = nil -- Intent requires communication; activity is not proof of purpose.
     local faction = affiliation.factionId ~= nil and KnoxPersistence.getFaction ~= nil
         and KnoxPersistence.getFaction(affiliation.factionId) or nil
     local knownSince = relationship ~= nil and relationship.firstMetHours
         or affiliation.joinedAtHours
     local role = roleFor(affiliation, duty)
-    local alive = KnoxPersistence.isSurvivorAlive == nil
-        or KnoxPersistence.isSurvivorAlive(id) ~= false
-    local recentHistory = recentHistoryFor(id)
+    local alive = true
+    local recentHistory = {} -- Private/offscreen memories require an actual report.
     if character ~= nil then
         local success, dead = pcall(function()
             return character:isDead()
         end)
         alive = alive and not (success and dead == true)
     end
-    local deathEvidence = KnoxPersistence.getSurvivorDeathEvidence ~= nil
-        and KnoxPersistence.getSurvivorDeathEvidence(id) or nil
-    local deathLocationLabel = "Deceased"
-    if type(deathEvidence) == "table" and tonumber(deathEvidence.x) ~= nil
-        and tonumber(deathEvidence.y) ~= nil and tonumber(deathEvidence.z) ~= nil then
-        local source = deathEvidence.locationSource == "loaded" and "exact"
-            or (deathEvidence.locationSource == "logical" and "logical" or "last-known")
-        deathLocationLabel = "Deceased - " .. source .. " location recorded"
+    local deathEvidence = nil
+    if character ~= nil and not alive then
+        local sq = character:getCurrentSquare()
+        deathEvidence = {x=sq:getX(), y=sq:getY(), z=sq:getZ(), locationSource="observed"}
     end
+    local deathLocationLabel = "Deceased - witnessed"
 
-    return {
+    local snapshot = {
         version = 2,
         id = id,
         forename = forename,
@@ -549,7 +494,7 @@ function ViewModel.getSurvivor(id, playerNum)
         personalityLabel = identity.personalityLabel,
         traits = capabilities.traitIds or {},
         skills = capabilities.skills or {},
-        trust = relationship ~= nil and tonumber(relationship.trust) or nil,
+        trustLabel = trustLabelFor(relationship),
         relationshipMeetings = relationship ~= nil and tonumber(relationship.meetings) or nil,
         recentHistory = recentHistory,
         latestMemory = recentHistory[1] ~= nil and recentHistory[1].label or nil,
@@ -558,13 +503,12 @@ function ViewModel.getSurvivor(id, playerNum)
         ageYears = ageYears ~= nil and math.floor(ageYears) or nil,
         daysSurvived = daysSurvived,
         daysKnown = wholeDaysSince(knownSince, nowHours),
-        locationLabel = alive and locationLabelFor(duty, character, distance, sameLevel) or deathLocationLabel,
+        locationLabel = character ~= nil and (alive and locationLabelFor(duty, character, distance, sameLevel) or deathLocationLabel) or "Location unknown",
         deathEvidence = deathEvidence,
-        orderLabel = orderLabelFor(duty, id),
+        orderLabel = character ~= nil and orderLabelFor(duty, id) or "Last accepted order",
         order = tostring(duty.order or "survive"),
-        activity = activityFor(duty, state, character ~= nil, alive, currentActivity),
-        needSummary = needSummary(state, vitalsAvailable, alive, character ~= nil,
-            isBitten(character, state)),
+        activity = character ~= nil and activityFor(duty, {}, true, alive, currentActivity) or "Out of contact",
+        needSummary = needSummary(state, vitalsAvailable),
         lifeIntent = lifeIntent ~= nil and {
             kind = lifeIntent.kind,
             phase = lifeIntent.phase,
@@ -591,7 +535,7 @@ function ViewModel.getSurvivor(id, playerNum)
             fatigue = vitalsAvailable and clamp01(state.fatigue) or nil,
             endurance = vitalsAvailable and clamp01(state.endurance) or nil,
             bleedingParts = vitalsAvailable and math.max(0, tonumber(state.bleedingParts) or 0) or nil,
-            pain = character ~= nil and vitalsAvailable and tonumber(state.pain) or nil,
+            pain = vitalsAvailable and tonumber(state.pain) or nil,
         },
         weaponName = weaponName(character),
         distanceTiles = distance,
@@ -616,6 +560,56 @@ function ViewModel.getSurvivor(id, playerNum)
         },
         portraitKey = character ~= nil and tostring(character) or "unloaded",
     }
+    -- Reports remain useful history; sight alone does not refresh physiology.
+    -- Every consumer (including the compact HUD) receives the same dated text.
+    if report ~= nil then
+        local ageMinutes = math.floor(math.max(0, nowHours - report.atHours) * 60)
+        snapshot.needSummary = "Last reported (" .. tostring(ageMinutes) .. " min ago): "
+            .. tostring(snapshot.needSummary or "All right")
+    else
+        snapshot.needSummary = "Needs not reported"
+    end
+    snapshot.knowledge = {source=character ~= nil and "observation" or "unknown",
+        atHours=character ~= nil and nowHours or nil, reportAtHours=report ~= nil and report.atHours or nil,
+        reportSource=report ~= nil and report.source or nil, current=character ~= nil}
+    local keys = {"alive", "role", "roleLabel", "duty", "order", "orderLabel", "activity",
+        "locationLabel", "weaponName", "deathEvidence", "position", "affiliation", "factionName",
+        "skills", "traits", "daysSurvived"}
+    if character ~= nil then
+        local sq = character:getCurrentSquare()
+        snapshot.position = {x=sq:getX(), y=sq:getY(), z=sq:getZ()}
+        local value = {}
+        for _, key in ipairs(keys) do value[key] = snapshot[key] end
+        if observerId ~= nil and KnoxPersistence.rememberObserverKnowledge ~= nil then
+            KnoxPersistence.rememberObserverKnowledge(observerId,id,"seen",value,nowHours)
+        end
+    else
+        local seen = known ~= nil and known.seen or nil
+        local previous = seen ~= nil and seen.value or {}
+        for _, key in ipairs(keys) do snapshot[key] = previous[key] end
+        local commitment = known ~= nil and known.commitment or nil
+        if commitment ~= nil and (seen == nil or commitment.atHours >= seen.atHours) then
+            snapshot.role, snapshot.duty, snapshot.order = commitment.value.role, commitment.value.duty, commitment.value.order
+            snapshot.roleLabel = ROLE_LABELS[snapshot.role]
+        end
+        snapshot.role = snapshot.role or role
+        snapshot.roleLabel = snapshot.roleLabel or ROLE_LABELS[snapshot.role]
+        snapshot.activity = seen ~= nil and (previous.alive == false and "Dead (witnessed)"
+            or "Last seen: " .. tostring(previous.activity or "Unknown")) or "Out of contact"
+        snapshot.locationLabel = seen ~= nil and "Last seen - " .. tostring(math.floor(math.max(0,
+            nowHours-seen.atHours)*60)) .. " min ago" or "Location unknown"
+        snapshot.weaponName = previous.weaponName or "Equipment unavailable"
+        snapshot.distanceTiles, snapshot.sameLevel = nil, nil
+        snapshot.knowledge.source = seen ~= nil and seen.source or "unknown"
+        snapshot.knowledge.atHours = seen ~= nil and seen.atHours or nil
+        -- Accepted owner orders remain known commitments, not proof of current
+        -- execution. Do not project autonomous task-board activity here.
+        if duty.ownerId == observerId and duty.mode == "companion" then
+            snapshot.order, snapshot.duty = duty.order, {mode=duty.mode, order=duty.order, ownerId=duty.ownerId}
+            snapshot.orderLabel = KnoxOrderCatalog.label(type(duty.directive)=="table" and duty.directive.kind or duty.order, "Follow")
+        end
+    end
+    return snapshot
 end
 
 function ViewModel.getForPlayer(playerNum)
@@ -627,10 +621,25 @@ function ViewModel.getForPlayer(playerNum)
     end
 
     local snapshots = {}
-    local ids = KnoxCompanionService.getCompanionIds(player)
+    local ids, included = {}, {}
+    for _, id in ipairs(KnoxCompanionService.getCompanionIds(player) or {}) do ids[#ids+1]=id; included[id]=true end
+    local observerId = existingPlayerId(player)
+    if observerId ~= nil and KnoxPersistence.getKnownSurvivorIds ~= nil then
+        for _, id in ipairs(KnoxPersistence.getKnownSurvivorIds(observerId)) do
+            if not included[id] then
+                local known = KnoxPersistence.getObserverKnowledge(observerId,id)
+                local latest = known ~= nil and known.seen or nil
+                if known ~= nil and known.commitment ~= nil and (latest == nil or known.commitment.atHours >= latest.atHours) then latest=known.commitment end
+                local rememberedRole = latest ~= nil and latest.value.role or nil
+                if rememberedRole == "companion" then
+                    ids[#ids+1]=id; included[id]=true
+                end
+            end
+        end
+    end
     for _, id in ipairs(ids or {}) do
         local snapshot = ViewModel.getSurvivor(id, playerIndex)
-        if snapshot ~= nil and snapshot.alive and snapshot.role == "companion" then
+        if snapshot ~= nil and snapshot.alive ~= false and snapshot.role == "companion" then
             snapshots[#snapshots + 1] = snapshot
         end
     end

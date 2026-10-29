@@ -124,4 +124,72 @@ function Layout.residentFooter(view, spacing, buttonHeight)
     view:setScrollHeight(top + footerHeight + spacing)
 end
 
+-- Read-only camera state shared by input and placement adapters. View.next is
+-- the installed Viewpoint API's next-mode query, not a camera-mode setter.
+function Layout.isPerspective()
+    local vp = rawget(_G, "Viewpoint")
+    if vp == nil or vp.View == nil or vp.View.next == nil then return false end
+    local ok, mode = pcall(vp.View.next)
+    return ok and (mode == "third" or mode == "isometric")
+end
+
+function Layout.bindInteractionWindow(window)
+    if window.knoxCaptureBound then return end
+    window.knoxCaptureBound = true
+    local update, close, keyRelease = window.update, window.close, window.onKeyRelease
+    local consume = window.isKeyConsumed
+    local function ownsKeys(self)
+        if not self.knoxOwnsCapture or not self:isVisible() then return false end
+        if UIManager == nil or UIManager.getUI == nil or self.javaObject == nil then return true end
+        local ok, owner = pcall(function()
+            local list = UIManager.getUI()
+            for index = list:size() - 1, 0, -1 do
+                local element = list:get(index)
+                if element:isVisible() and (element:isCapture() or element:isWantKeyEvents()) then
+                    return element == self.javaObject
+                end
+            end
+            return false
+        end)
+        return ok and owner == true
+    end
+    window.update = function(self, ...)
+        if update ~= nil then update(self, ...) end
+        if self.setCapture == nil then return end
+        if self:isVisible() and self.playerNum ~= nil and getSpecificPlayer ~= nil then
+            local player = getSpecificPlayer(self.playerNum)
+            if player == nil or (player.isDead ~= nil and player:isDead()) then self:close(); return end
+        end
+        local capture = Layout.isPerspective() and self:isVisible()
+        -- Use the actual native capture state: dragging may have released it.
+        local actual = self.javaObject ~= nil and self.javaObject.isCapture ~= nil
+            and self.javaObject:isCapture() or false
+        if capture ~= actual and (capture or self.knoxOwnsCapture) then self:setCapture(capture) end
+        if capture and not self.knoxOwnsCapture then
+            self.knoxPriorWantKeys = self.javaObject ~= nil and self.javaObject.isWantKeyEvents ~= nil
+                and self.javaObject:isWantKeyEvents() or false
+            if self.setWantKeyEvents ~= nil then self:setWantKeyEvents(true) end
+        elseif not capture and self.knoxOwnsCapture and self.setWantKeyEvents ~= nil then
+            self:setWantKeyEvents(self.knoxPriorWantKeys == true)
+        end
+        self.knoxOwnsCapture = capture
+    end
+    window.close = function(self, ...)
+        if self.knoxOwnsCapture and self.setCapture ~= nil then self:setCapture(false) end
+        if self.knoxOwnsCapture and self.setWantKeyEvents ~= nil then self:setWantKeyEvents(self.knoxPriorWantKeys == true) end
+        self.knoxOwnsCapture = false
+        if close ~= nil then return close(self, ...) end
+        self:setVisible(false)
+    end
+    window.isKeyConsumed = function(self, key)
+        if ownsKeys(self) then return true end
+        return consume ~= nil and consume(self, key) or false
+    end
+    window.onKeyRelease = function(self, key)
+        if ownsKeys(self) and Keyboard ~= nil and key == Keyboard.KEY_ESCAPE then
+            self:close()
+        elseif keyRelease ~= nil then keyRelease(self, key) end
+    end
+end
+
 return Layout

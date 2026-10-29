@@ -134,7 +134,8 @@ local function rollbackRoster(character, run)
                     -- A refused exit (moving vehicle, missing action) must not
                     -- strand the rider lease-free: mark them for the bounded
                     -- stationary retry in tick() below instead of inventing an exit.
-                    if not CompanionVehicles.exit(member) and member:getVehicle() == run.vehicle then
+                    CompanionVehicles.exitAfterPlayer(member, run.vehicle)
+                    if awaitingExit[member] == nil and member:getVehicle() == run.vehicle then
                         awaitingExit[member] = { vehicle = run.vehicle, tries = 0 }
                     end
                 end
@@ -145,27 +146,30 @@ local function rollbackRoster(character, run)
     end
 end
 
--- Bounded recovery sweep for abort-time exit refusals. A member with fresh
--- ownership (a new boarding lease) or who left the marked vehicle clears the
--- mark; otherwise a stationary vehicle gets a native exit attempt. Attempts
--- while moving do not count down, so a long drive waits rather than expires.
+-- Queue admission is not an exit receipt. Keep the intent while its action is
+-- pending, then retry if the member is still aboard. Moving/busy waits do not
+-- consume attempts. Explicit cancellation releases this transient intent.
 local function retryAwaitingExits()
+    -- Native preparation cancels ownership before queueing; snapshot entries
+    -- so restoring our own mark cannot invalidate Lua's table iteration.
+    local entries = {}
     for member, mark in pairs(awaitingExit) do
+        entries[#entries + 1] = { member = member, mark = mark }
+    end
+    for _, entry in ipairs(entries) do
+        local member, mark = entry.member, entry.mark
         local aboard = member.getVehicle ~= nil and member:getVehicle() ~= nil
             and (mark.vehicle == nil or member:getVehicle() == mark.vehicle)
-        if not aboard or CompanionVehicles.isBusy(member) then
+        if not aboard then
             awaitingExit[member] = nil
-        else
+        elseif not CompanionVehicles.isBusy(member) and awaitingExit[member] == mark then
             local speed = 0
             if mark.vehicle ~= nil and mark.vehicle.getCurrentSpeedKmHour ~= nil then
                 local ok, value = pcall(function() return mark.vehicle:getCurrentSpeedKmHour() end)
                 speed = (ok and tonumber(value)) or 0
             end
             if math.abs(speed) <= 1 then
-                mark.tries = (mark.tries or 0) + 1
-                if CompanionVehicles.exit(member) or member:getVehicle() == nil then
-                    awaitingExit[member] = nil
-                elseif mark.tries > EXIT_RETRY_LIMIT then
+                if (mark.tries or 0) >= EXIT_RETRY_LIMIT then
                     awaitingExit[member] = nil
                     -- A bounded wait that never resolves is a reportable fact,
                     -- not a silent print: one restrained line to the member,
@@ -174,6 +178,16 @@ local function retryAwaitingExits()
                         KnoxActivityFeed.speak(member, "I can't get out.")
                     end
                     print("[KnoxSurvivors][Driving] exit_unrecoverable member_mark_cleared=true")
+                else
+                    mark.tries = (mark.tries or 0) + 1
+                    CompanionVehicles.exit(member)
+                    -- prepareVehicle may clear the mark while admitting our
+                    -- own retry. Restore only while still in the exact car.
+                    if member:getVehicle() == mark.vehicle then
+                        awaitingExit[member] = mark
+                    else
+                        awaitingExit[member] = nil
+                    end
                 end
             end
         end
@@ -181,6 +195,7 @@ local function retryAwaitingExits()
 end
 
 function CompanionVehicles.cancel(character, keepPassengers)
+    if awaitingExit[character] ~= nil then awaitingExit[character] = nil end
     local run = driverRuns[character]
     stopDriver(character)
     local request = pending[character]
@@ -206,10 +221,18 @@ function CompanionVehicles.isBusy(character)
     local request = pending[character]
     if request == nil then return false end
     local currentHealth = health(character)
-    if getTimestampMs() >= request.deadline
-        or (character.isDead ~= nil and character:isDead())
-        or (currentHealth ~= nil and request.health ~= nil and currentHealth < request.health) then
+    local expired = getTimestampMs() >= request.deadline
+    local interrupted = (character.isDead ~= nil and character:isDead())
+        or (currentHealth ~= nil and request.health ~= nil and currentHealth < request.health)
+    if expired or interrupted then
+        local exitIntent = awaitingExit[character]
         CompanionVehicles.cancel(character)
+        -- A timed-out native exit is a missing receipt, not a new order.
+        -- Injury/death still releases ownership for ordinary interruption.
+        if expired and not interrupted and exitIntent ~= nil
+            and character:getVehicle() == exitIntent.vehicle then
+            awaitingExit[character] = exitIntent
+        end
         return false, "interrupted"
     end
     if request.runToVehicle and character.getVehicle ~= nil
@@ -251,7 +274,7 @@ local function queueActions(character, vehicle, seat, actions, options)
     if id == nil or runtime.prepareVehicle == nil or not runtime.prepareVehicle(id) then
         return false, "survivor_busy"
     end
-    local request = { vehicle = vehicle, seat = seat,
+    local request = { vehicle = vehicle, seat = seat, survivorId = id,
         deadline = getTimestampMs() + ACTION_TIMEOUT_MS, health = health(character), actions = {},
         runToVehicle = options ~= nil and options.runToVehicle == true }
     if request.runToVehicle then setBoardingPace(character, request, true) end
@@ -296,6 +319,69 @@ local function usablePassengerSeat(character, vehicle, seat)
     return true
 end
 
+local function stageDoorKey(action, character, vehicle, seat, part, key)
+    local nativeValid, nativeStart, nativeComplete = action.isValid, action.start, action.complete
+    assert(nativeValid ~= nil and nativeStart ~= nil and nativeComplete ~= nil,
+        "native unlock callbacks unavailable")
+    local received = false
+    local function owns()
+        local request = pending[character]
+        local runtime = rawget(_G, "KnoxSurvivorRuntime")
+        local currentHealth = health(character)
+        return request ~= nil and request.actions[action] == true
+            and request.vehicle == vehicle and request.seat == seat
+            and runtime ~= nil and runtime.idForCharacter(character) == request.survivorId
+            and getTimestampMs() < request.deadline and character:isDead() == false
+            and not (currentHealth ~= nil and request.health ~= nil and currentHealth < request.health)
+            and character:getVehicle() == nil and sameFloorAndNear(character, vehicle)
+            and vehicle:getPassengerDoor(seat) == part
+            and part:getArea() ~= nil and vehicle:isInArea(part:getArea(), character)
+    end
+    local function takeKey()
+        if not owns() then return false end
+        local inventory = character:getInventory()
+        if received then return inventory:contains(key) and key:getContainer() == inventory end
+        -- Native queue cancellation can precede the next isBusy observation.
+        -- A stale pending lease alone cannot authorize a new world transfer.
+        local queue = ISTimedActionQueue.queues[character]
+        local registered = false
+        for _, queuedAction in ipairs(queue ~= nil and queue.queue or {}) do
+            if queuedAction == action then registered = true; break end
+        end
+        if not registered then return false end
+        if not vehicle:isKeyIsOnDoor() or vehicle:getCurrentKey() ~= key then return false end
+        -- Merely building/admitting a route must not transfer a world resource.
+        -- Use the same real object only when the owned native unlock executes.
+        pcall(inventory.AddItem, inventory, key)
+        if not inventory:contains(key) or key:getContainer() ~= inventory then return false end
+        -- A native callback may replace the door's key while AddItem executes.
+        -- Never clear a different world item or manufacture a replacement.
+        if vehicle:getCurrentKey() ~= key then return false end
+        vehicle:setCurrentKey(nil)
+        vehicle:setKeyIsOnDoor(false)
+        received = vehicle:getCurrentKey() == nil and not vehicle:isKeyIsOnDoor()
+        if received and isClient ~= nil and isClient() and sendClientCommand ~= nil then
+            sendClientCommand(character, "vehicle", "removeKeyFromDoor", {vehicle=vehicle:getId()})
+        end
+        return received
+    end
+    action.isValid = function(candidate)
+        local ok, allowed = pcall(owns)
+        return ok and allowed and nativeValid(candidate)
+    end
+    action.start = function(candidate)
+        local ok, allowed = pcall(takeKey)
+        if not ok or not allowed or not owns() then candidate:forceStop();return end
+        return nativeStart(candidate)
+    end
+    action.complete = function(candidate)
+        local ok, allowed = pcall(takeKey)
+        if not ok or not allowed then return false end
+        return nativeComplete(candidate)
+    end
+    return action
+end
+
 local function appendDoorEntryActions(character, vehicle, seat, actions)
     local doorPart = vehicle:getPassengerDoor(seat)
     local door = doorPart ~= nil and doorPart:getDoor() or nil
@@ -309,19 +395,12 @@ local function appendDoorEntryActions(character, vehicle, seat, actions)
     if door:isLocked() then
         local keyOnDoor = vehicle.isKeyIsOnDoor ~= nil and vehicle:isKeyIsOnDoor()
             and vehicle.getCurrentKey ~= nil and vehicle:getCurrentKey() or nil
-        if keyOnDoor ~= nil and character.getInventory ~= nil
-            and vehicle.setKeyIsOnDoor ~= nil and vehicle.setCurrentKey ~= nil then
-            vehicle:setKeyIsOnDoor(false)
-            vehicle:setCurrentKey(nil)
-            character:getInventory():AddItem(keyOnDoor)
-            if isClient ~= nil and isClient() and sendClientCommand ~= nil then
-                sendClientCommand(character, "vehicle", "removeKeyFromDoor",
-                    { vehicle = vehicle:getId() })
-            end
-        else
-            assert(ISUnlockVehicleDoor ~= nil, "native vehicle unlock action unavailable")
-            actions[#actions + 1] = assert(ISUnlockVehicleDoor:new(character, doorPart))
+        assert(ISUnlockVehicleDoor ~= nil, "native vehicle unlock action unavailable")
+        local unlock = assert(ISUnlockVehicleDoor:new(character, doorPart))
+        if keyOnDoor ~= nil then
+            unlock = stageDoorKey(unlock, character, vehicle, seat, doorPart, keyOnDoor)
         end
+        actions[#actions + 1] = unlock
     end
     if not door:isOpen() then
         assert(ISOpenVehicleDoor ~= nil, "native vehicle door action unavailable")
@@ -472,9 +551,13 @@ function CompanionVehicles.exitAfterPlayer(character, vehicle)
         return false, "vehicle_changed"
     end
     local success, reason = CompanionVehicles.exit(character)
-    if not success and reason == "vehicle_moving" and character:getVehicle() == vehicle then
-        awaitingExit[character] = { vehicle = vehicle, tries = 0 }
-        return false, "exit_waiting_for_stop"
+    if character:getVehicle() == vehicle
+        and not (character.isDead ~= nil and character:isDead()) then
+        -- A ground-duty handoff can be refused by native preparation too.
+        -- Keep its bounded recovery rather than consume the new duty with no
+        -- exit owner. Missing APIs/actions eventually report, never succeed.
+        awaitingExit[character] = { vehicle = vehicle, tries = success and 1 or 0 }
+        if reason == "vehicle_moving" then return false, "exit_waiting_for_stop" end
     end
     return success, reason
 end
@@ -547,8 +630,12 @@ function CompanionVehicles.exit(character)
     if CompanionVehicles.isBusy(character) then return false, "vehicle_action_pending" end
     local built, action = pcall(function() return assert(ISExitVehicle:new(character)) end)
     if not built then return false, "vehicle_action_failed" end
-    local queued, reason = queueActions(character, character:getVehicle(), nil, { action })
+    local vehicle = character:getVehicle()
+    local queued, reason = queueActions(character, vehicle, nil, { action })
     if not queued then return false, reason end
+    if character:getVehicle() == vehicle then
+        awaitingExit[character] = { vehicle = vehicle, tries = 1 }
+    end
     return true, "exiting"
 end
 

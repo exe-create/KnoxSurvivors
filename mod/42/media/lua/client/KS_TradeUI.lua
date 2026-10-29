@@ -2,6 +2,7 @@ require "ISUI/ISCollapsableWindowJoypad"
 require "ISUI/ISScrollingListBox"
 require "ISUI/ISButton"
 require "KS_TradeAction"
+local UILayout = require "KS_SurvivorUILayout"
 
 local UI = rawget(_G, "KnoxTradeUI") or {}
 _G.KnoxTradeUI = UI
@@ -32,12 +33,17 @@ local MESSAGES = {
     danger = "Trading stopped because of danger.", relationship_changed = "Your relationship changed. Trading stopped.",
     not_alive = "That survivor is no longer alive.", not_loaded = "That survivor is no longer here.",
     survivor_changed = "That survivor is no longer available.",
+    survivor_unavailable = "They are temporarily unavailable. No items were exchanged.",
     trading_unavailable = "Trading is unavailable in this session.",
     browsing_expired = "The conversation ended. Speak to them again to trade.",
     trade_interrupted_or_expired = "The conversation ended. Speak to them again to trade.",
     capture_unavailable = "Their inventory could not be saved. No items were exchanged.",
+    queue_failed = "The exchange could not start. Review the offer and try again.",
+    queue_refused = "The exchange could not start. Review the offer and try again.",
+    exchange_permission_changed = "Those items are no longer available for this exchange.",
+    survivor_needs_care = "They need to take care of themselves first.",
     exchange_rolled_back = "The exchange failed. Both offers were returned.",
-    recovery_required = "Inventory recovery failed. Stop testing and keep the logs.",
+    recovery_required = "The exchange could not be safely restored. Trading is paused.",
     completed = "Trade complete.", gift_completed = "Gift delivered.", cancelled = "Trade cancelled.", closed = "Trade closed.",
     queue_cancelled = "Trade cancelled.", lease_lost = "Trading was interrupted.",
     combat = "Trading stopped because of combat.", danger_detected = "Trading stopped because of danger.",
@@ -198,13 +204,33 @@ function Window:stopBrowsing(reason)
     self.clearButton:setEnable(false)
 end
 
+function Window:recoverOffer(reason)
+    if self.closed then return false end
+    if self.session == nil or not self.session:isValid() then
+        KnoxTradeActions.endBrowse(self.session, reason)
+        local session, failure = KnoxTradeActions.beginBrowse(self.player, self.survivorId)
+        self.session = session
+        if session == nil then
+            self:stopBrowsing(reason or failure)
+            return false
+        end
+    end
+    -- A verified rollback or refused admission is reviewable in this same
+    -- window. Never auto-submit the old offer or hide its failure message.
+    self.browsingStopped, self.actionError = false, reason
+    self.giveButton:setEnable(true)
+    self.takeButton:setEnable(true)
+    self.clearButton:setEnable(true)
+    self:refreshStock()
+    return not self.browsingStopped
+end
+
 function Window:exchange()
     if self.action ~= nil or self.session == nil or not self.session:isValid() then return end
     local action, reason = KnoxTradeActions.queue(self.player, self.survivorId,
         selectedItems(self.giving), selectedItems(self.taking), self.session, self.giftMode and "gift" or nil)
     if action == nil then
-        self.actionError, self.status = reason, UI.message(reason)
-        self.tradeButton:setEnable(false)
+        self:recoverOffer(reason)
         return
     end
     self.action, self.status = action, "Exchanging items..."
@@ -220,7 +246,12 @@ function Window:update()
     if self.action ~= nil then
         if self.action.finished then
             self.status = UI.message(self.action.result)
-            if self.action.success then self:close() end
+            if self.action.success then self:close()
+            else
+                local reason = self.action.result
+                self.action = nil
+                self:recoverOffer(reason)
+            end
         end
         return
     end
@@ -308,6 +339,7 @@ function UI.show(playerNum, survivorId, giftMode)
     window.backgroundColor = { r = .06, g = .06, b = .06, a = .94 }
     window.borderColor = { r = .28, g = .28, b = .28, a = 1 }
     window:setTitle(trim((window.giftMode and "Give Item - " or "Trade - ") .. window.survivorName, width - 80))
+    UILayout.bindInteractionWindow(window)
     window:initialise()
     window:setRenderThisPlayerOnly(playerNum)
     window:addToUIManager()

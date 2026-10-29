@@ -4,6 +4,7 @@ require "Farming/TimedActions/ISPlowAction"
 require "Farming/TimedActions/ISSeedActionNew"
 require "TimedActions/ISTimedActionQueue"
 require "KS_SurvivorInventoryActions"
+pcall(function() require "KS_DebugLog" end)
 
 local Farming = rawget(_G, "KnoxBaseFarming") or {}
 _G.KnoxBaseFarming = Farming
@@ -111,6 +112,25 @@ local function seedTypeForItem(item)
     return nil
 end
 
+local function usableSeed(item)
+    if not itemUsable(item) then return false end
+    -- Planting material can be food (fruit, vegetables or cuttings). Apply
+    -- the installed player planting restrictions before selecting supplies;
+    -- the native seed action itself checks possession, not food quality.
+    local food = instanceof ~= nil and instanceof(item, "Food")
+    if not food then return true end
+    if safeCall(item, "isRotten") ~= false or safeCall(item, "isCooked") ~= false
+        or safeCall(item, "isBurnt") ~= false then return false end
+    local fresh = safeCall(item, "isFresh")
+    if fresh == nil then return false end
+    if ItemTag ~= nil and itemHasTag(item, ItemTag.IS_CUTTING) and not fresh then return false end
+    local whole = tonumber(safeCall(item, "getBaseHunger"))
+    local remaining = tonumber(safeCall(item, "getHungerChange"))
+    if whole == nil or remaining == nil or whole ~= whole or remaining ~= remaining
+        or math.abs(whole) == math.huge or math.abs(remaining) == math.huge then return false end
+    return math.abs(remaining) >= math.abs(whole) * (fresh and 1 or 0.75)
+end
+
 local function seedItem(character, desiredItemType, desiredCrop)
     if ItemTag == nil or ItemTag.IS_SEED == nil then
         return nil, nil
@@ -120,7 +140,7 @@ local function seedItem(character, desiredItemType, desiredCrop)
         return nil, nil
     end
     walkItems(character:getInventory(), function(item)
-        if found ~= nil or not itemHasTag(item, ItemTag.IS_SEED) then
+        if found ~= nil or not itemHasTag(item, ItemTag.IS_SEED) or not usableSeed(item) then
             return
         end
         local typeOfSeed = seedTypeForItem(item)
@@ -279,7 +299,7 @@ function Farming.findTask(base, character, eligible)
     if storage ~= nil and storage.findItemType ~= nil then
         if seed == nil then
             local _, storedSeed = storage.findItemType(base, function(item)
-                return itemUsable(item) and ItemTag ~= nil
+                return usableSeed(item) and ItemTag ~= nil
                     and itemHasTag(item, ItemTag.IS_SEED) and seedTypeForItem(item) ~= nil
             end)
             seed, seedType = storedSeed, seedTypeForItem(storedSeed)
@@ -417,14 +437,98 @@ local function prepareCarriedItem(character, item)
     return action ~= nil, reason
 end
 
-function Farming.queueAction(character, target, water)
+local function traceEnabled()
+    local log = rawget(_G, "KnoxDebugLog")
+    if log == nil or log.log == nil or log.diagnosticsEnabled == nil then return false end
+    local ok, enabled = pcall(log.diagnosticsEnabled)
+    return ok and enabled == true
+end
+
+-- Observe a native action instance, never its global class. This can also be
+-- used for a paired local-player action in the disposable diagnostic replay.
+function Farming.traceAction(character, target, action, context)
+    if action == nil or action.KnoxFarmingTraceAttached == true or not traceEnabled() then return action end
+    action.KnoxFarmingTraceAttached = true
+    context = context or {}
+    local lastPoll, observedPoll = {}, {}
+    local function emit(phase, result)
+        if not traceEnabled() then return end
+        -- Diagnostics cannot change native admission, returns or errors.
+        pcall(function()
+            local runtime = rawget(_G, "KnoxSurvivorRuntime")
+            local id = context.survivorId or (runtime ~= nil and runtime.idForCharacter ~= nil
+                and runtime.idForCharacter(character)) or "player_or_unregistered"
+            local square = safeCall(character, "getCurrentSquare")
+            local item = action.item or action.seed or target.plowItem or target.seedItem
+            local source = safeCall(item, "getContainer")
+            local client = CFarmingSystem ~= nil and CFarmingSystem.instance or nil
+            local server = SFarmingSystem ~= nil and SFarmingSystem.instance or nil
+            local clientPlant = safeCall(client, "getLuaObjectOnSquare", target.square)
+            local serverPlant = safeCall(server, "getLuaObjectOnSquare", target.square)
+            local function value(value) return value ~= nil and tostring(value) or "unavailable" end
+            KnoxDebugLog.log("jobs", id, "farm_native_" .. phase, {
+                task = context.taskId, base = context.baseId, kind = target.action,
+                action = value(action.Type), actionToken = tostring(action), result = value(result),
+                actorClass = value(safeCall(safeCall(character, "getClass"), "getName")),
+                charX = value(safeCall(square, "getX")), charY = value(safeCall(square, "getY")),
+                charZ = value(safeCall(square, "getZ")),
+                tx = value(safeCall(target.square, "getX")), ty = value(safeCall(target.square, "getY")),
+                tz = value(safeCall(target.square, "getZ")),
+                itemId = value(safeCall(item, "getID")), itemType = value(safeCall(item, "getFullType")),
+                itemInSource = value(safeCall(source, "contains", item)),
+                itemInRoot = value(safeCall(safeCall(character, "getInventory"), "contains", item)),
+                clientSystem = client ~= nil, serverSystem = server ~= nil,
+                clientState = value(clientPlant ~= nil and clientPlant.state or nil),
+                clientWater = value(clientPlant ~= nil and clientPlant.waterLvl or nil),
+                serverState = value(serverPlant ~= nil and serverPlant.state or nil),
+                serverWater = value(serverPlant ~= nil and serverPlant.waterLvl or nil),
+            })
+        end)
+    end
+    local function pack(...) return { n = select("#", ...), ... } end
+    for _, phase in ipairs({ "isValid", "waitToStart", "start", "stop", "perform", "complete" }) do
+        local original = action[phase]
+        if type(original) == "function" then
+            action[phase] = function(self, ...)
+                local poll = phase == "isValid" or phase == "waitToStart"
+                if not poll then emit(phase .. "_enter") end
+                local returned = pack(original(self, ...))
+                if poll then
+                    if not observedPoll[phase] or lastPoll[phase] ~= returned[1] then
+                        observedPoll[phase], lastPoll[phase] = true, returned[1]
+                        emit(phase, returned[1])
+                    end
+                else emit(phase .. "_return", returned[1]) end
+                return unpack(returned, 1, returned.n)
+            end
+        end
+    end
+    -- Attaching observation does not prove queue admission or native success.
+    emit("observed")
+    return action
+end
+
+-- Native add may refuse or throw from begin(), and successful begin can finish
+-- synchronously. The registered queue is admission; crop changes remain the
+-- separate completion receipt owned by isComplete and the controller.
+local function admitAction(character, target, action, context)
+    Farming.traceAction(character, target, action, context)
+    local ok, queue = pcall(ISTimedActionQueue.add, action)
+    if not ok then return nil, "farming_queue_error" end
+    if queue == nil or ISTimedActionQueue.queues == nil
+        or queue ~= ISTimedActionQueue.queues[character] then
+        return nil, "farming_queue_refused"
+    end
+    return action, "queued"
+end
+
+function Farming.queueAction(character, target, water, context)
     if character == nil or target == nil then
         return nil, "missing_farming_target"
     end
     if target.action == "farm_harvest" then
         local action = ISHarvestPlantAction:new(character, target.plant, 100)
-        ISTimedActionQueue.add(action)
-        return action, "queued"
+        return admitAction(character, target, action, context)
     end
     if target.action == "farm_water" then
         local item = water ~= nil and water.item or nil
@@ -443,8 +547,7 @@ function Farming.queueAction(character, target, water)
             target.square,
             20 + (6 * uses)
         )
-        ISTimedActionQueue.add(action)
-        return action, "queued"
+        return admitAction(character, target, action, context)
     end
     if target.action == "farm_plow" then
         if target.plowItem == nil then
@@ -457,11 +560,10 @@ function Farming.queueAction(character, target, water)
             target.square,
             target.plowItem
         )
-        ISTimedActionQueue.add(action)
-        return action, "queued"
+        return admitAction(character, target, action, context)
     end
     if target.action == "farm_seed" then
-        if target.seedItem == nil or target.seedType == nil then
+        if target.seedItem == nil or target.seedType == nil or not usableSeed(target.seedItem) then
             return nil, "seed_item_unavailable"
         end
         local ready, reason = prepareCarriedItem(character, target.seedItem)
@@ -472,8 +574,24 @@ function Farming.queueAction(character, target, water)
             target.seedType,
             target.plant
         )
-        ISTimedActionQueue.add(action)
-        return action, "queued"
+        -- A transfer/wait may outlive this plan. The native complete callback
+        -- removes its seed before checking whether the plot is still plowed,
+        -- so reject stale material/plots before either native boundary runs.
+        local nativeValid, nativeComplete = action.isValid, action.complete
+        local function current(self)
+            safeCall(target.plant, "updateFromIsoObject")
+            return usableSeed(self.seed) and seedTypeForItem(self.seed) == target.seedType
+                and plantAt(target.square) == target.plant and target.plant.state == "plow"
+                and (nativeValid == nil or nativeValid(self) == true)
+        end
+        action.isValid = current
+        if nativeComplete ~= nil then
+            action.complete = function(self)
+                if not current(self) then return false end
+                return nativeComplete(self)
+            end
+        end
+        return admitAction(character, target, action, context)
     end
     return nil, "unsupported_farming_action"
 end
@@ -494,7 +612,7 @@ function Farming.snapshot(target)
         return { water = 0, harvestable = false, state = nil }
     end
     return {
-        water = tonumber(target.plant.waterLvl) or 0,
+        water = tonumber(target.plant.waterLvl),
         harvestable = canHarvest(target.plant),
         state = target.plant.state,
     }
@@ -512,14 +630,20 @@ function Farming.isComplete(target, before)
         return false
     end
     if target.action == "farm_harvest" then
-        return not canHarvest(target.plant)
+        -- A failed native read is unknown, not evidence that harvest completed.
+        return before ~= nil and before.harvestable == true
+            and safeCall(target.plant, "canHarvest") == false
     end
     if target.action == "farm_seed" then
         return isSeeded(target.plant)
             and (target.seedType == nil or target.plant.typeOfSeed == target.seedType)
     end
-    local after = tonumber(target.plant.waterLvl) or 0
-    return after > (tonumber(before ~= nil and before.water or 0) or 0)
+    if target.action ~= "farm_water" then return false end
+    local after = tonumber(target.plant.waterLvl)
+    local prior = tonumber(before ~= nil and before.water or nil)
+    return after ~= nil and prior ~= nil and after == after and prior == prior
+        and after >= 0 and after < math.huge and prior >= 0 and prior < math.huge
+        and after > prior
 end
 
 return Farming

@@ -204,51 +204,80 @@ final class KnoxInventorySnapshot {
 
     Consumption consumeSupply(String kind, double requested, Class<?> itemClass)
         throws ReflectiveOperationException {
-        if ((!"food".equals(kind) && !"water".equals(kind))
-            || !Double.isFinite(requested) || requested <= 0 || requested > 1) return null;
-        for (int index = 0; index < items.size(); index++) {
-            ItemState state = items.get(index);
-            // Legacy snapshots do not know real food/fluid contents. Never infer
-            // safe food or a full water bottle from a newly-created default item.
-            if (state.nativeBytes.isEmpty()) continue;
-            Object root = loadNativeItem(state, itemClass);
-            Supply supply = findSupply(root, null, kind);
-            if (supply == null) continue;
-            double hunger = 0, thirst = 0;
-            boolean remove = false;
-            if ("water".equals(kind)) {
-                Object fluid = invoke(supply.item, "getFluidContainer");
-                double amount = ((Number) invoke(fluid, "getAmount")).doubleValue();
-                double consumed = Math.min(amount, requested * 1.2);
-                // Build 42 ISDrinkFromBottle uses 0.12 fluid for 0.1 thirst.
-                fluid.getClass().getMethod("adjustAmount", float.class)
-                    .invoke(fluid, (float) Math.max(0, amount - consumed));
-                thirst = consumed / 1.2;
-            } else {
-                double fraction = Math.min(1, requested / supply.benefit);
-                hunger = supply.benefit * fraction;
-                thirst = -((Number) invoke(supply.item, "getThirstChange")).doubleValue() * fraction;
-                supply.item.getClass().getMethod("multiplyFoodValues", float.class)
-                    .invoke(supply.item, (float) (1 - fraction));
-                remove = fraction >= 1;
-                if (remove && supply.parent != null) invokeCompatible(supply.parent, "Remove", supply.item);
-            }
-            List<ItemState> updated = new ArrayList<>(items);
-            if (remove && supply.item == root) {
-                updated.remove(index);
-            } else {
-                updated.set(index, new ItemState(state.fullType, state.condition, state.uses,
-                    state.favorite, state.worn, state.primary, state.secondary, state.visual,
-                    countItemTree(root, new IdentityHashMap<>(), 0), captureNativeItem(root)));
-            }
-            return new Consumption(new KnoxInventorySnapshot(updated, worldVersion), hunger, thirst,
-                (String) invoke(supply.item, "getFullType"));
-        }
-        return null;
+        return consumeSupply(kind, requested, itemClass, null);
     }
 
-    private static Supply findSupply(Object item, Object parent, String kind) throws ReflectiveOperationException {
+    Consumption consumeSupply(String kind, double requested, Class<?> itemClass, String communalBase)
+        throws ReflectiveOperationException {
+        return consumeSupply(kind, requested, itemClass, communalBase, 1);
+    }
+
+    Consumption consumeSupply(String kind, double requested, Class<?> itemClass, String communalBase, int reserve)
+        throws ReflectiveOperationException {
+        if (reserve < 1 || reserve > 2) return null;
+        if ((!"food".equals(kind) && !"water".equals(kind))
+            || !Double.isFinite(requested) || requested <= 0 || requested > 1
+            || (communalBase != null && communalBase.isBlank())) return null;
+        List<Supply> candidates = new ArrayList<>();
+        Object root = null;
+        int selected = -1;
+        int required = communalBase == null ? 1 : reserve + 1; // retain one actual shareable provision
+        for (int index = 0; index < items.size(); index++) {
+            ItemState state = items.get(index);
+            if (state.nativeBytes.isEmpty()) continue;
+            Object restored = loadNativeItem(state, itemClass);
+            findSupplies(restored, null, kind, communalBase, candidates, required);
+            if (selected < 0 && !candidates.isEmpty()) { selected = index; root = restored; }
+            if (candidates.size() >= required) break;
+        }
+        if (candidates.size() < required) return null;
+        int index = selected;
+        ItemState state = items.get(index);
+        Supply supply = candidates.get(0);
+        double hunger = 0, thirst = 0;
+        boolean remove = false;
         if ("water".equals(kind)) {
+            Object fluid = invoke(supply.item, "getFluidContainer");
+            double amount = ((Number) invoke(fluid, "getAmount")).doubleValue();
+            double consumed = Math.min(amount, requested * 1.2);
+            // Build 42 ISDrinkFromBottle uses 0.12 fluid for 0.1 thirst.
+            fluid.getClass().getMethod("adjustAmount", float.class)
+                .invoke(fluid, (float) Math.max(0, amount - consumed));
+            thirst = consumed / 1.2;
+        } else {
+            double fraction = Math.min(1, requested / supply.benefit);
+            hunger = supply.benefit * fraction;
+            thirst = -((Number) invoke(supply.item, "getThirstChange")).doubleValue() * fraction;
+            supply.item.getClass().getMethod("multiplyFoodValues", float.class)
+                .invoke(supply.item, (float) (1 - fraction));
+            remove = fraction >= 1;
+            if (remove && supply.parent != null) invokeCompatible(supply.parent, "Remove", supply.item);
+        }
+        List<ItemState> updated = new ArrayList<>(items);
+        if (remove && supply.item == root) {
+            updated.remove(index);
+        } else {
+            updated.set(index, new ItemState(state.fullType, state.condition, state.uses,
+                state.favorite, state.worn, state.primary, state.secondary, state.visual,
+                countItemTree(root, new IdentityHashMap<>(), 0), captureNativeItem(root)));
+        }
+        return new Consumption(new KnoxInventorySnapshot(updated, worldVersion), hunger, thirst,
+            (String) invoke(supply.item, "getFullType"));
+    }
+
+    private static void findSupplies(Object item, Object parent, String kind, String communalBase,
+        List<Supply> found, int limit) throws ReflectiveOperationException {
+        if (found.size() >= limit) return;
+        boolean eligible = true;
+        if (communalBase != null) {
+            // A protected bag protects its contents too. Mission delivery cargo
+            // cannot be reassigned by incidental offscreen sharing.
+            if (Boolean.TRUE.equals(invoke(item, "isFavorite"))) return;
+            Object data = invoke(item, "getModData");
+            if (invokeCompatible(data, "rawget", "KnoxBaseSupplyDelivery") != null) return;
+            eligible = communalBase.equals(invokeCompatible(data, "rawget", "KnoxBaseProvision"));
+        }
+        if (eligible && "water".equals(kind)) {
             Object fluid = invoke(item, "getFluidContainer");
             if (fluid != null) {
                 double amount = ((Number) invoke(fluid, "getAmount")).doubleValue();
@@ -256,10 +285,10 @@ final class KnoxInventorySnapshot {
                 if (Double.isFinite(amount) && amount > 0 && primary != null
                     && "Water".equals(invoke(primary, "getFluidTypeString"))
                     && (Boolean) invokeCompatible(fluid, "isPureFluid", primary)) {
-                    return new Supply(item, parent, amount / 1.2);
+                    found.add(new Supply(item, parent, amount / 1.2)); return;
                 }
             }
-        } else if ((Boolean) invoke(item, "IsFood")) {
+        } else if (eligible && (Boolean) invoke(item, "IsFood")) {
             double benefit = -((Number) invoke(item, "getHungerChange")).doubleValue();
             if (Double.isFinite(benefit) && benefit > .001
                 && Double.isFinite(((Number) invoke(item, "getThirstChange")).doubleValue())
@@ -271,20 +300,19 @@ final class KnoxInventorySnapshot {
                 && empty(invoke(item, "getReplaceOnUse"))) {
                 // Scripted consumption/byproducts need an actual character/action;
                 // leave these for loaded self-care rather than silently losing them.
-                return new Supply(item, parent, benefit);
+                found.add(new Supply(item, parent, benefit)); return;
             }
         }
         Method getter;
         try { getter = item.getClass().getMethod("getInventory"); }
-        catch (NoSuchMethodException leaf) { return null; }
+        catch (NoSuchMethodException leaf) { return; }
         Object container = getter.invoke(item);
         if (container != null) {
             for (Object child : (Collection<?>) invoke(container, "getItems")) {
-                Supply supply = findSupply(child, container, kind);
-                if (supply != null) return supply;
+                findSupplies(child, container, kind, communalBase, found, limit);
+                if (found.size() >= limit) return;
             }
         }
-        return null;
     }
 
     private static boolean empty(Object value) {

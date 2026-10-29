@@ -143,13 +143,13 @@ local function canPerceiveHuman(first, second)
     local firstSuccess, firstVisible = pcall(function()
         return first:CanSee(second)
     end)
-    if firstSuccess and firstVisible == true then
-        return true
-    end
-    local secondSuccess, secondVisible = pcall(function()
-        return second:CanSee(first)
-    end)
-    return secondSuccess and secondVisible == true
+    return firstSuccess and firstVisible == true
+end
+
+local function mutuallyAware(first, second)
+    if not canPerceiveHuman(first, second) then return false end
+    local ok, visible = pcall(function() return second:CanSee(first) end)
+    return ok and visible == true
 end
 
 function Relationships.canPerceiveHuman(first, second)
@@ -223,6 +223,10 @@ local function decideEncounterOutcome(firstId, secondId, record)
         or firstPersonality == "gunner" or secondPersonality == "gunner" then
         hostileChance = clamp(hostileChance + 8, 8, 30)
     end
+    local serviceContact = KnoxPersistence.getSurvivorServiceRole ~= nil
+        and (KnoxPersistence.getSurvivorServiceRole(firstId) ~= nil
+            or KnoxPersistence.getSurvivorServiceRole(secondId) ~= nil)
+    if serviceContact then hostileChance=0 end
     local cautiousGreetingChance = clamp(42 + (sociability - 50) * 0.30, 25, 58)
     local hasFamiliarity = record ~= nil and (tonumber(record.meetings) or 0) >= 2
     local sharedActivity = record ~= nil and ((tonumber(record.sharedRoam) or 0)
@@ -254,7 +258,8 @@ local function decideEncounterOutcome(firstId, secondId, record)
         return "hostile"
     end
     local socialRoll = roll - (KnoxSettings.allowHostileEncounters() and hostileChance or 0)
-    local lureChance = (firstPersonality == "opportunist" or secondPersonality == "opportunist")
+    local lureChance = not serviceContact
+        and (firstPersonality == "opportunist" or secondPersonality == "opportunist")
         and 10 or 0
     if lureChance > 0 and socialRoll < lureChance then
         return "lure"
@@ -377,6 +382,14 @@ local function activateLocalAllyDefense(controllers, aggressor, victim, ticks)
     local aggressorSquare, victimSquare = squareFor(aggressor), squareFor(victim)
     if aggressorSquare == nil or victimSquare == nil
         or aggressorSquare:getZ() ~= victimSquare:getZ() then return end
+    local function witnessed(controller)
+        if controller == aggressor or controller == victim then return true end
+        local ok, visible = pcall(function()
+            return controller.character:CanSee(aggressor.character) == true
+                and controller.character:CanSee(victim.character) == true
+        end)
+        return ok and visible == true
+    end
     local expiresAt = (tonumber(ticks) or 0) + 900
     local forAggressor, forVictim = 0, 0
     for id, controller in pairs(controllers or {}) do
@@ -385,14 +398,24 @@ local function activateLocalAllyDefense(controllers, aggressor, victim, ticks)
             and square:getZ() == aggressorSquare:getZ() then
             if KnoxPersistence.areSurvivorsAllied(id, aggressor.id)
                 and distanceSquared(square, aggressorSquare)
-                    <= GROUP_DEFENSE_RADIUS * GROUP_DEFENSE_RADIUS then
+                    <= GROUP_DEFENSE_RADIUS * GROUP_DEFENSE_RADIUS
+                and witnessed(controller) then
                 controller:registerAllyDefenseThreat(victim.id, expiresAt)
                 forAggressor = forAggressor + 1
             elseif KnoxPersistence.areSurvivorsAllied(id, victim.id)
                 and distanceSquared(square, victimSquare)
-                    <= GROUP_DEFENSE_RADIUS * GROUP_DEFENSE_RADIUS then
+                    <= GROUP_DEFENSE_RADIUS * GROUP_DEFENSE_RADIUS
+                and witnessed(controller) then
                 controller:registerAllyDefenseThreat(aggressor.id, expiresAt)
                 forVictim = forVictim + 1
+            elseif id ~= aggressor.id and id ~= victim.id
+                and KnoxPersistence.getSurvivorServiceRole ~= nil
+                and KnoxPersistence.getSurvivorServiceRole(id)=="law_enforcement"
+                and relationshipDisposition(id,victim.id)~="hostile"
+                and distanceSquared(square,victimSquare)<=GROUP_DEFENSE_RADIUS^2
+                and witnessed(controller) then
+                controller:registerAllyDefenseThreat(aggressor.id,expiresAt)
+                forVictim=forVictim+1
             end
         end
     end
@@ -459,7 +482,8 @@ local function coordinateFactionBaseScouting(controllers, orderedIds, ticks)
                         )
                     end
                 end
-                if candidate ~= nil then
+                if candidate ~= nil and getGameTime():getWorldAgeHours()
+                    >= (tonumber(candidate.retryAtHours) or 0) then
                     leader:setFactionBaseCandidate(faction.id, candidate)
                 end
             elseif leader ~= nil then
@@ -511,7 +535,7 @@ local function observePair(first, second, worldAge, ticks, participants)
         and firstSquare:getZ() == secondSquare:getZ()
     local pairDistance = sameLevel and distanceSquared(firstSquare, secondSquare) or math.huge
     local perceived = pairDistance <= AWARENESS_RADIUS * AWARENESS_RADIUS
-        and canPerceiveHuman(first.character, second.character)
+        and mutuallyAware(first.character, second.character)
     local near = perceived
     local cautiouslyClose = perceived
         and pairDistance <= CAUTIOUS_APPROACH_RADIUS * CAUTIOUS_APPROACH_RADIUS
@@ -672,26 +696,23 @@ function Relationships.observe(controllers, orderedIds, ticks)
         participants[meeting.firstId] = true
         participants[meeting.secondId] = true
     end
+    -- Eligibility and identity are survivor-level facts for this observation.
+    -- Snapshot them once in the same ordered roster used by the pair walk;
+    -- re-reading them for every pair made persistence work grow quadratically.
+    local eligible = {}
     for index = 1, #orderedIds do
         local first = controllers[orderedIds[index]]
         if first ~= nil and first.character ~= nil
             and availableForNpcSocial(first.id, first) then
             local forename, surname = fullName(first.character)
             KnoxPersistence.ensureSurvivorIdentity(first.id, forename, surname, worldAge)
-            for otherIndex = index + 1, #orderedIds do
-                local second = controllers[orderedIds[otherIndex]]
-                if second ~= nil and second.character ~= nil
-                    and availableForNpcSocial(second.id, second) then
-                    local secondForename, secondSurname = fullName(second.character)
-                    KnoxPersistence.ensureSurvivorIdentity(
-                        second.id,
-                        secondForename,
-                        secondSurname,
-                        worldAge
-                    )
-                    observePair(first, second, worldAge, ticks or 0, participants)
-                end
-            end
+            eligible[#eligible + 1] = first
+        end
+    end
+    for index = 1, #eligible do
+        local first = eligible[index]
+        for otherIndex = index + 1, #eligible do
+            observePair(first, eligible[otherIndex], worldAge, ticks or 0, participants)
         end
     end
 end
@@ -910,6 +931,16 @@ function Relationships.coordinate(controllers, orderedIds, ticks)
             -- Escape, treatment and explicit orders release social ownership
             -- just as combat does. Only the still-waiting partner is resumed.
             abortMeeting(key, meeting, first, second, ticks, "activity_changed")
+        elseif (meeting.phase == "REQUESTED"
+            or (meeting.phase == "APPROACHING" and first.state == "MEETING_READY")
+            or (meeting.phase == "GREETING" and
+                ((not meeting.responseSpoken and ticks - meeting.greetingAt >= 90)
+                    or ticks - meeting.greetingAt >= 240)))
+            and not mutuallyAware(first.character, second.character) then
+            -- A prior observation is not ongoing permission to speak, recruit
+            -- or record consequences. Approach may use its last observed target;
+            -- actual contact must be re-established before each commitment.
+            abortMeeting(key, meeting, first, second, ticks, "contact_lost")
         elseif meeting.phase == "REQUESTED" then
             if first:canInterruptForMeeting() and second:canInterruptForMeeting()
                 and first:interruptForMeeting() and second:interruptForMeeting() then

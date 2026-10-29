@@ -20,6 +20,13 @@ local function tryBridge()
     end
 
     local bridge = rawget(_G, "KnoxJavaBridge")
+    if bridge == nil and KnoxRuntimeApi ~= nil then
+        local ok, exposed = pcall(function() return KnoxRuntimeApi.getBridge() end)
+        if ok and exposed ~= nil then
+            bridge = exposed
+            rawset(_G, "KnoxJavaBridge", bridge)
+        end
+    end
     if bridge == nil then
         return false
     end
@@ -63,8 +70,9 @@ retryTick = function()
             local feed = rawget(_G, "KnoxActivityFeed")
             if feed ~= nil and feed.event ~= nil then
                 feed.event("Knox Survivors Java systems are not loaded. "
-                    .. "Install KnoxBridge, enable Knox Survivors, and approve the Knox module's exact file hash in KnoxBridge Setup. "
-                    .. "Restart Project Zomboid after installing or approving the module.")
+                    .. "Choose KnoxBridge or a compatible ZombieBuddy build, enable the chosen runtime and Knox Survivors, "
+                    .. "and approve the Knox Java package through that runtime. "
+                    .. "Restart Project Zomboid after installing or approving the package.")
             end
         end)
         stopRetrying()

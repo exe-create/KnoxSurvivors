@@ -41,6 +41,23 @@ local function addMany(inventory, fullType, count, added)
     return true
 end
 
+-- A profession alone (for example a veteran living in a house) is not evidence
+-- of a stocked facility. Only the saved matching location/profile gets its kit.
+function StartingGear.themeForOrigin(profile, origin)
+    if type(profile) ~= "table" or type(origin) ~= "table" then return nil end
+    if origin.source ~= "world_building" or type(origin.buildingId) ~= "string"
+        or origin.buildingId == "" then return nil end
+    local profession = profile.professionId
+    if origin.context == "law_enforcement" and profession == "base:policeofficer" then
+        return "police"
+    elseif origin.context == "military" and profession == "base:veteran" then
+        return "military"
+    elseif origin.context == "fire_service" and profession == "base:fireofficer" then
+        return "fire_rescue"
+    end
+    return nil
+end
+
 -- Character creation supplies clothing and the occasional bag. This adds only a
 -- restrained pocket-sized start: many people remain poorly prepared, while some
 -- arrive with the sort of ordinary item a new player might reasonably carry.
@@ -51,12 +68,20 @@ function StartingGear.initialize(id, character, bridge, loadoutTheme)
     local inventory = character:getInventory()
     local added = {}
     if loadoutTheme == "police" then
-        -- A restrained regular-officer kit.  Uniform clothing comes from the
-        -- native policeofficer creator definition; no firearm, ammo, artificial
-        -- skill or combat multiplier is granted here.
+        -- Uniform clothing comes from the native policeofficer definition.
+        -- Ammo remains finite and must be loaded by the existing native owner.
         if not add(inventory, "Base.Nightstick", added)
+            or not add(inventory, "Base.Pistol", added)
+            or not add(inventory, "Base.9mmClip", added)
+            or not addMany(inventory, "Base.Bullets9mm", 30, added)
             or not add(inventory, "Base.WalkieTalkie4", added) then
             return false, "police_kit_item_unavailable"
+        end
+    elseif loadoutTheme == "fire_rescue" then
+        if not add(inventory, "Base.Axe", added)
+            or not add(inventory, "Base.WalkieTalkie4", added)
+            or not add(inventory, "Base.Bandage", added) then
+            return false, "fire_rescue_kit_item_unavailable"
         end
     elseif loadoutTheme == "science" then
         -- Build 42 has no scientist profession or magic research inventory.
@@ -84,13 +109,13 @@ function StartingGear.initialize(id, character, bridge, loadoutTheme)
             end
         end
     elseif loadoutTheme == "military" then
-        -- A real M9, compatible magazine and three five-round 9mm stacks let
-        -- the existing native reload system establish weapon state. Nothing
-        -- here fabricates chamber/magazine state or combat bonuses.
+        -- Native magazine loading consumes one inventory entry per round;
+        -- AddItem(string) does not expand the ammo script's count=5 into entries.
+        -- Two magazines and 60 rounds are a finite start, never a replenishment.
         if not add(inventory, "Base.HuntingKnife", added)
-            or not add(inventory, "Base.Pistol", added)
-            or not add(inventory, "Base.9mmClip", added)
-            or not addMany(inventory, "Base.Bullets9mm", 3, added)
+            or not add(inventory, "Base.AssaultRifle", added)
+            or not addMany(inventory, "Base.556Clip", 2, added)
+            or not addMany(inventory, "Base.556Bullets", 60, added)
             or not add(inventory, "Base.WalkieTalkie5", added) then
             return false, "military_kit_item_unavailable"
         end

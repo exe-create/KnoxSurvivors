@@ -457,15 +457,31 @@ function CorpseHandling.resolveTarget(base, target, character)
     }, "resolved"
 end
 
+local function admitAction(character, action, stage)
+    -- Native begin may complete synchronously; the registered queue return
+    -- proves admission, while grapple/destination receipts remain separate.
+    local queue = ISTimedActionQueue.add(action)
+    if queue == nil or ISTimedActionQueue.queues == nil
+        or queue ~= ISTimedActionQueue.queues[character] then
+        return nil, stage .. "_queue_refused"
+    end
+    return action, "queued"
+end
+
 local function unequipHeld(character)
     local primary = safeCall(character, "getPrimaryHandItem")
     local secondary = safeCall(character, "getSecondaryHandItem")
     if primary ~= nil then
-        ISTimedActionQueue.add(ISUnequipAction:new(character, primary, 50))
+        local action, reason = admitAction(character,
+            ISUnequipAction:new(character, primary, 50), "corpse_unequip_primary")
+        if action == nil then return false, reason end
     end
     if secondary ~= nil and secondary ~= primary then
-        ISTimedActionQueue.add(ISUnequipAction:new(character, secondary, 50))
+        local action, reason = admitAction(character,
+            ISUnequipAction:new(character, secondary, 50), "corpse_unequip_secondary")
+        if action == nil then return false, reason end
     end
+    return true
 end
 
 function CorpseHandling.queueGrab(character, target)
@@ -475,10 +491,10 @@ function CorpseHandling.queueGrab(character, target)
     if safeCall(character, "isDraggingCorpse") == true then
         return nil, "already_dragging_corpse"
     end
-    unequipHeld(character)
+    local prepared, reason = unequipHeld(character)
+    if not prepared then return nil, reason end
     local action = ISGrabCorpseAction:new(character, target.body)
-    ISTimedActionQueue.add(action)
-    return action, "queued"
+    return admitAction(character, action, "corpse_grab")
 end
 
 function CorpseHandling.grabTransitionState(character)
@@ -558,8 +574,7 @@ function CorpseHandling.queueDrop(character, target)
         return nil, "not_dragging_corpse"
     end
     local action = ISDropCorpseAction:new(character, target.dropSquare)
-    ISTimedActionQueue.add(action)
-    return action, "queued"
+    return admitAction(character, action, "corpse_drop")
 end
 
 function CorpseHandling.isDragging(character)

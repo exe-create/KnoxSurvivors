@@ -72,12 +72,52 @@ local TASK_ACTIVITY = {
 }
 
 local DECISION_ACTIVITY = {
+    regroup_last_contact = "regroup_last_contact",
+    awaiting_player_contact = "awaiting_player_contact", regroup_route_blocked = "regroup_route_blocked",
     eat = "eating", drink = "drinking", rest = "resting", sleep = "sleeping",
     bandage = "treating_wounds", improvise_medical = "preparing_bandages",
+    waiting_for_food = "waiting_for_food", waiting_for_water = "waiting_for_water",
+    waiting_for_medical = "waiting_for_medical",
 }
 
 local function validId(id)
     return type(id) == "string" and id ~= ""
+end
+
+local function baseSupplyActivity(controller, state)
+    if controller == nil or controller.baseId == nil then return nil end
+    local deposit = controller.pendingBaseSupplyDeposit
+    local hasCargo = deposit ~= nil and deposit.item ~= nil
+    if state == "BASE_IDLE" and hasCargo
+        and controller.activeDecision == "base_supply_delivery_wait" then
+        return "waiting_to_store_base_supplies"
+    end
+    if state == "INVENTORY_CLEANUP" and controller.pendingCleanup ~= nil
+        and controller.pendingCleanup.baseSupply == true then
+        return "storing_base_supplies"
+    end
+    if state == "MOVING_TO_DEPOSIT" and hasCargo then
+        return "taking_base_supplies_to_storage"
+    end
+    local party = controller.baseSupplyParty == true
+    local returning = controller.baseSupplyPartyReturning == true
+        or party and controller.scavengeSortieReturning == true
+    if returning and (state == "BASE_RETURN" or state == "GROUP_FOLLOW"
+        or state == "GROUP_WAIT" or state == "GROUP_REGROUP"
+        or state == "BASE_IDLE" or state == "IDLE") then
+        return hasCargo and "returning_with_base_supplies" or "returning_from_supply_run"
+    end
+    if not party then return nil end
+    local pending = controller.pendingSupply
+    local partyPickup = pending ~= nil and pending.baseSupplyPartyBaseId == controller.baseId
+    if partyPickup and (state == "MOVING_TO_SUPPLY" or state == "SEARCHING") then
+        return "seeking_base_supplies"
+    end
+    if partyPickup and state == "LOOTING" then return "collecting_base_supplies" end
+    if state == "MOVING_TO_EXPLORE" or state == "ROAMING"
+        or state == "GROUP_FOLLOW" or state == "GROUP_WAIT" or state == "GROUP_REGROUP"
+        or state == "IDLE" or state == "BASE_IDLE" then return "on_supply_run" end
+    return nil
 end
 
 function Runtime.register(id, controller)
@@ -107,6 +147,31 @@ local function getEntry(id)
     return validId(id) and entries[id] or nil
 end
 
+-- OnSave can run after a native transfer receives an item but before its
+-- controller observes completion. Reconcile only that exact receipt before
+-- inventory serialization; do not interrupt actions or release reservations.
+function Runtime.prepareInventoryCapture(id, character)
+    local entry = getEntry(id)
+    local controller = entry ~= nil and entry.controller or nil
+    if controller == nil or controller.recordSettlementLootReceipt == nil then
+        return true, "no_pending_receipt_owner"
+    end
+    if controller.character ~= character then
+        return false, "receipt_character_mismatch"
+    end
+    local ok, received = pcall(controller.recordSettlementLootReceipt, controller)
+    if not ok or type(received) ~= "number" then
+        return false, "receipt_reconcile_failed=" .. tostring(received)
+    end
+    if controller.recordBaseSupplyDepositReceipt ~= nil then
+        local depositOk, deposited, detail = pcall(controller.recordBaseSupplyDepositReceipt, controller)
+        if not depositOk or type(deposited) ~= "boolean" or detail == "receipt_unreadable" then
+            return false, "deposit_receipt_reconcile_failed=" .. tostring(detail or deposited)
+        end
+    end
+    return true, "receipts=" .. tostring(received)
+end
+
 function Runtime.setLifecycleState(id, state)
     local entry = getEntry(id)
     if entry == nil or type(state) ~= "string" or state == "" then return false end
@@ -122,9 +187,18 @@ end
 function Runtime.canAcceptOrders(id)
     local state = Runtime.getLifecycleState(id)
     if state == "detached_transient" or state == "detached_grace"
-        or state == "detached_stale" or state == "hibernating" then
+        or state == "detached_stale" or state == "hibernating"
+        or state == "hibernate_recovery_pending" then
         return false, "companion_detached"
     end
+    return true
+end
+
+-- Visible native bodies can still belong to an incomplete hibernation
+-- transaction. Interaction uses the same lifecycle admission as commands.
+function Runtime.canInteract(id)
+    local accepted = Runtime.canAcceptOrders(id)
+    if not accepted then return false, "survivor_unavailable" end
     return true
 end
 
@@ -137,6 +211,13 @@ function Runtime.unregister(id, controller)
         return true
     end
     return false
+end
+
+-- Read-only identity lookup for UI attention/availability. The registered
+-- controller remains the sole action owner; never synthesize a second one.
+function Runtime.getController(id)
+    local entry = getEntry(id)
+    return entry ~= nil and entry.controller or nil
 end
 
 function Runtime.getCharacter(id)
@@ -211,13 +292,19 @@ function Runtime.snapshot(id)
     -- A decision is a meaningful live activity only while its controller state
     -- owns that action.  An interrupted eat/rest decision must not hide a
     -- higher-priority flee/combat/pathing state that has already taken over.
-    local decisionActivity = (state == "TIMED_ACTION" or state == "SLEEPING_RECOVERY"
-        or state == "WAITING_TO_RECOVER") and DECISION_ACTIVITY[tostring(decision or "")] or nil
+    local decisionActivity = ((state == "COMPANION_FOLLOW" and decision == "regroup_last_contact")
+        or state == "TIMED_ACTION" or state == "SLEEPING_RECOVERY"
+        or state == "WAITING_TO_RECOVER"
+        or (state == "COMPANION_WAIT" and (decision == "awaiting_player_contact" or decision == "regroup_route_blocked"))
+        or (state == "BASE_IDLE" and (decision == "waiting_for_food"
+            or decision == "waiting_for_water" or decision == "waiting_for_medical")))
+        and DECISION_ACTIVITY[tostring(decision or "")] or nil
     return {
         id = id,
         loaded = square ~= nil,
         state = state,
         activity = vehicleActivity or (reloading and "reloading") or dutyActivity or decisionActivity
+            or baseSupplyActivity(controller, state)
             or ((state == "BASE_RECREATION" or state == "BASE_COOKING") and decision)
             or ACTIVITY_BY_STATE[state] or "busy",
         decision = decision,
@@ -250,6 +337,8 @@ end
 -- Transient action lease only. Identity, orders and inventory stay in their
 -- existing owners; a replacement/detached controller cannot inherit this lease.
 function Runtime.beginPlayerConversation(id, player)
+    local accepted, reason = Runtime.canInteract(id)
+    if not accepted then return false, reason end
     local entry = getEntry(id)
     if entry == nil or entry.controller.beginPlayerConversation == nil then
         return false, "survivor_unavailable"
@@ -262,7 +351,20 @@ function Runtime.endPlayerConversation(id, player)
     return entry ~= nil and entry.controller:endPlayerConversation(player) or false
 end
 
+-- The partner's existing controller owns admission and its transient cooldown.
+-- Never address an old body during a lifecycle/identity handoff.
+function Runtime.acceptAmbientSocial(id, speaker, baseId, ticks)
+    if not Runtime.canInteract(id) then return false end
+    local entry = getEntry(id)
+    local controller = entry ~= nil and entry.controller or nil
+    if controller == nil or controller.acceptAmbientSocial == nil
+        or Runtime.getCharacter(id) ~= controller.character then return false end
+    return controller:acceptAmbientSocial(speaker, baseId, ticks) == true
+end
+
 function Runtime.beginTrade(id, action)
+    local accepted, reason = Runtime.canInteract(id)
+    if not accepted then return false, reason end
     local entry = getEntry(id)
     return entry ~= nil and entry.controller:beginTrade(action) or false
 end

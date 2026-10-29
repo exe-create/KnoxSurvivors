@@ -33,16 +33,51 @@ local function danger(character)
         or character:isAttacking() or character:isAiming()
 end
 
+local function pendingActions(character)
+    if not character:getCharacterActions():isEmpty() then return true end
+    local queue = ISTimedActionQueue.queues[character]
+    return queue ~= nil and #queue.queue > 0
+end
+
+local function retireAction(action)
+    -- The exchange is queued on the real player, not on its NPC attention
+    -- owner. Retire only this exact action; a mixed current queue drains with
+    -- permission revoked instead of deleting the player's other work.
+    local queue = ISTimedActionQueue.queues[action.character]
+    if queue == nil or type(queue.queue) ~= "table" then return end
+    local found, onlyOwned = false, #queue.queue > 0
+    for _, queued in ipairs(queue.queue) do
+        if queued == action then found = true else onlyOwned = false end
+    end
+    if not found then return end
+    if onlyOwned then
+        safe(function() ISTimedActionQueue.clear(action.character) end, false)
+    elseif queue.current ~= action then
+        safe(function()
+            action:forceCancel()
+            queue:removeFromQueue(action)
+        end, false)
+    end
+end
+
 local function physicalCheck(action)
     if not localOnly() or Trade.failedExchange ~= nil then return false, "trading_unavailable" end
     if action.cancelled or action.finished then return false, action.cancelled or "finished" end
+    if KnoxSurvivorRuntime.canInteract ~= nil
+        and not KnoxSurvivorRuntime.canInteract(action.survivorId) then
+        return false, "survivor_unavailable"
+    end
     local identity = action.character:getModData().KnoxSurvivors
     if identity == nil or identity.playerId ~= action.playerId then return false, "player_changed" end
     if KnoxSurvivorRuntime.getCharacter(action.survivorId) ~= action.npc
         or not KnoxPersistence.isSurvivorAlive(action.survivorId) then return false, "survivor_changed" end
     if not reachable(action.character, action.npc) then return false, "out_of_reach" end
     if danger(action.character) or danger(action.npc) then return false, "danger" end
-    if not action.npc:getCharacterActions():isEmpty() then return false, "survivor_busy" end
+    if action.browsing and pendingActions(action.character) then return false, "player_busy" end
+    if pendingActions(action.npc) then return false, "survivor_busy" end
+    if action.knoxTradeGuard ~= nil and action.knoxTradeGuard(action) ~= true then
+        return false, "exchange_permission_changed"
+    end
     local affiliation = KnoxPersistence.getSurvivorAffiliation(action.survivorId) or {}
     if affiliation.kind == "player" or KnoxPersistence.isSurvivorHostileToPlayer(action.survivorId, action.playerId) then
         return false, "relationship_changed"
@@ -173,7 +208,8 @@ local function commit(action)
 end
 
 function Action:isValid()
-    return KnoxSurvivorRuntime.ownsTrade(self.survivorId, self) and safe(function()
+    return type(self.knoxTradeGuard) == "function"
+        and KnoxSurvivorRuntime.ownsTrade(self.survivorId, self) and safe(function()
         return physicalCheck(self)
     end, false)
 end
@@ -193,6 +229,7 @@ function Action:finish(success, reason)
     if self.finished then return end
     self.finished, self.success, self.result = true, success, reason
     KnoxSurvivorRuntime.releaseTrade(self.survivorId, self)
+    if not success then retireAction(self) end
     if rawget(_G, "ISInventoryPage") ~= nil then ISInventoryPage.renderDirty = true end
 end
 
@@ -228,6 +265,7 @@ function Trade.beginBrowse(player, survivorId)
     function session:isValid()
         return not self.finished and getTimestampMs() >= self.openedAt
             and getTimestampMs() - self.openedAt < 120000
+            and type(self.knoxTradeGuard) == "function"
             and KnoxSurvivorRuntime.ownsTrade(self.survivorId, self)
             and safe(function() return physicalCheck(self) end, false)
     end
@@ -271,8 +309,22 @@ function Trade.queue(player, survivorId, giving, taking, session, mode)
         Trade.endBrowse(session, "exchange_started")
     end
     if not KnoxSurvivorRuntime.beginTrade(survivorId, action) then return nil, "survivor_busy_or_threatened" end
-    local queued = pcall(ISTimedActionQueue.add, action)
-    if not queued then action:finish(false, "queue_failed") return nil, "queue_failed" end
+    local queued, admitted = pcall(ISTimedActionQueue.add, action)
+    local present = false
+    if queued and admitted ~= nil and admitted == ISTimedActionQueue.queues[player] then
+        for _, entry in ipairs(admitted.queue or {}) do
+            if entry == action then present = true break end
+        end
+    end
+    if not queued or admitted == nil or admitted ~= ISTimedActionQueue.queues[player]
+        or (not present and not (action.finished and action.success))
+        or (action.finished and not action.success)
+        or (not action.finished and not KnoxSurvivorRuntime.ownsTrade(survivorId, action)) then
+        local failure = not queued and "queue_failed" or action.result or "queue_refused"
+        action:finish(false, failure)
+        retireAction(action)
+        return nil, failure
+    end
     return action, "queued"
 end
 

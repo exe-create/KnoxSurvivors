@@ -67,6 +67,20 @@ final class KnoxEquipmentController {
 
     /** Wears an existing carried clothing/container item without creating or deleting gear. */
     static String wearOwnedItem(Object body, String fullType) throws ReflectiveOperationException {
+        return wearOwnedItem(body, fullType, -1L);
+    }
+
+    /** Selects the exact carried garment/bag chosen by the Lua planner. */
+    static String wearOwnedItemById(Object body, String fullType, long itemId)
+        throws ReflectiveOperationException {
+        if (itemId < 0L) {
+            return "WEAR_FAILED INVALID_ITEM_ID";
+        }
+        return wearOwnedItem(body, fullType, itemId);
+    }
+
+    private static String wearOwnedItem(Object body, String fullType, long itemId)
+        throws ReflectiveOperationException {
         if (fullType == null || fullType.isBlank()) {
             return "WEAR_FAILED INVALID_ITEM";
         }
@@ -74,7 +88,10 @@ final class KnoxEquipmentController {
         Object selected = null;
         Object location = null;
         for (Object item : (Collection<?>) invoke(inventory, "getItems")) {
-            if (!fullType.equals(String.valueOf(invoke(item, "getFullType")))) {
+            if (item == null || !fullType.equals(String.valueOf(invoke(item, "getFullType")))) {
+                continue;
+            }
+            if (itemId >= 0L && ((Number) invoke(item, "getID")).longValue() != itemId) {
                 continue;
             }
             location = wearableLocation(item);
@@ -115,7 +132,7 @@ final class KnoxEquipmentController {
         Object inventory = invoke(body, "getInventory");
         Object selected = null;
         for (Object item : (Collection<?>) invoke(inventory, "getItems")) {
-            if (!inherits(item, "zombie.inventory.types.HandWeapon")
+            if (item == null || !inherits(item, "zombie.inventory.types.HandWeapon")
                 || (Boolean) invoke(item, "isBroken")
                 || !fullType.equals(String.valueOf(invoke(item, "getFullType")))) {
                 continue;

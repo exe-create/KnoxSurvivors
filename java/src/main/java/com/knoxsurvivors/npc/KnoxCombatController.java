@@ -14,11 +14,11 @@ final class KnoxCombatController {
     private static final int DIRECT_STATE_FALLBACK_TICKS = 3;
     private static final int ATTACK_RECOVERY_TICKS = 24;
     private static final int MELEE_RECOVERY_TICKS = 30;
-    private static final int MISSED_SWINGS_BEFORE_REPOSITION = 3;
     private static final float ATTACK_ENTRY_BUFFER = 0.05f;
     private static final float REAPPROACH_BUFFER = 0.20f;
     private static final int RANGED_REPOSITION_COOLDOWN_TICKS = 60;
     private static final int APPROACH_REFRESH_TICKS = 30;
+    private static final int DAMAGE_LOG_INTERVAL_TICKS = 60;
 
     private KnoxNpc npc;
     private Object target;
@@ -28,6 +28,9 @@ final class KnoxCombatController {
     private int attackRequests;
     private float initialTargetHealth;
     private float lastTargetHealth;
+    private int lastDamageLogTick = -DAMAGE_LOG_INTERVAL_TICKS;
+    private int pendingDamageSamples;
+    private float pendingDamageStartHealth;
     private int initialWeaponCondition;
     private float weaponMaxRange;
     private float desiredAttackRange;
@@ -44,7 +47,6 @@ final class KnoxCombatController {
     private boolean liveCombat;
     private int defenseWindowUntil;
     private Object approachSquare;
-    private int attacksAtLastDamage;
     private int lastRangedRepositionTick = -RANGED_REPOSITION_COOLDOWN_TICKS;
     private int lastApproachTick;
     private float approachTargetX;
@@ -78,6 +80,7 @@ final class KnoxCombatController {
         if (door == null || !inherits(door, "zombie.iso.objects.IsoDoor")) {
             return "COMBAT_FAILED NO_LOCKED_DOOR_TARGET";
         }
+        if (hasNativeRecoveryOwner(activeNpc)) return "COMBAT_DEFERRED NATIVE_RECOVERY";
 
         reset();
         npc = activeNpc;
@@ -90,7 +93,7 @@ final class KnoxCombatController {
             true,
             body.getClass().getClassLoader()
         );
-        if (!KnoxCombatGate.isPatchReady()) {
+        if (!KnoxCombatGate.isPatchReady() && !com.knoxsurvivors.agent.KnoxAgent.usesZombieBuddyPatches()) {
             reset();
             return "COMBAT_FAILED CALLBACK_PATCH_NOT_READY calls="
                 + KnoxCombatGate.getPatchedCallCount();
@@ -138,6 +141,7 @@ final class KnoxCombatController {
             || !humanTarget))) {
             return "COMBAT_FAILED INVALID_TARGET";
         }
+        if (hasNativeRecoveryOwner(activeNpc)) return "COMBAT_DEFERRED NATIVE_RECOVERY";
 
         reset();
         npc = activeNpc;
@@ -151,12 +155,13 @@ final class KnoxCombatController {
             true,
             body.getClass().getClassLoader()
         );
-        if (!KnoxCombatGate.isPatchReady()) {
+        if (!KnoxCombatGate.isPatchReady() && !com.knoxsurvivors.agent.KnoxAgent.usesZombieBuddyPatches()) {
             reset();
             return "COMBAT_FAILED CALLBACK_PATCH_NOT_READY calls="
                 + KnoxCombatGate.getPatchedCallCount();
         }
-        if (!controlledGate && zombieTarget && !KnoxCombatGate.isVisibilityPatchReady()) {
+        if (!controlledGate && zombieTarget && !KnoxCombatGate.isVisibilityPatchReady()
+            && !com.knoxsurvivors.agent.KnoxAgent.usesZombieBuddyPatches()) {
             reset();
             return "COMBAT_FAILED ZOMBIE_VISIBILITY_PATCH_NOT_READY calls="
                 + KnoxCombatGate.getVisibilityPatchedCallCount();
@@ -282,19 +287,29 @@ final class KnoxCombatController {
         }
 
         ticks++;
+        Object body = npc.getBody();
+        boolean actorUnavailable = combatantUnavailable(body);
+        // A live native crossing/opening owns input, facing and its route even
+        // when the combat target is already close enough to attack. Observe
+        // required native receipts without turning this into a movement tick.
+        if (!actorUnavailable && KnoxNpcFactory.hasNativeTraversalOwner(npc)) {
+            KnoxNpcFactory.observeNativeAction(npc);
+            return "COMBAT_NATIVE_ACTION phase=" + phase;
+        }
         if (liveCombat && inherits(target, "zombie.characters.IsoPlayer"))
             KnoxHumanCombatGate.refresh(this, npc.getBody(), target);
         float currentHealth = health(target);
-        if (currentHealth < lastTargetHealth) {
-            damageObserved = true;
-            attacksAtLastDamage = attackRequests;
-            KnoxAgent.writeLog(
-                "NPC combat DAMAGE targetHealth=" + currentHealth + " previous=" + lastTargetHealth
-            );
-        }
-        lastTargetHealth = currentHealth;
+        observeTargetHealth(currentHealth);
 
-        if (targetFinished(target)) {
+        boolean finishedTarget = targetFinished(target);
+        boolean unavailableTarget = !finishedTarget && targetUnavailable(target);
+        if (!actorUnavailable && (finishedTarget || unavailableTarget) && nativeAttackOwnsBody(body)) {
+            // The last native hit can finish a target before the animation's
+            // remaining frames release the actor. Retire the target afterward,
+            // without pressing another attack or cancelling this native action.
+            return "COMBAT_NATIVE_ATTACK phase=" + phase;
+        }
+        if (finishedTarget) {
             if (attackRequests == 0 || !damageObserved) {
                 phase = "FAILED";
                 return finish("COMBAT_FAILED TARGET_DIED_WITHOUT_NPC_DAMAGE attacks="
@@ -315,12 +330,11 @@ final class KnoxCombatController {
                 + " weaponCondition=" + initialWeaponCondition + "->" + condition);
         }
 
-        if (combatantUnavailable(npc.getBody()) || targetUnavailable(target)) {
+        if (actorUnavailable || unavailableTarget) {
             phase = "FAILED";
             return finish("COMBAT_FAILED INVALID_OR_UNLOADED_COMBATANT");
         }
 
-        Object body = npc.getBody();
         Object equippedWeapon = body.getClass().getMethod("getPrimaryHandItem").invoke(body);
         if (equippedWeapon != combatWeapon) {
             phase = "FAILED";
@@ -339,26 +353,24 @@ final class KnoxCombatController {
         String bodyAction = String.valueOf(
             body.getClass().getMethod("getCurrentActionContextStateName").invoke(body)
         );
-        if (liveCombat && isHitReactionAction(bodyAction)) {
+        String bodyState = String.valueOf(body.getClass().getMethod("getCurrentStateName").invoke(body));
+        if ((liveCombat || obstacleTarget) && nativeInjuryOwnsBody(body, bodyState, bodyAction)) {
             // A vanilla zombie hit reaction owns the shell until its action graph exits.
             // Reapplying aim/attack input here suppresses the visible reaction and can
             // leave AttackType set, which also makes a frontal zombie collision return
             // before AddRandomDamageFromZombie is called.
-            clearAttackIntent();
-            body.getClass().getMethod("clearVariable", String.class)
-                .invoke(body, "AttackType");
-            attackCycleActive = false;
-            lastAttackTick = ticks;
-            defenseWindowUntil = Math.max(
-                defenseWindowUntil,
-                ticks + ATTACK_RECOVERY_TICKS
-            );
+            clearNativeRecoveryInput(body);
             return "COMBAT_REACTING action=" + bodyAction
                 + " targetHealth=" + currentHealth;
         }
 
-        boolean attackInProgress = (Boolean) body.getClass().getMethod("isAttacking").invoke(body)
-            || (Boolean) body.getClass().getMethod("isPerformingAttackAnimation").invoke(body);
+        // One native ownership snapshot governs movement and attack admission.
+        // A requested attack can precede both the attacking flag and animation.
+        boolean attackStarted = (Boolean) body.getClass().getMethod("isAttackStarted").invoke(body);
+        boolean attacking = (Boolean) body.getClass().getMethod("isAttacking").invoke(body);
+        boolean attackAnimation = (Boolean) body.getClass()
+            .getMethod("isPerformingAttackAnimation").invoke(body);
+        boolean attackActive = attackStarted || attacking || attackAnimation;
         float minimumRangedDistance = minimumRangedDistance(desiredAttackRange);
         if (shouldRepositionRanged(
             rangedWeapon,
@@ -366,7 +378,7 @@ final class KnoxCombatController {
             minimumRangedDistance,
             ticks,
             lastRangedRepositionTick,
-            attackInProgress
+            attackActive
         )) {
             clearAttackIntent();
             KnoxNpcFactory.moveToRangeFromCurrentSide(
@@ -466,7 +478,7 @@ final class KnoxCombatController {
         }
 
         if (!obstacleTarget && targetDistance > reapproachThreshold) {
-            if (!attackInProgress) {
+            if (!attackActive) {
                 clearAttackIntent();
                 beginLiveApproach();
                 phase = "APPROACHING";
@@ -487,11 +499,6 @@ final class KnoxCombatController {
             classFor(body, "zombie.iso.IsoGridSquare")
         ).invoke(body, targetSquare);
 
-        boolean attackStarted = (Boolean) body.getClass().getMethod("isAttackStarted").invoke(body);
-        boolean attacking = (Boolean) body.getClass().getMethod("isAttacking").invoke(body);
-        boolean attackAnimation = (Boolean) body.getClass()
-            .getMethod("isPerformingAttackAnimation").invoke(body);
-        boolean attackActive = attackStarted || attacking || attackAnimation;
         if (attackCycleActive && !attackActive) {
             // Yield the complete interval between swings to vanilla defense/hit
             // reactions. AttackState rejects a frontal collision while the target's
@@ -527,29 +534,6 @@ final class KnoxCombatController {
             faceTarget(body, targetX, targetY);
         }
 
-        if (liveCombat
-            && attackRequests - attacksAtLastDamage >= MISSED_SWINGS_BEFORE_REPOSITION) {
-            clearAttackIntent();
-            KnoxNpcFactory.moveToRangeFromCurrentSide(
-                npc,
-                target,
-                approachSquare,
-                desiredAttackRange
-            );
-            npc.getBody().getClass().getMethod("setRunning", boolean.class).invoke(npc.getBody(), true);
-            rememberApproachTarget(targetX, targetY);
-            phase = "APPROACHING";
-            aimTicks = 0;
-            attackCycleActive = false;
-            attacksAtLastDamage = attackRequests;
-            KnoxAgent.writeLog(
-                "NPC combat REPOSITION missedSwings=" + MISSED_SWINGS_BEFORE_REPOSITION
-                    + " distance=" + targetDistance
-                    + " desiredRange=" + desiredAttackRange
-            );
-            return "COMBAT_REPOSITIONING distance=" + targetDistance
-                + " targetHealth=" + currentHealth;
-        }
         boolean aimAtFloor = targetOnFloor;
         applyCombatStance(body, false, aimAtFloor, rangedWeapon);
 
@@ -605,7 +589,7 @@ final class KnoxCombatController {
             body.getClass().getMethod("getAttackType").invoke(body)
         );
         boolean attackTypeClear = attackType.isEmpty() || "NONE".equalsIgnoreCase(attackType);
-        if (!attackStarted && !attacking && weaponReady && attackTypeClear
+        if (!attackActive && weaponReady && attackTypeClear
             && ticks - lastAttackTick >= ATTACK_RETRY_TICKS) {
             requestAttack(body, aimAtFloor, rangedWeapon);
             attackRequests++;
@@ -634,6 +618,24 @@ final class KnoxCombatController {
             + " state=" + body.getClass().getMethod("getCurrentStateName").invoke(body)
             + " action=" + body.getClass().getMethod("getCurrentActionContextStateName").invoke(body)
             + " attackType=" + attackType;
+    }
+
+    // Every native health decrease still reaches the combat state immediately.
+    // Only the synchronous filesystem diagnostic is coalesced.
+    void observeTargetHealth(float currentHealth) {
+        if (currentHealth < lastTargetHealth) {
+            damageObserved = true;
+            if (pendingDamageSamples == 0) pendingDamageStartHealth = lastTargetHealth;
+            pendingDamageSamples++;
+            if (lastDamageLogTick < 0 || ticks - lastDamageLogTick >= DAMAGE_LOG_INTERVAL_TICKS
+                || currentHealth <= 0.0f) {
+                KnoxAgent.writeLog("NPC combat DAMAGE targetHealth=" + currentHealth
+                    + " previous=" + pendingDamageStartHealth + " samples=" + pendingDamageSamples);
+                lastDamageLogTick = ticks;
+                pendingDamageSamples = 0;
+            }
+        }
+        lastTargetHealth = currentHealth;
     }
 
     String diagnostics() {
@@ -696,6 +698,9 @@ final class KnoxCombatController {
         attackRequests = 0;
         initialTargetHealth = 0.0f;
         lastTargetHealth = 0.0f;
+        lastDamageLogTick = -DAMAGE_LOG_INTERVAL_TICKS;
+        pendingDamageSamples = 0;
+        pendingDamageStartHealth = 0.0f;
         initialWeaponCondition = -1;
         weaponMaxRange = 0.0f;
         desiredAttackRange = 0.0f;
@@ -716,7 +721,6 @@ final class KnoxCombatController {
         approachTargetX = 0.0f;
         approachTargetY = 0.0f;
         stationaryApproachRetries = 0;
-        attacksAtLastDamage = 0;
         lastRangedRepositionTick = -RANGED_REPOSITION_COOLDOWN_TICKS;
     }
 
@@ -724,10 +728,10 @@ final class KnoxCombatController {
         if (approachSquare == null) {
             throw new IllegalStateException("Live combat has no approach square");
         }
-        // The selected square establishes the side from which this survivor should
-        // engage. The final point remains at weapon range from the zombie, not on
-        // the zombie's current coordinate.
-        KnoxNpcFactory.moveToRangeFrom(npc, target, approachSquare, desiredAttackRange);
+        // All encounter routes use the same current-side policy. A fallback tile
+        // resolves exact overlap; it must not pull an ordinary approach around
+        // the target or disagree with range refresh/ranged spacing.
+        KnoxNpcFactory.moveToRangeFromCurrentSide(npc, target, approachSquare, desiredAttackRange);
         rememberApproachTarget(
             ((Number) target.getClass().getMethod("getX").invoke(target)).floatValue(),
             ((Number) target.getClass().getMethod("getY").invoke(target)).floatValue()
@@ -764,8 +768,26 @@ final class KnoxCombatController {
         pathfinder.getClass().getMethod("cancel").invoke(pathfinder);
     }
 
+    String observeNativeRecovery(KnoxNpc activeNpc) throws ReflectiveOperationException {
+        if (!hasNativeRecoveryOwner(activeNpc)) return "IDLE";
+        // Input-only observation: no target health, terminal result, route or
+        // combat ownership progression is allowed while Lua waits on recovery.
+        clearNativeRecoveryInput(activeNpc.getBody());
+        return "NATIVE_RECOVERY";
+    }
+
+    private void clearNativeRecoveryInput(Object body) throws ReflectiveOperationException {
+        clearAttackIntent(body);
+        attackCycleActive=false;
+        lastAttackTick=ticks;
+        defenseWindowUntil=Math.max(defenseWindowUntil,ticks+ATTACK_RECOVERY_TICKS);
+    }
+
     private void clearAttackIntent() throws ReflectiveOperationException {
-        Object body = npc.getBody();
+        clearAttackIntent(npc.getBody());
+    }
+
+    private static void clearAttackIntent(Object body) throws ReflectiveOperationException {
         body.getClass().getMethod("setIsAiming", boolean.class).invoke(body, false);
         body.getClass().getMethod("setAuthorizeMeleeAction", boolean.class).invoke(body, false);
         body.getClass().getMethod("setAuthorizeShoveStomp", boolean.class).invoke(body, false);
@@ -909,6 +931,42 @@ final class KnoxCombatController {
             && action.toLowerCase(java.util.Locale.ROOT).contains("hitreaction");
     }
 
+    private static boolean nativeInjuryOwnsBody(Object body, String state, String action)
+        throws ReflectiveOperationException {
+        return isHitReactionAction(state) || isHitReactionAction(action)
+            || state.toLowerCase(java.util.Locale.ROOT).contains("onground")
+            || action.toLowerCase(java.util.Locale.ROOT).contains("onground")
+            // Get-up enters after knockdown flags can clear. Its native enter
+            // still blocks movement and explicitly clears attack input.
+            || state.equalsIgnoreCase("PlayerGetUpState") || action.equalsIgnoreCase("getup")
+            || (Boolean) body.getClass().getMethod("isKnockedDown").invoke(body);
+    }
+
+    static boolean hasNativeRecoveryOwner(KnoxNpc npc) throws ReflectiveOperationException {
+        Object body=npc.getBody();
+        if (combatantUnavailable(body)) return false;
+        return nativeInjuryOwnsBody(body,
+            String.valueOf(body.getClass().getMethod("getCurrentStateName").invoke(body)),
+            String.valueOf(body.getClass().getMethod("getCurrentActionContextStateName").invoke(body)));
+    }
+
+    private static boolean nativeAttackOwnsBody(Object body) throws ReflectiveOperationException {
+        String action = String.valueOf(body.getClass().getMethod("getCurrentActionContextStateName").invoke(body));
+        String state = String.valueOf(body.getClass().getMethod("getCurrentStateName").invoke(body));
+        // A hit reaction must remain vulnerable and keep its existing cleanup;
+        // stale attack animation/input flags cannot override that native owner.
+        if (nativeInjuryOwnsBody(body, state, action)) return false;
+        if ((Boolean) body.getClass().getMethod("isPerformingAttackAnimation").invoke(body)
+            || (Boolean) body.getClass().getMethod("isPerformingShoveAnimation").invoke(body)
+            || (Boolean) body.getClass().getMethod("isPerformingStompAnimation").invoke(body)) return true;
+        state = state.toLowerCase(java.util.Locale.ROOT);
+        action = action.toLowerCase(java.util.Locale.ROOT);
+        // AttackType/attackStarted/isAttacking can remain latched in Idle.
+        // They are not evidence that the native graph still owns an attack.
+        return state.contains("swipe") || action.equals("swipe") || action.equals("attack")
+            || action.equals("shove") || action.equals("stomp");
+    }
+
     private static void enterSwipeState(Object body) throws ReflectiveOperationException {
         ClassLoader loader = body.getClass().getClassLoader();
         Class<?> swipeClass = Class.forName("zombie.ai.states.SwipeStatePlayer", true, loader);
@@ -960,6 +1018,11 @@ final class KnoxCombatController {
     }
 
     private static float health(Object character) throws ReflectiveOperationException {
+        // Human damage lives in BodyDamage; the generic character field can
+        // stay at 1 after a real hit. Keep zombie and obstacle health native.
+        if (inherits(character, "zombie.characters.IsoPlayer")) {
+            return KnoxHealthController.health(character);
+        }
         return ((Number) character.getClass().getMethod("getHealth").invoke(character)).floatValue();
     }
 

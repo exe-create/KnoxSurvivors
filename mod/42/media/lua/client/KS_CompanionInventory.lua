@@ -34,6 +34,75 @@ local function nearby(player, character)
     return dx * dx + dy * dy <= MAX_DISTANCE_SQUARED
 end
 
+-- Capture the real local-player lookup: vanilla menu rendering below temporarily
+-- substitutes the survivor to draw native equipment controls.
+local localPlayerFor = getSpecificPlayer
+local exposedBodies = CompanionInventory._exposedBodies or {}
+CompanionInventory._exposedBodies = exposedBodies
+-- Remember only recognition of bodies exposed to a UI/action. Weak keys keep
+-- stale callbacks rejectable after pane cleanup without retaining retired actors.
+-- Runtime remains authoritative: canManage still requires its exact current body.
+local knownBodies = CompanionInventory._knownBodies or setmetatable({}, {__mode="k"})
+CompanionInventory._knownBodies = knownBodies
+
+function CompanionInventory.canManage(playerNum, survivorId, expectedBody)
+    local player = localPlayerFor(playerNum)
+    local character = KnoxSurvivorRuntime.getCharacter(survivorId)
+    if player == nil or player:isDead() then return false, "player_unavailable" end
+    if character == nil or (expectedBody ~= nil and character ~= expectedBody)
+        or character:isDead() or KnoxPersistence.isSurvivorAlive(survivorId) ~= true then
+        return false, "survivor_unavailable"
+    end
+    if KnoxSurvivorRuntime.canInteract ~= nil then
+        local accepted, reason = KnoxSurvivorRuntime.canInteract(survivorId)
+        if not accepted then return false, reason or "survivor_unavailable" end
+    end
+    local affiliation = KnoxPersistence.getSurvivorAffiliation(survivorId)
+    local ownerId = KnoxPersistence.ensurePlayerId(player)
+    if affiliation == nil or affiliation.kind ~= "player" or affiliation.ownerId ~= ownerId then
+        return false, "not_your_survivor"
+    end
+    if not nearby(player, character) then return false, "too_far_away" end
+    return true, nil, character
+end
+
+-- Resolve through native container ownership and the existing runtime identity
+-- lookup. This also recognizes stale callbacks after the loot pane was closed.
+local function containerSurvivor(container)
+    local current, seen = container, {}
+    for depth = 1, 32 do
+        if current == nil or seen[current] then break end
+        seen[current] = true
+        local ok, character = pcall(function() return current:getCharacter() end)
+        if ok and character ~= nil and character.getPlayerNum ~= nil then
+            local localOk, number = pcall(function() return character:getPlayerNum() end)
+            if localOk and tonumber(number) ~= nil and number >= 0 and localPlayerFor(number) == character then
+                return nil, nil
+            end
+        end
+        local id = ok and character ~= nil and KnoxSurvivorRuntime.idForCharacter(character) or nil
+        if id ~= nil then
+            knownBodies[character] = id
+            return character, id
+        end
+        if ok and character ~= nil and knownBodies[character] ~= nil then
+            return character, knownBodies[character]
+        end
+        local found, bag = pcall(function() return current:getContainingItem() end)
+        if not found or bag == nil then break end
+        local parentOk, parent = pcall(function() return bag:getContainer() end)
+        current = parentOk and parent or nil
+    end
+    return nil, nil
+end
+
+local function managementRefused()
+    local feed = rawget(_G, "KnoxActivityFeed")
+    if feed ~= nil and feed.event ~= nil then
+        feed.event("Inventory management is no longer available. Stay close to one of your available survivors.")
+    end
+end
+
 -- Context-menu callbacks can outlive an inventory refresh. Do not queue a
 -- native transfer for an item that has already been moved or consumed.
 local function sourceHasItem(source, item)
@@ -68,8 +137,8 @@ local function onRefreshContainers(page, state)
     if type(survivorId) ~= "string" or survivorId == "" then return end
     local player = getSpecificPlayer(playerNum)
     local character = KnoxSurvivorRuntime.getCharacter(survivorId)
-    if not nearby(player, character) then
-        active[playerNum] = nil
+    if not CompanionInventory.canManage(playerNum, survivorId, exposedBodies[playerNum]) then
+        CompanionInventory.finish(playerNum)
         return
     end
     local inventory = character ~= nil and character:getInventory() or nil
@@ -137,7 +206,7 @@ end
 local function isSurvivorContainer(playerNum, container)
     local survivorId = active[playerNum]
     if type(survivorId) ~= "string" or survivorId == "" or container == nil then return false, nil, nil end
-    local character = KnoxSurvivorRuntime.getCharacter(survivorId)
+    local character = exposedBodies[playerNum] or KnoxSurvivorRuntime.getCharacter(survivorId)
     local inv = character ~= nil and character:getInventory() or nil
     if inv == nil then return false, nil, nil end
     if container == inv then return true, character, inv end
@@ -167,6 +236,18 @@ if ISInventoryPane ~= nil and ISInventoryPane.refreshContainer ~= nil then
     ISInventoryPane.refreshContainer = function(self)
         local playerNum = self.player
         local survivorId = active[playerNum]
+        if survivorId ~= nil and not CompanionInventory.canManage(playerNum, survivorId, exposedBodies[playerNum]) then
+            local affected = isSurvivorContainer(playerNum, self.inventory)
+            local owner, id = containerSurvivor(self.inventory)
+            affected = affected or (id == survivorId and owner == exposedBodies[playerNum])
+            CompanionInventory.finish(playerNum)
+            if not affected then return origRefresh(self) end
+            local floor = ISInventoryPage.GetFloorContainer ~= nil
+                and ISInventoryPage.GetFloorContainer(playerNum) or nil
+            if floor == nil then return end
+            self.inventory = floor
+            return origRefresh(self)
+        end
         local character = type(survivorId) == "string" and KnoxSurvivorRuntime.getCharacter(survivorId) or nil
         local survInv = character ~= nil and character:getInventory() or nil
         local isSurvivorPane = survInv ~= nil and self.inventory == survInv
@@ -268,6 +349,11 @@ if ISInventoryPaneContextMenu ~= nil and ISInventoryPaneContextMenu.createMenu ~
             end
         end
         local container = testItem ~= nil and testItem.getContainer ~= nil and testItem:getContainer() or nil
+        local nativeOwner, nativeId = containerSurvivor(container)
+        if nativeId ~= nil and not CompanionInventory.canManage(player, nativeId, nativeOwner) then
+            managementRefused()
+            return
+        end
         local isSurvivor = false
         local character = nil
         if container ~= nil then
@@ -292,26 +378,55 @@ if ISInventoryPaneContextMenu ~= nil and ISInventoryPaneContextMenu.createMenu ~
     end
 end
 
-local function getSurvivorForItem(item)
+local function getSurvivorForItem(item, requester)
     if item == nil or item.getContainer == nil then return nil, nil end
     local ok, container = pcall(function() return item:getContainer() end)
     if not ok or container == nil then return nil, nil end
-    for pNum, sid in pairs(active) do
-        local ch = KnoxSurvivorRuntime.getCharacter(sid)
-        if ch ~= nil then
-            local inv = ch:getInventory()
-            if inv == container then return ch, sid end
-            local ok2, items = pcall(function() return inv:getItems() end)
-            if ok2 and items ~= nil then
-                for i = 0, items:size() - 1 do
-                    local bag = items:get(i)
-                    local bInv = bag ~= nil and bag.getInventory ~= nil and bag:getInventory() or nil
-                    if bInv == container then return ch, sid end
-                end
-            end
+    local character, id = containerSurvivor(container)
+    local playerNum = type(requester) == "number" and requester or nil
+    if playerNum == nil and requester ~= nil then
+        local found, number = pcall(function() return requester:getPlayerNum() end)
+        if found and tonumber(number) ~= nil and number >= 0 then playerNum = number end
+    end
+    -- Active bindings also identify the exact old body during native replacement.
+    for number, sid in pairs(active) do
+        local belongs, body = isSurvivorContainer(number, container)
+        if belongs then
+            character, id = body, sid
+            if playerNum == nil then playerNum = number end
+            break
         end
     end
-    return nil, nil
+    if id == nil then return nil, nil end
+    if playerNum == nil or not CompanionInventory.canManage(playerNum, id, character) then
+        return nil, id, true, playerNum
+    end
+    return character, id, false, playerNum
+end
+
+-- Only manually queued actions receive this guard. Autonomous native equipment
+-- and inventory work keep their existing owner and completion path.
+local function queueManaged(action, playerNum, id, character)
+    if action == nil then return nil end
+    local function permitted(self)
+        if CompanionInventory.canManage(playerNum, id, character) then return true end
+        if not self.knoxManagementRefusal then self.knoxManagementRefusal=true; managementRefused() end
+        return false
+    end
+    local originalValid = action.isValid
+    local mutationMethod = action.complete ~= nil and "complete" or "perform"
+    local originalMutation = action[mutationMethod]
+    action.isValid = function(self)
+        return permitted(self) and (originalValid == nil or originalValid(self))
+    end
+    if originalMutation ~= nil then
+        action[mutationMethod] = function(self, ...)
+            if not permitted(self) then return false end
+            return originalMutation(self, ...)
+        end
+    end
+    ISTimedActionQueue.add(action)
+    return action
 end
 
 local function isActiveSurvivor(character)
@@ -322,8 +437,8 @@ end
 -- Shared by inventory context actions. The active survivor inventory is a
 -- vanilla loot pane backed by an off-slot IsoPlayer, so item ownership must be
 -- resolved from the container rather than from the local player number.
-function CompanionInventory.getSurvivorForItem(item)
-    return getSurvivorForItem(item)
+function CompanionInventory.getSurvivorForItem(item, playerNum)
+    return getSurvivorForItem(item, playerNum)
 end
 
 -- Build 42's player equip/wear actions correctly mutate the IsoPlayer shell,
@@ -390,6 +505,30 @@ end
 -- A loot-window transfer is performed by the real local player, so vanilla's
 -- transfer detaches equipment from that player rather than from the survivor
 -- who owns the source container. Decorate only survivor-source transfers.
+-- Favorite is the existing explicit keep-allocation, including its bag
+-- contents. A player can still rearrange the survivor's own inventory and
+-- allocate ordinary gear without another approval UI.
+local function personalTransferAllowed(owner, item, source, destination)
+    local inside, sameOwner = pcall(function() return destination:isInCharacterInventory(owner) end)
+    if inside and sameOwner then return true end
+    local inventory = owner:getInventory()
+    local current, container, seen = item, source, {}
+    for depth = 1, 32 do
+        local ok, favorite = pcall(function() return current:isFavorite() end)
+        if not ok or favorite == true then return false end
+        if container == inventory then return true end
+        if container == nil or seen[container] then return false end
+        seen[container] = true
+        local found, bag = pcall(function() return container:getContainingItem() end)
+        if not found or bag == nil then return false end
+        current = bag
+        local parentOk, parent = pcall(function() return bag:getContainer() end)
+        if not parentOk then return false end
+        container = parent
+    end
+    return false
+end
+
 if ISInventoryTransferUtil ~= nil
     and ISInventoryTransferUtil.newInventoryTransferAction ~= nil then
     if CompanionInventory._origNewInventoryTransferAction == nil then
@@ -405,10 +544,58 @@ if ISInventoryTransferUtil ~= nil
             local belongs, owner = isSurvivorContainer(playerNum, srcContainer)
             if belongs then sourceSurvivor = owner; break end
         end
+        local playerNum
+        if character ~= nil and character.getPlayerNum ~= nil then
+            local ok, number = pcall(function() return character:getPlayerNum() end)
+            if ok and tonumber(number) ~= nil and number >= 0 and localPlayerFor(number) == character then
+                playerNum = number
+            end
+        end
+        if action ~= nil and playerNum ~= nil then
+            local sourceBody, sourceId = containerSurvivor(srcContainer)
+            local targetBody, targetId = containerSurvivor(destContainer)
+            if sourceBody ~= nil then sourceSurvivor = sourceBody end
+            if sourceId ~= nil or targetId ~= nil then
+                local function permitted(self)
+                    local accepted = (sourceId == nil or CompanionInventory.canManage(playerNum, sourceId, sourceBody))
+                        and (targetId == nil or CompanionInventory.canManage(playerNum, targetId, targetBody))
+                    if not accepted and not self.knoxManagementRefusal then
+                        self.knoxManagementRefusal=true; managementRefused()
+                    end
+                    return accepted
+                end
+                local nativeValid, nativeTransfer = action.isValid, action.transferItem
+                action.isValid = function(self)
+                    return permitted(self) and (nativeValid == nil or nativeValid(self))
+                end
+                if nativeTransfer ~= nil then
+                    action.transferItem = function(self, ...)
+                        if not permitted(self) then return end
+                        return nativeTransfer(self, ...)
+                    end
+                end
+            end
+        end
         if action ~= nil and sourceSurvivor ~= nil
             and sourceSurvivor ~= character and action.transferItem ~= nil then
             local originalTransferItem = action.transferItem
+            local function permitted(self, transferItem)
+                if personalTransferAllowed(sourceSurvivor, transferItem, srcContainer, destContainer) then return true end
+                if not self.knoxPersonalRefusal then
+                    self.knoxPersonalRefusal = true
+                    local feed = rawget(_G, "KnoxActivityFeed")
+                    if feed ~= nil and feed.event ~= nil then feed.event("That survivor is keeping this personal item.") end
+                end
+                return false
+            end
+            local originalValid = action.isValid
+            if originalValid ~= nil then
+                action.isValid = function(self)
+                    return permitted(self, self.item or item) and originalValid(self)
+                end
+            end
             action.transferItem = function(self, transferItem)
+                if not permitted(self, transferItem) then return end
                 local wasPresent = sourceHasItem(srcContainer, transferItem)
                 local ok, result = pcall(originalTransferItem, self, transferItem)
                 -- Vanilla may decline the transfer (favorite/dontAdd/already
@@ -452,13 +639,14 @@ if ISInventoryPaneContextMenu ~= nil and ISInventoryPaneContextMenu.wearItem ~= 
     if CompanionInventory._origWearItem == nil then CompanionInventory._origWearItem = ISInventoryPaneContextMenu.wearItem end
     local origWear = CompanionInventory._origWearItem
     ISInventoryPaneContextMenu.wearItem = function(item, player)
-        local ch, sid = getSurvivorForItem(item)
+        local ch, sid, denied, requester = getSurvivorForItem(item, player)
+        if denied then managementRefused(); return end
         if ch ~= nil then
             inventoryLog("wear", sid, item, player)
             -- Ensure survivor walk adj? vanilla transferIfNeeded will handle, but we bypass player transfer.
             local ok = pcall(function() ISInventoryPaneContextMenu.transferIfNeeded(ch, item) end)
             if not ok then pcall(function() print("[KnoxSurvivors][Inventory] transferIfNeeded failed") end) end
-            ISTimedActionQueue.add(ISWearClothing:new(ch, item, 50))
+            queueManaged(ISWearClothing:new(ch, item, 50), requester, sid, ch)
             return
         end
         return origWear(item, player)
@@ -469,7 +657,8 @@ if ISInventoryPaneContextMenu ~= nil and ISInventoryPaneContextMenu.transferIfNe
     if CompanionInventory._origTransferIfNeeded == nil then CompanionInventory._origTransferIfNeeded = ISInventoryPaneContextMenu.transferIfNeeded end
     local origTransfer = CompanionInventory._origTransferIfNeeded
     ISInventoryPaneContextMenu.transferIfNeeded = function(playerObj, item, preventTransferWorldObjects)
-        local ch, sid = getSurvivorForItem(item)
+        local ch, sid, denied, requester = getSurvivorForItem(item, playerObj)
+        if denied then managementRefused(); return end
         if ch ~= nil and ch == playerObj then
             -- Already owned by this off-slot survivor. Vanilla's helper still
             -- asks for getPlayerInventory(ch:getPlayerNum()), which is nil for
@@ -487,7 +676,7 @@ if ISInventoryPaneContextMenu ~= nil and ISInventoryPaneContextMenu.transferIfNe
                     ch, item, source, destination
                 )
                 if action ~= nil then
-                    ISTimedActionQueue.add(action)
+                    queueManaged(action, requester, sid, ch)
                     return action
                 end
             end
@@ -504,7 +693,7 @@ if ISInventoryPaneContextMenu ~= nil and ISInventoryPaneContextMenu.transferIfNe
                     ch, item, source, destination
                 )
                 if action ~= nil then
-                    ISTimedActionQueue.add(action)
+                    queueManaged(action, requester, sid, ch)
                     return action
                 end
             end
@@ -518,7 +707,8 @@ if ISInventoryPaneContextMenu ~= nil and ISInventoryPaneContextMenu.equipWeapon 
     if CompanionInventory._origEquipWeapon == nil then CompanionInventory._origEquipWeapon = ISInventoryPaneContextMenu.equipWeapon end
     local origEquip = CompanionInventory._origEquipWeapon
     ISInventoryPaneContextMenu.equipWeapon = function(weapon, primary, twoHands, player, alwaysTurnOn)
-        local ch, sid = getSurvivorForItem(weapon)
+        local ch, sid, denied, requester = getSurvivorForItem(weapon, player)
+        if denied then managementRefused(); return end
         if ch ~= nil then
             inventoryLog("equipWeapon", sid, weapon, player)
             local source = weapon:getContainer()
@@ -529,12 +719,12 @@ if ISInventoryPaneContextMenu ~= nil and ISInventoryPaneContextMenu.equipWeapon 
                 end
                 local action = ISInventoryTransferUtil.newInventoryTransferAction(ch, weapon, source, ch:getInventory())
                 action.maxTime = 20
-                ISTimedActionQueue.add(action)
-                ISTimedActionQueue.add(ISEquipWeaponAction:new(ch, weapon, 1, primary, twoHands, alwaysTurnOn))
+                queueManaged(action, requester, sid, ch)
+                queueManaged(ISEquipWeaponAction:new(ch, weapon, 1, primary, twoHands, alwaysTurnOn), requester, sid, ch)
                 return
             end
             ISInventoryPaneContextMenu.transferIfNeeded(ch, weapon)
-            ISTimedActionQueue.add(ISEquipWeaponAction:new(ch, weapon, 50, primary, twoHands, alwaysTurnOn))
+            queueManaged(ISEquipWeaponAction:new(ch, weapon, 50, primary, twoHands, alwaysTurnOn), requester, sid, ch)
             return
         end
         return origEquip(weapon, primary, twoHands, player, alwaysTurnOn)
@@ -552,10 +742,11 @@ if ISInventoryPaneContextMenu ~= nil and ISInventoryPaneContextMenu.unequipItem 
     end
     local originalUnequip = CompanionInventory._origUnequipItem
     ISInventoryPaneContextMenu.unequipItem = function(item, player)
-        local ch, sid = getSurvivorForItem(item)
+        local ch, sid, denied, requester = getSurvivorForItem(item, player)
+        if denied then managementRefused(); return end
         if ch ~= nil and ch:isEquipped(item) then
             inventoryLog("unequip", sid, item, player)
-            ISTimedActionQueue.add(ISUnequipAction:new(ch, item, 50))
+            queueManaged(ISUnequipAction:new(ch, item, 50), requester, sid, ch)
             return
         end
         return originalUnequip(item, player)
@@ -570,13 +761,14 @@ if ISInventoryPaneContextMenu ~= nil
     end
     local originalExtra = CompanionInventory._origClothingItemExtra
     ISInventoryPaneContextMenu.onClothingItemExtra = function(item, extra, playerObj)
-        local ch, sid = getSurvivorForItem(item)
+        local ch, sid, denied, requester = getSurvivorForItem(item, playerObj)
+        if denied then managementRefused(); return end
         if ch ~= nil then
             inventoryLog("attach", sid, item, playerObj)
             if ISInventoryPaneContextMenu.transferIfNeeded ~= nil then
                 ISInventoryPaneContextMenu.transferIfNeeded(ch, item)
             end
-            ISTimedActionQueue.add(ISClothingExtraAction:new(ch, item, extra))
+            queueManaged(ISClothingExtraAction:new(ch, item, extra), requester, sid, ch)
             return
         end
         return originalExtra(item, extra, playerObj)
@@ -586,11 +778,8 @@ end
 
 
 function CompanionInventory.show(playerNum, survivorId)
-    local player = getSpecificPlayer(playerNum)
-    local character = KnoxSurvivorRuntime.getCharacter(survivorId)
-    if not nearby(player, character) then
-        return false, "too_far_away"
-    end
+    local accepted, reason, character = CompanionInventory.canManage(playerNum, survivorId)
+    if not accepted then return false, reason end
 
     local loot = getPlayerLoot(playerNum)
     local playerInv = getPlayerInventory(playerNum)
@@ -600,6 +789,8 @@ function CompanionInventory.show(playerNum, survivorId)
     end
 
     active[playerNum] = survivorId
+    exposedBodies[playerNum] = character
+    knownBodies[character] = survivorId
 
     -- Vanilla loot flow: the survivor ItemContainer is presented as the loot
     -- container so all vanilla transfer actions, drag/drop, context menus and
@@ -623,17 +814,21 @@ end
 
 function CompanionInventory.clear(playerNum)
     if active ~= nil then active[playerNum] = nil end
+    exposedBodies[playerNum] = nil
 end
 
 function CompanionInventory.finish(playerNum)
     local sid = active[playerNum]
     if active ~= nil then active[playerNum] = nil end
+    exposedBodies[playerNum] = nil
     local loot = getPlayerLoot(playerNum)
     if loot ~= nil then
         local floor = ISInventoryPage.GetFloorContainer and ISInventoryPage.GetFloorContainer(playerNum) or nil
         if floor ~= nil then
             pcall(function() loot:setNewContainer(floor) end)
             loot.title = nil
+        else
+            loot:setVisible(false)
         end
         ISInventoryPage.dirtyUI()
     end

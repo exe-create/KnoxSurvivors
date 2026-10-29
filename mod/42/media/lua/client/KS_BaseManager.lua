@@ -4,6 +4,7 @@ require "KS_SurvivorRuntime"
 require "KS_BaseStorage"
 require "KS_ToolCupboard"
 require "KS_Settings"
+require "KS_CompanionPatrol"
 require "Util/AdjacentFreeTileFinder"
 
 local BaseManager = rawget(_G, "KnoxBaseManager") or {}
@@ -140,7 +141,7 @@ local function findOutdoorSquare(area, preferredDistance, accepts)
     return nil
 end
 
-local function ensureFactionZones(base)
+local function ensureFactionZones(base, faction)
     local area = base ~= nil and (base.territory or base.home) or nil
     if area == nil then return end
     local minX = tonumber(area.minX) or 0
@@ -168,6 +169,30 @@ local function ensureFactionZones(base)
     local residentIds = KnoxPersistence.getBaseResidentIds ~= nil
         and KnoxPersistence.getBaseResidentIds(base.id) or {}
     local residentCount = type(residentIds) == "table" and #residentIds or 0
+    if faction ~= nil and faction.background == "law_enforcement" and residentCount >= 3
+        and (KnoxSettings.policeNeighborhoodPatrols==nil or KnoxSettings.policeNeighborhoodPatrols()) then
+        local existing = false
+        for _,zone in pairs(base.zones or {}) do
+            if zone.label == "Neighborhood Patrol" then existing=true break end
+        end
+        if not existing then
+            -- This is a work route, never territory. Wait for real loaded
+            -- standing positions near every corner before offering the route.
+            local centerX,centerY=math.floor((minX+maxX)/2),math.floor((minY+maxY)/2)
+            local margin=KnoxSettings.policePatrolMargin~=nil and KnoxSettings.policePatrolMargin() or 16
+            local route={x1=math.max(minX-margin,centerX-32),y1=math.max(minY-margin,centerY-32),
+                x2=math.min(maxX+margin,centerX+32),y2=math.min(maxY+margin,centerY+32),z=z,priority=73}
+            local patrol=rawget(_G,"KnoxCompanionPatrol")
+            local cell=getCell ~= nil and getCell() or nil
+            local points=patrol ~= nil and patrol.waypoints(route) or {}
+            local valid=#points==4 and cell~=nil
+            for step=0,#points-1 do
+                local stop=patrol.resolveWaypoint(route,base.id,step,cell,nil,nil,0,true)
+                if stop==nil or stop:getRoom()~=nil then valid=false break end
+            end
+            if valid then KnoxPersistence.addBaseZone(base.id,"patrol",route,"Neighborhood Patrol") end
+        end
+    end
     if residentCount >= 6 and countZoneType(base, "patrol") < 2 then
         -- Split a large settlement's perimeter into a second route.  It is
         -- still an ordinary patrol zone; task claims and waypoint rotation
@@ -674,7 +699,7 @@ function BaseManager.ensureFactionBase(faction)
             base.name = faction.name .. " Base"
         end
         if KnoxSettings.autoGenerateBaseWorkAreas() then
-            ensureFactionZones(base)
+            ensureFactionZones(base, faction)
             ensureFactionStorage(base)
         end
         for _, survivorId in ipairs(faction.memberIds or {}) do
@@ -987,6 +1012,12 @@ function BaseManager.canPerformTask(survivorId, baseId, task)
         and jobs.containsWorkSquare(base,square)
     if square==nil or (not BaseManager.containsSquare(base,square) and not atWork) then
         return false, "not_physically_at_base"
+    end
+    if task ~= nil and task.target ~= nil and task.target.action == "repair_engine" then
+        local engine = rawget(_G, "KnoxBaseEngineRepairs")
+        if engine == nil or engine.resolveTarget(base, task.target, character) == nil then
+            return false, "engine_work_unavailable"
+        end
     end
     return meetsRequirements(
         survivorId,

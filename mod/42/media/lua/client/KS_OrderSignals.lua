@@ -17,6 +17,8 @@ local EMOTES = {follow="followme",hold="stop",relax="signalok",guard="stop",
     enable_autoloot="moveout",disable_autoloot="signalok",
     formation="moveout",combat_stance="stop",weapon_preference="signalok",
     enter_vehicle="comehere",exit_vehicle="signalok",dismiss="signalok",
+    drive_ahead="moveout",drive_nearest_vehicle="moveout",
+    enable_auto_equipment="signalok",disable_auto_equipment="signalok",
     signalok="signalok",
     talk="wavehi",joke="clap",compliment="thumbsup",funny_face="shrug",
     insult="insult",slap="thumbsdown"}
@@ -44,18 +46,26 @@ function Signals.play(actor, emote)
     if success then cooldowns[actor]=now end
     return success
 end
-function Signals.order(player, kind, survivor)
+function Signals.send(player, kind)
     local emote=EMOTES[kind]
     if emote==nil then return false end
-    local played=Signals.play(player,emote)
-    if survivor~=nil and survivor~=player then
-        local first,second=call(player,"getCurrentSquare"),call(survivor,"getCurrentSquare")
-        if first~=nil and second~=nil and first:getZ()==second:getZ()
-            and (first:getX()-second:getX())^2+(first:getY()-second:getY())^2<=49 then
-            Signals.play(survivor,"yes")
-        end
-    end
+    return Signals.play(player,emote)
+end
+function Signals.order(player, kind, survivor)
+    local played=Signals.send(player,kind)
+    if played then Signals.acknowledge(player, survivor) end
     return played
+end
+
+function Signals.acknowledge(leader, member)
+    if member == nil or member == leader then return false end
+    local ok, visible = pcall(function()
+        local first, second = leader:getCurrentSquare(), member:getCurrentSquare()
+        return first ~= nil and second ~= nil and first:getZ() == second:getZ()
+            and (first:getX() - second:getX())^2 + (first:getY() - second:getY())^2 <= 49
+            and member:CanSee(leader) == true
+    end)
+    return ok and visible and Signals.play(member, "yes") or false
 end
 
 -- Autonomous leaders use the same readable gestures as player-issued orders.
@@ -64,16 +74,8 @@ end
 function Signals.group(leader, members, kind)
     local emote = EMOTES[kind]
     if emote == nil or not Signals.play(leader, emote) then return false end
-    local first = leader ~= nil and call(leader, "getCurrentSquare") or nil
     for _, member in ipairs(members or {}) do
-        if member ~= nil and member ~= leader then
-            local second = call(member, "getCurrentSquare")
-            if first ~= nil and second ~= nil and first:getZ() == second:getZ()
-                and (first:getX() - second:getX()) ^ 2
-                    + (first:getY() - second:getY()) ^ 2 <= 49 then
-                Signals.play(member, "yes")
-            end
-        end
+        Signals.acknowledge(leader, member)
     end
     return true
 end

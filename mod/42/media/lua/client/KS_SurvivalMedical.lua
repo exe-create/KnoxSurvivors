@@ -163,7 +163,7 @@ local function findWorldSource(character, radius)
     return nil
 end
 
-local function queueCraft(character, recipeName, selectedItem)
+local function queueCraft(character, recipeName, selectedItem, admit)
     local recipe = getScriptManager():getCraftRecipe(recipeName)
     if recipe == nil then
         return false, "recipe_missing=" .. tostring(recipeName)
@@ -180,7 +180,19 @@ local function queueCraft(character, recipeName, selectedItem)
     if action == nil then
         return false, "action_creation_failed=" .. tostring(recipeName)
     end
-    ISTimedActionQueue.add(action)
+    -- The registered queue returned by add is native admission evidence even
+    -- when begin completes synchronously. A constructed action alone is not.
+    action.knoxMedicalSource = selectedItem
+    if admit ~= nil then
+        local accepted, reason = admit(character, action)
+        if accepted ~= action then return false, reason or "craft_queue_refused" end
+    else
+        local queue = ISTimedActionQueue.add(action)
+        if queue == nil or ISTimedActionQueue.queues == nil
+            or queue ~= ISTimedActionQueue.queues[character] then
+            return false, "craft_queue_refused"
+        end
+    end
     logic:startCraftAction(action)
     return true, action
 end
@@ -220,7 +232,7 @@ function MedicalSupplies.plan(character, radius)
     return { kind = "search_world", reason = "no_safe_treatment_source" }
 end
 
-function MedicalSupplies.queueImprovisation(character, plan)
+function MedicalSupplies.canImprovise(character, plan)
     if plan == nil
         or (plan.kind ~= "rip_owned_sheet" and plan.kind ~= "rip_owned_spare_clothing") then
         return false, "plan_not_craftable"
@@ -228,7 +240,13 @@ function MedicalSupplies.queueImprovisation(character, plan)
     if isProtectedPersonalItem(character, plan.item) then
         return false, "source_became_protected"
     end
-    return queueCraft(character, plan.recipe, plan.item)
+    return true
+end
+
+function MedicalSupplies.queueImprovisation(character, plan, admit)
+    local allowed, reason = MedicalSupplies.canImprovise(character, plan)
+    if not allowed then return false, reason end
+    return queueCraft(character, plan.recipe, plan.item, admit)
 end
 
 function MedicalSupplies.findTreatment(character)

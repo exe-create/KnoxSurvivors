@@ -28,6 +28,7 @@ local activeIds = {}
 local STATUS_INTERVAL_TICKS = 300
 local RELATIONSHIP_INTERVAL_TICKS = 60
 local POPULATION_INTERVAL_TICKS = 300
+local ACTIVATION_RETRY_TICKS = POPULATION_INTERVAL_TICKS * 2
 local HIBERNATION_INTERVAL_TICKS = 30
 local DEFAULT_ACTIVATION_DISTANCE = 280
 local function activationDistance()
@@ -45,6 +46,7 @@ local DETACHED_GRACE_CHECKS = 3
 local DETACHED_COMPANION_GRACE_CHECKS = 10
 local detachedGrace = {}
 local recentlyDetached = {}
+local activationRetryAt = {}
 local departureRetryAt = {}
 local departureFailures = {}
 local DECISIONS_REQUIRED = 2
@@ -181,16 +183,16 @@ end
 
 local function createSurvivorAt(bridge, id, square, developerKit)
     if square == nil then
-        return nil, "no_loaded_spawn_square"
+        return nil, "no_loaded_spawn_square", false
     end
     local result = tostring(bridge:spawnNpc(id, square))
     if string.find(result, "SPAWNED", 1, true) ~= 1 then
-        return nil, result
+        return nil, result, true
     end
     local character = bridge:getNpcCharacter(id)
     if character == nil then
         bridge:removeNpc(id)
-        return nil, "spawned_character_unavailable"
+        return nil, "spawned_character_unavailable", true
     end
     local eventPolicy = KnoxEventFactions ~= nil
         and KnoxEventFactions.materializationPolicy(id)
@@ -204,7 +206,7 @@ local function createSurvivorAt(bridge, id, square, developerKit)
     )
     if capabilities == nil then
         bridge:removeNpc(id)
-        return nil, "capabilities_failed=" .. tostring(capabilityResult)
+        return nil, "capabilities_failed=" .. tostring(capabilityResult), true
     end
     local appearanceOk, appearance = KnoxCharacterAppearance.randomizeNewSurvivor(
         bridge,
@@ -214,7 +216,7 @@ local function createSurvivorAt(bridge, id, square, developerKit)
     )
     if not appearanceOk then
         bridge:removeNpc(id)
-        return nil, "appearance_failed=" .. tostring(appearance)
+        return nil, "appearance_failed=" .. tostring(appearance), true
     end
     local equipmentOk = true
     local equipped
@@ -226,8 +228,16 @@ local function createSurvivorAt(bridge, id, square, developerKit)
             id,
             character,
             bridge,
-            eventPolicy ~= nil and eventPolicy.loadoutTheme or nil
+            eventPolicy ~= nil and eventPolicy.loadoutTheme
+                or KnoxSurvivorStartingGear.themeForOrigin(
+                    capabilities, KnoxPersistence.getSurvivorOrigin(id))
         )
+    end
+    if not equipmentOk then
+        -- Do not turn a rejected partial kit into a captured record: a later
+        -- attempt would restore it and bypass the first-creation gear owner.
+        bridge:removeNpc(id)
+        return nil, "initialization_failed equipment=" .. tostring(equipped), true
     end
     KnoxPersistence.ensureSurvivorIdentityFromCharacter(
         id,
@@ -235,9 +245,9 @@ local function createSurvivorAt(bridge, id, square, developerKit)
         getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
     )
     local saved, evidence = KnoxPersistence.captureActiveSurvivor(id)
-    if not equipmentOk or not saved then
+    if not saved then
         bridge:removeNpc(id)
-        return nil, "initialization_failed equipment=" .. equipped .. " save=" .. tostring(evidence)
+        return nil, "initialization_failed equipment=" .. equipped .. " save=" .. tostring(evidence), true
     end
     return character,
         "SPAWNED " .. id .. " " .. tostring(appearance)
@@ -251,17 +261,17 @@ end
 
 local function restoreSurvivor(bridge, id, record)
     if not KnoxPersistence.isSurvivorAlive(id) then
-        return nil, "dead_identity"
+        return nil, "dead_identity", false
     end
     local square, location = squareForRecord(bridge, record)
     if square == nil then
-        return nil, "saved_square_not_loaded=" .. tostring(location)
+        return nil, "saved_square_not_loaded=" .. tostring(location), false
     end
     local result = tostring(bridge:restoreTestNpcRecord(record, square))
     if string.find(result, "RESTORED", 1, true) ~= 1 then
-        return nil, result
+        return nil, result, true
     end
-    return bridge:getNpcCharacter(id), result
+    return bridge:getNpcCharacter(id), result, true
 end
 
 local function addActiveId(id)
@@ -385,7 +395,7 @@ local function registerController(bridge, id, character, result)
     return true, result
 end
 
-local function ensurePopulation(bridge, player, requiredIds)
+local function ensurePopulation(bridge, player, requiredIds, spawnOrigin)
     for _, id in ipairs(requiredIds or {}) do
         if controllers[id] == nil then
             local character = bridge:getNpcCharacter(id)
@@ -398,7 +408,7 @@ local function ensurePopulation(bridge, player, requiredIds)
                     character, result = createDeveloperSurvivor(
                         bridge,
                         id,
-                        player:getCurrentSquare()
+                        spawnOrigin or player:getCurrentSquare()
                     )
                 end
             end
@@ -860,7 +870,8 @@ local function hibernateDistantWorldSurvivors(bridge, players)
                 detachedGrace[id] = grace
                 local companion = type(duty) == "table"
                     and tostring(duty.mode or "") == "companion"
-                local transient = companion and recognizedDetachedTransient(character)
+                local transient = recognizedDetachedTransient(character)
+                local tileLoaded = KnoxSurvivorLifecyclePolicy.detachedTileLoaded(character)
                 local shouldHibernate, decision
                 if companion then
                     shouldHibernate, decision =
@@ -877,13 +888,21 @@ local function hibernateDistantWorldSurvivors(bridge, players)
                             finiteDistanceSquared,
                             hibernationDistanceSquared(),
                             grace,
-                            DETACHED_GRACE_CHECKS
+                            DETACHED_GRACE_CHECKS,
+                            tileLoaded,
+                            transient
                         )
                 end
                 KnoxSurvivorRuntime.setLifecycleState(id,
                     shouldHibernate and "detached_stale"
                         or transient and "detached_transient" or "detached_grace")
-                print(TAG .. " detach-detected id=" .. tostring(id) .. " actorXYZ=" .. actorXYZDescription(character) .. " currentSquare=" .. squareDescription(square) .. " finiteDistance=" .. tostring(finiteDistance) .. " squareDistance=" .. tostring(squareDistance) .. " detachedTicks=" .. tostring(grace) .. " decision=" .. tostring(decision))
+                -- Record admission, policy transitions and sparse progress, not
+                -- the same detached shell every thirty ticks for minutes.
+                if grace == 1 or grace == DETACHED_GRACE_CHECKS
+                    or grace == DETACHED_COMPANION_GRACE_CHECKS
+                    or grace % 60 == 0 or shouldHibernate then
+                    print(TAG .. " detach-detected id=" .. tostring(id) .. " actorXYZ=" .. actorXYZDescription(character) .. " currentSquare=" .. squareDescription(square) .. " finiteDistance=" .. tostring(finiteDistance) .. " squareDistance=" .. tostring(squareDistance) .. " detachedTicks=" .. tostring(grace) .. " tileLoaded=" .. tostring(tileLoaded) .. " decision=" .. tostring(decision))
+                end
                 if shouldHibernate then
                     detachedGrace[id] = nil
                     hibernate[#hibernate + 1] = {
@@ -948,7 +967,14 @@ local function hibernateDistantWorldSurvivors(bridge, players)
                 getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
             )
             if not marked then
-                KnoxSurvivorRuntime.setLifecycleState(entry.id, "active")
+                -- shutdown has already released actions and claims. Restore
+                -- loaded ledger ownership and resume that same controller via
+                -- the retry owner, even when the stored commit was refused.
+                hibernateRollbackPending[entry.id] = {
+                    controller = entry.controller,
+                    reason = entry.reason,
+                }
+                KnoxSurvivorRuntime.setLifecycleState(entry.id, "hibernate_recovery_pending")
                 print(TAG .. " id=" .. entry.id
                     .. " hibernate-store-failed reason=" .. tostring(entry.reason)
                     .. " result=" .. tostring(markResult))
@@ -1017,27 +1043,47 @@ local function hibernateDistantWorldSurvivors(bridge, players)
     end
 end
 
-local function activateWorldCandidate(bridge, candidate)
+local function activateWorldCandidate(bridge, candidate, options)
     local character = bridge:getNpcCharacter(candidate.id)
     local result = "ADOPTED_ACTIVE"
+    local nativeAttempted = false
     if character == nil and candidate.mode == "restore" then
         if candidate.awayMission == true and candidate.square ~= nil then
             result = tostring(bridge:restoreTestNpcRecord(
                 candidate.record,
                 candidate.square
             ))
+            nativeAttempted = true
             if string.find(result, "RESTORED", 1, true) == 1 then
                 character = bridge:getNpcCharacter(candidate.id)
             end
         else
-            character, result = restoreSurvivor(
+            character, result, nativeAttempted = restoreSurvivor(
                 bridge,
                 candidate.id,
                 candidate.record
             )
         end
     elseif character == nil and candidate.mode == "spawn" then
-        character, result = createSurvivorAt(
+        -- Candidates are selected as a batch. Earlier native creations can
+        -- occupy a shared fallback tile before this one's turn. Reuse the
+        -- population owner's current placement gates at the commit boundary.
+        -- Authored spouse entry and saved-record restore have separate rules.
+        if candidate.firstMaterialization == true then
+            local current, reason = KnoxWorldPopulation.activationCandidate(
+                candidate.id, bridge, options
+            )
+            if current == nil then
+                return false, "first_materialization_deferred=" .. tostring(reason)
+            end
+            if current.mode ~= "spawn" then
+                return false, "first_materialization_record_changed"
+            end
+            candidate.square = current.square
+            candidate.x, candidate.y, candidate.z = current.x, current.y, current.z
+            candidate.distanceSquared = current.distanceSquared
+        end
+        character, result, nativeAttempted = createSurvivorAt(
             bridge,
             candidate.id,
             candidate.square,
@@ -1045,7 +1091,7 @@ local function activateWorldCandidate(bridge, candidate)
         )
     end
     if character == nil then
-        return false, result
+        return false, result, nativeAttempted == true
     end
     local registered, registerResult = registerController(bridge, candidate.id, character, result)
     if registered and candidate.blockedDispatchRecovery == true then
@@ -1057,7 +1103,7 @@ local function activateWorldCandidate(bridge, candidate)
         if not recovered then
             print(TAG .. " id=" .. tostring(candidate.id)
                 .. " blocked-dispatch-recovery-failed result=" .. tostring(recoveryResult))
-            return false, "blocked_dispatch_recovery_failed=" .. tostring(recoveryResult)
+            return false, "blocked_dispatch_recovery_failed=" .. tostring(recoveryResult), true
         end
         local controller = controllers[candidate.id]
         if controller ~= nil and controller.setAwayTeam ~= nil then
@@ -1067,10 +1113,37 @@ local function activateWorldCandidate(bridge, candidate)
             .. " state=BLOCKED_DISPATCH_RECOVERED team="
             .. tostring(candidate.blockedAwayTeamId))
     end
-    return registered, registerResult
+    return registered, registerResult, true
 end
 
 local function reconcileWorldPopulation(bridge)
+    -- Only attempted native activation failures enter this transient gate.
+    -- Filter before the population owner truncates its candidate list, so one
+    -- broken candidate cannot take every pass's limited activation slots.
+    for id, retryAt in pairs(activationRetryAt) do
+        if ticks >= retryAt then activationRetryAt[id] = nil end
+    end
+    local function acceptsActivation(candidate)
+        if activationRetryAt[candidate.id] ~= nil then
+            return false, "activation_retry_cooldown"
+        end
+        return KnoxSurvivorLifecyclePolicy.restoreAfterDetach(
+            recentlyDetached[candidate.id], ticks, candidate.distanceSquared), "streaming_edge_cooldown"
+    end
+    local profileStarted = nil
+    local profiling = KnoxWorldPopulation.isPopulationProfileActive ~= nil
+        and KnoxWorldPopulation.isPopulationProfileActive()
+    if profiling then
+        if type(getTimestampMs) == "function" then
+            local ok, value = pcall(getTimestampMs)
+            profileStarted = ok and tonumber(value) or nil
+        end
+        if profileStarted == nil and type(os) == "table" and type(os.clock) == "function" then
+            local ok, value = pcall(os.clock)
+            profileStarted = ok and tonumber(value) and tonumber(value) * 1000 or nil
+        end
+    end
+    local phaseStarted = KnoxWorldPopulation.beginPopulationProfilePhase()
     releaseMissingActiveBodies(bridge)
     local players = currentPlayers()
     for _, player in ipairs(players) do
@@ -1084,20 +1157,23 @@ local function reconcileWorldPopulation(bridge)
     local now = getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
     local awayChanged = KnoxPersistence.advanceAwayTeams ~= nil
         and KnoxPersistence.advanceAwayTeams(now) or 0
+    KnoxWorldPopulation.endPopulationProfilePhase("body_spouse_away_reconcile", phaseStarted)
+    phaseStarted = KnoxWorldPopulation.beginPopulationProfilePhase()
     local advanced, notable = KnoxUnloadedSurvival.advanceAll(activeIds, now)
+    KnoxWorldPopulation.endPopulationProfilePhase("unloaded_survival", phaseStarted)
     local summary = KnoxWorldPopulation.maintain(now, { players = players })
+    phaseStarted = KnoxWorldPopulation.beginPopulationProfilePhase()
     KnoxFactionCamps.reconcile(controllers, activeIds, now)
+    KnoxWorldPopulation.endPopulationProfilePhase("faction_camps", phaseStarted)
     local remaining = KnoxSettings.activationBudget(#activeIds)
     local candidates, rejected = KnoxWorldPopulation.activationCandidates(
         bridge,
         activeIds,
         remaining,
         { players = players, maximumDistance = activationDistance(),
-            acceptCandidate = function(candidate)
-                return KnoxSurvivorLifecyclePolicy.restoreAfterDetach(
-                    recentlyDetached[candidate.id], ticks, candidate.distanceSquared)
-            end }
+            acceptCandidate = acceptsActivation }
     )
+    phaseStarted = KnoxWorldPopulation.beginPopulationProfilePhase()
     -- Away missions are normally excluded from proximity activation. Once a
     -- destination or return point is inside the loaded player band, add those
     -- members through this same population budget so their persisted mission
@@ -1125,7 +1201,7 @@ local function reconcileWorldPopulation(bridge)
                                 allowBlockedDispatchRecovery = true,
                             }
                         )
-                        if candidate ~= nil then
+                        if candidate ~= nil and acceptsActivation(candidate) then
                             candidates[#candidates + 1] = candidate
                             missionSeen[memberId] = true
                         end
@@ -1148,9 +1224,18 @@ local function reconcileWorldPopulation(bridge)
     for _, candidate in ipairs(candidates) do
         if activated >= remaining then break end
         local ready, evidence = false, "streaming_edge_cooldown"
-        if KnoxSurvivorLifecyclePolicy.restoreAfterDetach(
-            recentlyDetached[candidate.id], ticks, candidate.distanceSquared) then
-            ready, evidence = activateWorldCandidate(bridge, candidate)
+        if acceptsActivation(candidate) then
+            local nativeAttempted
+            ready, evidence, nativeAttempted = activateWorldCandidate(bridge, candidate,
+                { players = players, maximumDistance = activationDistance() })
+            if ready then
+                activationRetryAt[candidate.id] = nil
+            elseif nativeAttempted == true then
+                activationRetryAt[candidate.id] = ticks + ACTIVATION_RETRY_TICKS
+            end
+        end
+        if profiling and KnoxWorldPopulation.recordActivationResult ~= nil then
+            KnoxWorldPopulation.recordActivationResult(ready == true, ready and nil or evidence)
         end
         if ready then
             recentlyDetached[candidate.id] = nil
@@ -1193,6 +1278,22 @@ local function reconcileWorldPopulation(bridge)
     if awayChanged > 0 then
         print(TAG .. " away-teams advanced=" .. tostring(awayChanged))
     end
+    KnoxWorldPopulation.endPopulationProfilePhase("native_activation_delivery", phaseStarted)
+    if profiling then
+        local profileEnded = nil
+        if type(getTimestampMs) == "function" then
+            local ok, value = pcall(getTimestampMs)
+            profileEnded = ok and tonumber(value) or nil
+        end
+        if profileEnded == nil and type(os) == "table" and type(os.clock) == "function" then
+            local ok, value = pcall(os.clock)
+            profileEnded = ok and tonumber(value) and tonumber(value) * 1000 or nil
+        end
+        if profileStarted ~= nil and profileEnded ~= nil
+            and KnoxWorldPopulation.recordReconcileDuration ~= nil then
+            KnoxWorldPopulation.recordReconcileDuration(math.max(0, profileEnded - profileStarted))
+        end
+    end
 end
 
 local function completedDecisions(controller)
@@ -1230,7 +1331,7 @@ local function reportPassIfReady(bridge)
 end
 
 local function configureScenario(player, scenario, ids)
-    if scenario == "single" then
+    if scenario == "single" or scenario == "encounter" then
         return true, "independent"
     end
     local hours = getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
@@ -1307,15 +1408,22 @@ update = function()
     end
     if ticks >= nextPopulationUpdate then
         nextPopulationUpdate = ticks + POPULATION_INTERVAL_TICKS
+        local updateStarted = KnoxWorldPopulation.beginPopulationProfilePhase()
+        local phaseStarted = KnoxWorldPopulation.beginPopulationProfilePhase()
         local hours = getGameTime():getWorldAgeHours()
         KnoxEvents.maintain(hours)
         if KnoxSettings.enableKnoxEvents ~= nil and KnoxSettings.enableKnoxEvents() then
             KnoxEvents.scheduleAutomaticRaid(hours, KnoxSettings.allowFactionRaids(),
                 KnoxSettings.factionRaidMinimumDays(), KnoxSettings.factionRaidIntervalDays())
-            KnoxEvents.scheduleAutomaticEntry(hours, true, 1, 3)
+            KnoxEvents.scheduleAutomaticEntry(hours, KnoxSettings.automaticFactionEntries(),
+                KnoxSettings.factionEntryMinimumDays(), KnoxSettings.factionEntryIntervalDays())
         end
+        KnoxWorldPopulation.endPopulationProfilePhase("event_maintenance", phaseStarted)
         reconcileWorldPopulation(bridge)
+        phaseStarted = KnoxWorldPopulation.beginPopulationProfilePhase()
         reconcileSettlementDefinitions()
+        KnoxWorldPopulation.endPopulationProfilePhase("settlement_definitions", phaseStarted)
+        KnoxWorldPopulation.endPopulationProfilePhase("scheduled_population_update", updateStarted)
     end
     KnoxZombieAwareness.update(controllers, activeIds, ticks)
     if KnoxCompanionVehicles ~= nil and KnoxCompanionVehicles.tick ~= nil then
@@ -1403,6 +1511,7 @@ local function onGameStart()
     end
     ticks = 0
     recentlyDetached = {}
+    activationRetryAt = {}
     detachedGrace = {}
     controllers = {}
     KnoxSurvivorRuntime.clear()
@@ -1482,6 +1591,7 @@ local function onMainMenuEnter()
     hibernateRollbackPending = {}
     detachedGrace = {}
     recentlyDetached = {}
+    activationRetryAt = {}
     stop()
 end
 
@@ -1576,29 +1686,48 @@ Events.OnMainMenuEnter.Add(onMainMenuEnter)
 Events.OnCreatePlayer.Add(onCreatePlayer)
 Events.OnPlayerDeath.Add(onPlayerDeath)
 
-function Autonomy.spawnDeveloperScenario(player, scenario, qaOwnership)
+function Autonomy.spawnDeveloperScenario(player, scenario, qaOwnership, options)
     if not KnoxSettings.developerToolsEnabled() then
         return false, "developer_tools_disabled"
     end
     local factionMinimum = KnoxSettings.npcFactionMinimumMembers ~= nil
         and KnoxSettings.npcFactionMinimumMembers() or 3
-    local counts = { single = 1, companion = 1, group = 2, faction = factionMinimum, faction_base = factionMinimum }
+    local counts = { single = 1, companion = 1, encounter = 2, group = 2, faction = factionMinimum, faction_base = factionMinimum }
     local count = counts[scenario]
     local bridge = rawget(_G, "KnoxJavaBridge")
     if player == nil or bridge == nil or count == nil then
         return false, "scenario_unavailable"
+    end
+    if qaOwnership ~= nil and (type(qaOwnership) ~= "table"
+        or type(qaOwnership.runId) ~= "string" or qaOwnership.runId == ""
+        or type(qaOwnership.ownerToken) ~= "string" or qaOwnership.ownerToken == ""
+        or KnoxPersistence.tagDeveloperQaFixture == nil) then
+        return false, "invalid_qa_ownership"
+    end
+    local origin
+    if options ~= nil then
+        if type(options) ~= "table" then return false,"invalid_spawn_options" end
+        if options.count ~= nil then
+            local requested=tonumber(options.count)
+            local minimum=scenario=="group" and 2 or factionMinimum
+            local maximum=scenario=="group" and 12 or KnoxSettings.npcFactionMaxMembers()
+            if (scenario~="group" and scenario~="faction" and scenario~="faction_base")
+                or requested==nil or requested~=requested or requested~=math.floor(requested)
+                or requested<minimum or requested>maximum then return false,"invalid_party_size" end
+            count=requested
+        end
+        origin=options.square
+        if origin~=nil then
+            local cell=getCell()
+            if cell==nil or cell:getGridSquare(origin:getX(),origin:getY(),origin:getZ())~=origin
+                or not origin:canStand() then return false,"target_square_unavailable" end
+        end
     end
     local ids = {}
     for _ = 1, count do
         local id = KnoxPersistence.allocateDeveloperSurvivorId()
         ids[#ids + 1] = id
         if qaOwnership ~= nil then
-            if type(qaOwnership) ~= "table"
-                or type(qaOwnership.runId) ~= "string"
-                or type(qaOwnership.ownerToken) ~= "string"
-                or KnoxPersistence.tagDeveloperQaFixture == nil then
-                return false, "invalid_qa_ownership", table.concat(ids, ",")
-            end
             local tagged, tagResult = KnoxPersistence.tagDeveloperQaFixture(
                 id, qaOwnership.runId, qaOwnership.ownerToken, qaOwnership.scenarioId)
             if not tagged then
@@ -1606,7 +1735,7 @@ function Autonomy.spawnDeveloperScenario(player, scenario, qaOwnership)
             end
         end
     end
-    local ready, result = ensurePopulation(bridge, player, ids)
+    local ready, result = ensurePopulation(bridge, player, ids, origin)
     if not ready then
         return false, result, table.concat(ids, ",")
     end
@@ -1618,7 +1747,7 @@ function Autonomy.spawnDeveloperScenario(player, scenario, qaOwnership)
         scenarioIds[#scenarioIds + 1] = id
         KnoxCompanionService.syncController(id, controllers[id])
     end
-    return true, table.concat(ids, ",") .. " " .. tostring(configureResult)
+    return true, table.concat(ids, ",") .. " " .. tostring(configureResult), table.concat(ids, ",")
 end
 
 -- Remove only survivors created through allocateDeveloperSurvivorId. Automated

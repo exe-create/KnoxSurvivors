@@ -9,18 +9,24 @@ local SUPPORT_DISTANCE_SQUARED = 9
 local function safeCall(object, method, fallback, ...)
     if object == nil or type(object[method]) ~= "function" then return fallback end
     local ok, value = pcall(object[method], object, ...)
-    return ok and value or fallback
+    if ok and value ~= nil then return value end
+    return fallback
 end
 
-local function walk(container, visitor)
+local function walk(container, visitor, seen, depth)
+    seen, depth = seen or {}, depth or 0
+    if container == nil or seen[container] or depth > 32 then return end
+    seen[container] = true
     local items = safeCall(container, "getItems", nil)
     local size = tonumber(safeCall(items, "size", 0)) or 0
     for index = 0, size - 1 do
         local item = safeCall(items, "get", nil, index)
-        if item ~= nil then
+        local data = safeCall(item, "getModData", nil)
+        if item ~= nil and safeCall(item, "isFavorite", false) ~= true
+            and not (data ~= nil and data.KnoxBaseSupplyDelivery ~= nil) then
             visitor(item)
             if safeCall(item, "IsInventoryContainer", false) == true then
-                walk(safeCall(item, "getInventory", nil), visitor)
+                walk(safeCall(item, "getInventory", nil), visitor, seen, depth+1)
             end
         end
     end
@@ -64,16 +70,22 @@ local function ownNeed(character, kind)
     return needed == kind
 end
 
-function Support.findSafeSurplus(character, kind)
-    if character == nil or character:getInventory() == nil then return nil, "missing_inventory" end
+local function safeSupplies(character, kind, itemAvailable)
     local candidates = {}
     walk(character:getInventory(), function(item)
         if category(item, kind)
             and safeCall(item, "isFavorite", false) ~= true
-            and safeCall(character, "isEquipped", false, item) ~= true then
+            and safeCall(character, "isEquipped", false, item) ~= true
+            and (itemAvailable == nil or itemAvailable(item) == true) then
             candidates[#candidates + 1] = item
         end
     end)
+    return candidates
+end
+
+function Support.findSafeSurplus(character, kind, itemAvailable)
+    if character == nil or character:getInventory() == nil then return nil, "missing_inventory" end
+    local candidates = safeSupplies(character, kind, itemAvailable)
     local reserve = 1
     if ownNeed(character, kind) then reserve = reserve + 1 end
     if #candidates <= reserve then return nil, "reserve_protected" end
@@ -106,7 +118,7 @@ local function urgency(kind, state)
     return 100 + (tonumber(state ~= nil and state.hunger) or 0) * 100
 end
 
-function Support.plan(donor, recipients, reservedRecipients, reservedItems)
+function Support.plan(donor, recipients, reservedRecipients, reservedItems, itemAvailable)
     if donor == nil or safeCall(donor, "isDead", false) == true then return nil end
     local seen, choices = {}, {}
     for _, recipient in ipairs(recipients or {}) do
@@ -117,8 +129,11 @@ function Support.plan(donor, recipients, reservedRecipients, reservedItems)
             seen[recipient] = true
             local kind, state = needKind(recipient)
             if kind ~= nil then
-                local item = Support.findSafeSurplus(donor, kind)
-                if item ~= nil and (reservedItems == nil or reservedItems[item] == nil) then
+                local item = Support.findSafeSurplus(donor, kind, function(candidate)
+                    return (reservedItems == nil or reservedItems[candidate] == nil)
+                        and (itemAvailable == nil or itemAvailable(candidate) == true)
+                end)
+                if item ~= nil then
                     choices[#choices + 1] = {
                         recipient = recipient,
                         kind = kind,
@@ -161,17 +176,47 @@ function Support.mostUrgentNeed(observer, recipients)
     return best
 end
 
-function Support.queue(donor, plan)
+-- Sharing is a nearby handoff of a still-safe spare. Recheck at native
+-- validity and transfer time, because either person may move or use the stock
+-- while the action is waiting/turning.
+function Support.transferAllowed(donor, plan)
+    if donor == nil or plan == nil or plan.recipient == nil
+        or plan.source == nil or plan.destination == nil or plan.item == nil
+        or safeCall(donor, "isDead", true) ~= false
+        or safeCall(plan.recipient, "isDead", true) ~= false
+        or needKind(plan.recipient) ~= plan.kind
+        or not nearby(donor, plan.recipient)
+        or safeCall(plan.recipient, "getInventory", nil) ~= plan.destination
+        or not plan.source:contains(plan.item) then return false end
+    local candidates = safeSupplies(donor, plan.kind)
+    local reserve = ownNeed(donor, plan.kind) and 2 or 1
+    if #candidates <= reserve then return false end
+    for _, item in ipairs(candidates) do
+        if item == plan.item and safeCall(item, "getContainer", nil) == plan.source then
+            return true
+        end
+    end
+    return false
+end
+
+function Support.queue(donor, plan, guard)
     if donor == nil or plan == nil or plan.source == nil or plan.destination == nil
         or not plan.source:contains(plan.item) then
         return nil, "support_item_unavailable"
+    end
+    -- Keep the exact wrapped permission available before native admission.
+    -- addToQueue can register/start the action and then throw before returning.
+    plan.guard = function(action, item)
+        return item == plan.item and Support.transferAllowed(donor, plan)
+            and (guard == nil or guard(action, item) == true)
     end
     return KnoxInventoryActions.queueTransfer(
         donor,
         plan.item,
         plan.source,
         plan.destination,
-        nil
+        nil,
+        plan.guard
     )
 end
 

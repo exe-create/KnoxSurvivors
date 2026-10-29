@@ -23,12 +23,13 @@ local function orderedDefinitions(javaList, idOf)
     for index = 0, javaList:size() - 1 do
         local definition = javaList:get(index)
         if definition ~= nil then
-            values[#values + 1] = definition
+            values[#values + 1] = { value = definition, id = idOf(definition) }
         end
     end
     table.sort(values, function(first, second)
-        return idOf(first) < idOf(second)
+        return first.id < second.id
     end)
+    for index, entry in ipairs(values) do values[index] = entry.value end
     return values
 end
 
@@ -43,18 +44,18 @@ end
 local function ranked(values, survivorId, salt, idOf)
     local copied = {}
     for _, value in ipairs(values) do
-        copied[#copied + 1] = value
+        local id = idOf(value)
+        copied[#copied + 1] = {
+            value = value, id = id, rank = hash(survivorId .. ":" .. salt .. ":" .. id),
+        }
     end
     table.sort(copied, function(first, second)
-        local firstId = idOf(first)
-        local secondId = idOf(second)
-        local firstRank = hash(survivorId .. ":" .. salt .. ":" .. firstId)
-        local secondRank = hash(survivorId .. ":" .. salt .. ":" .. secondId)
-        if firstRank == secondRank then
-            return firstId < secondId
+        if first.rank == second.rank then
+            return first.id < second.id
         end
-        return firstRank < secondRank
+        return first.rank < second.rank
     end)
+    for index, entry in ipairs(copied) do copied[index] = entry.value end
     return copied
 end
 

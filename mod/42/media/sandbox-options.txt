@@ -11,7 +11,7 @@ option KnoxSurvivors.ContinueSurvivorsAfterPlayerDeath = {
 }
 
 option KnoxSurvivors.WorldPopulation = {
-    type = integer, min = 0, max = 256, default = 48, page = KnoxSurvivors_Population, translation = KnoxSurvivors_WorldPopulation,
+    type = integer, min = 0, max = 8192, default = 2048, page = KnoxSurvivors_Population, translation = KnoxSurvivors_WorldPopulation,
 }
 option KnoxSurvivors.PopulationRefillDays = {
     type = integer, min = 0, max = 30, default = 5, page = KnoxSurvivors_Population, translation = KnoxSurvivors_PopulationRefillDays,
@@ -23,13 +23,16 @@ option KnoxSurvivors.InitialGroupMaxSize = {
     type = integer, min = 2, max = 6, default = 4, page = KnoxSurvivors_Population, translation = KnoxSurvivors_InitialGroupMaxSize,
 }
 option KnoxSurvivors.InitialGroupCount = {
-    type = integer, min = 1, max = 4, default = 3, page = KnoxSurvivors_Population, translation = KnoxSurvivors_InitialGroupCount,
+    type = integer, min = 0, max = 512, default = 128, page = KnoxSurvivors_Population, translation = KnoxSurvivors_InitialGroupCount,
+}
+option KnoxSurvivors.InitialFactionCount = {
+    type = integer, min = 0, max = 64, default = 12, page = KnoxSurvivors_Population, translation = KnoxSurvivors_InitialFactionCount,
 }
 option KnoxSurvivors.DisableSurvivorCaps = {
     type = boolean, default = false, page = KnoxSurvivors_Population, translation = KnoxSurvivors_DisableSurvivorCaps,
 }
 option KnoxSurvivors.MaxActiveSurvivors = {
-    type = integer, min = 1, max = 48, default = 16, page = KnoxSurvivors_Population, translation = KnoxSurvivors_MaxActiveSurvivors,
+    type = integer, min = 1, max = 128, default = 32, page = KnoxSurvivors_Population, translation = KnoxSurvivors_MaxActiveSurvivors,
 }
 option KnoxSurvivors.ActivationsPerUpdate = {
     type = integer, min = 1, max = 4, default = 2, page = KnoxSurvivors_Population, translation = KnoxSurvivors_ActivationsPerUpdate,
@@ -70,6 +73,27 @@ option KnoxSurvivors.UseReputation = {
 }
 option KnoxSurvivors.EnableKnoxEvents = {
     type = boolean, default = false, page = KnoxSurvivors_World, translation = KnoxSurvivors_EnableKnoxEvents,
+}
+option KnoxSurvivors.AutomaticFactionEntries = {
+    type = boolean, default = true, page = KnoxSurvivors_World, translation = KnoxSurvivors_AutomaticFactionEntries,
+}
+option KnoxSurvivors.FactionEntryMinimumDays = {
+    type = integer, min = 1, max = 90, default = 3, page = KnoxSurvivors_World, translation = KnoxSurvivors_FactionEntryMinimumDays,
+}
+option KnoxSurvivors.FactionEntryIntervalDays = {
+    type = integer, min = 1, max = 30, default = 7, page = KnoxSurvivors_World, translation = KnoxSurvivors_FactionEntryIntervalDays,
+}
+option KnoxSurvivors.PoliceNeighborhoodPatrols = {
+    type = boolean, default = true, page = KnoxSurvivors_World, translation = KnoxSurvivors_PoliceNeighborhoodPatrols,
+}
+option KnoxSurvivors.PolicePatrolMargin = {
+    type = integer, min = 4, max = 32, default = 16, page = KnoxSurvivors_World, translation = KnoxSurvivors_PolicePatrolMargin,
+}
+option KnoxSurvivors.MilitaryFacilityClearing = {
+    type = boolean, default = true, page = KnoxSurvivors_World, translation = KnoxSurvivors_MilitaryFacilityClearing,
+}
+option KnoxSurvivors.MilitaryClearanceDistance = {
+    type = integer, min = 2, max = 16, default = 8, page = KnoxSurvivors_World, translation = KnoxSurvivors_MilitaryClearanceDistance,
 }
 option KnoxSurvivors.AllowFactionRaids = {
     type = boolean, default = false, page = KnoxSurvivors_World, translation = KnoxSurvivors_AllowFactionRaids,
@@ -120,6 +144,9 @@ option KnoxSurvivors.ShowLegacyContextCommands = {
 }
 option KnoxSurvivors.EnableExperimentalNpcDriving = {
     type = boolean, default = false, page = KnoxSurvivors_Companions, translation = KnoxSurvivors_EnableExperimentalNpcDriving,
+}
+option KnoxSurvivors.EnableExperimentalEngineWork = {
+    type = boolean, default = false, page = KnoxSurvivors_Bases, translation = KnoxSurvivors_EnableExperimentalEngineWork,
 }
 option KnoxSurvivors.NpcDrivingSpeed = {
     type = integer, min = 5, max = 30, default = 20,

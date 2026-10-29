@@ -8,28 +8,20 @@ _G.KnoxOffscreenStories = Stories
 -- with the engine enabled.
 --   _G.KnoxOffscreenStoriesDisabled = true
 
--- Offscreen storylets: the TIS-style meta in miniature. Hibernated survivors
--- do not just march and starve; once per simulation step at most one small
--- narrative event may resolve for them. Every outcome is bounded,
--- deterministic (stable across save/load), and recorded as ledger history.
+-- Bounded nearby stored-survivor encounters use canonical people/positions.
+-- Condition and ordinary travel belong to UnloadedSurvival, never random
+-- narrative rewards or penalties. Historical story records remain readable.
 --
 -- Hard rules (never relaxed):
 --   * No hunger/thirst relief: only real items relieve needs.
---   * No health increases and no items, loot, or supplies of any kind.
+--   * No condition changes and no items, loot, or supplies of any kind.
 --   * No world mutation: effects land on the survivor ledger, relationship
 --     records, queued scar traces, and the activity feed only.
 --   * Away-team, event-owned, and non-hibernated survivors are never touched.
 
 local HISTORY_CAP = 12
-local SCAR_CAP = 4
 local MEET_RADIUS_TILES = 60
-local DETOUR_MAX_TILES = 10
 local CANDIDATE_SCAN_CAP = 48
-local RIDE_MIN_DISTANCE_TILES = 150
-
-local function clamp(value, low, high)
-    return math.max(low, math.min(high, tonumber(value) or low))
-end
 
 local function stableHash(text)
     local result = 5381
@@ -49,51 +41,12 @@ local function persistence()
     return rawget(_G, "KnoxPersistence")
 end
 
-local function profileFor(id)
-    local fallback = {
-        personality = "guarded", sociability = 30, aggression = 24,
-        courage = 42, deception = 18,
-    }
-    local persist = persistence()
-    if persist == nil then return fallback end
-    local identity = {}
-    if persist.getSurvivorIdentity ~= nil then
-        local ok, result = pcall(persist.getSurvivorIdentity, id)
-        if ok and type(result) == "table" then identity = result end
-    end
-    local result = {
-        personality = identity.personality or fallback.personality,
-        sociability = tonumber(identity.sociability) or fallback.sociability,
-        aggression = tonumber(identity.aggression) or fallback.aggression,
-        courage = tonumber(identity.courage) or fallback.courage,
-        deception = tonumber(identity.deception) or fallback.deception,
-    }
-    if persist.getSurvivorPersonality ~= nil then
-        local ok, profile = pcall(persist.getSurvivorPersonality, id)
-        if ok and type(profile) == "table" then
-            if type(profile.personality) == "string" then
-                result.personality = profile.personality
-            end
-        end
-    end
-    return result
-end
-
 local function pushHistory(state, entry)
     if type(state.history) ~= "table" then state.history = {} end
     entry.t = tonumber(entry.t) or nowHours()
     state.history[#state.history + 1] = entry
     while #state.history > HISTORY_CAP do
         table.remove(state.history, 1)
-    end
-end
-
-local function pushScar(state, scar)
-    if type(state.scars) ~= "table" then state.scars = {} end
-    scar.t = tonumber(scar.t) or nowHours()
-    state.scars[#state.scars + 1] = scar
-    while #state.scars > SCAR_CAP do
-        table.remove(state.scars, 1)
     end
 end
 
@@ -205,69 +158,6 @@ local function nearbyStored(id, x, y, z)
     return found
 end
 
-local function detour(state, phase, purpose, hours)
-    local x, y, z = virtualPosition(state)
-    if x == nil then return false end
-    local distance = 2 + (stableHash(tostring(phase) .. ":" .. tostring(purpose) .. ":d") % (DETOUR_MAX_TILES - 1))
-    local angle = (stableHash(tostring(phase) .. ":" .. tostring(purpose) .. ":a") % 360) * math.pi / 180
-    state.virtualX = x + math.cos(angle) * distance
-    state.virtualY = y + math.sin(angle) * distance
-    state.virtualZ = z
-    state.virtualAtHours = hours
-    return true
-end
-
-local function meetingHostileChance(profile, otherProfile)
-    profile = type(profile) == "table" and profile or {}
-    otherProfile = type(otherProfile) == "table" and otherProfile or {}
-    local aggression = ((tonumber(profile.aggression) or 35)
-        + (tonumber(otherProfile.aggression) or 35)) / 2
-    local hostileChance = clamp(5 + (aggression - 45) * 0.30, 3, 20)
-    if profile.personality == "predatory" or otherProfile.personality == "predatory"
-        or profile.personality == "gunner" or otherProfile.personality == "gunner" then
-        hostileChance = clamp(hostileChance + 8, 8, 30)
-    end
-    return hostileChance
-end
-
-function Stories.meetingHostileChance(profile, otherProfile)
-    return meetingHostileChance(profile, otherProfile)
-end
-
-local function meetOutcome(id, otherId, profile, otherProfile, hours, roll)
-    local persist = persistence()
-    local disposition = encounterDisposition(id, otherId)
-    if disposition == nil then return nil, false end
-    local record = nil
-    if persist ~= nil and persist.getRelationship ~= nil then
-        local ok, existing = pcall(persist.getRelationship, id, otherId)
-        if ok then record = existing end
-    end
-    local firstMeeting = record == nil or (tonumber(record.meetings) or 0) == 0
-    local hostileChance = meetingHostileChance(profile, otherProfile)
-    if persist ~= nil and persist.recordEncounter ~= nil then
-        pcall(persist.recordEncounter, id, otherId, {
-            worldAgeHours = hours,
-            began = firstMeeting,
-            nearbyHours = 0.1,
-            sharedRoam = 1,
-        })
-    end
-    if disposition == "hostile" then
-        if persist ~= nil and persist.setRelationshipDisposition ~= nil then
-            pcall(persist.setRelationshipDisposition, id, otherId, "hostile", hours + 24)
-        end
-        return "hostile", firstMeeting
-    end
-    if roll < hostileChance then
-        if persist ~= nil and persist.setRelationshipDisposition ~= nil then
-            pcall(persist.setRelationshipDisposition, id, otherId, "hostile", hours + 24)
-        end
-        return "hostile", firstMeeting
-    end
-    return "friendly", firstMeeting
-end
-
 --- Record a pending meet intent on both ledgers. Either side materializing
 -- near the other lets the loaded encounter engine prioritize the pair.
 -- Kinds: rob (hostile intent), befriend (first friendly contact), greet
@@ -318,92 +208,17 @@ local function writePendingMeet(id, state, otherId, otherState, kind, hours, pha
     return true
 end
 
---- Resolve the current far destination for a potential vehicle leg: the
--- active base return first, then the travel-group objective. Returns
--- targetX, targetY, targetZ or nil. Never invents destinations.
-function Stories.rideTarget(id, state)
-    if type(state.baseReturn) == "table"
-        and tonumber(state.baseReturn.targetX) ~= nil
-        and tonumber(state.baseReturn.targetY) ~= nil then
-        return tonumber(state.baseReturn.targetX), tonumber(state.baseReturn.targetY),
-            tonumber(state.baseReturn.targetZ) or tonumber(state.virtualZ) or 0
-    end
-    local persist = persistence()
-    if persist == nil or persist.getTravelGroupFor == nil
-        or persist.getTravelGroupObjective == nil then
-        return nil
-    end
-    local okGroup, group = pcall(persist.getTravelGroupFor, id)
-    if not okGroup or type(group) ~= "table" or group.id == nil then return nil end
-    if tostring(group.leaderId or "") ~= tostring(id) then return nil end
-    local okObjective, objective = pcall(persist.getTravelGroupObjective, group.id)
-    if not okObjective or type(objective) ~= "table" then return nil end
-    if objective.phase ~= "seeking" and objective.phase ~= "traveling" then return nil end
-    if tonumber(objective.targetX) == nil or tonumber(objective.targetY) == nil then
-        return nil
-    end
-    return tonumber(objective.targetX), tonumber(objective.targetY),
-        tonumber(objective.targetZ) or tonumber(state.virtualZ) or 0
-end
-
---- End a vehicle trip with a history line. Used on arrival, timeout,
--- base-return start, and materialization.
-function Stories.endVehicleTrip(state, hours, outcome, detail)
-    if type(state) ~= "table" or type(state.vehicleTrip) ~= "table" then return false end
-    state.vehicleTrip = nil
-    pushHistory(state, {
-        kind = "ride", detail = tostring(detail or "the ride ended"), outcome = tostring(outcome or "done"),
-    })
-    return true
-end
-
+-- Physical condition, rest, weather exposure, transport and discovered supplies
+-- require evidence from their real owners. A seeded story cannot supply it
+-- (BUG-KS-079). Keep only the existing nearby stored-survivor encounter path.
 local STORYLETS = {}
 
--- A quiet moment: catch breath, check gear, keep going. Tiny fatigue relief
--- with explicit evidence; never touches hunger, thirst, or health.
-STORYLETS.restful_moment = {
-    activities = { sheltering = true, base_life = true, exploring = true },
-    chance = function(activity) return activity == "exploring" and 10 or 14 end,
-    resolve = function(id, state, profile, hours, phase)
-        local relief = 0.02 + (stableHash(tostring(id) .. ":" .. tostring(phase) .. ":rest") % 4) / 100
-        state.fatigue = clamp(state.fatigue - relief, 0, 1)
-        pushHistory(state, { kind = "rest", detail = "caught breath off the road", outcome = "rested" })
-        return "rested"
-    end,
-}
-
--- Something moved in the dark. Costs endurance; the courageous usually walk
--- away clean, the frightened sometimes do not. Injuries are small, explicit,
--- and never fatal on their own.
-STORYLETS.close_call = {
-    activities = { exploring = true, seeking_supplies = true, group_travel = true, group_objective = true },
-    chance = function() return 22 end,
-    resolve = function(id, state, profile, hours, phase)
-        state.endurance = clamp(state.endurance - 0.03, 0, 1)
-        local x, y, z = virtualPosition(state)
-        local escape = clamp(55 + ((tonumber(profile.courage) or 42) - 50) * 0.8, 25, 90)
-        if rollFor(id, phase, "escape") < escape then
-            detour(state, phase, "escape", hours)
-            pushHistory(state, { kind = "close_call", detail = "heard it coming, went still", outcome = "escaped" })
-            return "escaped"
-        end
-        local injury = 1 + (stableHash(tostring(id) .. ":" .. tostring(phase) .. ":hurt") % 3)
-        state.health = clamp(state.health - injury, 1, 100)
-        if x ~= nil then
-            pushScar(state, { x = x, y = y, z = z, kind = "injury", detail = "bloodied escape" })
-        end
-        pushHistory(state, { kind = "close_call", detail = "it got a piece before letting go", outcome = "hurt" })
-        feed("id=" .. tostring(id) .. " hurt offscreen evidence=close_call")
-        return "hurt"
-    end,
-}
-
--- Cross paths with another stored survivor. Meetings accumulate on the
--- shared relationship record; hostility flips disposition with a scar trace.
+-- Stored proximity proposes contact with a real canonical person. Only the
+-- loaded encounter owner can commit a conversation, hostility or shared memory.
 STORYLETS.fellow_traveler = {
     activities = { exploring = true, seeking_supplies = true, group_travel = true, group_objective = true },
     chance = function() return 30 end,
-    resolve = function(id, state, profile, hours, phase)
+    resolve = function(id, state, hours, phase)
         if not socialAllows(id, state) then return nil end
         local x, y, z = virtualPosition(state)
         if x == nil then return nil end
@@ -414,101 +229,18 @@ STORYLETS.fellow_traveler = {
         if otherState == nil or pairAlreadyProcessed(id, state, otherId, otherState, phase) then
             return nil
         end
-        local otherProfile = profileFor(otherId)
-        local outcome, first = meetOutcome(id, otherId, profile, otherProfile, hours,
-            rollFor(id, phase, "meet:" .. tostring(otherId)))
-        if outcome == nil then return nil end
-        -- A pending meet lets the loaded encounter engine prioritize this
-        -- pair when both materialize near each other (see
-        -- KnoxSurvivorRelationships.pendingMeetOutcome). Robbery and ambush
-        -- transfers still only happen loaded, never here.
-        local kind = outcome == "hostile" and "rob" or (first and "befriend" or "greet")
+        local disposition = encounterDisposition(id, otherId)
+        if disposition == nil then return nil end
+        -- Preserve established hostility; never create it from a seeded roll.
+        local kind = disposition == "hostile" and "rob" or "greet"
         if not writePendingMeet(id, state, otherId, otherState, kind, hours, phase) then
             return nil
         end
-        if outcome == "hostile" then
-            detour(state, phase, "meet:away", hours)
-            pushScar(state, { x = x, y = y, z = z, kind = "fight", with = otherId, detail = "turned hostile" })
-            pushHistory(state, { kind = "meet", with = otherId, detail = "crossed paths, drew weapons", outcome = "hostile" })
-            feed("id=" .. tostring(id) .. " met " .. tostring(otherId) .. " outcome=hostile")
-            return "met_hostile"
-        end
-        detour(state, phase, "meet:on", hours)
-        pushHistory(state, { kind = "meet", with = otherId, detail = "crossed paths, exchanged word", outcome = "friendly" })
-        if first then
-            feed("id=" .. tostring(id) .. " met " .. tostring(otherId) .. " outcome=friendly_first")
-        end
-        return "met_friendly"
+        return "contact_pending"
     end,
 }
 
--- Familiar ground steadies the nerves. Narrative flag only, plus a breath.
--- Places with scar traces pull twice as often: the ledger remembers.
-STORYLETS.old_haunt = {
-    activities = { exploring = true, sheltering = true },
-    chance = function() return 8 end,
-    resolve = function(id, state, profile, hours)
-        state.fatigue = clamp(state.fatigue - 0.02, 0, 1)
-        pushHistory(state, { kind = "haunt", detail = "walked ground that felt known", outcome = "steadied" })
-        return "steadied"
-    end,
-    boostNearScars = true,
-}
-
--- Bad weather off the road. Small endurance tax, explicit evidence.
-STORYLETS.foul_weather = {
-    activities = { exploring = true, seeking_supplies = true, group_travel = true, group_objective = true },
-    chance = function() return 12 end,
-    resolve = function(id, state, profile, hours)
-        state.endurance = clamp(state.endurance - 0.04, 0, 1)
-        pushHistory(state, { kind = "weather", detail = "pushed through bad weather", outcome = "weathered" })
-        return "weathered"
-    end,
-}
-
--- A remembered cache that may matter later. Narrative flag only: no items,
--- no relief, no fabrication. Future systems may resolve it against the real
--- world; until then it weights recounts and later storylets.
-STORYLETS.stash_memory = {
-    activities = { exploring = true, seeking_supplies = true },
-    chance = function() return 7 end,
-    resolve = function(id, state, profile, hours)
-        local x, y, z = virtualPosition(state)
-        if x == nil then return nil end
-        state.cacheMemory = { x = x, y = y, z = z, atHours = hours }
-        pushHistory(state, { kind = "cache", detail = "marked a possible stash in memory", outcome = "remembered" })
-        return "remembered"
-    end,
-}
-
--- Caught a ride: a virtual vehicle leg toward the current far destination.
--- TIS radar-blip style: no vehicle entity is claimed, no teleport happens;
--- the ledger simply advances at vehicle pace while the trip is active. The
--- trip dissolves the moment the survivor loads (real boarding is owned by
--- the loaded vehicle systems), on arrival, or after 24 hours.
-STORYLETS.catch_ride = {
-    activities = { group_travel = true, group_objective = true },
-    chance = function() return 10 end,
-    resolve = function(id, state, profile, hours)
-        local x, y, z = virtualPosition(state)
-        if x == nil then return nil end
-        local tx, ty, tz = Stories.rideTarget(id, state)
-        if tx == nil then return nil end
-        local dx, dy = tx - x, ty - y
-        if dx * dx + dy * dy < RIDE_MIN_DISTANCE_TILES * RIDE_MIN_DISTANCE_TILES then
-            return nil
-        end
-        state.vehicleTrip = { targetX = tx, targetY = ty, targetZ = tz, atHours = hours }
-        pushHistory(state, { kind = "ride", detail = "caught a ride toward the far goal", outcome = "riding" })
-        feed("id=" .. tostring(id) .. " caught a ride")
-        return "riding"
-    end,
-}
-
-local STORYLET_ORDER = {
-    "fellow_traveler", "close_call", "catch_ride", "foul_weather", "restful_moment",
-    "old_haunt", "stash_memory",
-}
+local STORYLET_ORDER = { "fellow_traveler" }
 
 local function activityChance(activity)
     if activity == "exploring" or activity == "group_travel" or activity == "group_objective" then
@@ -521,21 +253,6 @@ local function activityChance(activity)
 end
 
 local SCAR_RETURN_RADIUS_TILES = 30
-local SCAR_MEMORY_RADIUS_TILES = 15
-
-local function scarNear(state, radius)
-    if type(state.scars) ~= "table" or #state.scars == 0 then return false end
-    local x, y, z = virtualPosition(state)
-    if x == nil then return false end
-    for _, scar in ipairs(state.scars) do
-        if type(scar) == "table" and tonumber(scar.x) ~= nil and tonumber(scar.z or z) == z then
-            local dx, dy = tonumber(scar.x) - x, tonumber(scar.y) - y
-            if dx * dx + dy * dy <= radius * radius then return true end
-        end
-    end
-    return false
-end
-
 --- Resolve at most one storylet for a hibernated survivor's simulation step.
 -- @param id string survivor id
 -- @param state table mutable survival ledger (history/scars appended in place)
@@ -561,18 +278,14 @@ function Stories.resolveFor(id, state, hours, elapsed)
     if rollFor(id, phase, "any:" .. activity) >= activityChance(activity) then
         return nil
     end
-    local profile = profileFor(id)
     local cursor = rollFor(id, phase, "pick")
     for _, key in ipairs(STORYLET_ORDER) do
         local storylet = STORYLETS[key]
         local allowed = storylet.activities[activity] == true
         if allowed then
             local chance = storylet.chance(activity)
-            if storylet.boostNearScars == true and scarNear(state, SCAR_MEMORY_RADIUS_TILES) then
-                chance = chance * 2
-            end
             if cursor < chance then
-                local ok, outcome = pcall(storylet.resolve, id, state, profile, hours, phase)
+                local ok, outcome = pcall(storylet.resolve, id, state, hours, phase)
                 if ok and outcome ~= nil then
                     return tostring(outcome)
                 end

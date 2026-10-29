@@ -6,6 +6,7 @@ require "Util/AdjacentFreeTileFinder"
 require "ISUI/ISWorldObjectContextMenu"
 require "KS_SurvivorInventoryActions"
 require "KS_BaseSupplyPlanner"
+require "KS_BaseEngineRepairs"
 
 local Repairs = rawget(_G, "KnoxBaseRepairs") or {}
 _G.KnoxBaseRepairs = Repairs
@@ -341,6 +342,11 @@ function Repairs.findTask(base, character, eligible)
             end
         end
     end
+    local engine,engineResult=nil,nil
+    if KnoxBaseEngineRepairs ~= nil then
+        engine,engineResult=KnoxBaseEngineRepairs.findTask(base,character,eligible)
+    end
+    if engine ~= nil then return engine,engineResult end
     return best, best ~= nil and "found" or "no_repair_ready"
 end
 
@@ -361,6 +367,9 @@ local function objectAt(square, target)
 end
 
 function Repairs.resolveTarget(base, target, character)
+    if target ~= nil and target.action == "repair_engine" then
+        return KnoxBaseEngineRepairs.resolveTarget(base,target,character)
+    end
     local cell = getCell ~= nil and getCell() or nil
     if base == nil or target == nil or cell == nil or character == nil then
         return nil, "missing_repair_target"
@@ -385,7 +394,23 @@ function Repairs.resolveTarget(base, target, character)
     }, "resolved"
 end
 
+-- Installed add returns this character's queue on admission, nil on refusal.
+-- begin() may run synchronously, so admission is distinct from queue presence
+-- or eventual repair health receipt. The controller owns failure cleanup.
+local function queueNativeAction(character, action, stage)
+    local ok, queue = pcall(ISTimedActionQueue.add, action)
+    if not ok then return nil, stage .. "_queue_error" end
+    if queue == nil or ISTimedActionQueue.queues == nil
+        or queue ~= ISTimedActionQueue.queues[character] then
+        return nil, stage .. "_queue_refused"
+    end
+    return action, "queued"
+end
+
 function Repairs.queueAction(character, target)
+    if target ~= nil and target.kind == "engine" then
+        return KnoxBaseEngineRepairs.queueAction(character,target)
+    end
     if character == nil or target == nil or target.props == nil
         or target.object == nil or target.square == nil then
         return nil, "missing_repair_target"
@@ -422,7 +447,9 @@ function Repairs.queueAction(character, target)
                         return nil, "repair_clothing_transfer_failed"
                     end
                 end
-                ISTimedActionQueue.add(ISWearClothing:new(character, secondTool))
+                local wear, wearReason = queueNativeAction(character,
+                    ISWearClothing:new(character, secondTool), "repair_clothing")
+                if wear == nil then return nil, wearReason end
             end
         else
             ISWorldObjectContextMenu.equip(
@@ -444,17 +471,29 @@ function Repairs.queueAction(character, target)
         nil,
         nil
     )
-    ISTimedActionQueue.add(action)
-    return action, "queued"
+    return queueNativeAction(character, action, "repair_action")
 end
 
 function Repairs.snapshot(target)
-    return tonumber(safeCall(target ~= nil and target.object or nil, "getHealth")) or 0
+    if target ~= nil and target.kind == "engine" then return KnoxBaseEngineRepairs.snapshot(target) end
+    local object = target ~= nil and target.object or nil
+    local square = safeCall(object,"getSquare")
+    local index = tonumber(safeCall(object,"getObjectIndex"))
+    local objects = safeCall(square,"getObjects")
+    if object == nil or square == nil or square ~= target.square
+        or index == nil or index < 0 or objects == nil
+        or safeCall(objects,"get",index) ~= object then return nil end
+    local health = tonumber(safeCall(object,"getHealth"))
+    if health == nil or health ~= health or health < 0 or health == math.huge then return nil end
+    return health
 end
 
 function Repairs.isComplete(target, before)
-    local health = tonumber(safeCall(target ~= nil and target.object or nil, "getHealth")) or 0
-    return health > (tonumber(before) or 0)
+    if target ~= nil and target.kind == "engine" then return KnoxBaseEngineRepairs.isComplete(target,before) end
+    before = tonumber(before)
+    if before == nil or before ~= before or before < 0 or before == math.huge then return false end
+    local health = Repairs.snapshot(target)
+    return health ~= nil and health > before
 end
 
 function Repairs.resolveTaskSquare(base, target, character)

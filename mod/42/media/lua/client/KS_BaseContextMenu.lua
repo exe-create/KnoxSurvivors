@@ -66,7 +66,11 @@ end
 
 function BaseContextMenu.establish(player, square)
     local base, result = KnoxBaseManager.establishPlayerBase(player, square)
-    if base ~= nil then
+    if base ~= nil and result == "existing" then
+        KnoxActivityFeed.event("This building is already your home base.")
+    elseif base ~= nil and result == "move_confirmation_required" then
+        KnoxActivityFeed.event("You already have a home base. Use Move Home Base Here to confirm a move.")
+    elseif base ~= nil then
         KnoxActivityFeed.event("Home base established.")
     else
         KnoxActivityFeed.event("Could not establish a base here: " .. tostring(result) .. ".")
@@ -423,22 +427,30 @@ function BaseContextMenu.toggleDoorLock(player, base, door)
         if not locked and door.isLocked ~= nil then locked = door:isLocked() == true end
     end)
     local ok = pcall(function()
+        if door.setLockedByKey == nil and door.setLocked == nil then error("lock_api_unavailable") end
         if door.setLockedByKey ~= nil then
             door:setLockedByKey(not locked)
         end
         if door.setLocked ~= nil then
             door:setLocked(not locked)
         end
-        if door.setKeyId ~= nil and not locked then
-            door:setKeyId(tostring(base.id))
-        end
+        -- A base ID is not an engine key ID. Preserve the real lock/key identity.
         if door.transmitCompleteItemToServer ~= nil then
             door:transmitCompleteItemToServer()
         elseif door.transmitModData ~= nil then
             door:transmitModData()
         end
     end)
+    local confirmed = false
     if ok then
+        local read, actual = pcall(function()
+            local byKey = door.isLockedByKey ~= nil and door:isLockedByKey() == true
+            local plain = door.isLocked ~= nil and door:isLocked() == true
+            return byKey or plain
+        end)
+        confirmed = read and actual == not locked
+    end
+    if confirmed then
         -- Persist locked doors so they survive reloads.
         if KnoxPersistence.setBaseDoorLock ~= nil then
             local sq = door.getSquare ~= nil and door:getSquare() or nil
@@ -457,8 +469,8 @@ end
 -- Direct base orders for specific windows/build sites. Queues the concrete
 -- task (if needed) and assigns it to the best available resident. If nobody
 -- can take it right now the queued task remains for automatic pickup.
-local function bestResidentForTask(player, base, taskType)
-    if KnoxPersistence.getBaseResidentIds == nil then return nil end
+local function residentsForTask(base, taskType)
+    if KnoxPersistence.getBaseResidentIds == nil then return {} end
     local candidates = KnoxPersistence.getBaseResidentIds(base.id) or {}
     local preferred = {}
     local fallback = {}
@@ -466,30 +478,31 @@ local function bestResidentForTask(player, base, taskType)
         local duty = KnoxPersistence.getSurvivorDuty ~= nil
             and KnoxPersistence.getSurvivorDuty(survivorId) or {}
         local pref = tostring(duty.jobPreference or "auto")
-        if pref == taskType or pref == "woodwork" or pref == "auto" then
+        if pref == "auto" or KnoxOrderCatalog.preferenceMatchesTask(pref, taskType) then
             preferred[#preferred + 1] = survivorId
         else
             fallback[#fallback + 1] = survivorId
         end
     end
-    for _, list in ipairs({ preferred, fallback }) do
-        for _, survivorId in ipairs(list) do
-            -- Eligibility (at base, skills, materials) is enforced by claimSpecific.
-            return survivorId
-        end
-    end
-    return nil
+    for _, survivorId in ipairs(fallback) do preferred[#preferred + 1] = survivorId end
+    return preferred
 end
 
 local function assignTaskToBestResident(player, base, task)
     if task == nil then return nil end
     local service = rawget(_G, "KnoxCompanionService")
     if service == nil or service.assignBaseTask == nil then return nil end
-    local preference = task.type == "barricade" and "barricade" or "woodwork"
-    local survivorId = bestResidentForTask(player, base, preference)
-    if survivorId == nil then return nil end
-    local assigned = service.assignBaseTask(player, survivorId, base.id, task.id)
-    return assigned
+    local playerId = service.getPlayerId(player)
+    for _, survivorId in ipairs(residentsForTask(base, task.type)) do
+        local eligible = KnoxBaseTaskBoard.canClaimSpecific(base.id, task.id, survivorId, playerId)
+        -- A queued order is not permission to command an unseen resident.
+        -- Read-only admission avoids repeated failed-order speech/feed spam.
+        if eligible and service.orderContact(player, survivorId) then
+            local assigned = service.assignBaseTask(player, survivorId, base.id, task.id)
+            if assigned ~= nil then return assigned end
+        end
+    end
+    return nil
 end
 
 function BaseContextMenu.orderBarricadeHere(player, base, square)
@@ -525,7 +538,7 @@ function BaseContextMenu.orderBarricadeHere(player, base, square)
     local hammer = barricades.findHammer ~= nil and barricades.findHammer(nil, base) or nil
     local hammerType = hammer ~= nil and hammer.getFullType ~= nil
         and hammer:getFullType() or "Base.Hammer"
-    local queued, assigned = 0, nil
+    local queued, assigned = 0, 0
     for _, target in ipairs(targets) do
         -- Reuse existing queued task for the same window when present.
         local task = nil
@@ -550,8 +563,8 @@ function BaseContextMenu.orderBarricadeHere(player, base, square)
                 task.auto = nil
             end
             queued = queued + 1
-            if assigned == nil then
-                assigned = assignTaskToBestResident(player, base, task)
+            if task.state == "queued" and assignTaskToBestResident(player, base, task) ~= nil then
+                assigned = assigned + 1
             end
         end
     end
@@ -559,8 +572,9 @@ function BaseContextMenu.orderBarricadeHere(player, base, square)
         KnoxActivityFeed.event("Could not queue barricade work.")
         return
     end
-    KnoxActivityFeed.event(assigned ~= nil
-        and ("Resident ordered to barricade " .. tostring(queued) .. " windows.")
+    KnoxActivityFeed.event(assigned > 0
+        and (tostring(assigned) .. (assigned == 1 and " resident assigned; " or " residents assigned; ")
+            .. tostring(queued) .. " window jobs ordered.")
         or ("Barricade work queued (" .. tostring(queued) .. ") — residents will take it."))
 end
 
@@ -657,6 +671,15 @@ function BaseContextMenu.onFill(playerNum, context, worldobjects, test)
     local player = getSpecificPlayer(playerNum)
     local square = firstSquare(worldobjects)
     if player == nil or square == nil then
+        return
+    end
+    local compat = rawget(_G, "KnoxViewpointCompatibility")
+    if compat ~= nil and compat.hasSelection ~= nil and compat.hasSelection(player) then
+        -- Interface already supplies the aimed corner action. Its world-object
+        -- harvester must not turn the fallback option into a second choice.
+        if compat.usesNativeAdapter ~= nil and compat.usesNativeAdapter() then return end
+        if test then return ISWorldObjectContextMenu.setTest() end
+        context:addOption("Select corner here", player, compat.selectionAction, square)
         return
     end
     local playerId = KnoxPersistence.ensurePlayerId(player)

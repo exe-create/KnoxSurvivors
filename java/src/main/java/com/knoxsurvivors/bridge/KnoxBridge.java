@@ -26,8 +26,42 @@ public final class KnoxBridge {
         return RUNTIME_VERSION;
     }
 
+    public String getRuntimeSource() {
+        return KnoxAgent.getRuntimeSource();
+    }
+
     public boolean isRuntimeLoaded() {
         return true;
+    }
+
+    /** Native ordinary-speech intelligibility, not a Knox hearing radius or radio receipt. */
+    public boolean canHearOrder(Object speaker, Object listener) {
+        if (speaker == null || listener == null) return false;
+        try {
+            ClassLoader loader = listener.getClass().getClassLoader();
+            Class<?> player = Class.forName("zombie.characters.IsoPlayer", false, loader);
+            Class<?> object = Class.forName("zombie.iso.IsoObject", false, loader);
+            if (!player.isInstance(listener) || !object.isInstance(speaker)) return false;
+            if (Boolean.TRUE.equals(listener.getClass().getMethod("isAsleep").invoke(listener))
+                || Boolean.TRUE.equals(listener.getClass().getMethod("isDead").invoke(listener))
+                || Boolean.TRUE.equals(speaker.getClass().getMethod("isDead").invoke(speaker))
+                || listener.getClass().getMethod("getCurrentSquare").invoke(listener) == null
+                || speaker.getClass().getMethod("getCurrentSquare").invoke(speaker) == null) return false;
+            Class<?> trait = Class.forName("zombie.scripting.objects.CharacterTrait", false, loader);
+            Object deaf = trait.getField("DEAF").get(null);
+            if (deaf == null || Boolean.TRUE.equals(listener.getClass()
+                .getMethod("hasTrait", trait).invoke(listener, deaf))) return false;
+            Class<?> say = Class.forName("zombie.chat.defaultChats.SayChat", false, loader);
+            Object settings = say.getMethod("getDefaultSettings").invoke(null);
+            float range = ((Number) settings.getClass().getMethod("getRange").invoke(settings)).floatValue();
+            if (!Float.isFinite(range) || range <= 0) return false;
+            Class<?> utility = Class.forName("zombie.chat.ChatUtility", false, loader);
+            float scramble = ((Number) utility.getMethod("getScrambleValue", object, player, float.class)
+                .invoke(null, speaker, listener, range)).floatValue();
+            return Float.isFinite(scramble) && scramble == 0;
+        } catch (ReflectiveOperationException | LinkageError | RuntimeException unavailable) {
+            return false;
+        }
     }
 
     public synchronized long getPingCount() {
@@ -92,6 +126,14 @@ public final class KnoxBridge {
         return npcRegistry.tick(id);
     }
 
+    public String observeNpcNativeAction(String id) {
+        return npcRegistry.observeNativeAction(id);
+    }
+
+    public String observeNpcNativeRecovery(String id) {
+        return npcRegistry.observeNativeRecovery(id);
+    }
+
     public String cancelNpcMove(String id) {
         return npcRegistry.cancelMove(id);
     }
@@ -102,6 +144,14 @@ public final class KnoxBridge {
 
     public boolean setNpcDoorWindowOpeningAllowed(String id, boolean allowed) {
         return npcRegistry.setDoorWindowOpeningAllowed(id, allowed);
+    }
+
+    public String openNpcDoor(String id, Object door) {
+        return npcRegistry.openDoor(id, door);
+    }
+
+    public String closeNpcOpenedDoor(String id) {
+        return npcRegistry.closeOpenedDoor(id);
     }
 
     public boolean setNpcProtectedArea(String id, int minX, int minY, int maxX, int maxY) {
@@ -171,6 +221,11 @@ public final class KnoxBridge {
     /** Wears an existing owned clothing or container item without creating gear. */
     public String wearNpcOwnedItem(String id, String fullType) {
         return npcRegistry.wearOwnedItem(id, fullType);
+    }
+
+    /** Wears the exact carried garment/bag selected by the Lua planner. */
+    public String wearNpcOwnedItemById(String id, String fullType, long itemId) {
+        return npcRegistry.wearOwnedItemById(id, fullType, itemId);
     }
 
     /** Developer-only real-item kit for the native firearm test path. */
@@ -282,6 +337,10 @@ public final class KnoxBridge {
         return npcRegistry.restorePersistentRecord(encoded, square);
     }
 
+    public java.util.Map<String, Integer> getNpcRecordLocation(String encoded) {
+        return npcRegistry.persistentRecordLocation(encoded);
+    }
+
     public int getTestNpcRecordX(String encoded) {
         return npcRegistry.persistentRecordX(encoded);
     }
@@ -316,6 +375,11 @@ public final class KnoxBridge {
     /** Consumes real saved food/fluid without creating an IsoPlayer or default supplies. */
     public java.util.Map<String, Object> consumeNpcRecordSupply(String encoded, String kind, double amount) {
         return npcRegistry.consumePersistentRecordSupply(encoded, kind, amount);
+    }
+
+    /** Shares only explicitly allocated native base provisions, retaining a spare. */
+    public java.util.Map<String, Object> consumeNpcRecordBaseSupply(String encoded, String kind, double amount, String baseId, int reserve) {
+        return npcRegistry.consumePersistentRecordBaseSupply(encoded, kind, amount, baseId, reserve);
     }
 
     public String relocateNpcRecord(String encoded, int x, int y, int z) {

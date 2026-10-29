@@ -153,6 +153,57 @@ public final class KnoxInventorySnapshotVerifier {
         }
         require(captured.consumeSupply("food", .5, Item.class) == null, "rotten saved food consumed");
 
+        // A shared base is not a claim on somebody's personal inventory.
+        Body shared = new Body();
+        Item personal = new Item("Base.PersonalMeal"); personal.hunger=-.2f;
+        shared.inventory.AddItem(personal);
+        Item communalA = new Item("Base.CommunalMealA"); communalA.hunger=-.2f; communalA.communalBase="home";
+        Item communalB = new Item("Base.CommunalMealB"); communalB.hunger=-.2f; communalB.communalBase="home";
+        shared.inventory.AddItem(communalA); shared.inventory.AddItem(communalB);
+        KnoxInventorySnapshot offered=KnoxInventorySnapshot.capture(shared,240);
+        require(offered.consumeSupply("food",.8,Item.class,"other") == null,"foreign base claimed provisions");
+        require(offered.consumeSupply("food",.8,Item.class,"home",2) == null,"needy donor lost extra reserve");
+        KnoxInventorySnapshot.Consumption given=offered.consumeSupply("food",.8,Item.class,"home");
+        require(given != null && given.type().equals("Base.CommunalMealA"),"shared operation chose a personal meal");
+        Body delivered=new Body(); KnoxInventorySnapshot.decode(given.inventory().encode()).restore(delivered,Item.class);
+        require(delivered.inventory.items.size()==2 && delivered.inventory.items.get(0).type.equals("Base.PersonalMeal")
+            && delivered.inventory.items.get(1).communalBase.equals("home"),"shared receipt/roundtrip lost ownership or personal stock");
+        require(given.inventory().consumeSupply("food",.8,Item.class,"home")==null,"last communal reserve was redistributed");
+        communalA.favorite=true;
+        require(KnoxInventorySnapshot.capture(shared,240).consumeSupply("food",.8,Item.class,"home")==null,"favorite allocation shared");
+        communalA.favorite=false; communalA.mission=true;
+        require(KnoxInventorySnapshot.capture(shared,240).consumeSupply("food",.8,Item.class,"home")==null,"mission cargo donated");
+        communalA.mission=false;
+        Item protectedBag=new Item("Base.ProtectedBag");protectedBag.favorite=true;protectedBag.inventory=new Container();
+        protectedBag.inventory.AddItem(communalA);protectedBag.inventory.AddItem(communalB);
+        Body protectedOwner=new Body();protectedOwner.inventory.AddItem(protectedBag);
+        require(KnoxInventorySnapshot.capture(protectedOwner,240).consumeSupply("food",.8,Item.class,"home")==null,
+            "protected bag contents shared");
+        require(KnoxInventorySnapshot.capture(protectedOwner,240).consumeSupply("food",.1,Item.class)!=null,
+            "own survival was disabled by protection against other people's claims");
+
+        // Controlled detached-record workload: actual fixture deserializations,
+        // not native frame timing. Early receipt stops; an absent claim scans once.
+        Body large = new Body();
+        for (int i=0;i<240;i++) {
+            Item item=new Item("Base.LoadMeal"+i);item.hunger=-.2f;
+            item.communalBase=i<2 ? "home" : "";
+            large.inventory.AddItem(item);
+        }
+        KnoxInventorySnapshot largeRecord=KnoxInventorySnapshot.capture(large,240);
+        int loadsBefore=Item.loadCalls;
+        long started=System.nanoTime();
+        for (int i=0;i<100;i++) require(largeRecord.consumeSupply("food",.1,Item.class,"home")!=null,
+            "bounded early communal receipt failed");
+        int earlyLoads=Item.loadCalls-loadsBefore;
+        require(earlyLoads==200,"shared lookup continued after reserve proof");
+        loadsBefore=Item.loadCalls;
+        for (int i=0;i<100;i++) require(largeRecord.consumeSupply("food",.1,Item.class,"foreign")==null,
+            "worst-case scan invented foreign supply");
+        require(Item.loadCalls-loadsBefore==24000,"absent claim rescanned native roots");
+        System.out.println("Resource fixture workload PASS trials=200 items=240 earlyLoads="+earlyLoads
+            +" absentLoads="+(Item.loadCalls-loadsBefore)+" elapsedMs="+(System.nanoTime()-started)/1_000_000);
+
         Item cyclic = new Item("Base.Cycle");
         cyclic.inventory = new Container();
         cyclic.inventory.AddItem(cyclic);
@@ -248,13 +299,15 @@ public final class KnoxInventorySnapshotVerifier {
     }
 
     public static final class Item {
-        static int loadedVersion;
+        static int loadedVersion, loadCalls;
         static boolean dropChild, failLoad;
         final String type;
         int condition = 10, uses = 1, rounds;
         float fluid, hunger, age, thirst;
         boolean favorite, chambered, rotten;
         String padding = "";
+        String communalBase = "";
+        boolean mission;
         Container inventory;
         Item(String type) { this.type = type; }
         public String getFullType() { return type; }
@@ -270,6 +323,7 @@ public final class KnoxInventorySnapshotVerifier {
         public int getCurrentAmmoCount() { return rounds; }
         public int getUses() { return uses; }
         public boolean isFavorite() { return favorite; }
+        public ItemData getModData() { return new ItemData(this); }
         public void setCondition(int value) { condition = value; }
         public void setUses(int value) { uses = value; }
         public void setFavorite(boolean value) { favorite = value; }
@@ -298,11 +352,13 @@ public final class KnoxInventorySnapshotVerifier {
             bytes.putFloat(fluid).putFloat(hunger).putFloat(age).putFloat(thirst);
             bytes.put((byte) (favorite ? 1 : 0)).put((byte) (chambered ? 1 : 0)).put((byte) (rotten ? 1 : 0));
             put(bytes, padding);
+            put(bytes, communalBase); bytes.put((byte)(mission ? 1 : 0));
             bytes.putInt(inventory == null ? -1 : inventory.items.size());
             if (inventory != null) for (Item child : inventory.items) child.saveWithSize(bytes, network);
             bytes.putInt(start, bytes.position() - start - 4);
         }
         public static Item loadItem(ByteBuffer bytes, int version) {
+            loadCalls++;
             loadedVersion = version;
             int size = bytes.getInt();
             if (failLoad) { bytes.position(bytes.position() + size); return null; }
@@ -311,6 +367,7 @@ public final class KnoxInventorySnapshotVerifier {
             item.fluid = bytes.getFloat(); item.hunger = bytes.getFloat(); item.age = bytes.getFloat(); item.thirst = bytes.getFloat();
             item.favorite = bytes.get() != 0; item.chambered = bytes.get() != 0; item.rotten = bytes.get() != 0;
             item.padding = get(bytes);
+            item.communalBase = get(bytes); item.mission = bytes.get()!=0;
             int count = bytes.getInt();
             if (count >= 0) {
                 item.inventory = new Container();
@@ -329,6 +386,16 @@ public final class KnoxInventorySnapshotVerifier {
             byte[] value = new byte[bytes.getInt()];
             bytes.get(value);
             return new String(value, StandardCharsets.UTF_8);
+        }
+    }
+
+    public static final class ItemData {
+        final Item item;
+        ItemData(Item item) { this.item=item; }
+        public Object rawget(Object key) {
+            if ("KnoxBaseProvision".equals(key)) return item.communalBase.isEmpty() ? null : item.communalBase;
+            if ("KnoxBaseSupplyDelivery".equals(key)) return item.mission ? "mission" : null;
+            return null;
         }
     }
 

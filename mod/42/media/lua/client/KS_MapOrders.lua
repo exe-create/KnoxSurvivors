@@ -40,80 +40,58 @@ local function finiteNumber(value)
     return number
 end
 
-local function recordLocation(id)
-    local bridge=rawget(_G,"KnoxJavaBridge")
-    local record=KnoxPersistence.getRecord~=nil and KnoxPersistence.getRecord(id) or nil
-    if bridge==nil or record==nil then return nil end
-    local ok,x,y,z=pcall(function()
-        return bridge:getTestNpcRecordX(record),bridge:getTestNpcRecordY(record),bridge:getTestNpcRecordZ(record)
-    end)
-    x,y,z=finiteNumber(x),finiteNumber(y),finiteNumber(z)
-    if not ok or x==nil or y==nil or z==nil then return nil end
-    return x,y,z
-end
-
--- Read-only locator data for player-owned survivors.  It deliberately never
--- materializes, moves or persists a survivor/map symbol.
+-- Map and journal share the same observer projection. A loaded native body is
+-- not proof that this player can see it; logical travel is never a GPS signal.
+-- Keep lightweight in the public signature for callers, without bypassing knowledge.
 function Orders.ownedLocations(playerNum, lightweight)
-    local player=getSpecificPlayer(playerNum)
-    local playerId=player~=nil and KnoxPersistence.ensurePlayerId(player) or nil
-    if playerId==nil or KnoxPersistence.getSurvivorIds==nil then return {},{unlocatedCount=0,invalidCount=0} end
-    local locations,seenIds={},{}
-    local summary={unlocatedCount=0,invalidCount=0}
-    for _,id in ipairs(KnoxPersistence.getSurvivorIds() or {}) do
-        if id~=nil and not seenIds[id] then
-        seenIds[id]=true
-        local affiliation=KnoxPersistence.getSurvivorAffiliation(id)
-        if affiliation~=nil and affiliation.kind=="player" and affiliation.ownerId==playerId
-            and KnoxPersistence.isSurvivorAlive(id) then
-            local character=KnoxSurvivorRuntime~=nil and KnoxSurvivorRuntime.getCharacter(id) or nil
-            local x,y,z,source=nil,nil,nil,nil
-            local invalidCoordinates=false
-            if character~=nil then
-                local ok,cx,cy,cz=pcall(function() return character:getX(),character:getY(),character:getZ() end)
-                cx,cy,cz=finiteNumber(cx),finiteNumber(cy),finiteNumber(cz)
-                if ok and cx~=nil and cy~=nil and cz~=nil then
-                    x,y,z,source=cx,cy,cz,"loaded"
-                elseif ok then
-                    invalidCoordinates=true
-                end
-            end
-            local state=KnoxPersistence.getUnloadedSurvivalState~=nil
-                and KnoxPersistence.getUnloadedSurvivalState(id) or nil
-            if source==nil and state~=nil then
-                local sx,sy,sz=finiteNumber(state.virtualX),finiteNumber(state.virtualY),finiteNumber(state.virtualZ)
-                if sx~=nil and sy~=nil and sz~=nil then
-                    x,y,z,source=sx,sy,sz,"logical"
-                elseif state.virtualX~=nil or state.virtualY~=nil or state.virtualZ~=nil then
-                    invalidCoordinates=true
-                end
-            end
-            if source==nil then
-                x,y,z=recordLocation(id)
-                if x~=nil then source="last_known"
-                elseif KnoxPersistence.getRecord~=nil and KnoxPersistence.getRecord(id)~=nil then invalidCoordinates=true end
-            end
-            if source~=nil then
-                local snapshot=not lightweight and KnoxSurvivorViewModel~=nil and KnoxSurvivorViewModel.getSurvivor~=nil
-                    and KnoxSurvivorViewModel.getSurvivor(id,playerNum) or nil
-                locations[#locations+1]={id=id,name=displayName(id),x=x,y=y,z=z,source=source,
-                    confidence=source,activity=snapshot~=nil and snapshot.activity or (state~=nil and state.activity or "Unknown"),
-                    status=snapshot~=nil and snapshot.locationLabel or source}
-            else
-                summary.unlocatedCount=summary.unlocatedCount+1
-                if invalidCoordinates then summary.invalidCount=summary.invalidCount+1 end
-            end
-        elseif KnoxPersistence.isSurvivorAlive(id)==false then
-            local evidence=KnoxPersistence.getSurvivorDeathEvidence~=nil
-                and KnoxPersistence.getSurvivorDeathEvidence(id) or nil
-            if type(evidence)=="table" and evidence.ownerKind=="player"
-                and evidence.ownerId==playerId and tonumber(evidence.x)~=nil
-                and tonumber(evidence.y)~=nil and tonumber(evidence.z)~=nil then
-                locations[#locations+1]={id=id,name=displayName(id),x=tonumber(evidence.x),y=tonumber(evidence.y),z=tonumber(evidence.z),
-                    source="deceased",confidence="deceased",activity="Deceased",corpseState=evidence.corpseState,
-                    status="Deceased - "..tostring(evidence.locationSource or "last-known").." location recorded"}
-            end
+    local player = getSpecificPlayer(playerNum)
+    local playerId = player ~= nil and KnoxPersistence.ensurePlayerId(player) or nil
+    local summary = {unlocatedCount=0, invalidCount=0}
+    local model = rawget(_G, "KnoxSurvivorViewModel")
+    if playerId == nil or model == nil or model.getSurvivor == nil then return {}, summary end
+    local ids, included = {}, {}
+    for _, list in ipairs({
+        KnoxPersistence.getSurvivorIds ~= nil and KnoxPersistence.getSurvivorIds() or {},
+        KnoxPersistence.getKnownSurvivorIds ~= nil and KnoxPersistence.getKnownSurvivorIds(playerId) or {},
+    }) do
+        for _, id in ipairs(list) do
+            if not included[id] then included[id]=true; ids[#ids+1]=id end
         end
+    end
+    local locations = {}
+    for _, id in ipairs(ids) do
+        local affiliation = KnoxPersistence.getSurvivorAffiliation(id)
+        local known = KnoxPersistence.getObserverKnowledge ~= nil
+            and KnoxPersistence.getObserverKnowledge(playerId,id) or nil
+        if (affiliation ~= nil and affiliation.kind == "player" and affiliation.ownerId == playerId)
+            or known ~= nil then
+            local view = model.getSurvivor(id,playerNum)
+            local owner = view ~= nil and view.affiliation or nil
+            local duty = view ~= nil and view.duty or nil
+            local evidence = view ~= nil and view.alive == false and view.deathEvidence or nil
+            -- Death retires live affiliation. Only after the observer already
+            -- knows the death may the existing receipt identify prior ownership;
+            -- its hidden coordinates/state never supply marker information.
+            local priorOwner = evidence ~= nil and KnoxPersistence.getSurvivorDeathEvidence ~= nil
+                and KnoxPersistence.getSurvivorDeathEvidence(id) or nil
+            local owned = (owner ~= nil and owner.kind == "player" and owner.ownerId == playerId)
+                or (duty ~= nil and duty.ownerId == playerId)
+                or (evidence ~= nil and evidence.ownerKind == "player" and evidence.ownerId == playerId)
+                or (priorOwner ~= nil and priorOwner.ownerKind == "player" and priorOwner.ownerId == playerId)
+            if owned then
+                local point = view.position or {}
+                local x,y,z = finiteNumber(point.x), finiteNumber(point.y), finiteNumber(point.z)
+                if x ~= nil and y ~= nil and z ~= nil then
+                    local current = view.knowledge ~= nil and view.knowledge.current == true
+                    local source = view.alive == false and "deceased" or (current and "loaded" or "last_known")
+                    locations[#locations+1] = {id=id,name=view.displayName or displayName(id),x=x,y=y,z=z,
+                        source=source,confidence=source,activity=view.activity or "Unknown",
+                        status=view.locationLabel or "Location unknown",corpseState=evidence ~= nil and evidence.corpseState or nil}
+                else
+                    summary.unlocatedCount=summary.unlocatedCount+1
+                    if view.position ~= nil then summary.invalidCount=summary.invalidCount+1 end
+                end
+            end
         end
     end
     table.sort(locations,function(a,b) return a.id<b.id end)
@@ -121,7 +99,7 @@ function Orders.ownedLocations(playerNum, lightweight)
 end
 
 local OWNED_MARKER_GROUP_DISTANCE=20
-local LOCATION_CONFIDENCE_RANK={last_known=1,logical=2,loaded=3}
+local LOCATION_CONFIDENCE_RANK={last_known=1,loaded=3}
 local function groupOwnedLocations(locations)
     local groups={}
     for _,location in ipairs(locations or {}) do
@@ -196,8 +174,8 @@ local function drawOwnedLocations(map)
             else
                 local names={}
                 for _,member in ipairs(group.members) do names[#names+1]=member.name end
-                label=tostring(group.count).." survivors ("..tostring(group.loadedCount).." loaded, "
-                    ..tostring(group.logicalCount).." persisted, "..tostring(group.lastKnownCount).." last-known): "
+                label=tostring(group.count).." survivors ("..tostring(group.loadedCount).." visible, "
+                    ..tostring(group.lastKnownCount).." last seen): "
                     ..table.concat(names,", ")
             end
             local size=group.count>1 and 7 or 5
@@ -207,10 +185,8 @@ local function drawOwnedLocations(map)
     end
     if cached.summary~=nil and cached.summary.unlocatedCount>0 then
         local count=cached.summary.unlocatedCount
-        local noun=count==1 and "survivor has" or "survivors have"
-        local invalid=cached.summary.invalidCount or 0
-        local detail=invalid>0 and (" ("..tostring(invalid).." invalid coordinate"..(invalid==1 and "" or "s")..")") or ""
-        map:drawText("? "..tostring(count).." owned "..noun.." no usable map location"..detail,
+        local noun=count==1 and "survivor" or "survivors"
+        map:drawText("Location unknown for "..tostring(count).." known "..noun,
             8,8,0.95,0.75,0.25,0.95,UIFont.Small)
     end
 end

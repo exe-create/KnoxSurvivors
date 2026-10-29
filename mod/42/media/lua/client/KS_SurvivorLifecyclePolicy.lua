@@ -1,12 +1,42 @@
 local LifecyclePolicy = rawget(_G, "KnoxSurvivorLifecyclePolicy") or {}
 _G.KnoxSurvivorLifecyclePolicy = LifecyclePolicy
 
+-- Only successful square and containing-chunk lookups can establish that the
+-- actor has left loaded terrain. A missing API or failed lookup is
+-- unknown, not permission to remove a live body.
+function LifecyclePolicy.detachedTileLoaded(character)
+    local ok, loaded = pcall(function()
+        if character == nil or getCell == nil then return nil end
+        local cell = getCell()
+        if cell == nil then return nil end
+        local x, y, z = character:getX(), character:getY(), character:getZ()
+        for _, value in ipairs({x, y, z}) do
+            if type(value) ~= "number" or value ~= value
+                or value == math.huge or value == -math.huge then return nil end
+        end
+        if x == nil or y == nil or z == nil then return nil end
+        x, y, z = math.floor(x), math.floor(y), math.floor(z)
+        if z < -32 or z > 31 then return nil end
+        if cell:getGridSquare(x, y, z) ~= nil then return true end
+        -- A loaded chunk can have no square at this floor. That is not an
+        -- unload: let native traversal/falling recover without removing it.
+        return cell:getChunkForGridSquare(x, y, z) ~= nil
+    end)
+    if not ok then return nil end
+    return loaded
+end
+
 function LifecyclePolicy.detachedDecision(
     finiteDistanceSquared,
     activeDistanceSquared,
     grace,
-    graceLimit
+    graceLimit,
+    tileLoaded,
+    recognizedTransient
 )
+    if recognizedTransient == true then
+        return false, "preserve-native-transient"
+    end
     grace = math.max(1, math.floor(tonumber(grace) or 1))
     graceLimit = math.max(1, math.floor(tonumber(graceLimit) or 1))
     if finiteDistanceSquared == nil then
@@ -15,13 +45,12 @@ function LifecyclePolicy.detachedDecision(
     if finiteDistanceSquared > activeDistanceSquared then
         return true, "hibernate-far"
     end
-    -- Native traversal can temporarily detach an IsoPlayer shell from its
-    -- current square while it opens a window, crosses it, or streams a cell.
-    -- A near survivor with valid coordinates is still live and must never be
-    -- captured solely because that transient state lasted longer than a few
-    -- hibernation checks. Distance (or the absence of finite coordinates) is
-    -- the only unload authority here.
+    -- Player distance is not the loaded-cell boundary. Independent survivors
+    -- can leave streamed terrain while still inside the encounter radius.
+    -- Preserve a grace interval, then hand an absent tile to the existing
+    -- capture/store/remove owner; loaded or unknown tiles retain native recovery.
     if grace >= graceLimit then
+        if tileLoaded == false then return true, "hibernate-unloaded-tile" end
         return false, "preserve-near-detached"
     end
     return false, "preserve-grace"

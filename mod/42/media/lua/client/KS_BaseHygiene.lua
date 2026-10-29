@@ -21,7 +21,7 @@ local function inside(area, square)
         and square:getY() >= minY and square:getY() <= maxY
 end
 
-function Hygiene.dirtyParts(character)
+local function readDirtyParts(character)
     -- Mirror vanilla ISWashYourself exactly: static enum access uses dot
     -- calls with no self argument. The generic call() helper above passes
     -- self explicitly, which is correct for instance methods but turns
@@ -29,12 +29,12 @@ function Hygiene.dirtyParts(character)
     -- reflection call; that type error escapes Kahlua pcall and spammed a
     -- stack dump on every hygiene check while silently disabling washing.
     if character == nil or character.getHumanVisual == nil
-        or BloodBodyPartType == nil or BloodBodyPartType.MAX == nil then return 0 end
+        or BloodBodyPartType == nil or BloodBodyPartType.MAX == nil then return nil end
     local okVisual, visual = pcall(function() return character:getHumanVisual() end)
-    if not okVisual or visual == nil then return 0 end
+    if not okVisual or visual == nil then return nil end
     local okMax, maximum = pcall(function() return BloodBodyPartType.MAX:index() end)
     maximum = (okMax and tonumber(maximum)) or 0
-    if maximum <= 0 then return 0 end
+    if maximum <= 0 or maximum~=maximum or maximum==math.huge then return nil end
     local dirty = 0
     for index = 0, maximum - 1 do
         local okPart, part = pcall(function() return BloodBodyPartType.FromIndex(index) end)
@@ -42,12 +42,21 @@ function Hygiene.dirtyParts(character)
             local okRead, blood, dirt = pcall(function()
                 return visual:getBlood(part), visual:getDirt(part)
             end)
-            if okRead and (tonumber(blood) or 0) + (tonumber(dirt) or 0) > 0 then
+            blood,dirt=tonumber(blood),tonumber(dirt)
+            if not okRead or blood==nil or dirt==nil or blood~=blood or dirt~=dirt
+                or blood<0 or dirt<0 or blood==math.huge or dirt==math.huge then return nil end
+            if blood + dirt > 0 then
                 dirty = dirty + 1
             end
-        end
+        else return nil end
     end
-    return dirty
+    return dirty, maximum
+end
+
+function Hygiene.dirtyParts(character)
+    -- Compatibility for admission callers: unknown state cannot request work.
+    -- The action receipt uses the readable snapshot directly, never this zero.
+    return readDirtyParts(character) or 0
 end
 
 -- Hygiene is an ambient base activity. A few stains after work are normal;
@@ -167,17 +176,29 @@ function Hygiene.step(plan, character, bridge, id, ticks)
     if plan.phase == "prepare" then
         if character:getCharacterActions():isEmpty() == false then return "failed", "wash_action_busy" end
         if (tonumber(call(plan.object, "getFluidAmount", 0)) or 0) < 1 then return "failed", "wash_water_empty" end
+        local before=readDirtyParts(character)
+        if before==nil then return "failed", "wash_dirty_unavailable" end
+        if before==0 then return "failed", "wash_no_longer_needed" end
         local action = ISWashYourself:new(character, plan.object)
-        ISTimedActionQueue.add(action)
-        local queue = ISTimedActionQueue.getTimedActionQueue(character)
-        if queue == nil or queue:indexOf(action) == -1 then return "failed", "wash_not_queued" end
-        plan.phase, plan.action, plan.actionStarted = "washing", action, ticks
+        local queue = ISTimedActionQueue.add(action)
+        if queue == nil or ISTimedActionQueue.queues==nil
+            or queue~=ISTimedActionQueue.queues[character] then return "failed", "wash_not_queued" end
+        plan.phase, plan.action, plan.actionStarted, plan.dirtyBefore = "washing", action, ticks, before
         return "working"
     end
     if plan.phase == "washing" then
         if character:getCharacterActions():isEmpty() == false then return "working" end
+        local queue=ISTimedActionQueue.getTimedActionQueue(character)
+        if queue==nil then return "failed", "wash_queue_unavailable" end
+        if plan.action~=nil and queue:indexOf(plan.action)~=-1 then return "working" end
+        local before=tonumber(plan.dirtyBefore)
+        local after,maximum=readDirtyParts(character)
+        if before==nil or before~=before or before<=0 or after==nil
+            or before>maximum or before~=math.floor(before) then
+            return "failed", "wash_dirty_unavailable"
+        end
+        if after < before then return "complete", "washed" end
         if ticks - plan.actionStarted > 7200 then return "failed", "wash_timeout" end
-        if Hygiene.dirtyParts(character) < (plan.dirtyBefore or math.huge) then return "complete", "washed" end
         return "failed", "wash_no_change"
     end
     return "failed", "wash_invalid_phase"

@@ -4,11 +4,12 @@ _G.KnoxSettings = Settings
 local DEFAULTS = {
     Enabled = true,
     DisableSurvivorCaps = false,
-    WorldPopulation = 48,
+    WorldPopulation = 2048,
     InitialGroupChance = 65,
     InitialGroupMaxSize = 4,
-    InitialGroupCount = 3,
-    MaxActiveSurvivors = 16,
+    InitialGroupCount = 128,
+    InitialFactionCount = 12,
+    MaxActiveSurvivors = 32,
     ActivationsPerUpdate = 2,
     PopulationRefillDays = 5,
     MinimumSpawnDistance = 40,
@@ -18,12 +19,20 @@ local DEFAULTS = {
     FollowerSpacing = 1,
     ToolCupboardCapacity = 500,
     EnableExperimentalNpcDriving = false,
+    EnableExperimentalEngineWork = false,
     NpcDrivingSpeed = 20,
     SurvivorAimingAssist = 1,
     SpawnWithSpouse = false,
     ContinueSurvivorsAfterPlayerDeath = true,
     AllowNPCFactions = true,
     EnableKnoxEvents = false,
+    AutomaticFactionEntries = true,
+    FactionEntryMinimumDays = 3,
+    FactionEntryIntervalDays = 7,
+    PoliceNeighborhoodPatrols = true,
+    PolicePatrolMargin = 16,
+    MilitaryFacilityClearing = true,
+    MilitaryClearanceDistance = 8,
     NPCFactionMinimumMembers = 4,
     NPCFactionMaxMembers = 8,
     AllowHostileEncounters = true,
@@ -109,7 +118,7 @@ function Settings.enabled()
 end
 
 function Settings.worldPopulation()
-    return integer("WorldPopulation", 0, 256)
+    return integer("WorldPopulation", 0, 8192)
 end
 
 function Settings.initialGroupChance()
@@ -121,7 +130,11 @@ function Settings.initialGroupMaxSize()
 end
 
 function Settings.initialGroupCount()
-    return integer("InitialGroupCount", 1, 4)
+    return integer("InitialGroupCount", 0, 512)
+end
+
+function Settings.initialFactionCount()
+    return integer("InitialFactionCount", 0, 64)
 end
 
 function Settings.capsDisabled()
@@ -130,7 +143,7 @@ end
 
 function Settings.maxActiveSurvivors()
     if Settings.capsDisabled() then return math.huge end
-    return integer("MaxActiveSurvivors", 1, 48)
+    return integer("MaxActiveSurvivors", 1, 128)
 end
 
 function Settings.activationsPerUpdate()
@@ -180,6 +193,10 @@ function Settings.enableExperimentalNpcDriving()
     return Settings.enabled() and value("EnableExperimentalNpcDriving") == true
 end
 
+function Settings.enableExperimentalEngineWork()
+    return Settings.enabled() and value("EnableExperimentalEngineWork") == true
+end
+
 function Settings.npcDrivingSpeed()
     return integer("NpcDrivingSpeed", 5, 30)
 end
@@ -210,6 +227,34 @@ end
 
 function Settings.enableKnoxEvents()
     return Settings.enabled() and value("EnableKnoxEvents") == true
+end
+
+function Settings.automaticFactionEntries()
+    return Settings.enableKnoxEvents() and value("AutomaticFactionEntries") ~= false
+end
+
+function Settings.factionEntryMinimumDays()
+    return integer("FactionEntryMinimumDays", 1, 90)
+end
+
+function Settings.factionEntryIntervalDays()
+    return integer("FactionEntryIntervalDays", 1, 30)
+end
+
+function Settings.policeNeighborhoodPatrols()
+    return Settings.enabled() and value("PoliceNeighborhoodPatrols") ~= false
+end
+
+function Settings.policePatrolMargin()
+    return integer("PolicePatrolMargin", 4, 32)
+end
+
+function Settings.militaryFacilityClearing()
+    return Settings.enabled() and value("MilitaryFacilityClearing") ~= false
+end
+
+function Settings.militaryClearanceDistance()
+    return integer("MilitaryClearanceDistance", 2, 16)
 end
 
 function Settings.npcFactionMinimumMembers()

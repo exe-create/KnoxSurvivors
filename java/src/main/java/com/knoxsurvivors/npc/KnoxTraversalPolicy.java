@@ -18,6 +18,14 @@ final class KnoxTraversalPolicy {
     private KnoxTraversalPolicy() {
     }
 
+    static boolean nativeTraversalBusy(boolean climbing, String stateName, String actionName) {
+        if (climbing) return true;
+        String state = (String.valueOf(stateName) + " " + String.valueOf(actionName))
+            .toLowerCase(java.util.Locale.ROOT);
+        return state.contains("climb") || state.contains("vault")
+            || state.contains("openwindow") || state.contains("smashwindow");
+    }
+
     static DoorAction doorAction(boolean open, boolean barricaded) {
         if (open) {
             return DoorAction.PASS;

@@ -38,18 +38,43 @@ local function diagNeed(character, event, details)
     pcall(function() log.log("needs", id, event, details) end)
 end
 
-local function actionAccepted(character, action)
-    local queue = ISTimedActionQueue.getTimedActionQueue(character)
-    return action ~= nil and queue:indexOf(action) ~= -1
+-- Read actual transition evidence only. Missing posture/square APIs are
+-- reported as unavailable, never used to grant sleep or manufacture posture.
+local function diagSleep(character, event, details)
+    local log = rawget(_G, "KnoxDebugLog")
+    if log == nil or log.log == nil then return end
+    if log.diagnosticsEnabled ~= nil then
+        local ok, enabled = pcall(log.diagnosticsEnabled)
+        if not ok or not enabled then return end
+    end
+    local function read(getter)
+        local ok, value = pcall(getter)
+        if not ok or value == nil then return "unavailable" end
+        return value
+    end
+    details = details or {}
+    details.asleep = read(function() return character:isAsleep() end)
+    details.sitOnGround = read(function() return character:isSitOnGround() end)
+    details.sittingOnFurniture = read(function() return character:isSittingOnFurniture() end)
+    details.square = read(function()
+        local square = character:getCurrentSquare()
+        if square == nil then return "unloaded" end
+        return tostring(square:getX()) .. "," .. tostring(square:getY()) .. "," .. tostring(square:getZ())
+    end)
+    details.fatigue = read(function() return character:getStats():get(CharacterStat.FATIGUE) end)
+    details.visibleZombies = read(function() return character:getStats():getNumVisibleZombies() end)
+    details.chasingZombies = read(function() return character:getStats():getNumChasingZombies() end)
+    details.closeZombies = read(function() return character:getStats():getNumVeryCloseZombies() end)
+    diagNeed(character, event, details)
 end
 
 local function walkInventory(container, visitor)
     local items = container:getItems()
     for index = 0, items:size() - 1 do
         local item = items:get(index)
-        visitor(item, container)
+        if visitor(item, container) == true then return true end
         if item:IsInventoryContainer() then
-            walkInventory(item:getInventory(), visitor)
+            if walkInventory(item:getInventory(), visitor) == true then return true end
         end
     end
 end
@@ -93,11 +118,11 @@ local function waterState(item)
     return { item = item, tainted = tainted, amount = fluid:getAmount() }
 end
 
-function Needs.findBestFood(character)
+function Needs.findBestFood(character, available)
     local best = nil
     local bestScore = -math.huge
     walkInventory(character:getInventory(), function(item)
-        if isSafeFood(item) then
+        if isSafeFood(item) and (available == nil or available(item)) then
             local score = foodScore(item)
             if score > bestScore then
                 best = item
@@ -128,34 +153,48 @@ function Needs.waterSourceState(source)
     end)
     amount = ok and tonumber(amount) or nil
     if not ok or type(hasFluid) ~= "boolean" or amount == nil or amount < 0
+        or amount ~= amount or amount == math.huge or amount == -math.huge
         or type(tainted) ~= "boolean" then return nil end
     return { source = source, amount = amount,
         available = hasFluid and amount > 0, tainted = tainted }
 end
 
--- Smoking runs through the same native eat action as food: vanilla
--- ISEatFoodAction special-cases Base.Cigarettes, so stress/unhappiness
--- relief, sounds and timing are engine-owned, exactly like the player.
-function Needs.findSmokeItem(character)
+local function isSmokeItem(item)
+    local ok, supported = pcall(function()
+        return item ~= nil and item:IsFood() and ItemTag ~= nil
+            and ItemTag.SMOKABLE ~= nil and item:hasTag(ItemTag.SMOKABLE)
+    end)
+    return ok and supported == true
+end
+
+-- Build 42 uses tagged Food cigarettes/cigars, not unopened drainable packs.
+-- Native Eat and its timed action own consumption, relief and ignition use.
+function Needs.findSmokeItem(character, available)
     if character == nil or character.getInventory == nil then return nil end
     local inventory = character:getInventory()
-    if inventory == nil or inventory.getItems == nil then return nil end
+    if inventory == nil then return nil end
     local found = nil
-    local ok, items = pcall(function() return inventory:getItems() end)
-    if not ok or items == nil then return nil end
-    local okSize, count = pcall(function() return items:size() end)
-    for index = 0, (okSize and tonumber(count) or 0) - 1 do
-        local okItem, item = pcall(function() return items:get(index) end)
-        if okItem and item ~= nil and item.getFullType ~= nil then
-            local okType, fullType = pcall(function() return item:getFullType() end)
-            local name = okType and tostring(fullType or "") or ""
-            if name == "Base.Cigarettes" or string.find(name, "Cigar", 1, true) then
-                found = item
-                break
-            end
-        end
-    end
+    pcall(function()
+        walkInventory(inventory, function(item)
+            if isSmokeItem(item) and (available == nil or available(item)) then found = item; return true end
+        end)
+    end)
     return found
+end
+
+local function smokeState(character)
+    local function read(getter)
+        local ok, value = pcall(getter)
+        if ok and type(value) == "number" and value == value
+            and value ~= math.huge and value ~= -math.huge and value >= 0 then return value end
+    end
+    local state = {
+        elapsed = read(function() return character:getStats():getTimeSinceLastSmoke() end),
+        stress = read(function() return character:getStats():get(CharacterStat.STRESS) end),
+        unhappy = read(function() return character:getStats():get(CharacterStat.UNHAPPINESS) end),
+    }
+    if state.elapsed == nil and state.stress == nil and state.unhappy == nil then return nil end
+    return state
 end
 
 function Needs.smokeMotive(character)
@@ -179,11 +218,12 @@ function Needs.smokeMotive(character)
     return stressed >= 2 or unhappy >= 2
 end
 
-function Needs.findBestWater(character, allowTainted)
+function Needs.findBestWater(character, allowTainted, available)
     local best = nil
     walkInventory(character:getInventory(), function(item)
         local state = waterState(item)
-        if state ~= nil and (allowTainted or not state.tainted) then
+        if state ~= nil and (allowTainted or not state.tainted)
+            and (available == nil or available(item)) then
             if best == nil
                 or (best.tainted and not state.tainted)
                 or (best.tainted == state.tainted and state.amount > best.amount) then
@@ -315,9 +355,161 @@ function Needs.decide(character, threat)
     return { kind = "roam", state = state }
 end
 
-function Needs.execute(character, decision)
+local function finite(value)
+    return type(value) == "number" and value == value
+        and value ~= math.huge and value ~= -math.huge
+end
+
+local function carriedIn(character, item, source)
+    local found = false
+    walkInventory(character:getInventory(), function(candidate, container)
+        if candidate == item and (source == nil or container == source) then found = true; return true end
+    end)
+    return found
+end
+
+local function consumptionReceipt(character, intent)
+    local after = Needs.snapshot(character)
+    if intent.kind == "eat" then
+        local remaining = math.abs(intent.item:getHungerChange())
+        local consumed = not carriedIn(character, intent.item, nil)
+            or (finite(remaining) and remaining < intent.foodAmount - NEED_CHANGE_EPSILON)
+        return consumed and finite(after.hunger) and finite(intent.before.hunger)
+            and after.hunger < intent.before.hunger - NEED_CHANGE_EPSILON
+    elseif intent.kind == "drink" or intent.kind == "drink_world" then
+        local amount
+        if intent.kind == "drink" then
+            if intent.item:getFluidContainer() ~= intent.fluid then return false end
+            amount = intent.fluid:getAmount()
+        else
+            local state = Needs.waterSourceState(intent.source)
+            amount = state ~= nil and state.amount or nil
+        end
+        return finite(amount) and amount < intent.sourceAmount - NEED_CHANGE_EPSILON
+            and finite(after.thirst) and finite(intent.before.thirst)
+            and after.thirst < intent.before.thirst - NEED_CHANGE_EPSILON
+    elseif intent.kind == "smoke" then
+        if carriedIn(character, intent.item, nil) then return false end
+        local current = smokeState(character)
+        if current == nil then return false end
+        for _, key in ipairs({"elapsed", "stress", "unhappy"}) do
+            if finite(intent.smokeBefore[key]) and finite(current[key])
+                and current[key] < intent.smokeBefore[key] - NEED_CHANGE_EPSILON then return true end
+        end
+    elseif intent.kind == "bandage" then
+        return intent.bodyPart ~= nil and intent.bodyPart:bandaged()
+            and not carriedIn(character, intent.item, nil)
+    elseif intent.kind == "improvise_medical" then
+        local treatment = KnoxMedicalSupplies.findTreatment(character)
+        return not carriedIn(character, intent.item, nil) and treatment ~= nil
+            and treatment ~= intent.treatmentBefore
+    end
+    return false
+end
+
+-- This is permission around the existing native action, never replacement
+-- consumption. Install before add: native begin/complete can run immediately.
+local function bindNeedAction(character, action, intent, ownership)
+    local item, source = intent.item, intent.source
+    intent.character, intent.action = character, action
+    if ownership ~= nil then ownership.action, ownership.intent, ownership.source = action, intent, source end
+    local function allowed(candidate)
+        local ok, valid = pcall(function()
+            if candidate ~= action or candidate.character ~= character or intent.cancelled
+                or intent.item ~= item or intent.source ~= source then return false end
+            if ownership ~= nil and (ownership.cancelled or ownership.allowed(candidate, intent) ~= true) then return false end
+            if intent.kind == "drink_world" then
+                if candidate.waterObject ~= intent.source then return false end
+                local state = Needs.waterSourceState(intent.source)
+                local thirst = Needs.snapshot(character).thirst
+                return state ~= nil and state.available
+                    and (not state.tainted or (finite(thirst) and thirst >= 0.90))
+            end
+            if intent.kind == "improvise_medical" then
+                -- Native start/serverStart constructs a fresh HandcraftLogic.
+                -- The accepted recipe survives that transition; logic identity does not.
+                return candidate.knoxMedicalSource == item and intent.craftRecipe ~= nil
+                    and candidate.craftRecipe == intent.craftRecipe
+                    and ((intent.recipeCompleted and intent.receipt == true)
+                        or (carriedIn(character, item, source)
+                            and KnoxMedicalSupplies.canImprovise(character, intent.supplyPlan) == true))
+            end
+            if candidate.item ~= intent.item or not carriedIn(character, intent.item, intent.source) then return false end
+            if intent.kind == "bandage" then
+                return candidate.bodyPart == intent.bodyPart and candidate.otherPlayer == character
+                    and intent.bodyPart:HasInjury() and not intent.bodyPart:bandaged()
+            end
+            if intent.kind == "prepare_supply" then return true end
+            if intent.kind == "eat" then return isSafeFood(intent.item) end
+            if intent.kind == "smoke" then return isSmokeItem(intent.item) end
+            if intent.kind == "drink" then
+                local state = waterState(intent.item)
+                local thirst = Needs.snapshot(character).thirst
+                return state ~= nil and intent.item:getFluidContainer() == intent.fluid
+                    and (not state.tainted or (finite(thirst) and thirst >= 0.90))
+            end
+            return false
+        end)
+        return ok and valid == true
+    end
+    intent.guard, action.knoxNeedGuard = allowed, allowed
+    if ownership ~= nil then ownership.guard = allowed end
+    local nativeValid = action.isValid
+    action.isValid = function(candidate)
+        return allowed(candidate) and nativeValid ~= nil and nativeValid(candidate)
+    end
+    local function wrapMutation(name, once)
+        local native = action[name]
+        if native == nil then return end
+        local completedKey = name == "performRecipe" and "recipeCompleted" or "nativeCompleted"
+        action[name] = function(candidate, ...)
+            if not allowed(candidate) or (once and intent[completedKey]) then return false end
+            if once then intent[completedKey] = true end
+            local result = native(candidate, ...)
+            local ok, received = pcall(consumptionReceipt, character, intent)
+            if ok and received then intent.receipt = true end
+            return result
+        end
+    end
+    if intent.kind ~= "prepare_supply" then
+        wrapMutation("complete", true)
+        -- Native stops/partial water updates can consume too. Revoked care
+        -- must not eat/drink later while an unrelated current queue drains.
+        if intent.kind == "eat" or intent.kind == "smoke" then wrapMutation("eat")
+        elseif intent.kind == "drink" then wrapMutation("drink")
+        elseif intent.kind == "drink_world" then wrapMutation("transferFluid")
+        elseif intent.kind == "improvise_medical" then wrapMutation("performRecipe", true) end
+    end
+end
+
+local function registeredNeedAction(character, action, admitted, intent)
+    local registered = ISTimedActionQueue.queues and ISTimedActionQueue.queues[character]
+    if admitted == nil or admitted ~= registered or intent.cancelled then return false end
+    for _, candidate in ipairs(admitted.queue or {}) do if candidate == action then return true end end
+    return intent.receipt == true
+end
+
+local function queueNeedAction(character, action, intent, ownership)
+    bindNeedAction(character, action, intent, ownership)
+    if not intent.guard(action) then intent.cancelled = true; return nil, "permission_changed" end
+    local ok, admitted = pcall(ISTimedActionQueue.add, action)
+    if not ok or not registeredNeedAction(character, action, admitted, intent)
+        or (ownership ~= nil and ownership.cancelled) then
+        intent.cancelled = true
+        return nil, ok and "queue_refused" or "queue_failed"
+    end
+    intent.admitted = true
+    return action
+end
+
+function Needs.execute(character, decision, ownership)
     if decision == nil then
         return nil, "missing_decision"
+    end
+    if (decision.kind == "eat" and (decision.state == nil or not finite(decision.state.hunger)))
+        or ((decision.kind == "drink" or decision.kind == "drink_world")
+            and (decision.state == nil or not finite(decision.state.thirst))) then
+        return nil, "need_state_unavailable"
     end
     -- Report queue outcomes (success confirms the loop; rejections are the
     -- usual "won't eat/drink" evidence). Throttled per survivor/kind.
@@ -340,6 +532,15 @@ function Needs.execute(character, decision)
         return action, result, intent
     end
     if decision.kind == "bandage" then
+        local intent = { kind = "bandage", before = decision.state,
+            item = decision.item, bodyPart = decision.bodyPart }
+        if ownership ~= nil then
+            local action, result = KnoxMedicalActions.queueBandage(character,
+                decision.item, decision.bodyPart, function(actor, candidate)
+                    return queueNeedAction(actor, candidate, intent, ownership)
+                end)
+            return report(action, result or "queued_bandage", intent)
+        end
         local action, result = KnoxMedicalActions.queueBandage(
             character,
             decision.item,
@@ -352,10 +553,14 @@ function Needs.execute(character, decision)
             bodyPart = decision.bodyPart,
         })
     end
-    if decision.kind == "drink" or decision.kind == "eat" then
+    if decision.kind == "smoke" then
+        decision.item = decision.item or Needs.findSmokeItem(character)
+        if not isSmokeItem(decision.item) then return report(nil, "no_smoke_carried") end
+    end
+    if decision.kind == "drink" or decision.kind == "eat" or decision.kind == "smoke" then
         local inventory, source = character:getInventory(), nil
         walkInventory(inventory, function(item, container)
-            if item == decision.item then source = container end
+            if item == decision.item then source = container; return true end
         end)
         if source == nil then
             diagNeed(character, "need_action_failed", {
@@ -366,34 +571,55 @@ function Needs.execute(character, decision)
         if source ~= inventory then
             -- Native eating validates main-inventory ownership. Retrieving a
             -- bagged meal is a separate verified action, never consumption.
-            local action, reason = KnoxInventoryActions.queueTransfer(
-                character, decision.item, source, inventory)
-            if not actionAccepted(character, action) then
+            local intent = { kind = "prepare_supply", needKind = decision.kind,
+                before = decision.state, item = decision.item, source = source, destination = inventory }
+            local guard
+            guard = function(candidate, item)
+                if intent.action == nil then
+                    bindNeedAction(character, candidate, intent, ownership)
+                    if ownership ~= nil then ownership.guard = guard end
+                end
+                return intent.guard(candidate) and item == intent.item
+                    and candidate.srcContainer == source and candidate.destContainer == inventory
+            end
+            if ownership ~= nil then ownership.guard, ownership.intent = guard, intent end
+            local ok, action, reason = pcall(KnoxInventoryActions.queueTransfer,
+                character, decision.item, source, inventory, nil, guard)
+            if ok and action ~= nil then
+                if intent.action == nil then bindNeedAction(character, action, intent, ownership) end
+                if ownership ~= nil then ownership.guard = guard end
+                intent.receipt = not carriedIn(character, intent.item, source)
+                    and carriedIn(character, intent.item, inventory)
+            end
+            local registered = ISTimedActionQueue.queues and ISTimedActionQueue.queues[character]
+            if not ok or action == nil or not registeredNeedAction(character, action, registered, intent)
+                or (ownership ~= nil and ownership.cancelled) then
+                intent.cancelled = true
                 diagNeed(character, "need_action_failed", {
                     kind = tostring(decision.kind), result = "supply_transfer_rejected",
                 })
                 return nil, "supply_transfer_rejected"
             end
-            return report(action, reason, { kind = "prepare_supply", needKind = decision.kind,
-                before = decision.state, item = decision.item })
+            intent.admitted = true
+            return report(action, reason, intent)
         end
     end
     if decision.kind == "drink" then
         local thirst = decision.state.thirst
         local uses = math.max(1, math.ceil(math.max(0, thirst - 0.15) / 0.1))
+        local state = waterState(decision.item)
+        if state == nil or not finite(state.amount) then return report(nil, "water_state_unavailable") end
+        local intent = { kind = "drink", before = decision.state, item = decision.item,
+            source = character:getInventory(), fluid = decision.item:getFluidContainer(), sourceAmount = state.amount }
         local action = ISDrinkFromBottle:new(character, decision.item, uses)
-        ISTimedActionQueue.add(action)
-        if not actionAccepted(character, action) then
+        local accepted = queueNeedAction(character, action, intent, ownership)
+        if accepted == nil then
             diagNeed(character, "need_action_failed", {
                 kind = "drink", result = "drink_queue_rejected",
             })
             return nil, "drink_queue_rejected"
         end
-        return report(action, "queued_drink", {
-            kind = "drink",
-            before = decision.state,
-            item = decision.item,
-        })
+        return report(action, "queued_drink", intent)
     end
     if decision.kind == "drink_world" then
         local sourceState = Needs.waterSourceState(decision.source)
@@ -411,17 +637,13 @@ function Needs.execute(character, decision)
         end
         local action = ISTakeWaterAction:new(
             character, nil, decision.source, sourceState.tainted)
-        ISTimedActionQueue.add(action)
-        if not actionAccepted(character, action) then
+        local intent = { kind = "drink_world", before = decision.state, source = decision.source,
+            sourceAmount = sourceState.amount, tainted = sourceState.tainted }
+        local accepted = queueNeedAction(character, action, intent, ownership)
+        if accepted == nil then
             return report(nil, "native_water_action_queue_rejected")
         end
-        return report(action, "queued_native_water_drink", {
-            kind = "drink_world",
-            before = decision.state,
-            source = decision.source,
-            sourceAmount = sourceState.amount,
-            tainted = sourceState.tainted,
-        })
+        return report(action, "queued_native_water_drink", intent)
     end
     if decision.kind == "eat" then
         local benefit = math.max(0.01, math.abs(decision.item:getHungerChange()))
@@ -430,20 +652,30 @@ function Needs.execute(character, decision)
             math.min(1.0, math.max(0, decision.state.hunger - 0.15) / benefit)
         )
         local action = ISEatFoodAction:new(character, decision.item, percentage)
-        ISTimedActionQueue.add(action)
-        if not actionAccepted(character, action) then
+        local intent = { kind = "eat", before = decision.state, item = decision.item,
+            source = character:getInventory(), foodAmount = math.abs(decision.item:getHungerChange()) }
+        local accepted = queueNeedAction(character, action, intent, ownership)
+        if accepted == nil then
             diagNeed(character, "need_action_failed", {
                 kind = "eat", result = "eat_queue_rejected",
             })
             return nil, "eat_queue_rejected"
         end
-        return report(action, "queued_eat percentage=" .. tostring(percentage), {
-            kind = "eat",
-            before = decision.state,
-            item = decision.item,
-        })
+        return report(action, "queued_eat percentage=" .. tostring(percentage), intent)
     end
     if decision.kind == "improvise_medical" then
+        if ownership ~= nil then
+            local intent = { kind = "improvise_medical", before = decision.state,
+                item = decision.supplyPlan ~= nil and decision.supplyPlan.item or nil,
+                supplyPlan = decision.supplyPlan,
+                treatmentBefore = KnoxMedicalSupplies.findTreatment(character) }
+            local ok, action = KnoxMedicalSupplies.queueImprovisation(character,
+                decision.supplyPlan, function(actor, candidate)
+                    intent.craftRecipe = candidate.craftRecipe
+                    return queueNeedAction(actor, candidate, intent, ownership)
+                end)
+            return report(ok and action or nil, ok and "queued_improvise_medical" or action, intent)
+        end
         local action, result = KnoxMedicalSupplies.queueImprovisation(
             character,
             decision.supplyPlan
@@ -463,18 +695,23 @@ function Needs.execute(character, decision)
             return nil, "no_smoke_carried"
         end
         local smokeAction = ISEatFoodAction:new(character, smoke, 1.0)
-        ISTimedActionQueue.add(smokeAction)
-        if not actionAccepted(character, smokeAction) then
+        local ignitionOk, ignition = pcall(function()
+            return smokeAction.carLighter or smokeAction.openFlame
+                or smokeAction:getRequiredItem() ~= nil
+        end)
+        if not ignitionOk or not ignition then return report(nil, "smoke_ignition_unavailable") end
+        local baseline = smokeState(character)
+        if baseline == nil then return report(nil, "smoke_state_unavailable") end
+        local intent = { kind = "smoke", before = decision.state, item = smoke,
+            source = character:getInventory(), smokeBefore = baseline }
+        local accepted = queueNeedAction(character, smokeAction, intent, ownership)
+        if accepted == nil then
             diagNeed(character, "need_action_failed", {
                 kind = "smoke", result = "smoke_queue_rejected",
             })
             return nil, "smoke_queue_rejected"
         end
-        return report(smokeAction, "queued_smoke", {
-            kind = "smoke",
-            before = decision.state,
-            item = smoke,
-        })
+        return report(smokeAction, "queued_smoke", intent)
     end
     diagNeed(character, "need_action_failed", {
         kind = tostring(decision.kind), result = "decision_requires_world_action",
@@ -489,16 +726,53 @@ function Needs.verify(character, intent)
     if character == nil or intent == nil or intent.before == nil then
         return false, "missing_intent"
     end
+    if intent.kind == "eat" or intent.kind == "drink" or intent.kind == "drink_world"
+        or intent.kind == "smoke" or intent.kind == "prepare_supply"
+        or ((intent.kind == "bandage" or intent.kind == "improvise_medical") and intent.action ~= nil) then
+        if intent.cancelled or intent.action == nil or intent.admitted ~= true then
+            return false, "need_action_unconfirmed"
+        end
+        if intent.kind ~= "prepare_supply" and intent.receipt ~= true then
+            return false, "native_consumption_unconfirmed"
+        end
+    end
     local after = Needs.snapshot(character)
+    if intent.kind == "smoke" then
+        local carriedOk, carried = pcall(function()
+            local found = false
+            walkInventory(character:getInventory(), function(item)
+                if item == intent.item then found = true; return true end
+            end)
+            return found
+        end)
+        if not carriedOk or type(carried) ~= "boolean" or carried or intent.item == nil then
+            return false, "smoke_consumption_unconfirmed"
+        end
+        local baseline, current = intent.smokeBefore, smokeState(character)
+        if type(baseline) ~= "table" or current == nil then return false, "smoke_state_unavailable" end
+        for _, key in ipairs({"elapsed", "stress", "unhappy"}) do
+            if type(baseline[key]) == "number" and type(current[key]) == "number"
+                and current[key] < baseline[key] - NEED_CHANGE_EPSILON then
+                return true, "smoke_consumed " .. key .. "=" .. tostring(baseline[key]) .. "->" .. tostring(current[key])
+            end
+        end
+        return false, "smoke_no_observed_change"
+    end
     if intent.kind == "prepare_supply" then
-        return character:getInventory():contains(intent.item), "supply_main_inventory"
+        local ok, received = pcall(function()
+            return intent.source ~= nil and not carriedIn(character, intent.item, intent.source)
+                and carriedIn(character, intent.item, character:getInventory())
+        end)
+        return ok and received == true, "supply_main_inventory"
     end
     if intent.kind == "eat" then
-        return after.hunger < intent.before.hunger - NEED_CHANGE_EPSILON,
+        local ok, received = pcall(consumptionReceipt, character, intent)
+        return ok and received == true,
             "hunger=" .. tostring(intent.before.hunger) .. "->" .. tostring(after.hunger)
     end
     if intent.kind == "drink" then
-        return after.thirst < intent.before.thirst - NEED_CHANGE_EPSILON,
+        local ok, received = pcall(consumptionReceipt, character, intent)
+        return ok and received == true,
             "thirst=" .. tostring(intent.before.thirst) .. "->" .. tostring(after.thirst)
     end
     if intent.kind == "drink_world" then
@@ -545,17 +819,22 @@ function Needs.verifyRecovery(character, intent)
     return false, "unsupported_recovery=" .. tostring(intent.kind)
 end
 
-function Needs.sleepHours(character, fatigue)
+function Needs.sleepHours(character, fatigue, bedType)
     local value = tonumber(fatigue) or 0
-    local hours = math.floor(value * 10) + 1
+    -- Installed onSleepWalkToComplete order, preserving fractional hours.
+    local hours = ZombRand(value * 10, value * 13) + 1
+    local quality = tostring(bedType or "averageBed")
+    if string.find(quality, "goodBed", 1, true) ~= nil then hours = hours - 1 end
+    if string.find(quality, "badBed", 1, true) ~= nil then hours = hours + 1 end
+    if string.find(quality, "floor", 1, true) ~= nil then hours = hours * 0.7 end
     if character:hasTrait(CharacterTrait.INSOMNIAC) then
-        hours = math.floor(hours * 0.5)
+        hours = hours * 0.5
     end
     if character:hasTrait(CharacterTrait.NEEDS_LESS_SLEEP) then
-        hours = math.floor(hours * 0.75)
+        hours = hours * 0.75
     end
     if character:hasTrait(CharacterTrait.NEEDS_MORE_SLEEP) then
-        hours = math.ceil(hours * 1.18)
+        hours = hours * 1.18
     end
     return math.max(3, math.min(16, hours))
 end
@@ -566,8 +845,35 @@ function Needs.startSleep(character, bed, bedType)
     if character == nil or character:isAsleep() then
         return false, "sleep_unavailable"
     end
+    -- Recheck at arrival, just as the installed Build 42 context-menu sleep
+    -- transition does. Conditions may have changed while walking to the bed.
+    -- Unreadable native state cannot authorize sleep.
+    local inspected, blocker = pcall(function()
+        local stats = character:getStats()
+        if stats:getNumVisibleZombies() > 0 or stats:getNumChasingZombies() > 0
+            or stats:getNumVeryCloseZombies() > 0 then
+            return "sleep_not_safe"
+        end
+        if character:getSleepingTabletEffect() < 2000 then
+            local moodles = character:getMoodles()
+            if moodles:getMoodleLevel(MoodleType.PAIN) >= 2
+                and stats:get(CharacterStat.FATIGUE) <= 0.85 then
+                return "sleep_pain"
+            end
+            if moodles:getMoodleLevel(MoodleType.PANIC) >= 1 then
+                return "sleep_panic"
+            end
+        end
+        return nil
+    end)
+    if not inspected or blocker ~= nil then
+        local result = inspected and blocker or "sleep_state_unavailable"
+        diagSleep(character, "sleep_blocked", { result = result })
+        return false, result
+    end
     local state = Needs.snapshot(character)
-    local hours = Needs.sleepHours(character, state.fatigue)
+    local sleepBedType = bedType or (bed ~= nil and "averageBed" or "floor")
+    local hours = Needs.sleepHours(character, state.fatigue, sleepBedType)
     local wakeAt = GameTime.getInstance():getTimeOfDay() + hours
     if wakeAt >= 24 then
         wakeAt = wakeAt - 24
@@ -576,7 +882,7 @@ function Needs.startSleep(character, bed, bedType)
     character:setVariable("ExerciseEnded", true)
     local ok, reason = pcall(function()
         character:setBed(bed)
-        character:setBedType(bedType or (bed ~= nil and "averageBed" or "floor"))
+        character:setBedType(sleepBedType)
         character:setForceWakeUpTime(wakeAt)
         character:setAsleepTime(0.0)
         character:setAsleep(true)
@@ -588,13 +894,13 @@ function Needs.startSleep(character, bed, bedType)
         -- of keeping a false SLEEPING_RECOVERY state forever.
         pcall(function() character:setAsleep(false) end)
         pcall(function() character:setBed(nil) end)
-        diagNeed(character, "sleep_failed", {
-            result = "native_sleep_error", bedType = tostring(bedType),
+        diagSleep(character, "sleep_failed", {
+            result = "native_sleep_error", bedType = tostring(sleepBedType),
         })
         return false, "native_sleep_error:" .. tostring(reason)
     end
-    diagNeed(character, "sleep_started", {
-        hours = hours, bedType = tostring(bedType or (bed ~= nil and "averageBed" or "floor")),
+    diagSleep(character, "sleep_started", {
+        hours = hours, bedType = tostring(sleepBedType), wakeAt = wakeAt,
     })
     return true, "native_sleep hours=" .. tostring(hours)
 end
@@ -604,5 +910,6 @@ function Needs.wakeForDanger(character)
         return false
     end
     getSleepingEvent():wakeUp(character)
+    diagSleep(character, "sleep_woken", { result = "requested_wake" })
     return true
 end

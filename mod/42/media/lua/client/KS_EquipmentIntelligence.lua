@@ -144,7 +144,23 @@ local function rootItems(character)
 end
 
 local function actionActive(character)
-    return not safe(function() return character:getCharacterActions():isEmpty() end, true)
+    -- Unknown native ownership cannot authorize a passive gear change.
+    if safe(function() return character:getCharacterActions():isEmpty() end, nil) ~= true then return true end
+    local queues = ISTimedActionQueue ~= nil and ISTimedActionQueue.queues or nil
+    local queue = queues ~= nil and queues[character] or nil
+    -- Vanilla clearQueue may retain .current after both actual queues drain.
+    return queue ~= nil and (type(queue.queue) ~= "table" or #queue.queue > 0)
+end
+
+local function availableItem(item, available)
+    return available == nil or safe(function() return available(item) end, false) == true
+end
+
+local function carriedRoot(character, item)
+    for _, candidate in ipairs(rootItems(character)) do
+        if candidate == item then return true end
+    end
+    return false
 end
 
 local function replacedWearScore(character, location, scoreItem)
@@ -166,7 +182,7 @@ local function replacedWearScore(character, location, scoreItem)
     return found and total or nil
 end
 
-function Equipment.choose(character)
+function Equipment.choose(character, available)
     if character == nil then return nil end
     local candidates = rootItems(character)
     local primary = safe(function() return character:getPrimaryHandItem() end, nil)
@@ -177,26 +193,28 @@ function Equipment.choose(character)
     local bestWear, bestWearGain = nil, 0
 
     for _, item in ipairs(candidates) do
-        local score = meleeScore(item)
-        if score ~= nil and score > bestMeleeScore then
-            bestMelee, bestMeleeScore = item, score
-        end
-        local location = wearableLocation(item)
-        if location ~= nil then
-            local worn = safe(function() return character:getWornItem(location) end, nil)
-            local candidate, current, margin
-            if isContainer(item) then
-                candidate, current, margin = bagScore(item),
-                    safe(function() return replacedWearScore(character, location, bagScore) end, math.huge),
-                    BAG_SWITCH_MARGIN
-            elseif isClothing(item) then
-                candidate, current, margin = clothingScore(item),
-                    safe(function() return replacedWearScore(character, location, clothingScore) end, math.huge),
-                    CLOTHING_SWITCH_MARGIN
+        if availableItem(item, available) then
+            local score = meleeScore(item)
+            if score ~= nil and score > bestMeleeScore then
+                bestMelee, bestMeleeScore = item, score
             end
-            local gain = candidate ~= nil and candidate - (current or -1) or nil
-            if gain ~= nil and gain >= margin and item ~= worn and gain > bestWearGain then
-                bestWear, bestWearGain = item, gain
+            local location = wearableLocation(item)
+            if location ~= nil then
+                local worn = safe(function() return character:getWornItem(location) end, nil)
+                local candidate, current, margin
+                if isContainer(item) then
+                    candidate, current, margin = bagScore(item),
+                        safe(function() return replacedWearScore(character, location, bagScore) end, math.huge),
+                        BAG_SWITCH_MARGIN
+                elseif isClothing(item) then
+                    candidate, current, margin = clothingScore(item),
+                        safe(function() return replacedWearScore(character, location, clothingScore) end, math.huge),
+                        CLOTHING_SWITCH_MARGIN
+                end
+                local gain = candidate ~= nil and candidate - (current or -1) or nil
+                if gain ~= nil and gain >= margin and item ~= worn and gain > bestWearGain then
+                    bestWear, bestWearGain = item, gain
+                end
             end
         end
     end
@@ -207,15 +225,17 @@ function Equipment.choose(character)
         return { kind = "melee", item = bestMelee, score = bestMeleeScore }
     end
     if bestWear ~= nil then
-        return { kind = "wear", item = bestWear, gain = bestWearGain }
+        return { kind = "wear", item = bestWear, gain = bestWearGain,
+            location = wearableLocation(bestWear) }
     end
     return nil
 end
 
-function Equipment.reconsider(id, character, bridge, ticks, force)
+function Equipment.reconsider(id, character, bridge, ticks, force, available)
     if character == nil or bridge == nil then return false, "equipment_unavailable" end
     local state = states[character] or { nextAt = 0 }
     states[character] = state
+    if state.inProgress then return false, "equipment_busy" end
     if not force and (ticks or 0) < (state.nextAt or 0) then
         return false, "equipment_cooldown"
     end
@@ -224,19 +244,41 @@ function Equipment.reconsider(id, character, bridge, ticks, force)
         return false, "equipment_action_active"
     end
     state.nextAt = (ticks or 0) + EVALUATION_TICKS
-    local decision = Equipment.choose(character)
+    local decision = Equipment.choose(character, available)
     if decision == nil then return false, "equipment_stable" end
     local typeName = fullType(decision.item)
     if typeName == nil then return false, "equipment_unknown_item" end
-    if decision.kind == "melee" and bridge.equipNpcOwnedWeapon ~= nil then
-        local result = tostring(bridge:equipNpcOwnedWeapon(id, typeName))
-        return string.find(result, "EQUIPPED_WEAPON", 1, true) == 1, result
-    end
-    if decision.kind == "wear" and bridge.wearNpcOwnedItem ~= nil then
-        local result = tostring(bridge:wearNpcOwnedItem(id, typeName))
-        return string.find(result, "WORN_OWNED", 1, true) == 1, result
-    end
-    return false, "equipment_bridge_unavailable"
+    local itemId = safe(function() return decision.item:getID() end, nil)
+    if type(itemId) ~= "number" or itemId ~= itemId or itemId == math.huge
+        or itemId < 0 or itemId ~= math.floor(itemId) then return false, "equipment_identity_unavailable" end
+    local operation
+    if decision.kind == "melee" then operation = bridge.equipNpcOwnedWeaponById
+    elseif decision.kind == "wear" then operation = bridge.wearNpcOwnedItemById end
+    if operation == nil then return false, "equipment_bridge_unavailable" end
+    -- This transition is synchronous and keeps the existing bridge owner. Do
+    -- not substitute a same-type item or enter recursively during capture.
+    state.inProgress = true
+    local ok, changed, result = pcall(function()
+        local current = Equipment.choose(character, available)
+        if actionActive(character) or not carriedRoot(character, decision.item)
+            or current == nil or current.item ~= decision.item or current.kind ~= decision.kind
+            or current.location ~= decision.location or fullType(decision.item) ~= typeName
+            or decision.item:getID() ~= itemId then return false, "equipment_permission_changed" end
+        local response = tostring(operation(bridge, id, typeName, itemId))
+        local prefix = decision.kind == "melee" and "EQUIPPED_WEAPON" or "WORN_OWNED"
+        if string.find(response, prefix, 1, true) ~= 1 then return false, response end
+        local equipped
+        if decision.kind == "melee" then equipped = character:getPrimaryHandItem()
+        else equipped = character:getWornItem(decision.location) end
+        if equipped ~= decision.item or not carriedRoot(character, decision.item)
+            or not availableItem(decision.item, available) then
+            return false, "equipment_receipt_unconfirmed"
+        end
+        return true, response
+    end)
+    state.inProgress = nil
+    if not ok then return false, "equipment_bridge_failed" end
+    return changed, result
 end
 
 function Equipment.resetRuntime()

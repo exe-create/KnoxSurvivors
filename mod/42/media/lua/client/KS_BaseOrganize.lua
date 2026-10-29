@@ -44,7 +44,7 @@ end
 
 -- Best shelf for an item among loaded filtered policies, ranked exactly
 -- like deposits (priority, exactness, distance). Returns the policy key.
-local function bestPolicyFor(base, character, item, excludeKey)
+local function bestPolicyFor(base, character, item, excludeKey, destinationReserved)
     if base == nil or character == nil or item == nil then return nil end
     local origin = call(character, "getCurrentSquare", nil)
     if origin == nil then return nil end
@@ -53,8 +53,12 @@ local function bestPolicyFor(base, character, item, excludeKey)
         -- An automatically discovered container is only a deposit fallback.
         -- Organizing should move misplaced items toward an explicit filter,
         -- never shuffle them between otherwise-unfiltered chests.
-        if policy.key ~= excludeKey and policy.transientContainer ~= true
-            and KnoxBaseStorage.acceptsDeposit(policy, item) then
+        local destination = policy.key ~= excludeKey and policy.transientContainer ~= true
+            and (destinationReserved == nil or not destinationReserved(policy))
+            and KnoxBaseStorage.acceptsDeposit(policy, item)
+            and KnoxBaseStorage.resolvePolicy(policy) or nil
+        if destination ~= nil
+            and KnoxBaseStorage.canReceiveItem(destination.container, character, item) then
             local rank = KnoxBaseStorage.priorityRank ~= nil
                 and KnoxBaseStorage.priorityRank(policy) or 2
             local exact = KnoxBaseStorage.classifyItem ~= nil
@@ -77,7 +81,7 @@ end
 -- priority tier, or a misplaced item (its shelf rejects it) moving to a
 -- shelf that accepts it. Equal-tier shuffles never qualify, so settled
 -- bases stay settled.
-function Organize.find(base, character, available, reserved)
+function Organize.find(base, character, available, reserved, destinationReserved)
     if base == nil or character == nil or getCell == nil or getCell() == nil then
         return nil, "organize_unavailable"
     end
@@ -105,7 +109,7 @@ function Organize.find(base, character, available, reserved)
                             and (reserved == nil or not reserved(item)) then
                             local misplaced = policy.transientContainer == true
                                 or not KnoxBaseStorage.acceptsDeposit(policy, item)
-                            local best = bestPolicyFor(base, character, item, policy.key)
+                            local best = bestPolicyFor(base, character, item, policy.key, destinationReserved)
                             if best ~= nil then
                                 local srcRank = KnoxBaseStorage.priorityRank ~= nil
                                     and KnoxBaseStorage.priorityRank(policy) or 2
@@ -137,13 +141,21 @@ function Organize.find(base, character, available, reserved)
     return nil, "shelves_settled"
 end
 
-function Organize.cancelAction(character, plan)
-    local queue = ISTimedActionQueue.getTimedActionQueue(character)
-    if plan ~= nil and plan.action ~= nil and queue:indexOf(plan.action) ~= -1 then
-        if queue.current == plan.action then ISTimedActionQueue.clear(character)
-        else plan.action:forceCancel(); queue:removeFromQueue(plan.action) end
+function Organize.cancelAction(character, plan, retireActions)
+    if plan ~= nil then plan.cancelled = true end
+    if plan ~= nil and retireActions ~= nil then
+        -- The controller owns mixed-queue cancellation and its drain latch.
+        -- Revoke permission first, including actions whose begin() threw
+        -- before admission could return their identity.
+        retireActions({plan})
+    else
+        local queue = ISTimedActionQueue.getTimedActionQueue(character)
+        if plan ~= nil and plan.action ~= nil and queue:indexOf(plan.action) ~= -1 then
+            if queue.current == plan.action then ISTimedActionQueue.clear(character)
+            else plan.action:forceCancel(); queue:removeFromQueue(plan.action) end
+        end
     end
-    if plan ~= nil then plan.action = nil end
+    if plan ~= nil then plan.action = nil; plan.guard = nil end
 end
 
 local function moveTo(plan, square, character, bridge, id, ticks, phase)
@@ -164,6 +176,32 @@ local function sourceSquare(base, plan)
         tonumber(policy.x) or 0, tonumber(policy.y) or 0, tonumber(policy.z) or 0)
 end
 
+-- Native storage movement ends beside furniture. Pickup and deposit must
+-- agree on usable reach, otherwise arriving beside a cupboard restarts the
+-- same route forever. Walls and different floors still require movement.
+local function withinReach(character, square)
+    local origin = character:getCurrentSquare()
+    return origin ~= nil and square ~= nil and origin:getZ() == square:getZ()
+        and (origin:getX() - square:getX()) ^ 2
+            + (origin:getY() - square:getY()) ^ 2 <= 2
+        and (origin == square or (origin.isSomethingTo ~= nil
+            and not origin:isSomethingTo(square)))
+end
+
+local function depositDestination(base, plan)
+    for _, policy in ipairs(KnoxBaseStorage.operationalPolicies(base)) do
+        if policy.key == plan.destinationPolicy.key then
+            if not KnoxBaseStorage.acceptsDeposit(policy, plan.item) then
+                return nil, "organize_filter_changed"
+            end
+            local resolved = KnoxBaseStorage.resolvePolicy(policy)
+            if resolved ~= nil then return resolved end
+            break
+        end
+    end
+    return nil, "organize_destination_gone"
+end
+
 function Organize.step(plan, character, base, bridge, id, ticks)
     if plan == nil or character == nil or base == nil or base.id ~= plan.baseId then
         return "failed", "organize_base_changed"
@@ -174,6 +212,8 @@ function Organize.step(plan, character, base, bridge, id, ticks)
     local inventory = character:getInventory()
     local queue = ISTimedActionQueue.getTimedActionQueue(character)
     local busy = not character:getCharacterActions():isEmpty()
+        or queue.current ~= nil
+        or (type(queue.queue) == "table" and #queue.queue > 0)
     local actionPending = plan.action ~= nil and queue:indexOf(plan.action) ~= -1
     if plan.phase == "borrow_move" or plan.phase == "deposit_move" then
         local result = tostring(bridge:tickNpc(id))
@@ -185,16 +225,32 @@ function Organize.step(plan, character, base, bridge, id, ticks)
         return "working"
     end
     if plan.phase == "prepare" then
-        if busy then return "failed", "organize_action_busy" end
+        if busy then return "working" end
         if not plan.source:contains(plan.item) then return "failed", "organize_item_taken" end
+        local readable, destination, refusal = pcall(depositDestination, base, plan)
+        if not readable then return "failed", "organize_destination_unreadable" end
+        if destination == nil then return "failed", refusal end
+        if not KnoxBaseStorage.canReceiveItem(destination.container, character, plan.item) then
+            return "failed", "organize_destination_unavailable"
+        end
         local square = sourceSquare(base, plan)
         if square == nil then return "failed", "organize_source_unloaded" end
-        local here = character:getCurrentSquare()
-        if here == nil or here ~= square then
+        if not withinReach(character, square) then
             return moveTo(plan, square, character, bridge, id, ticks, "borrow_move")
         end
-        local action, reason = KnoxInventoryActions.queueTransfer(
-            character, plan.item, plan.source, inventory, nil)
+        local intendedContainer = destination.container
+        local function allowed(_, candidate)
+            if plan.cancelled or candidate ~= plan.item then return false end
+            local current = depositDestination(base, plan)
+            return current ~= nil and current.container == intendedContainer
+                and plan.source:contains(candidate)
+                and KnoxBaseStorage.canReceiveItem(current.container, character, candidate)
+        end
+        -- Permission may change while native pickup is turning/waiting too.
+        plan.guard = allowed
+        local admitted, action, reason = pcall(KnoxInventoryActions.queueTransfer,
+            character, plan.item, plan.source, inventory, nil, allowed)
+        if not admitted then return "failed", "organize_transfer_queue_error" end
         if action == nil then return "failed", reason end
         plan.action, plan.phase, plan.actionStarted = action, "borrowing", ticks
         return "working"
@@ -208,32 +264,28 @@ function Organize.step(plan, character, base, bridge, id, ticks)
         plan.phase, plan.action = "deposit", nil
     end
     if plan.phase == "deposit" then
-        if busy then return "failed", "organize_action_busy" end
+        if busy then return "working" end
         if not inventory:contains(plan.item) then return "failed", "organize_item_missing" end
-        -- Re-resolve the destination at drop time: shelves fill, unload, or
-        -- get reassigned while walking. A stale plan re-plans, never forces.
-        local store = nil
-        if KnoxBaseStorage.operationalPolicies ~= nil then
-            for _, policy in ipairs(KnoxBaseStorage.operationalPolicies(base)) do
-                if policy.key == plan.destinationPolicy.key then
-                    local resolved = KnoxBaseStorage.resolvePolicy(policy)
-                    if resolved ~= nil then store = resolved end
-                    break
-                end
-            end
-        end
-        if store == nil then return "failed", "organize_destination_gone" end
-        local origin = character:getCurrentSquare()
-        local near = origin ~= nil and origin:getZ() == store.square:getZ()
-            and (origin:getX() - store.square:getX()) ^ 2
-                + (origin:getY() - store.square:getY()) ^ 2 <= 2
-            and (origin == store.square or (origin.isSomethingTo ~= nil
-                and not origin:isSomethingTo(store.square)))
-        if not near then
+        -- Re-resolve and recheck the current filter after travel. A stale plan
+        -- yields to the existing cleanup/retry owner with its actual carried item.
+        local readable, store, refusal = pcall(depositDestination, base, plan)
+        if not readable then return "failed", "organize_destination_unreadable" end
+        if store == nil then return "failed", refusal end
+        if not withinReach(character, store.square) then
             return moveTo(plan, store.square, character, bridge, id, ticks, "deposit_move")
         end
-        local action, reason = KnoxInventoryActions.queueTransfer(
-            character, plan.item, inventory, store.container, nil)
+        plan.depositSource, plan.depositDestination = inventory, store.container
+        local function allowed(_, candidate)
+            if plan.cancelled or candidate ~= plan.item then return false end
+            local current = depositDestination(base, plan)
+            return current ~= nil and current.container == plan.depositDestination
+                and inventory:contains(candidate)
+                and KnoxBaseStorage.canReceiveItem(current.container, character, candidate)
+        end
+        plan.guard = allowed
+        local admitted, action, reason = pcall(KnoxInventoryActions.queueTransfer,
+            character, plan.item, inventory, store.container, nil, allowed)
+        if not admitted then return "failed", "organize_transfer_queue_error" end
         if action == nil then return "failed", reason end
         plan.action, plan.phase, plan.actionStarted = action, "depositing", ticks
         return "working"
@@ -244,11 +296,13 @@ function Organize.step(plan, character, base, bridge, id, ticks)
         end
         if busy or actionPending then return "working" end
         Organize.cancelAction(character, plan)
-        if inventory:contains(plan.item) then
-            -- Still carried (destination filled mid-walk): not lost, just
-            -- pocketed for the next cleanup pass.
-            return "done", "organize_shelf_full"
-        end
+        local readable, received = pcall(function()
+            return plan.depositSource ~= nil and plan.depositDestination ~= nil
+                and not plan.depositSource:contains(plan.item)
+                and plan.depositDestination:contains(plan.item)
+        end)
+        if not readable then return "failed", "organize_receipt_unreadable" end
+        if not received then return "failed", "organize_transfer_failed" end
         return "done", "organize_completed"
     end
     return "failed", "unknown_organize_phase"

@@ -128,6 +128,10 @@ function SpouseStart.update(player, activate)
     relation.trust = 90
     relation.meetings = math.max(1, relation.meetings or 0)
     relation.firstMetHours = relation.firstMetHours or now
+    if KnoxPersistence.rememberObserverKnowledge ~= nil then
+        KnoxPersistence.rememberObserverKnowledge(playerId,start.id,"commitment",
+            {role="companion",order="follow",duty={mode="companion",order="follow",ownerId=playerId}},now)
+    end
     start.status = "complete"
     return true
 end

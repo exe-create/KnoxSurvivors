@@ -17,7 +17,10 @@ local SCENARIOS = {
     { "Spawn Test Travel Group", "group" },
     { "Spawn Test Faction", "faction" },
     { "Spawn Test Faction Seeking a Base", "faction_base" },
+    { "Spawn Two Strangers (Natural Encounter)", "encounter" },
 }
+local spawnBatches = {}
+local spawnSequence = 0
 
 local COMBAT_SCENARIOS = {
     { "Survivor vs Zombie", "duel" },
@@ -29,9 +32,18 @@ local COMBAT_SCENARIOS = {
     { "Survivor Firearm Test", "firearm_duel" },
 }
 
-function DeveloperTools.spawn(playerNum, scenario)
+function DeveloperTools.spawn(playerNum, scenario, worldObjects, count)
     local player = getSpecificPlayer(playerNum)
-    local success, result = KnoxSurvivorAutonomy.spawnDeveloperScenario(player, scenario)
+    local object=worldObjects~=nil and worldObjects[1] or nil
+    local square=object~=nil and object:getSquare() or nil
+    spawnSequence=spawnSequence+1
+    local token="manual-spawn-"..tostring(getTimestampMs~=nil and getTimestampMs() or 0).."-"..spawnSequence
+    local owner={runId=token,ownerToken=token,scenarioId=scenario}
+    local success, result, encodedIds = KnoxSurvivorAutonomy.spawnDeveloperScenario(player, scenario,
+        owner,{square=square,count=count})
+    local ids={}
+    for id in tostring(encodedIds or ""):gmatch("[^,]+") do ids[#ids+1]=id end
+    if #ids>0 then spawnBatches[#spawnBatches+1]={ids=ids,owner=owner} end
     if success then
         KnoxActivityFeed.event("Developer scenario spawned: " .. tostring(scenario) .. ".")
     else
@@ -39,6 +51,43 @@ function DeveloperTools.spawn(playerNum, scenario)
     end
     print("[KnoxSurvivors][DeveloperTools] scenario=" .. tostring(scenario)
         .. " success=" .. tostring(success) .. " result=" .. tostring(result))
+end
+
+function DeveloperTools.cleanupLastSpawn()
+    if not KnoxSettings.developerToolsEnabled() then return end
+    local batch=spawnBatches[#spawnBatches]
+    if batch==nil then KnoxActivityFeed.event("No manual spawn from this session to remove.");return end
+    local pending={}
+    for _,id in ipairs(batch.ids) do
+        local owner=KnoxPersistence.getDeveloperQaFixtureOwner(id)
+        if owner~=nil then pending[#pending+1]=id
+        else
+            -- A successful partial cleanup clears ownership only after verified
+            -- native removal and retirement. Missing ownership on a live or
+            -- unreadable fixture is not evidence that it was removed.
+            local bridge=rawget(_G,"KnoxJavaBridge")
+            local ok,body=pcall(function() return bridge:getNpcCharacter(id) end)
+            if KnoxPersistence.isSurvivorAlive==nil or KnoxPersistence.isSurvivorAlive(id)~=false
+                or not ok or body~=nil then
+                KnoxActivityFeed.event("Last test spawn has missing ownership; removal remains blocked.")
+                return
+            end
+        end
+    end
+    local success,result=KnoxSurvivorAutonomy.cleanupDeveloperScenario(pending,"manual_menu",batch.owner)
+    if success then table.remove(spawnBatches) end
+    KnoxActivityFeed.event("Remove last test spawn: "..tostring(result)..(success and "." or "; retry available."))
+end
+
+function DeveloperTools.writeSettings()
+    local vars=rawget(_G,"SandboxVars")
+    local keys={}
+    for key in pairs(vars~=nil and vars.KnoxSurvivors or {}) do keys[#keys+1]=key end
+    table.sort(keys)
+    for _,key in ipairs(keys) do print("[KnoxSurvivors][Settings] "..key.."="..tostring(vars.KnoxSurvivors[key])) end
+    print("[KnoxSurvivors][Settings] effective county="..KnoxSettings.worldPopulation()
+        .." bodies="..KnoxSettings.maxActiveSurvivors().." loading="..KnoxSettings.activationsPerUpdate())
+    KnoxActivityFeed.event("Sandbox choices and effective population limits written to console.txt.")
 end
 
 function DeveloperTools.printStatus()
@@ -66,6 +115,115 @@ function DeveloperTools.printStatus()
         end
     end
     KnoxActivityFeed.event("Developer status written to console.txt.")
+end
+
+function DeveloperTools.startPopulationProfile()
+    local population = rawget(_G, "KnoxWorldPopulation")
+    if population == nil or population.startPopulationProfileSample == nil then
+        print("[KnoxSurvivors][PopulationProfile] status=unavailable reason=module_missing")
+        return
+    end
+    local ok, result = population.startPopulationProfileSample()
+    print("[KnoxSurvivors][PopulationProfile] status=" .. tostring(result)
+        .. " action=" .. tostring(ok) .. " note=runtime_only_no_save_changes")
+    KnoxActivityFeed.event("Population profile started; stops automatically after two minutes.")
+end
+
+function DeveloperTools.stopPopulationProfile()
+    local population = rawget(_G, "KnoxWorldPopulation")
+    if population == nil or population.stopPopulationProfileSample == nil then return end
+    local ok, result = population.stopPopulationProfileSample()
+    print("[KnoxSurvivors][PopulationProfile] status=" .. tostring(result)
+        .. " action=" .. tostring(ok) .. " profiling=false")
+    KnoxActivityFeed.event("Population profiling is off. The last sample remains available to write.")
+end
+
+local function printProfileMap(label, values)
+    if type(values) ~= "table" then return end
+    local keys = {}
+    for key in pairs(values) do keys[#keys + 1] = tostring(key) end
+    table.sort(keys)
+    for _, key in ipairs(keys) do
+        local value = values[key]
+        if type(value) == "table" then
+            value = "calls=" .. tostring(value.calls or 0)
+                .. ",totalMs=" .. tostring(value.totalMs or 0)
+                .. ",maxMs=" .. tostring(value.maxMs or 0)
+        end
+        print("[KnoxSurvivors][PopulationProfile] " .. tostring(label)
+            .. " name=" .. key .. " value=" .. tostring(value))
+    end
+end
+
+function DeveloperTools.writePopulationProfile()
+    local population = rawget(_G, "KnoxWorldPopulation")
+    local autonomy = rawget(_G, "KnoxSurvivorAutonomy")
+    if population == nil or population.writePopulationProfile == nil then
+        print("[KnoxSurvivors][PopulationProfile] status=unavailable reason=module_missing")
+        return
+    end
+    local runtime = autonomy ~= nil and autonomy.status ~= nil and autonomy.status() or nil
+    local bridge = rawget(_G, "KnoxJavaBridge")
+    local ok, report = pcall(population.writePopulationProfile, bridge, runtime)
+    if not ok or type(report) ~= "table" then
+        print("[KnoxSurvivors][PopulationProfile] status=error reason=report_failed")
+        return
+    end
+    local persistence = report.persistence or {}
+    print("[KnoxSurvivors][PopulationProfile] status=report map=" .. tostring(report.map)
+        .. " catalog=" .. tostring(report.catalogStatus)
+        .. " configuredTarget=" .. tostring(report.target or "unavailable")
+        .. " storedLastTarget=" .. tostring(persistence.storedPopulationLastTarget or "unavailable")
+        .. " logicalRecords=" .. tostring(persistence.logicalPopulationRecords or "unavailable")
+        .. " logicalLiving=" .. tostring(persistence.livingPopulation or "unavailable")
+        .. " nativeBodies=" .. tostring(report.nativeActiveBodyCount or "unavailable")
+        .. " nativeIdDuplicates=" .. tostring(report.nativeActiveDuplicateIds)
+        .. " runtimeActiveIds=" .. tostring(report.runtimeActiveIdCount or "unavailable")
+        .. " controllers=" .. tostring(report.controllerCount or "unavailable")
+        .. " persistenceStatus=" .. tostring(report.persistenceStatus or "available")
+        .. " luaHeapKB=" .. tostring(report.luaHeapKB or "unavailable"))
+    local catalog = report.catalog or {}
+    print("[KnoxSurvivors][PopulationProfile] catalog metadataStatus="
+        .. tostring(catalog.buildingMetadataStatus or "unavailable")
+        .. " buildingsScanned=" .. tostring(catalog.metadataBuildingsScanned or "unavailable")
+        .. " buildingOriginsSelected=" .. tostring(catalog.buildingOriginsSelected or "unavailable")
+        .. " origins=" .. tostring(catalog.catalogOrigins or "unavailable")
+        .. " invalidSpawnPoints=" .. tostring(catalog.invalidSpawnPoints or "unavailable")
+        .. " duplicateSpawnPoints=" .. tostring(catalog.duplicateSpawnPoints or "unavailable")
+        .. " missingGroundRooms=" .. tostring(catalog.metadataBuildingsWithoutGroundRoom or "unavailable")
+        .. " metadataReadFailures=" .. tostring(catalog.metadataBuildingReadFailures or "unavailable")
+        .. " coverage=" .. tostring(catalog.classificationCoverage or "unavailable"))
+    if report.sample ~= nil then
+        local sample = report.sample
+        print("[KnoxSurvivors][PopulationProfile] sample status=" .. tostring(sample.status)
+            .. " active=" .. tostring(sample.active == true)
+            .. " durationMs=" .. tostring(sample.durationMs or "unavailable")
+            .. " clock=" .. tostring(sample.clock)
+            .. " allocationsAttempted=" .. tostring(sample.allocationsAttempted)
+            .. " allocationsSucceeded=" .. tostring(sample.allocationsSucceeded)
+            .. " allocationsRejected=" .. tostring(sample.allocationsRejected)
+            .. " activationBudget=" .. tostring(sample.activationBudget or "unavailable")
+            .. " activationScannedIds=" .. tostring(sample.activationScannedIds)
+            .. " activationCandidates=" .. tostring(sample.activationCandidates)
+            .. " catalogBuilds=" .. tostring(sample.catalogBuilds)
+            .. " activationsSucceeded=" .. tostring(sample.activationsSucceeded)
+            .. " activationsFailed=" .. tostring(sample.activationsFailed))
+        printProfileMap("timing", sample.timings)
+        printProfileMap("activation_rejection", sample.activationRejections)
+    else
+        print("[KnoxSurvivors][PopulationProfile] sample status=not_started note=use_start_sample_then_report")
+    end
+    printProfileMap("building_context", catalog.buildingsByVerifiedContext)
+    printProfileMap("building_category", catalog.buildingsByPopulationCategory)
+    printProfileMap("persisted_origin_context", persistence.contexts)
+    printProfileMap("persisted_origin_category", persistence.locationCategories)
+    printProfileMap("unavailable_category", catalog.unavailableCategories)
+    print("[KnoxSurvivors][PopulationProfile] limits diskWriteTiming=unavailable_moddata_create_is_not_disk_write"
+        .. " nativeMemory=unavailable objectAllocationCount=unavailable"
+        .. " catalogOrigins=" .. tostring(report.memoryObjectCounts.catalogOrigins or "unavailable")
+        .. " candidateRows=" .. tostring(report.memoryObjectCounts.lastSampleCandidateRows or "unavailable")
+        .. " noAllocatorOrMaterializerCalled=true")
+    KnoxActivityFeed.event("Population profile written to console.txt.")
 end
 
 function DeveloperTools.printFactionReadiness()
@@ -267,6 +425,10 @@ end
 -- a zero-population sandbox preset for a fully quiet world; this handles
 -- the zombies already on the map.
 function DeveloperTools.calmTestScene(playerNum)
+    if not KnoxSettings.allowDestructiveDeveloperTests() then
+        KnoxActivityFeed.event("Clearing nearby zombies requires Allow Destructive Tests.")
+        return
+    end
     local player = getSpecificPlayer(playerNum)
     local origin = player ~= nil and player:getCurrentSquare() or nil
     local cell = getCell ~= nil and getCell() or nil
@@ -294,14 +456,14 @@ function DeveloperTools.calmTestScene(playerNum)
                                 end
                             end)
                             if isZombie then
-                                pcall(function()
+                                local cleared=pcall(function()
                                     object:setTarget(nil)
                                     object:setUseless(true)
                                     object:setCanWalk(false)
                                     object:removeFromWorld()
                                     object:removeFromSquare()
                                 end)
-                                removed = removed + 1
+                                if cleared then removed = removed + 1 end
                             end
                         end
                     end
@@ -328,24 +490,38 @@ local function onFill(playerNum, context, worldObjects, test)
     local menu = ISContextMenu:getNew(context)
     context:addSubMenu(rootOption, menu)
 
-    local populationOption = menu:addOption("Population Scenarios", nil, nil)
+    local populationOption = menu:addOption("Spawn Survivors, Groups & Factions", nil, nil)
     local populationMenu = ISContextMenu:getNew(menu)
     menu:addSubMenu(populationOption, populationMenu)
     for _, definition in ipairs(SCENARIOS) do
-        populationMenu:addOption(definition[1], playerNum, DeveloperTools.spawn, definition[2])
+        if definition[2]~="group" and definition[2]~="faction" and definition[2]~="faction_base" then
+            populationMenu:addOption(definition[1], playerNum, DeveloperTools.spawn, definition[2],worldObjects)
+        else
+            local option=populationMenu:addOption(definition[1],nil,nil)
+            local sizes=ISContextMenu:getNew(populationMenu)
+            populationMenu:addSubMenu(option,sizes)
+            local minimum=definition[2]=="group" and 2 or KnoxSettings.npcFactionMinimumMembers()
+            local maximum=definition[2]=="group" and 12 or KnoxSettings.npcFactionMaxMembers()
+            for size=minimum,maximum do
+                sizes:addOption(tostring(size).." survivors",playerNum,DeveloperTools.spawn,
+                    definition[2],worldObjects,size)
+            end
+        end
     end
+    populationMenu:addOption("Remove Last Spawn (Test Survivors Only)",nil,DeveloperTools.cleanupLastSpawn)
 
     local jobsOption = menu:addOption("Base & Job Tests", nil, nil)
     local jobsMenu = ISContextMenu:getNew(menu)
     menu:addSubMenu(jobsOption, jobsMenu)
     local stock = jobsMenu:addOption("Stock Assigned Storage for Job Tests", playerNum, DeveloperTools.stockJobTests)
     stock.notAvailable = not KnoxSettings.ignoreJobResourceRequirements()
-    jobsMenu:addOption("Write Job and Survivor Status to Log", nil, DeveloperTools.printStatus)
-    jobsMenu:addOption("Calm Test Scene (Clear Zombies Nearby)", playerNum, DeveloperTools.calmTestScene)
     local scenarios = rawget(_G, "KnoxJobTestScenarios")
     if scenarios ~= nil and scenarios.list ~= nil then
+        local jobOption=jobsMenu:addOption("Run a Job Scenario",nil,nil)
+        local jobMenu=ISContextMenu:getNew(jobsMenu)
+        jobsMenu:addSubMenu(jobOption,jobMenu)
         for _, definition in ipairs(scenarios.list()) do
-            jobsMenu:addOption(definition.label, playerNum, DeveloperTools.runJobTest,
+            jobMenu:addOption(definition.label, playerNum, DeveloperTools.runJobTest,
                 definition.key, worldObjects)
         end
     end
@@ -359,10 +535,9 @@ local function onFill(playerNum, context, worldObjects, test)
     combatMenu:addOption("Write Combat Snapshot to Log", nil, KnoxCombatTestScenarios.writeSnapshot)
     combatMenu:addOption("Cleanup Combat Test", nil, KnoxCombatTestScenarios.cleanup)
 
-    local worldOption = menu:addOption("Faction & World Events", nil, nil)
+    local worldOption = menu:addOption("Faction & World Events (Experimental)", nil, nil)
     local worldMenu = ISContextMenu:getNew(menu)
     menu:addSubMenu(worldOption, worldMenu)
-    worldMenu:addOption("Write Faction Formation Status to Log", nil, DeveloperTools.printFactionReadiness)
     worldMenu:addOption("Dispatch Loaded Faction Scout Here", playerNum,
         DeveloperTools.dispatchScout, worldObjects)
 
@@ -370,6 +545,7 @@ local function onFill(playerNum, context, worldObjects, test)
         local destructiveOption = worldMenu:addOption("Destructive Tests", nil, nil)
         local destructiveMenu = ISContextMenu:getNew(worldMenu)
         worldMenu:addSubMenu(destructiveOption, destructiveMenu)
+        destructiveMenu:addOption("Calm Test Scene (Clear Zombies Nearby)",playerNum,DeveloperTools.calmTestScene)
         destructiveMenu:addOption("Schedule Eligible Faction Raid Now", nil,
             DeveloperTools.scheduleEligibleRaid)
         destructiveMenu:addOption("Schedule Police Entry Here", playerNum,
@@ -386,7 +562,15 @@ local function onFill(playerNum, context, worldObjects, test)
     local diagnosticsMenu = ISContextMenu:getNew(menu)
     menu:addSubMenu(diagnosticsOption, diagnosticsMenu)
     diagnosticsMenu:addOption("Write Survivor Status to Log", nil, DeveloperTools.printStatus)
+    diagnosticsMenu:addOption("Write Faction Formation Status to Log",nil,DeveloperTools.printFactionReadiness)
+    diagnosticsMenu:addOption("Write Sandbox Settings to Log",nil,DeveloperTools.writeSettings)
     diagnosticsMenu:addOption("Diagnose Survivor Damage State", playerNum, DeveloperTools.diagnoseDamage)
+    diagnosticsMenu:addOption("Start Population Profile Sample", nil,
+        DeveloperTools.startPopulationProfile)
+    diagnosticsMenu:addOption("Stop Population Profile Sample", nil,
+        DeveloperTools.stopPopulationProfile)
+    diagnosticsMenu:addOption("Write Population & Location Profile", nil,
+        DeveloperTools.writePopulationProfile)
 end
 
 Events.OnFillWorldObjectContextMenu.Add(onFill)

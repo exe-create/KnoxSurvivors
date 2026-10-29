@@ -8,19 +8,31 @@ require "KS_ActivityFeed"
 local FilterUI = rawget(_G, "KnoxBaseStorageFilterUI") or {}
 _G.KnoxBaseStorageFilterUI = FilterUI
 
-local FILTER_LABELS = {
-    food = "Food & Drink", water = "Water", medical = "Medical",
-    weapons = "Weapons", ammunition = "Ammunition", tools = "Tools",
-    logs = "Logs & Lumber", building = "Materials", farming = "Farming",
-    clothing = "Clothing", junk = "Junk", general = "General Storage (all items)",
-}
-
 local FilterWindow = ISCollapsableWindowJoypad:derive("KnoxBaseStorageFilterWindow")
 
 local function hasEntries(value)
     if type(value) ~= "table" then return false end
     for _ in pairs(value) do return true end
     return false
+end
+
+local function editableFilterKey(key)
+    if key == "perishable" or key == "nonperishable" then return true end
+    return type(key) == "string" and string.sub(key, 1, 8) == "display:"
+        and KnoxBaseStorage.isValidFilterCategory(key)
+end
+
+local function editableFilters(policy)
+    local filters, result = KnoxBaseStorage.filtersForPolicy(policy), {}
+    for category, enabled in pairs(filters) do
+        if enabled == true and editableFilterKey(category) then
+            result[category] = true
+        end
+    end
+    -- Old Knox convenience groups and the old General catch-all are readable
+    -- by storage policy code but are not new/editable UI filters. Saving an
+    -- edited policy replaces them with native DisplayCategory choices.
+    return result
 end
 
 local function nativeCategories()
@@ -46,6 +58,8 @@ local function nativeCategories()
 end
 
 local function categoryLabel(category)
+    if category == "perishable" then return "Perishable" end
+    if category == "nonperishable" then return "Non-Perishable" end
     local key = "IGUI_ItemCat_" .. category
     local translated = getTextOrNull ~= nil and getTextOrNull(key) or nil
     return translated ~= nil and translated ~= "" and translated or category
@@ -63,11 +77,12 @@ function FilterWindow:new(playerNum, baseId, object, containerIndex, policy)
     window.playerNum, window.baseId, window.object = playerNum or 0, baseId, object
     window.containerIndex = tonumber(containerIndex) or 0
     window.policy = policy
-    window.selectedFilters = KnoxBaseStorage.filtersForPolicy(policy)
+    window.selectedFilters = editableFilters(policy)
     window:setTitle("Container Item Filters")
     window:setResizable(true)
     window.backgroundColor = { r = 0.06, g = 0.06, b = 0.06, a = 0.94 }
     window.borderColor = { r = 0.38, g = 0.38, b = 0.38, a = 0.95 }
+    require("KS_SurvivorUILayout").bindInteractionWindow(window)
     return window
 end
 
@@ -76,7 +91,7 @@ function FilterWindow:createChildren()
     local pad = 12
     local titleHeight = self:titleBarHeight()
     self.instructions = ISLabel:new(pad, titleHeight + 6, 20,
-        "Choose vanilla item categories. Filtered containers are preferred; other base containers remain fallback storage.",
+        "Choose vanilla item categories or perishability. Filtered containers are preferred; other base containers remain fallback storage.",
         0.9, 0.9, 0.9, 1, UIFont.Small, true)
     self.instructions:initialise()
     self:addChild(self.instructions)
@@ -102,10 +117,8 @@ function FilterWindow:createChildren()
     self.categoryList:setAnchorRight(true)
     self.categoryList:setAnchorBottom(true)
 
-    for _, key in ipairs({ "food", "water", "medical", "weapons", "ammunition",
-            "tools", "logs", "building", "farming", "clothing", "junk", "general" }) do
-        self.categoryList:addItem(FILTER_LABELS[key], { key = key })
-    end
+    self.categoryList:addItem(categoryLabel("perishable"), { key = "perishable" })
+    self.categoryList:addItem(categoryLabel("nonperishable"), { key = "nonperishable" })
     for _, category in ipairs(nativeCategories()) do
         self.categoryList:addItem(categoryLabel(category), { key = "display:" .. category })
     end
@@ -153,12 +166,7 @@ function FilterWindow.onToggleCategory(target, entry)
     -- direct callers too, but always unwrap native rows before toggling.
     local data = type(entry) == "table" and (entry.item or entry) or nil
     local key = type(data) == "table" and data.key or nil
-    if target == nil or key == nil then return end
-    if key == "general" then
-        target.selectedFilters = target.selectedFilters.general and {} or { general = true }
-        return
-    end
-    target.selectedFilters.general = nil
+    if target == nil or not editableFilterKey(key) then return end
     target.selectedFilters[key] = not target.selectedFilters[key] or nil
 end
 
@@ -244,4 +252,12 @@ end
 FilterUI.FilterWindow = FilterWindow
 FilterUI.nativeCategories = nativeCategories
 FilterUI.categoryLabel = categoryLabel
+FilterUI.editableFilters = editableFilters
+FilterUI.filterCategoryKeys = function()
+    local result = { "perishable", "nonperishable" }
+    for _, category in ipairs(nativeCategories()) do
+        result[#result + 1] = "display:" .. category
+    end
+    return result
+end
 return FilterUI

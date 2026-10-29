@@ -28,6 +28,60 @@ local function worldAge()
     return getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
 end
 
+-- The notebook and activity feed describe the same work result. Keep exact
+-- executor codes on the task record, and explain the practical next step here.
+function TaskBoard.blockerText(value)
+    local reason = tostring(value or "")
+    if reason == "" then return nil end
+    local stayingHome = reason:match("^stay_home_missing_supplies:(.*)$")
+    if stayingHome ~= nil then
+        return (TaskBoard.blockerText(stayingHome) or "Supplies unavailable") .. "; staying home"
+    end
+    local itemType = reason:match("^missing_assigned_item=(.+)$")
+    if itemType ~= nil then
+        local names = { ["Base.Nails"] = "nails", ["Base.Plank"] = "planks", ["Base.Log"] = "logs",
+            ["Base.Hammer"] = "a hammer", ["Base.Saw"] = "a saw", ["Base.Axe"] = "an axe" }
+        local name = names[itemType]
+        if name == nil and getScriptManager ~= nil then
+            local ok, displayName = pcall(function()
+                local item = getScriptManager():FindItem(itemType)
+                return item ~= nil and item:getDisplayName() or nil
+            end)
+            if ok and displayName ~= nil and tostring(displayName) ~= "" then name = tostring(displayName) end
+        end
+        return name ~= nil and ("Needs " .. name .. " in base storage")
+            or "Required supply missing from base storage"
+    end
+    for _, prefix in ipairs({"barricade_queue:", "tree_queue:", "corpse_queue:", "repair_queue:", "farming_queue:"}) do
+        if reason:sub(1, #prefix) == prefix then reason = reason:sub(#prefix + 1); break end
+    end
+    local labels = {
+        missing_carried_nails = "Needs two nails in inventory",
+        missing_carried_hammer_or_plank = "Needs a hammer and plank in inventory",
+        missing_hammer_plank_or_nails = "Needs a hammer, plank and two nails",
+        missing_axe = "Needs a usable axe", missing_saw = "Needs a usable saw", missing_log = "Needs a log to saw",
+        repair_tool_unavailable = "Required repair tool unavailable",
+        assigned_supply_entry_unavailable = "Cannot reach supplies; check storage access",
+        assigned_supply_no_progress = "Cannot reach supplies; check the route to storage",
+        task_move_no_progress = "Cannot reach the job; check the route",
+        assigned_supply_no_longer_available = "Supplies unavailable; check base storage",
+        assigned_supply_transfer_not_completed = "Supplies were not collected; check storage access",
+        corpse_drop_square_unavailable = "No usable disposal tile; check the corpse area",
+        cooking_heat_action_not_queued = "Could not start heating; will retry",
+        missing_required_materials_after_search = "Supplies not found after searching",
+    }
+    if labels[reason] ~= nil then return labels[reason] end
+    if reason:match("^assigned_supply_transfer_queue:") then
+        return "Could not collect supplies; will retry"
+    end
+    if reason:match("^free_job_supplies:") then return "Test supplies unavailable; check the job requirements" end
+    if reason:match("_queue_refused$") or reason:match("_queue_error$") then
+        return "Could not start work; will retry"
+    end
+    reason = reason:gsub("_", " ")
+    return reason:sub(1, 1):upper() .. reason:sub(2)
+end
+
 function TaskBoard.queue(baseId, taskType, target, requirements, priority)
     taskType = KnoxOrderCatalog.normalizeTaskType(taskType) or taskType
     if TaskBoard.TASK_TYPES[taskType] ~= true then
@@ -163,12 +217,12 @@ end
 -- automatic work selection.  The notebook may choose a concrete queued task,
 -- but it must not bypass base ownership, resident eligibility, skill gates, or
 -- the one-active-task-per-resident invariant.
-function TaskBoard.claimSpecific(baseId, taskId, survivorId, playerId)
+function TaskBoard.canClaimSpecific(baseId, taskId, survivorId, playerId)
     local base = KnoxPersistence.getBase(baseId)
     local task = base ~= nil and base.tasks[taskId] or nil
     if base == nil or base.ownerKind ~= "player"
         or tostring(base.ownerId or "") ~= tostring(playerId or "") then
-        return nil, "not_your_base"
+        return false, "not_your_base"
     end
     -- Keep resident ownership authoritative at the task boundary as well as
     -- in the Notebook picker. Future callers must not assign a faction or
@@ -177,15 +231,28 @@ function TaskBoard.claimSpecific(baseId, taskId, survivorId, playerId)
         and KnoxPersistence.getSurvivorAffiliation(survivorId) or nil
     if affiliation == nil or affiliation.kind ~= "player"
         or tostring(affiliation.ownerId or "") ~= tostring(playerId or "") then
-        return nil, "not_player_resident"
+        return false, "not_player_resident"
     end
     if task == nil or task.state ~= "queued" then
-        return nil, "unavailable"
+        return false, "unavailable"
+    end
+    for _, existing in pairs(base.tasks or {}) do
+        if existing.state == "claimed" and existing.claimedBy == survivorId then
+            return false, "already_claimed_task"
+        end
     end
     if KnoxBaseManager.canPerformTask ~= nil
         and not KnoxBaseManager.canPerformTask(survivorId, baseId, task) then
-        return nil, "not_eligible"
+        return false, "not_eligible"
     end
+    return true, "eligible"
+end
+
+function TaskBoard.claimSpecific(baseId, taskId, survivorId, playerId)
+    -- The picker may inspect candidates without speaking to each unavailable
+    -- resident. Recheck here; persistence still owns the atomic claim.
+    local allowed, reason = TaskBoard.canClaimSpecific(baseId, taskId, survivorId, playerId)
+    if not allowed then return nil, reason end
     local assigned, result = KnoxPersistence.claimBaseTask(
         baseId,
         taskId,
@@ -198,6 +265,9 @@ function TaskBoard.claimSpecific(baseId, taskId, survivorId, playerId)
         -- rejected/concurrent claim must not mutate a queued task.
         assigned.manual = true
         assigned.auto = nil
+        -- Failure clears the transient claim flags. Keep this explicit order
+        -- eligible for the existing retry lane until success or cancellation.
+        assigned.manualOrder = true
     end
     return assigned, result
 end

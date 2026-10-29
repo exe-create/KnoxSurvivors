@@ -5,11 +5,14 @@ require "ISUI/ISCollapsableWindowJoypad"
 require "KS_SurvivorRuntime"
 require "KS_SurvivorViewModel"
 require "KS_Settings"
+local UILayout = require "KS_SurvivorUILayout"
 
 local InteractionUI = rawget(_G, "KnoxSurvivorInteractionUI") or {}
 _G.KnoxSurvivorInteractionUI = InteractionUI
 
 local INTERACTION_RANGE_SQUARED = 16
+local RETAINED_RANGE_SQUARED = 25 -- Existing controller departure boundary.
+local CONTACT_GRACE_MS = 1500
 local SCAN_INTERVAL_MS = 180
 local INTERACTION_KEY_BINDING = "KnoxSurvivorInteract"
 local INTERACTION_KEY_DEFAULT = "F"
@@ -170,17 +173,20 @@ local function currentSquare(character)
     return square
 end
 
-local function inInteractionRange(player, character)
+local function inInteractionRange(player, character, maximumDistanceSquared, checkSight)
     if player == nil or character == nil then return false end
     local playerSquare, survivorSquare = currentSquare(player), currentSquare(character)
     if playerSquare == nil or survivorSquare == nil then return false end
     local ok, near = pcall(function()
         if playerSquare:getZ() ~= survivorSquare:getZ() then return false end
-        local dx = playerSquare:getX() - survivorSquare:getX()
-        local dy = playerSquare:getY() - survivorSquare:getY()
-        return dx * dx + dy * dy <= INTERACTION_RANGE_SQUARED
+        local dx = (player.getX ~= nil and player:getX() or playerSquare:getX())
+            - (character.getX ~= nil and character:getX() or survivorSquare:getX())
+        local dy = (player.getY ~= nil and player:getY() or playerSquare:getY())
+            - (character.getY ~= nil and character:getY() or survivorSquare:getY())
+        return dx * dx + dy * dy <= (maximumDistanceSquared or INTERACTION_RANGE_SQUARED)
     end)
     if not ok or not near then return false end
+    if checkSight == false then return true end
     -- The prompt is for the player's interaction affordance. Testing the
     -- survivor's sight in the opposite direction made it flicker with NPC
     -- facing/vision even when the player could clearly see them.
@@ -205,6 +211,21 @@ end
 local function candidateFor(player)
     local runtime = rawget(_G, "KnoxSurvivorRuntime")
     if player == nil or runtime == nil or runtime.activeIds == nil then return nil end
+    local vpui = rawget(_G, "ViewpointUI")
+    local compat = rawget(_G, "KnoxViewpointCompatibility")
+    if compat ~= nil and compat.usesNativeAdapter ~= nil and compat.usesNativeAdapter()
+        and vpui ~= nil and vpui.Interactions ~= nil
+        and vpui.Interactions.current ~= nil and runtime.idForCharacter ~= nil then
+        local ok, aimed = safeCall(vpui.Interactions.current)
+        local character = ok and aimed ~= nil and aimed.object or nil
+        local survivorId = character ~= nil and runtime.idForCharacter(character) or nil
+        if survivorId ~= nil and alive(survivorId, character)
+            and inInteractionRange(player, character) and controllerAvailable(player, survivorId) then
+            return { id = survivorId, character = character,
+                name = identityName(survivorId, playerNumber(player)) }
+        end
+        return nil -- Never replace an aimed stranger/wall with a nearby companion.
+    end
     local ok, ids = safeCall(runtime.activeIds)
     if not ok or type(ids) ~= "table" then return nil end
     local best, bestDistance = nil, math.huge
@@ -283,7 +304,8 @@ local function isHostile(player, survivorId)
         or persistence.isSurvivorHostileToPlayer == nil then return false end
     local okId, playerId = safeCall(service.getPlayerId, player)
     if not okId or playerId == nil then return false end
-    local ok, hostile = safeCall(persistence.isSurvivorHostileToPlayer, survivorId, playerId)
+    local check = service.isSociallyHostileToPlayer or persistence.isSurvivorHostileToPlayer
+    local ok, hostile = safeCall(check, survivorId, playerId)
     return ok and hostile == true
 end
 
@@ -292,6 +314,68 @@ local function singlePlayer()
     pcall(function() client = isClient() end)
     pcall(function() server = isServer() end)
     return not client and not server
+end
+
+local ACTION_REASON_TEXT = {
+    already_with_group = "They are already travelling with a group.",
+    busy = "They are busy right now.",
+    character_dead = "They are no longer available.",
+    companion_limit = "Your party is full.",
+    cooldown = "Give them a little time before trying again.",
+    danger = "It is not safe to approach right now.",
+    dangerous = "It is not safe to approach right now.",
+    hostile = "They will not speak with you.",
+    low_reputation = "They need more trust before they join you.",
+    lure = "They suggested going somewhere quieter.",
+    mod_disabled = "Survivor interactions are disabled.",
+    needs_time = "They need more time before travelling with you.",
+    needs_unavailable = "Their needs are unavailable right now.",
+    not_independent = "Only independent survivors can be recruited.",
+    not_visible = "They cannot see you right now.",
+    player_unavailable = "You cannot interact right now.",
+    prefers_alone = "They prefer to travel alone.",
+    survivor_busy = "They are busy right now.",
+    survivor_unavailable = "They are temporarily unavailable.",
+    too_far_away = "Move closer to interact.",
+    unknown_social_act = "That interaction is unavailable.",
+}
+
+local function actionReasonText(reason, fallback)
+    if type(reason) == "string" and ACTION_REASON_TEXT[reason] ~= nil then
+        return ACTION_REASON_TEXT[reason]
+    end
+    return fallback or "That interaction could not be completed."
+end
+
+local function tradeWindowIsOpen(window, playerNum, survivorId)
+    if type(window) ~= "table" or window.playerNum ~= playerNum
+        or tostring(window.survivorId or "") ~= tostring(survivorId or "")
+        or type(window.isVisible) ~= "function" or window.closed == true then
+        return false
+    end
+    local ok, visible = safeCall(window.isVisible, window)
+    return ok and visible == true
+end
+
+local function releaseInteractionAttention(window)
+    if window.attentionStarted ~= true then return true, false end
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    if runtime == nil or runtime.endPlayerConversation == nil then return false end
+    local ok, released = safeCall(runtime.endPlayerConversation,
+        window.survivorId, window.player)
+    if not ok or released ~= true then return false end
+    window.attentionStarted = false
+    return true, true
+end
+
+local function resumeInteractionAttention(window, shouldResume)
+    if not shouldResume then return false end
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    if runtime == nil or runtime.beginPlayerConversation == nil then return false end
+    local ok, attentive = safeCall(runtime.beginPlayerConversation,
+        window.survivorId, window.player)
+    window.attentionStarted = ok and attentive == true
+    return window.attentionStarted
 end
 
 function Window:createChildren()
@@ -361,8 +445,9 @@ function Window:prerender()
         self:drawText(self.description, contentX, self.descriptionY,
             0.70, 0.70, 0.67, 1, UIFont.Small)
     end
-    if self.feedback ~= nil and self.feedback ~= "" then
-        self:drawText(self.feedback, contentX, self.feedbackY,
+    local feedback = self.contactFeedback or self.feedback
+    if feedback ~= nil and feedback ~= "" then
+        self:drawText(feedback, contentX, self.feedbackY,
             0.84, 0.82, 0.75, 1, UIFont.Small)
     end
 end
@@ -393,27 +478,33 @@ local function actionAvailability(window, action)
     if player == nil or not inInteractionRange(player, liveCharacter(id)) then
         return false, "Too far away"
     end
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    if runtime ~= nil and runtime.canInteract ~= nil and not runtime.canInteract(id) then
+        return false, "Temporarily unavailable"
+    end
     if isHostile(player, id) then
         return false, "They will not speak with you"
     end
     if action == "trade" or action == "give_item" then
         if playerIsOwner(player, id) then return false, "For independent survivors" end
         if not singlePlayer() then return false, "Single-player only" end
+        local trade = rawget(_G, "KnoxTradeUI")
+        local method = nil
+        if trade ~= nil then
+            if action == "give_item" then method = trade.showGift
+            else method = trade.show end
+        end
+        if type(method) ~= "function" then
+            return false, action == "give_item"
+                and "Give Item is unavailable." or "Trade is unavailable."
+        end
         return true
     end
     if action == "recruit" then
         if service == nil or service.canRecruit == nil then return false, "Unavailable" end
         local ok, available, reason = safeCall(service.canRecruit, player, id)
         if not ok or available ~= true then
-            local labels = {
-                needs_time = "Needs more time",
-                low_reputation = "Needs more trust",
-                prefers_alone = "Prefers to travel alone",
-                already_with_group = "Already travelling with a group",
-                dangerous = "Not safe to approach",
-                companion_limit = "Party is full",
-            }
-            return false, labels[reason] or "Not available"
+            return false, actionReasonText(reason, "Not available")
         end
     end
     return true
@@ -471,20 +562,70 @@ function Window:onCategory(button)
 end
 
 function Window:close()
+    if windows[tonumber(self.playerNum) or 0] ~= self then return end
     InteractionUI.close(self.playerNum)
 end
 
 function Window:onJoypadDown(button, joypadData)
     if button == Joypad.BButton then
-        InteractionUI.close(self.playerNum)
+        self:close()
         return
     end
     ISCollapsableWindowJoypad.onJoypadDown(self, button, joypadData)
 end
 
 function Window:onAction(button)
+    if self.closed then return end
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    if self.attentionController ~= nil and runtime ~= nil and runtime.getController ~= nil
+        and runtime.getController(self.survivorId) ~= self.attentionController then
+        InteractionUI.close(self.playerNum)
+        return
+    end
     local action = button ~= nil and button.knoxAction or nil
     if type(action) ~= "string" then return end
+    local available, unavailableReason = actionAvailability(self, action)
+    if not available then
+        self.feedback = unavailableReason
+        self:refreshActions()
+        return
+    end
+    if action == "trade" or action == "give_item" then
+        local trade = rawget(_G, "KnoxTradeUI")
+        local method = nil
+        if trade ~= nil then
+            if action == "give_item" then method = trade.showGift
+            else method = trade.show end
+        end
+        if type(method) ~= "function" then
+            self.feedback = action == "give_item"
+                and "Give Item is unavailable." or "Trade is unavailable."
+            self:refreshActions()
+            return
+        end
+        local canOpen, resumeAttention = releaseInteractionAttention(self)
+        if not canOpen then
+            self.feedback = "They are busy right now."
+            self:refreshActions()
+            return
+        end
+        local called, tradeWindow = pcall(method, self.playerNum, self.survivorId)
+        if called and tradeWindowIsOpen(tradeWindow, self.playerNum, self.survivorId) then
+            -- Only retire this panel after the trade owner confirms that its
+            -- player-scoped window is actually present. Failed opening keeps
+            -- the panel and may resume attention through the existing owner.
+            if windows[tonumber(self.playerNum) or 0] == self then
+                InteractionUI.close(self.playerNum)
+            end
+            return
+        end
+        resumeInteractionAttention(self, resumeAttention)
+        self.feedback = action == "give_item"
+            and "Give Item could not be opened. Try again."
+            or "Trade could not be opened. Try again."
+        self:refreshActions()
+        return
+    end
     local service = rawget(_G, "KnoxCompanionService")
     local ok, result = false, "unavailable"
     local called, first, second = pcall(function()
@@ -499,17 +640,6 @@ function Window:onAction(button)
             end
         elseif action == "recruit" and service ~= nil and service.recruit ~= nil then
             return service.recruit(self.player, self.survivorId)
-        elseif action == "trade" or action == "give_item" then
-            local trade = rawget(_G, "KnoxTradeUI")
-            if trade ~= nil then
-                InteractionUI.close(self.playerNum)
-                if action == "give_item" and trade.showGift ~= nil then
-                    trade.showGift(self.playerNum, self.survivorId)
-                elseif trade.show ~= nil then
-                    trade.show(self.playerNum, self.survivorId)
-                end
-                return true, "opened"
-            end
         end
         return false, "unavailable"
     end)
@@ -529,7 +659,7 @@ function Window:onAction(button)
             return
         end
     else
-        self.feedback = tostring(result or "Unavailable")
+        self.feedback = actionReasonText(result)
     end
     local character = liveCharacter(self.survivorId)
     if character ~= nil then self:setCharacter(character) end
@@ -552,6 +682,7 @@ function Window:new(playerNum, target, player)
     window.feedback = nil
     window.uiScale = scale
     window:setTitle(target.name)
+    UILayout.bindInteractionWindow(window)
     return window
 end
 
@@ -567,7 +698,22 @@ function InteractionUI.open(playerNum, target, player)
     window:addToUIManager()
     window:bringToTop()
     windows[playerNum] = window
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    if runtime ~= nil and runtime.beginPlayerConversation ~= nil then
+        local ok, attentive, reason = safeCall(runtime.beginPlayerConversation, target.id, player)
+        window.attentionStarted = ok and attentive == true
+        if window.attentionStarted and runtime.getController ~= nil then
+            window.attentionController = runtime.getController(target.id)
+        end
+        if not window.attentionStarted then
+            InteractionUI.close(playerNum)
+            local feed = rawget(_G, "KnoxActivityFeed")
+            if feed ~= nil and feed.event ~= nil then feed.event(actionReasonText(ok and reason or nil)) end
+            return false
+        end
+    end
     if JoypadState ~= nil and JoypadState.players ~= nil and JoypadState.players[playerNum + 1] then
+        window.previousJoypadFocus = JoypadState.players[playerNum + 1].focus
         pcall(function() setJoypadFocus(playerNum, window) end)
     end
     return true
@@ -578,14 +724,29 @@ function InteractionUI.close(playerNum)
     local window = windows[key]
     if window == nil then return false end
     windows[key] = nil
+    window.closed = true
     if window.attentionStarted then
         window.attentionStarted = false
         local runtime = rawget(_G, "KnoxSurvivorRuntime")
-        if runtime ~= nil and runtime.endPlayerConversation ~= nil then
+        if runtime ~= nil and runtime.endPlayerConversation ~= nil
+            and (window.attentionController == nil or (runtime.getController ~= nil
+                and runtime.getController(window.survivorId) == window.attentionController)) then
             pcall(runtime.endPlayerConversation, window.survivorId, window.player)
         end
     end
     pcall(function() window:setVisible(false); window:removeFromUIManager() end)
+    local joypad = JoypadState ~= nil and JoypadState.players ~= nil and JoypadState.players[key + 1] or nil
+    local focus = joypad ~= nil and joypad.focus or nil
+    while focus ~= nil do
+        if focus == window then
+            -- A trade/health panel may already own focus. Only retire our own
+            -- window/children, following the existing inventory/card convention.
+            pcall(function() setJoypadFocus(key, window.previousJoypadFocus) end)
+            break
+        end
+        focus = focus.parent
+    end
+
     return true
 end
 
@@ -670,6 +831,8 @@ end
 
 function InteractionUI.onContextKey(player, timePressedContext)
     if player == nil then return end
+    local compat = rawget(_G, "KnoxViewpointCompatibility")
+    if compat ~= nil and compat.ownsInteractionInput ~= nil and compat.ownsInteractionInput() then return end
     if tonumber(timePressedContext) ~= nil
         and tonumber(timePressedContext) > 700 then return end
     local playerNum = playerNumber(player)
@@ -712,27 +875,67 @@ function InteractionUI.update()
             local ok, value = safeCall(settings.enabled)
             enabled = ok and value == true
         end
+        local playerAvailable = false
         if player ~= nil then
             local dead, vehicle, aiming = false, nil, false
-            pcall(function()
+            local readable = pcall(function()
                 dead, vehicle = player:isDead(), player:getVehicle()
                 aiming = player:isAiming()
             end)
-            if enabled and not dead and vehicle == nil and not aiming
-                and not anotherUIHasFocus(playerNum) then
+            playerAvailable = readable and enabled and not dead and vehicle == nil and not aiming
+            local compat = rawget(_G, "KnoxViewpointCompatibility")
+            local nativePrompt = compat ~= nil and compat.ownsInteractionInput ~= nil and compat.ownsInteractionInput()
+            if playerAvailable and not nativePrompt and not anotherUIHasFocus(playerNum) then
                 target = candidateFor(player)
             end
         end
         setPrompt(playerNum, target)
         local window = windows[playerNum]
         if window ~= nil then
+            local attentionOkay = true
             local character = liveCharacter(window.survivorId)
-            local stillAvailable = player ~= nil and alive(window.survivorId, character)
-                and inInteractionRange(player, character)
+            local retainedRange = inInteractionRange(player, character, RETAINED_RANGE_SQUARED, false)
+            local seen, visible = pcall(function() return player:CanSee(character) end)
+            local contact = seen and visible == true
+            if contact then
+                window.lostSightAt = nil
+                window.contactFeedback = nil
+            else
+                window.lostSightAt = window.lostSightAt or now
+                window.contactFeedback = "Lost sight of them. Move back into view."
+            end
+            local contactRetained = contact or (now ~= nil and window.lostSightAt ~= nil
+                and now - window.lostSightAt < CONTACT_GRACE_MS)
+            local runtime = rawget(_G, "KnoxSurvivorRuntime")
+            if window.attentionStarted then
+                local ok, attentive = false, false
+                if playerAvailable and player == window.player
+                    and runtime ~= nil and runtime.beginPlayerConversation ~= nil
+                    and runtime.getController ~= nil then
+                    local found, owner = safeCall(runtime.getController, window.survivorId)
+                    local lease = found and owner ~= nil and owner.playerConversation or nil
+                    -- Refresh retains attention; it must not reacquire it after
+                    -- needs, danger, expiry or a new order released the lease.
+                    if lease ~= nil and lease.player == window.player
+                        and owner == window.attentionController
+                        and owner.state == "PLAYER_CONVERSATION" then
+                        if retainedRange and contact and not anotherUIHasFocus(playerNum) then
+                            ok, attentive = safeCall(runtime.beginPlayerConversation,
+                                window.survivorId, window.player)
+                        else
+                            -- Keep the existing short lease; a focus/LOS blip
+                            -- cannot restart it or extend it indefinitely.
+                            ok, attentive = true, true
+                        end
+                    end
+                end
+                attentionOkay = ok and attentive == true
+            end
+            local stillAvailable = attentionOkay and playerAvailable and player == window.player
+                and alive(window.survivorId, character)
+                and retainedRange and contactRetained
                 and controllerAvailable(player, window.survivorId)
                 and not isHostile(player, window.survivorId)
-                and not anotherUIHasFocus(playerNum)
-            local runtime = rawget(_G, "KnoxSurvivorRuntime")
             local controller = runtime ~= nil and runtime.getController ~= nil
                 and runtime.getController(window.survivorId) or nil
             if stillAvailable and window.attentionStarted and controller ~= nil
@@ -744,6 +947,15 @@ function InteractionUI.update()
                 window:setCharacter(character)
                 window:refreshActions()
             else
+                local feed = rawget(_G, "KnoxActivityFeed")
+                if feed ~= nil and feed.event ~= nil then
+                    local message = not alive(window.survivorId, character) and "Survivor unavailable."
+                        or not playerAvailable and "Conversation interrupted."
+                        or not retainedRange and "Too far away to continue talking."
+                        or not contactRetained and "Conversation ended: contact lost."
+                        or "Conversation interrupted; they need to act."
+                    feed.event(message)
+                end
                 InteractionUI.close(playerNum)
             end
         end

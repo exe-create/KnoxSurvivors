@@ -37,6 +37,7 @@ local BUILDING_TYPES = {
     ["Base.SheetMetal"] = true,
     ["Base.SmallSheetMetal"] = true,
     ["Base.Nails"] = true,
+    ["Base.Glue"] = true,
     ["Base.Woodglue"] = true,
     ["Base.Screws"] = true,
     ["Base.DuctTape"] = true,
@@ -239,9 +240,16 @@ function Storage.policies(base)
     local result = {}
     for key, policy in pairs(base.storage or {}) do
         if type(policy) == "table" and type(policy.key) == "string" then
+            if policy.storageFilterVersion == 1 then
+                -- A versioned filter record is authoritative even if an older
+                -- or partially migrated save lacks the compatibility role.
+                if policy.storageRole == nil then
+                    policy.storageRole = policy.category or "supplies"
+                end
+                result[#result + 1] = policy
             -- Unmigrated records without any category are preserved on disk but
             -- never treated as assigned storage (legacy fridge check).
-            if policy.category == nil and policy.storageRole == nil then
+            elseif policy.category == nil and policy.storageRole == nil then
                 -- Transient legacy-fridge migration: an old-save record that
                 -- still resolves to a loaded fridge/freezer is surfaced as
                 -- food storage so residents can eat from a stocked fridge.
@@ -411,8 +419,10 @@ local STORAGE_FILTER_LABELS = {
         tools = "Tools", logs = "Logs & Lumber", general = "General Storage",
         building = "Materials", farming = "Farming",
         clothing = "Clothing", junk = "Junk",
+        perishable = "Perishable", nonperishable = "Non-Perishable",
 }
 local STORAGE_FILTER_ORDER = {
+    "perishable", "nonperishable",
     "food", "water", "medical", "weapons", "ammunition", "tools",
     "logs", "building", "farming", "clothing", "junk", "general",
 }
@@ -447,6 +457,15 @@ function Storage.filtersForPolicy(policy)
     local role = policy.storageRole or policy.category or "supplies"
     if role == "supplies" or role == "depot" then role = "general" end
     return STORAGE_FILTER_LABELS[role] ~= nil and { [role] = true } or {}
+end
+
+function Storage.hasActiveFilters(policy)
+    if policy == nil or policy.storageFilterVersion ~= 1 then return false end
+    local filters = Storage.filtersForPolicy(policy)
+    for _, enabled in pairs(filters) do
+        if enabled == true then return true end
+    end
+    return false
 end
 
 function Storage.filterLabel(category)
@@ -491,6 +510,10 @@ function Storage.filterAllowsItem(policy, item)
     if policy == nil or item == nil then return false end
     if policy.storageFilterVersion ~= 1 then return true end
     local filters = Storage.filtersForPolicy(policy)
+    -- An empty selection is ordinary fallback storage. This keeps the
+    -- player-facing "no categories" rule consistent across deposits,
+    -- organizing, needs, and job-material retrieval.
+    if not Storage.hasActiveFilters(policy) then return true end
     if filters.general then return true end
     for _, category in ipairs(STORAGE_FILTER_ORDER) do
         if filters[category] and filteredCategoryMatchesDeposit(item, category) then
@@ -515,12 +538,10 @@ function Storage.filterAllowsKind(policy, kind)
     if policy == nil then return false end
     if policy.storageFilterVersion ~= 1 then return true end
     local filters = Storage.filtersForPolicy(policy)
+    if not Storage.hasActiveFilters(policy) then return true end
     if filters.general == true or filters[kind] == true
         or (kind == "water" and filters.food == true)
     then return true end
-    for category, enabled in pairs(filters) do
-        if enabled == true and nativeFilterCategory(category) ~= nil then return true end
-    end
     return false
 end
 
@@ -584,6 +605,17 @@ function Storage.matchesCategory(item, category)
     category = tostring(category or "general")
     if category == "general" then
         return true
+    end
+    if category == "perishable" or category == "nonperishable" then
+        -- InventoryItem:getOffAgeMax() is the native spoilage lifetime used by
+        -- Build 42 food-aging logic. Unknown items stay outside both filters;
+        -- do not guess that a missing API means "non-perishable".
+        if item.getOffAgeMax == nil then return false end
+        local ok, value = pcall(function() return item:getOffAgeMax() end)
+        local days = ok and tonumber(value) or nil
+        if days == nil then return false end
+        if category == "perishable" then return days > 0 end
+        return days <= 0
     end
     if category == "food" then
         return KnoxSurvivorNeeds.isSafeFood(item)
@@ -732,23 +764,28 @@ end
 -- that will enter the survivor inventory and later serialized record.
 function Storage.findSurvivalSupply(base, character, kind)
     if kind ~= "food" and kind ~= "water" then return nil, "invalid_kind" end
-    for _, policy in ipairs(orderedPoliciesByDistance(base, character)) do
-        local resolved = Storage.filterAllowsKind(policy, kind)
-            and Storage.resolvePolicy(policy) or nil
-        if resolved ~= nil then
-            local found = nil
-            walkContainerItems(resolved.container, function(candidate, sourceContainer)
-                if found == nil and survivalKind(candidate) == kind
-                    and Storage.filterAllowsItem(policy, candidate) then
-                    found = {
-                        kind = kind,
-                        item = candidate,
-                        source = sourceContainer,
-                        policy = policy,
-                    }
+    local policies = orderedPoliciesByDistance(base, character)
+    for pass = 1, 2 do
+        for _, policy in ipairs(policies) do
+            local filtered = Storage.hasActiveFilters(policy)
+            if (pass == 1 and filtered) or (pass == 2 and not filtered) then
+                local resolved = Storage.resolvePolicy(policy)
+                if resolved ~= nil then
+                    local found = nil
+                    walkContainerItems(resolved.container, function(candidate, sourceContainer)
+                        if found == nil and survivalKind(candidate) == kind
+                            and Storage.filterAllowsItem(policy, candidate) then
+                            found = {
+                                kind = kind,
+                                item = candidate,
+                                source = sourceContainer,
+                                policy = policy,
+                            }
+                        end
+                    end)
+                    if found ~= nil then return found, "found" end
                 end
-            end)
-            if found ~= nil then return found, "found" end
+            end
         end
     end
     return nil, "assigned_" .. kind .. "_unavailable"
@@ -814,6 +851,13 @@ function Storage.provisionSurvivalSupplies(base, character, targets)
                 report.shortages[kind] = moveResult
                 break
             end
+            -- Native item provenance survives the existing inventory snapshot.
+            -- Mark only an exact completed withdrawal from assigned communal
+            -- storage; carried personal food is never retroactively communal.
+            if type(base.id) == "string" and transfer.item.getModData ~= nil then
+                local ok, data = pcall(function() return transfer.item:getModData() end)
+                if ok and data ~= nil then data.KnoxBaseProvision = base.id end
+            end
             counts[kind] = counts[kind] + quantity
             report.transferred[kind] = report.transferred[kind] + quantity
         end
@@ -863,8 +907,10 @@ function Storage.summarize(base)
     return summary
 end
 
-local function hasRoom(container, item, character)
-    if container == nil then
+-- Read-only native eligibility, shared by deposit discovery and organizing.
+-- Filters and exact transfer receipts remain separate caller-owned checks.
+function Storage.canReceiveItem(container, character, item)
+    if container == nil or character == nil or item == nil then
         return false
     end
     -- Real native capacity: assigned storage fills like any Project Zomboid
@@ -876,6 +922,7 @@ local function hasRoom(container, item, character)
             return container:hasRoomFor(character, item)
         end)
         return success and result == true
+            and safeBoolean(container, "isItemAllowed", item) == true
     end
     return false
 end
@@ -909,8 +956,7 @@ local function findDeposit(base, character, item, trip, excluded, ticks, policyK
             and (excluded == nil or (excluded[policy.key] or 0) <= (ticks or 0))
             and (exact or overflow or lastResort or unassigned) then
             local resolved = Storage.resolvePolicy(policy)
-            if resolved ~= nil and hasRoom(resolved.container, item, character)
-                and safeBoolean(resolved.container, "isItemAllowed", item) == true then
+            if resolved ~= nil and Storage.canReceiveItem(resolved.container, character, item) then
                 -- Native transfer validity does not itself reject every wall
                 -- between two containers. Require a clear adjacent interaction.
                 local approach = trip and AdjacentFreeTileFinder.Find(resolved.square, character) or origin
@@ -925,9 +971,9 @@ local function findDeposit(base, character, item, trip, excluded, ticks, policyK
                     local exactCategory = policy.storageFilterVersion == 1
                         and exact or policy.storageRole == classified
                         or (policy.storageRole == "food" and Storage.acceptsDeposit(policy, item))
-                    -- RimWorld order: highest-priority valid shelf first,
-                    -- then exact-type matches, then distance. A critical
-                    -- overflow shelf beats a normal exact one by design.
+                    -- Matching filters precede fallback storage (D-037).
+                    -- Within a preference tier use configured priority,
+                    -- then live distance; discovery never proves receipt.
                     resolved.priorityRank = Storage.priorityRank(policy)
                     resolved.preference = unassigned and 4
                         or exactCategory and 0
@@ -953,8 +999,8 @@ local function findDeposit(base, character, item, trip, excluded, ticks, policyK
     return candidates[1], candidates[1] ~= nil and "nearby_storage" or "no_reachable_storage"
 end
 
-function Storage.findNearbyDeposit(base, character, item, policyKey)
-    return findDeposit(base, character, item, false, nil, nil, policyKey)
+function Storage.findNearbyDeposit(base, character, item, policyKey, excluded, ticks)
+    return findDeposit(base, character, item, false, excluded, ticks, policyKey)
 end
 
 -- Only loaded owned containers within a practical local trip. The native
@@ -1012,6 +1058,7 @@ orderedPoliciesByDistance = function(base, character)
     end)
     return policies
 end
+Storage.orderedPoliciesByDistance = orderedPoliciesByDistance
 
 -- Finds one real item needed by a claimed base task.  It deliberately searches
 -- only assigned base storage and returns one transfer at a time, allowing the
@@ -1025,26 +1072,30 @@ local function findRequiredTransferReal(base, character, requirements)
     for itemType, required in pairs(requiredItems) do
         local needed = math.max(0, math.floor(tonumber(required) or 0))
         if needed > KnoxBaseSupplyPlanner.inventoryCount(inventory, itemType, requirements) then
-            for _, policy in ipairs(orderedPoliciesByDistance(base, character)) do
-                if policyCanSupply(policy, tostring(itemType)) then
-                    local resolved = Storage.resolvePolicy(policy)
-                    if resolved ~= nil then
-                        local found = nil
-                        walkContainerItems(resolved.container, function(item, sourceContainer)
-                            if found == nil and fullType(item) == tostring(itemType)
-                                and Storage.filterAllowsItem(policy, item)
-                                and KnoxBaseSupplyPlanner.matchesRequirement(item, requirements) then
-                                found = {
-                                    sourcePolicy = policy,
-                                    source = sourceForItem(resolved, sourceContainer),
-                                    item = item,
-                                    itemType = tostring(itemType),
-                                    required = needed,
-                                }
+            local policies = orderedPoliciesByDistance(base, character)
+            for pass = 1, 2 do
+                for _, policy in ipairs(policies) do
+                    local filtered = Storage.hasActiveFilters(policy)
+                    if (pass == 1 and filtered) or (pass == 2 and not filtered) then
+                        if policyCanSupply(policy, tostring(itemType)) then
+                            local resolved = Storage.resolvePolicy(policy)
+                            if resolved ~= nil then
+                                local found = nil
+                                walkContainerItems(resolved.container, function(item, sourceContainer)
+                                    if found == nil and fullType(item) == tostring(itemType)
+                                        and Storage.filterAllowsItem(policy, item)
+                                        and KnoxBaseSupplyPlanner.matchesRequirement(item, requirements) then
+                                        found = {
+                                            sourcePolicy = policy,
+                                            source = sourceForItem(resolved, sourceContainer),
+                                            item = item,
+                                            itemType = tostring(itemType),
+                                            required = needed,
+                                        }
+                                    end
+                                end)
+                                if found ~= nil then return found, "found" end
                             end
-                        end)
-                        if found ~= nil then
-                            return found, "found"
                         end
                     end
                 end
@@ -1064,6 +1115,50 @@ function Storage.findRequiredTransfer(base, character, requirements)
     return findRequiredTransferReal(base, character, requirements)
 end
 
+-- Recheck a selected cupboard at the native transfer boundary. Policy removal,
+-- changed filters and moving a bag out of the cupboard revoke the old pickup.
+-- This visits configured policies and the selected container only, never a
+-- fresh scan of every square in the base on each timed-action validity check.
+function Storage.taskSupplyStillAvailable(base, transfer)
+    if base == nil or transfer == nil or transfer.sourcePolicy == nil then return false end
+    local selected, current, resolved = transfer.sourcePolicy, nil, nil
+    local original = Storage.resolvePolicy(selected, true)
+    if original == nil then return false end
+    for _, policy in ipairs(Storage.policies(base)) do
+        if policy.key == selected.key then
+            current, resolved = policy, Storage.resolvePolicy(policy, true)
+            break
+        elseif selected.transientContainer == true then
+            local candidate = Storage.resolvePolicy(policy, true)
+            if candidate ~= nil and candidate.container == original.container then
+                current, resolved = policy, candidate
+                break
+            end
+        end
+    end
+    if current == nil and selected.transientContainer == true and selected.base == base then
+        current, resolved = selected, original
+    end
+    if current == nil or resolved == nil or resolved.container ~= original.container
+        or not Storage.filterAllowsItem(current, transfer.item) then return false end
+    local source = transfer.source ~= nil and transfer.source.container or nil
+    if source == nil or transfer.item:getContainer() ~= source
+        or source:contains(transfer.item) ~= true then return false end
+    -- Follow only the selected bag's ancestry. Scanning every nested item on
+    -- every native validity call would make a large pantry needlessly costly.
+    local seen = {}
+    while source ~= resolved.container do
+        if seen[source] then return false end
+        seen[source] = true
+        local bag = source:getContainingItem()
+        if bag == nil or bag:getInventory() ~= source then return false end
+        local parent = bag:getContainer()
+        if parent == nil or parent:contains(bag) ~= true then return false end
+        source = parent
+    end
+    return true
+end
+
 -- Real inventory-vs-storage comparison that ignores the ignore-resources
 -- sandbox flag. Lets workers fetch what is actually stored even when gating
 -- is bypassed; native job actions still need carried items.
@@ -1077,22 +1172,49 @@ end
 function Storage.findItemType(base, predicate, character)
     if type(predicate) ~= "function" then return nil end
     local policies = orderedPoliciesByDistance(base, character)
-    for _, policy in ipairs(policies) do
-        local resolved = Storage.resolvePolicy(policy)
-        local found = nil
-        walkContainerItems(resolved ~= nil and resolved.container or nil, function(item)
-            if found == nil then
-                local success, matches = pcall(predicate, item)
-                if success and matches == true and Storage.filterAllowsItem(policy, item) then
-                    found = item
+    for pass = 1, 2 do
+        for _, policy in ipairs(policies) do
+            local filtered = Storage.hasActiveFilters(policy)
+            if (pass == 1 and filtered) or (pass == 2 and not filtered) then
+                local resolved = Storage.resolvePolicy(policy)
+                local found = nil
+                walkContainerItems(resolved ~= nil and resolved.container or nil, function(item)
+                    if found == nil then
+                        local success, matches = pcall(predicate, item)
+                        if success and matches == true and Storage.filterAllowsItem(policy, item) then
+                            found = item
+                        end
+                    end
+                end)
+                if found ~= nil then
+                    return fullType(found), found
                 end
             end
-        end)
-        if found ~= nil then
-            return fullType(found), found
         end
     end
     return nil
+end
+
+-- Counts a real exact item already in operational assigned storage, honoring
+-- the same policy filters used by task transfers. Used only to describe shared
+-- job demand before a real world search; it never moves or creates stock.
+function Storage.countAssignedItem(base, itemType, requirements)
+    local count = 0
+    for _, policy in ipairs(Storage.operationalPolicies(base)) do
+        if policyCanSupply(policy, tostring(itemType)) then
+            local resolved = Storage.resolvePolicy(policy)
+            if resolved ~= nil then
+                walkContainerItems(resolved.container, function(item)
+                    if fullType(item) == tostring(itemType)
+                        and Storage.filterAllowsItem(policy, item)
+                        and KnoxBaseSupplyPlanner.matchesRequirement(item, requirements) then
+                        count = count + itemQuantity(item)
+                    end
+                end)
+            end
+        end
+    end
+    return count
 end
 
 function Storage.requirementsAvailable(base, character, requirements)

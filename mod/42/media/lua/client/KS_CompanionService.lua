@@ -20,17 +20,6 @@ local partyFormationRuntime = {}
 local lastPlayerVehicle = setmetatable({}, { __mode = "k" })
 local PARTY_DESTINATION_TTL_HOURS = 1
 local PARTY_HEADING_CONFIRM_DISTANCE = 1.5
-local PARTY_DESTINATION_SUPERSEDING_ORDERS = {
-    follow = true, hold = true, relax = true, return_to_base = true,
-    resume_normal_duty = true, go_to = true, guard = true,
-    patrol = true, patrol_area = true, loot_area = true,
-    loot_building = true, loot_corpses = true, find_food = true,
-    find_water = true, find_medical = true, find_weapon = true,
-    find_tools = true, find_wood = true, find_materials = true,
-    find_clothing = true, find_ammo = true, clean_inventory = true,
-    enter_vehicle = true, drive_ahead = true, drive_nearest_vehicle = true,
-    exit_vehicle = true, dismiss = true,
-}
 if Events ~= nil and Events.OnGameStart ~= nil and Events.OnGameStart.Add ~= nil then
     Events.OnGameStart.Add(function()
         -- Lua may remain resident when returning to the main menu and loading
@@ -45,6 +34,11 @@ end
 local function signalOrder(player, survivorId, kind)
     local signals = rawget(_G, "KnoxOrderSignals")
     if signals == nil or signals.order == nil then return false end
+    -- Delivery may already have played the leader's gesture. A successful
+    -- recipient can still acknowledge it without replaying that gesture.
+    if signals.acknowledge ~= nil then
+        signals.acknowledge(player, KnoxSurvivorRuntime.getCharacter(survivorId))
+    end
     -- Some party routes still resolve per survivor because each member can be
     -- in a different place. Keep that useful routing while coalescing the
     -- visible leader gesture and acknowledgements for one repeated order.
@@ -209,6 +203,10 @@ local function recordSocialEvent(playerId, survivorId, event)
 end
 
 local function validateInteraction(player, survivorId, maximumDistanceSquared)
+    if KnoxSurvivorRuntime.canInteract ~= nil then
+        local accepted, reason = KnoxSurvivorRuntime.canInteract(survivorId)
+        if not accepted then return nil, reason end
+    end
     local character = KnoxSurvivorRuntime.getCharacter(survivorId)
     local playerSquare = player ~= nil and player:getCurrentSquare() or nil
     local survivorSquare = character ~= nil and character:getCurrentSquare() or nil
@@ -235,6 +233,91 @@ end
 
 function CompanionService.getPlayerId(player)
     return KnoxPersistence.ensurePlayerId(player)
+end
+
+-- Read-only contact admission. No stored ledger, global position or merely
+-- carried radio establishes delivery. The shared native bridge supplies normal
+-- speech intelligibility; visual commands use the existing seven-tile gesture.
+local function contactChannel(player, character)
+    local ready, available = pcall(function()
+        return player ~= nil and character ~= nil and not player:isDead()
+            and not character:isDead() and not character:isAsleep()
+            and player:getCurrentSquare() ~= nil and character:getCurrentSquare() ~= nil
+    end)
+    if ready and available then
+        local bridge = rawget(_G, "KnoxJavaBridge")
+        local heard, audible = pcall(function() return bridge:canHearOrder(player, character) end)
+        if heard and audible == true then return true, "voice" end
+        local seen, visible = pcall(function()
+            local a, b = player:getCurrentSquare(), character:getCurrentSquare()
+            return a:getZ() == b:getZ() and (a:getX()-b:getX())^2+(a:getY()-b:getY())^2 <= 49
+                and character:CanSee(player) == true
+        end)
+        if seen and visible then return true, "visual" end
+    end
+    return false, "order_not_delivered"
+end
+
+function CompanionService.orderContact(player, survivorId)
+    local owner = CompanionService.getPlayerId(player)
+    local affiliation = KnoxPersistence.getSurvivorAffiliation(survivorId)
+    if owner == nil or affiliation == nil or affiliation.kind ~= "player"
+        or affiliation.ownerId ~= owner then return false, "not_your_survivor" end
+    if KnoxSurvivorRuntime.canAcceptOrders ~= nil then
+        local accepted, reason = KnoxSurvivorRuntime.canAcceptOrders(survivorId)
+        if not accepted then return false, reason end
+    end
+    return contactChannel(player, KnoxSurvivorRuntime.getCharacter(survivorId))
+end
+
+-- Batch receipts live only for one synchronous party dispatch. Each recipient
+-- still needs its own contact check; one real utterance/gesture can reach several.
+local ORDER_SPEECH = {
+    allow_climbing = "Vault and climb when needed", disallow_climbing = "Avoid vaulting and climbing",
+    allow_doors = "Use doors and windows", disallow_doors = "Leave doors and windows alone",
+    enable_auto_equipment = "Improve your gear when you can", disable_auto_equipment = "Keep your current gear",
+}
+function CompanionService.deliverOrder(player, survivorId, kind, batch, detail)
+    local ready, channel = CompanionService.orderContact(player, survivorId)
+    local function receiptContact()
+        if KnoxPersistence.rememberSurvivorPlayerContact ~= nil then
+            local square = player:getCurrentSquare()
+            KnoxPersistence.rememberSurvivorPlayerContact(survivorId, CompanionService.getPlayerId(player),
+                {x=square:getX(),y=square:getY(),z=square:getZ(),atHours=worldAge(),source=channel})
+        end
+        return true, channel
+    end
+    if ready then
+        local receipt = batch or {}
+        if channel == "voice" then
+            if receipt.voice then return receiptContact() end
+            local label = ORDER_SPEECH[kind] or (KnoxOrderCatalog ~= nil and KnoxOrderCatalog.label ~= nil
+                and KnoxOrderCatalog.label(kind, tostring(kind)) or tostring(kind))
+            if detail ~= nil then label = label .. ": " .. tostring(detail) end
+            local sent = pcall(function() player:Say(label .. ".") end)
+            if sent then receipt.voice = true; return receiptContact() end
+        else
+            local signals = rawget(_G, "KnoxOrderSignals")
+            if receipt.visual then return receiptContact() end
+            if signals ~= nil and signals.send ~= nil and signals.send(player, kind) then
+                receipt.visual = true; return receiptContact()
+            end
+        end
+        channel = "order_not_delivered"
+    end
+    if channel == "order_not_delivered" and KnoxActivityFeed ~= nil and KnoxActivityFeed.event ~= nil then
+        KnoxActivityFeed.event("No contact with " .. displayName(survivorId) .. ". Existing orders continue.")
+    end
+    return false, channel
+end
+
+function CompanionService.rememberCommitment(player, survivorId)
+    if KnoxPersistence.rememberObserverKnowledge == nil then return end
+    local duty = KnoxPersistence.getSurvivorDuty(survivorId)
+    if duty == nil then return end
+    KnoxPersistence.rememberObserverKnowledge(CompanionService.getPlayerId(player), survivorId,
+        "commitment", {role=duty.mode == "companion" and "companion" or (duty.mode == "base" and "resident" or "independent"),
+        duty=duty, order=duty.order}, worldAge())
 end
 
 function CompanionService.resolvePlayer(playerId)
@@ -403,6 +486,19 @@ function CompanionService.removePlayerPartyFormationMember(playerId, survivorId)
     return existed
 end
 
+local function hasPlayerAffiliation(survivorId)
+    local affiliation = KnoxPersistence.getSurvivorAffiliation ~= nil
+        and KnoxPersistence.getSurvivorAffiliation(survivorId) or nil
+    return affiliation ~= nil and affiliation.kind == "player"
+end
+
+-- Social admission must honor the same protected-team boundary as combat.
+-- Keep legacy hostility history; it is not an executable fight while affiliated.
+function CompanionService.isSociallyHostileToPlayer(survivorId, playerId)
+    return not hasPlayerAffiliation(survivorId)
+        and KnoxPersistence.isSurvivorHostileToPlayer(survivorId, playerId)
+end
+
 function CompanionService.talk(player, survivorId)
     local character, availability = validateInteraction(player, survivorId)
     local playerId = CompanionService.getPlayerId(player)
@@ -410,13 +506,14 @@ function CompanionService.talk(player, survivorId)
         return false, availability
     end
     local social = playerSocialDisposition(playerId, survivorId)
-    if social == "attack_on_sight" then
+    local protectedTeam = hasPlayerAffiliation(survivorId)
+    if not protectedTeam and social == "attack_on_sight" then
         KnoxPersistence.setSurvivorHostileToPlayer(survivorId, playerId, true)
         socialSpeech(character, survivorId, "player_attack_warning", "Back away.")
         KnoxActivityFeed.event("A survivor attacked without warning.")
         return false, "hostile"
     end
-    if KnoxPersistence.isSurvivorHostileToPlayer(survivorId, playerId) then return false, "hostile" end
+    if CompanionService.isSociallyHostileToPlayer(survivorId, playerId) then return false, "hostile" end
     local attentive, attentionReason = KnoxSurvivorRuntime.beginPlayerConversation(survivorId, player)
     if not attentive then
         KnoxActivityFeed.speak(character, attentionReason == "danger"
@@ -437,7 +534,9 @@ function CompanionService.talk(player, survivorId)
         return false, result
     end
     if result == "cooldown" then
-        KnoxSurvivorRuntime.endPlayerConversation(survivorId, player)
+        -- A reward cooldown is not the end of the encounter. Keep the
+        -- admitted attention lease so the player can ask about needs, trade,
+        -- or choose another response. Danger/needs/expiry still own release.
         KnoxActivityFeed.speak(character, "Give me a minute.")
         return false, result
     end
@@ -446,7 +545,9 @@ function CompanionService.talk(player, survivorId)
     if KnoxActivityFeed.reputation ~= nil then
         KnoxActivityFeed.reputation(character, (tonumber(relation.trust) or previousTrust) - previousTrust)
     end
-    if social == "lure" then
+    if protectedTeam then
+        socialSpeech(character, survivorId, "player_talk", line)
+    elseif social == "lure" then
         if (tonumber(relation.lureAttempts) or 0) == 0 then
             recordSocialEvent(playerId, survivorId, "lure_attempt")
             socialSpeech(character, survivorId, "player_lure",
@@ -507,6 +608,18 @@ end
 function CompanionService.askNeeds(player, survivorId)
     local character, availability = validateInteraction(player, survivorId)
     if character == nil then return false, availability end
+    local bridge = rawget(_G, "KnoxJavaBridge")
+    local reached, heard = pcall(function() return bridge:canHearOrder(player, character) end)
+    local answered, replyHeard = pcall(function() return bridge:canHearOrder(character, player) end)
+    if not reached or heard ~= true or not answered or replyHeard ~= true then
+        KnoxActivityFeed.event("Cannot discuss needs without clear contact.")
+        return false, "order_not_delivered"
+    end
+    local spoken = pcall(function() player:Say("How are you holding up?") end)
+    if not spoken then
+        KnoxActivityFeed.event("Could not ask about their needs. Try speaking to them again.")
+        return false, "order_not_delivered"
+    end
     local needs = rawget(_G, "KnoxSurvivorNeeds")
     if needs == nil then
         pcall(require, "KS_SurvivorNeeds")
@@ -558,20 +671,27 @@ function CompanionService.askNeeds(player, survivorId)
             end
         end
     end
+    local bridge = rawget(_G, "KnoxJavaBridge")
+    local ok, heard = pcall(function() return bridge:canHearOrder(character, player) end)
+    if ok and heard == true and KnoxPersistence.rememberObserverKnowledge ~= nil then
+        KnoxPersistence.rememberObserverKnowledge(CompanionService.getPlayerId(player), survivorId,
+            "report", {state=state, line=line}, worldAge())
+    end
     KnoxActivityFeed.speak(character, line)
     return true, line
 end
 
 function CompanionService.askNeedsAll(player)
-    local answered = 0
+    local answered, firstFailure = 0, nil
     for _, survivorId in ipairs(CompanionService.getCompanionIds(player)) do
-        local success = CompanionService.askNeeds(player, survivorId)
+        local success, reason = CompanionService.askNeeds(player, survivorId)
+        if not success and firstFailure == nil then firstFailure = reason end
         answered = answered + (success and 1 or 0)
     end
     if answered > 0 then
         KnoxActivityFeed.event("Party needs check.")
     end
-    return answered > 0, answered
+    return answered > 0, answered, answered > 0 and "checked" or firstFailure or "no_companions"
 end
 
 -- Sims-style social menu. Trust deltas run through the shared reputation
@@ -605,7 +725,8 @@ function CompanionService.socialAct(player, survivorId, act)
     if character == nil or playerId == nil then
         return false, availability
     end
-    if KnoxPersistence.isSurvivorHostileToPlayer(survivorId, playerId) then
+    local protectedTeam = hasPlayerAffiliation(survivorId)
+    if CompanionService.isSociallyHostileToPlayer(survivorId, playerId) then
         return false, "hostile"
     end
     local attentive, attentionReason = KnoxSurvivorRuntime.beginPlayerConversation(survivorId, player)
@@ -624,19 +745,23 @@ function CompanionService.socialAct(player, survivorId, act)
         return false, result
     end
     if result == "cooldown" then
-        KnoxSurvivorRuntime.endPlayerConversation(survivorId, player)
         -- Cooldowns only bite while upset; otherwise this is a quiet pass.
+        -- Retain attention just as Talk does; this refuses the reward, not
+        -- every other interaction in the open conversation.
         KnoxActivityFeed.speak(character, before < 25 and "Give me a minute." or "We just did that one.")
         return false, result
     end
     local after = tonumber(recorded.trust) or before
     signalOrder(player, survivorId, act)
     local line = definition.lines[((recorded.meetings - 1) % #definition.lines) + 1]
+    if protectedTeam and (act == "insult" or act == "slap") then
+        line = act == "slap" and "Do not touch me." or "Do not speak to me like that."
+    end
     KnoxActivityFeed.speak(character, line)
     if KnoxActivityFeed.reputation ~= nil then
         KnoxActivityFeed.reputation(character, after - before)
     end
-    if (act == "insult" or act == "slap") and after < 10 then
+    if not protectedTeam and (act == "insult" or act == "slap") and after < 10 then
         KnoxPersistence.setSurvivorHostileToPlayer(survivorId, playerId, true)
         socialSpeech(character, survivorId, "player_attack_warning", line)
         KnoxActivityFeed.event("The conversation turned hostile.")
@@ -664,13 +789,14 @@ function CompanionService.canRecruit(player, survivorId)
     if character == nil then
         return false, availability
     end
+    if not contactChannel(player, character) then return false, "no_contact" end
     if KnoxPersistence.isSurvivorHostileToPlayer(survivorId, playerId) then return false, "hostile" end
-    if not KnoxPersistence.isIndependentSurvivor(survivorId) then
-        return false, "not_independent"
-    end
     if KnoxPersistence.getTravelGroupFor(survivorId) ~= nil
         or KnoxPersistence.getFactionForSurvivor(survivorId) ~= nil then
         return false, "already_with_group"
+    end
+    if not KnoxPersistence.isIndependentSurvivor(survivorId) then
+        return false, "not_independent"
     end
     if #KnoxPersistence.getCompanionIds(playerId) >= KnoxSettings.companionLimit() then
         return false, "companion_limit"
@@ -703,6 +829,7 @@ function CompanionService.recruit(player, survivorId)
     local ready, reason, trust = CompanionService.canRecruit(player, survivorId)
     local character = KnoxSurvivorRuntime.getCharacter(survivorId)
     if not ready then
+        if reason == "no_contact" then return false, reason end
         if character ~= nil then
             local line = reason == "already_with_group"
                 and "I'm already travelling with people."
@@ -762,6 +889,7 @@ function CompanionService.recruit(player, survivorId)
     if character ~= nil then
         KnoxActivityFeed.speak(character, "All right. I'll come with you.")
     end
+    CompanionService.rememberCommitment(player, survivorId)
     KnoxSurvivorRuntime.notifyDutyChanged(survivorId)
     KnoxActivityFeed.event(displayName(survivorId) .. " joined you.")
     print(
@@ -771,7 +899,7 @@ function CompanionService.recruit(player, survivorId)
     return true, "recruited"
 end
 
-function CompanionService.command(player, survivorId, order, suppressSignal)
+function CompanionService.command(player, survivorId, order, suppressSignal, batch)
     local playerId = CompanionService.getPlayerId(player)
     if playerId == nil or not KnoxOrderCatalog.isPrimaryOrder(order)
         or (order ~= "follow" and order ~= "hold" and order ~= "relax") then
@@ -781,6 +909,8 @@ function CompanionService.command(player, survivorId, order, suppressSignal)
         local accepted, reason = KnoxSurvivorRuntime.canAcceptOrders(survivorId)
         if not accepted then return false, reason end
     end
+    local delivered, delivery = CompanionService.deliverOrder(player, survivorId, order, batch)
+    if not delivered then return false, delivery end
     if not KnoxPersistence.updateCompanionOrder(
         survivorId,
         playerId,
@@ -789,6 +919,8 @@ function CompanionService.command(player, survivorId, order, suppressSignal)
     ) then
         return false, "not_your_companion"
     end
+    CompanionService.excludePartyDestinationRecipient(player, survivorId)
+    CompanionService.rememberCommitment(player, survivorId)
     KnoxSurvivorRuntime.notifyDutyChanged(survivorId)
     local character = KnoxSurvivorRuntime.getCharacter(survivorId)
     if character ~= nil then
@@ -798,17 +930,19 @@ function CompanionService.command(player, survivorId, order, suppressSignal)
                 or (order == "relax" and "I'll take a breather." or "I'll stay here.")
         )
     end
-    if not suppressSignal then signalOrder(player, survivorId, order) end
+    signalOrder(player, survivorId, order)
     return true, order
 end
 
 function CompanionService.commandAll(player, order)
+    local batch = {}
     local ids = CompanionService.getCompanionIds(player)
-    local changed = 0
+    local changed, firstFailure = 0, nil
     local members = {}
     for _, survivorId in ipairs(ids) do
-        local success = CompanionService.command(player, survivorId, order, true)
+        local success, reason = CompanionService.command(player, survivorId, order, true, batch)
         changed = changed + (success and 1 or 0)
+        if not success and firstFailure == nil then firstFailure = reason end
         if success then
             local character = KnoxSurvivorRuntime.getCharacter(survivorId)
             if character ~= nil then members[#members + 1] = character end
@@ -820,13 +954,18 @@ function CompanionService.commandAll(player, order)
             hold = "Party order: hold position.",
             relax = "Party order: rest and recover.",
         }
-        KnoxActivityFeed.event(messages[order] or "Party order updated.")
+        local message = messages[order] or "Party order updated."
+        if changed < #ids then
+            message = message .. " " .. tostring(changed) .. " of " .. tostring(#ids)
+                .. " companions received it."
+        end
+        KnoxActivityFeed.event(message)
         local signals = rawget(_G, "KnoxOrderSignals")
         if signals ~= nil and signals.group ~= nil then
             signals.group(player, members, order)
         end
     end
-    return changed > 0, changed
+    return changed > 0, changed, changed > 0 and "updated" or firstFailure or "no_companions"
 end
 
 -- Single player-facing dispatch point.  The catalogue describes the order;
@@ -868,9 +1007,6 @@ function CompanionService.issueOrder(player, survivorId, kind, payload)
     -- preference branch below.
     if payload ~= nil and normalizedKind == "patrol" then
         normalizedKind = "patrol_area"
-    end
-    if PARTY_DESTINATION_SUPERSEDING_ORDERS[normalizedKind] then
-        CompanionService.excludePartyDestinationRecipient(player, survivorId)
     end
     if normalizedKind == "follow" or normalizedKind == "hold" or normalizedKind == "relax" then
         return CompanionService.command(player, survivorId, normalizedKind)
@@ -1001,6 +1137,8 @@ end
 -- This keeps ownership validation and runtime refresh in one place without
 -- creating a second command or scheduling system.
 function CompanionService.assignBaseTask(player, survivorId, baseId, taskId)
+    local delivered, delivery = CompanionService.deliverOrder(player, survivorId, "job")
+    if not delivered then return nil, delivery end
     local playerId = CompanionService.getPlayerId(player)
     if playerId == nil or baseId == nil or taskId == nil or survivorId == nil then
         return nil, "invalid_assignment"
@@ -1156,13 +1294,31 @@ function CompanionService.issuePartyDestination(player, directive)
     local playerId = CompanionService.getPlayerId(player)
     if playerId == nil then return false, 0, "invalid_player" end
     if not validPartyDestination(directive) then
-        clearPartyDestinationRecord(playerId, "invalid_destination")
         return false, 0, "destination_unavailable"
     end
     local recipients = playerPartyMemberIds(playerId)
     if #recipients == 0 then
-        clearPartyDestinationRecord(playerId, "roster_invalid")
         return false, 0, "no_eligible_companions"
+    end
+    local checked, contactIds = {}, {}
+    local old = partyDestinations[playerId]
+    for _, roster in ipairs({recipients, old ~= nil and old.recipientIds or {}}) do
+        for _, id in ipairs(roster) do
+            if not checked[id] then
+                local contact, reason = CompanionService.orderContact(player, id)
+                if not contact then
+                    if KnoxActivityFeed.event ~= nil then KnoxActivityFeed.event("Cannot reach every party member. Existing destination continues.") end
+                    return false, 0, reason
+                end
+                checked[id] = true
+                contactIds[#contactIds+1] = id
+            end
+        end
+    end
+    local batch = {}
+    for _, id in ipairs(contactIds) do
+        local delivered, reason = CompanionService.deliverOrder(player, id, "go_to", batch)
+        if not delivered then return false, 0, reason end
     end
     local x, y, z = tonumber(directive.minX), tonumber(directive.minY), tonumber(directive.z)
     local destination = { kind = "go_to", minX = x, minY = y,
@@ -1178,6 +1334,7 @@ function CompanionService.issuePartyDestination(player, directive)
     clearPartyDestinationRecord(playerId, "replaced")
     partyDestinations[playerId] = record
     for _, id in ipairs(recipients) do
+        signalOrder(player, id, "go_to")
         if KnoxSurvivorRuntime ~= nil and KnoxSurvivorRuntime.notifyDutyChanged ~= nil then
             KnoxSurvivorRuntime.notifyDutyChanged(id)
         end
@@ -1185,23 +1342,33 @@ function CompanionService.issuePartyDestination(player, directive)
     if KnoxActivityFeed ~= nil and KnoxActivityFeed.event ~= nil then
         KnoxActivityFeed.event("Party destination set for " .. tostring(#recipients) .. " companions.")
     end
-    local signals = rawget(_G, "KnoxOrderSignals")
-    if signals ~= nil and signals.group ~= nil then
-        local members = {}
-        for _, id in ipairs(recipients) do
-            local character = KnoxSurvivorRuntime.getCharacter ~= nil
-                and KnoxSurvivorRuntime.getCharacter(id) or nil
-            if character ~= nil then members[#members + 1] = character end
-        end
-        signals.group(player, members, "go_to")
-    end
     return true, #recipients, "destination_set"
 end
 
 function CompanionService.cancelPartyDestination(player)
     local playerId = CompanionService.getPlayerId(player)
     if playerId == nil then return false, 0, "invalid_player" end
+    local record = partyDestinations[playerId]
+    if record ~= nil then
+        for _, id in ipairs(record.recipientIds) do
+            local contact, reason = CompanionService.orderContact(player, id)
+            if not contact then
+                if reason == "order_not_delivered" and KnoxActivityFeed ~= nil and KnoxActivityFeed.event ~= nil then
+                    KnoxActivityFeed.event("Cannot reach every party member. Existing destination continues.")
+                end
+                return false, 0, reason
+            end
+        end
+        local batch = {}
+        for _, id in ipairs(record.recipientIds) do
+            local delivered, reason = CompanionService.deliverOrder(player, id, "follow", batch)
+            if not delivered then return false, 0, reason end
+        end
+    end
     local cleared, notified = clearPartyDestinationRecord(playerId, "cancelled")
+    if cleared then
+        for _, id in ipairs(record.recipientIds) do signalOrder(player, id, "follow") end
+    end
     if cleared and KnoxActivityFeed ~= nil and KnoxActivityFeed.event ~= nil then
         KnoxActivityFeed.event("Party destination cancelled.")
     end
@@ -1245,6 +1412,7 @@ function CompanionService.markPartyDestinationArrived(survivorId, revision)
 end
 
 function CompanionService.issueOrderAll(player, kind, payload)
+    local companionFailure
     local resolved, resolveResult
     if KnoxOrderCatalog.resolve ~= nil then
         resolved, resolveResult = KnoxOrderCatalog.resolve(kind)
@@ -1260,97 +1428,92 @@ function CompanionService.issueOrderAll(player, kind, payload)
     if payload ~= nil and normalizedKind == "patrol" then
         normalizedKind = "patrol_area"
     end
-    local partyDestinationCancelled = false
-    if normalizedKind ~= "go_to"
-        and PARTY_DESTINATION_SUPERSEDING_ORDERS[normalizedKind] then
-        partyDestinationCancelled = CompanionService.cancelPartyDestination(player) == true
-    end
+
     if normalizedKind == "follow" or normalizedKind == "hold" or normalizedKind == "relax" then
-        local success, changed = CompanionService.commandAll(player, normalizedKind)
-        return success, changed, success and "updated" or "no_companions"
+        return CompanionService.commandAll(player, normalizedKind)
     end
     if normalizedKind == "return_to_base" then
-        local changed = partyDestinationCancelled and 1 or 0
+        local changed, firstFailure = 0, nil
         for _, survivorId in ipairs(CompanionService.getCompanionIds(player)) do
-            local success = CompanionService.sendToBase(player, survivorId)
+            local success, reason = CompanionService.sendToBase(player, survivorId)
+            if not success and firstFailure == nil then firstFailure = reason end
             if success then changed = changed + 1 end
         end
-        return changed > 0, changed, changed > 0 and "returned" or "no_companions"
+        return changed > 0, changed, changed > 0 and "returned" or firstFailure or "no_companions"
     end
     if normalizedKind == "resume_normal_duty" then
-        local _, changed = CompanionService.clearDirectiveAll(player)
-        changed = changed + (partyDestinationCancelled and 1 or 0)
+        local _, changed, firstFailure = CompanionService.clearDirectiveAll(player)
         local playerId = CompanionService.getPlayerId(player)
         local manager = rawget(_G, "KnoxBaseManager")
         local base = manager ~= nil and playerId ~= nil
             and manager.getForOwner("player", playerId) or nil
         if base ~= nil and KnoxPersistence.getBaseResidentIds ~= nil then
             for _, residentId in ipairs(KnoxPersistence.getBaseResidentIds(base.id) or {}) do
-                local success = CompanionService.clearBaseSupplyOrder(player, residentId)
+                local success, reason = CompanionService.clearBaseSupplyOrder(player, residentId)
+                if not success and firstFailure == nil then firstFailure = reason end
                 if success then changed = changed + 1 end
             end
         end
-        return changed > 0, changed, changed > 0 and "cleared" or "no_directives"
+        return changed > 0, changed, changed > 0 and "cleared" or firstFailure or "no_directives"
     end
     -- Party actions reuse the existing per-member service methods. Recruit and
     -- dismiss intentionally remain individual-only so a broad click cannot
     -- change ownership for the whole party accidentally.
     if normalizedKind == "check_needs" then
-        local success, changed = CompanionService.askNeedsAll(player)
-        return success, changed, success and "checked" or "no_companions"
+        return CompanionService.askNeedsAll(player)
     end
     if normalizedKind == "go_to" and payload ~= nil then
         return CompanionService.issuePartyDestination(player, payload)
     end
     if normalizedKind == "enter_vehicle" then
-        local success, changed = CompanionService.boardAllPlayerVehicle(player)
-        return success, changed, success and "boarded" or "no_companions"
+        local success, changed, waiting, reason = CompanionService.boardAllPlayerVehicle(player)
+        return success, changed, reason
     end
     if normalizedKind == "exit_vehicle" then
-        local success, changed = CompanionService.exitAllVehicles(player)
-        return success, changed, success and "exited" or "no_companions"
+        return CompanionService.exitAllVehicles(player)
     end
     if normalizedKind == "allow_climbing"
         or normalizedKind == "disallow_climbing" then
-        local success, changed = CompanionService.setClimbingAll(
+        local success, changed, reason = CompanionService.setClimbingAll(
             player,
             normalizedKind == "allow_climbing"
         )
-        return success, changed, success and "updated" or "no_companions"
+        return success, changed, reason or (success and "updated" or "no_companions")
     end
     if normalizedKind == "allow_doors"
         or normalizedKind == "disallow_doors" then
-        local success, changed = CompanionService.setDoorOpeningAll(
+        local success, changed, reason = CompanionService.setDoorOpeningAll(
             player,
             normalizedKind == "allow_doors"
         )
-        return success, changed, success and "updated" or "no_companions"
+        return success, changed, reason or (success and "updated" or "no_companions")
     end
     if normalizedKind == "enable_autoloot"
         or normalizedKind == "disable_autoloot" then
-        local success, changed = CompanionService.setAutoLootAll(
+        local success, changed, reason = CompanionService.setAutoLootAll(
             player,
             normalizedKind == "enable_autoloot"
         )
-        return success, changed, success and "updated" or "no_companions"
+        return success, changed, reason or (success and "updated" or "no_companions")
     end
     if normalizedKind == "combat_stance" then
         local stance = type(payload) == "table" and payload.stance or payload
-        local success, changed = CompanionService.setCombatStanceAll(player, stance)
-        return success, changed, success and "updated" or "no_companions"
+        local success, changed, reason = CompanionService.setCombatStanceAll(player, stance)
+        return success, changed, reason or (success and "updated" or "no_companions")
     end
     if normalizedKind == "weapon_preference" then
         local preference = type(payload) == "table" and payload.preference or payload
-        local success, changed = CompanionService.setWeaponPreferenceAll(player, preference)
-        return success, changed, success and "updated" or "no_companions"
+        local success, changed, reason = CompanionService.setWeaponPreferenceAll(player, preference)
+        return success, changed, reason or (success and "updated" or "no_companions")
     end
     -- Without a selected area, resolve search orders per companion so each
     -- survivor searches near its own current body.  A shared player-centred
     -- directive would make a separated party converge on one stale square.
     if payload == nil and SEARCH_DIRECTIVES[normalizedKind] then
-        local changed = 0
+        local changed, firstFailure = 0, nil
         for _, survivorId in ipairs(CompanionService.getCompanionIds(player)) do
-            local success = CompanionService.issueOrder(player, survivorId, normalizedKind)
+            local success, reason = CompanionService.issueOrder(player, survivorId, normalizedKind)
+            if not success and firstFailure == nil then firstFailure = reason end
             if success then changed = changed + 1 end
         end
         -- A party-wide resource order also reaches the player's base
@@ -1366,12 +1529,13 @@ function CompanionService.issueOrderAll(player, kind, payload)
             for _, survivorId in ipairs(KnoxPersistence.getBaseResidentIds(base.id) or {}) do
                 local duty = KnoxPersistence.getSurvivorDuty(survivorId) or {}
                 if duty.mode == "base" then
-                    local success = CompanionService.issueOrder(player, survivorId, normalizedKind)
+                    local success, reason = CompanionService.issueOrder(player, survivorId, normalizedKind)
+                    if not success and firstFailure == nil then firstFailure = reason end
                     if success then changed = changed + 1 end
                 end
             end
         end
-        return changed > 0, changed, changed > 0 and "updated" or "no_companions"
+        return changed > 0, changed, changed > 0 and "updated" or firstFailure or "no_companions"
     end
     -- Guard/Patrol are also valid base preferences, but a party-wide command
     -- with no selected area should still reach travelling companions. Resolve
@@ -1379,22 +1543,24 @@ function CompanionService.issueOrderAll(player, kind, payload)
     -- path below and keep their persistent settlement duty.
     if payload == nil and (normalizedKind == "guard"
         or normalizedKind == "patrol" or normalizedKind == "patrol_area") then
-        local changed = 0
+        local changed, firstFailure = 0, nil
         for _, survivorId in ipairs(CompanionService.getCompanionIds(player)) do
-            local success = CompanionService.issueOrder(player, survivorId, normalizedKind)
+            local success, reason = CompanionService.issueOrder(player, survivorId, normalizedKind)
+            if not success and firstFailure == nil then firstFailure = reason end
             if success then changed = changed + 1 end
         end
         if changed > 0 then
             return true, changed, "updated"
         end
+        companionFailure = firstFailure
     end
     if payload ~= nil and KnoxOrderCatalog.isDirective(normalizedKind) then
         local directive, result = KnoxOrderCatalog.makeDirective(normalizedKind, payload)
         if directive == nil then
             return false, 0, result
         end
-        local success, changed = CompanionService.issueDirectiveAll(player, directive)
-        return success, changed, success and "updated" or "no_companions"
+        local success, changed, reason = CompanionService.issueDirectiveAll(player, directive)
+        return success, changed, reason or (success and "updated" or "no_companions")
     end
     if KnoxOrderCatalog.isBasePreference(normalizedKind) then
         local playerId = CompanionService.getPlayerId(player)
@@ -1402,16 +1568,17 @@ function CompanionService.issueOrderAll(player, kind, payload)
         local base = manager ~= nil and playerId ~= nil
             and manager.getForOwner("player", playerId) or nil
         if base == nil or KnoxPersistence.getBaseResidentIds == nil then
-            return false, 0, "no_player_base"
+            return false, 0, companionFailure or "no_player_base"
         end
-        local changed = 0
+        local changed, firstFailure = 0, nil
         for _, survivorId in ipairs(KnoxPersistence.getBaseResidentIds(base.id) or {}) do
-            local success = CompanionService.setBaseJobPreference(
+            local success, reason = CompanionService.setBaseJobPreference(
                 player, survivorId, normalizedKind
             )
+            if not success and firstFailure == nil then firstFailure = reason end
             if success then changed = changed + 1 end
         end
-        return changed > 0, changed, changed > 0 and "updated" or "no_residents"
+        return changed > 0, changed, changed > 0 and "updated" or firstFailure or companionFailure or "no_residents"
     end
     local taskPreference = KnoxOrderCatalog.preferenceForTask ~= nil
         and KnoxOrderCatalog.preferenceForTask(normalizedKind) or nil
@@ -1421,32 +1588,37 @@ function CompanionService.issueOrderAll(player, kind, payload)
         local base = manager ~= nil and playerId ~= nil
             and manager.getForOwner("player", playerId) or nil
         if base == nil or KnoxPersistence.getBaseResidentIds == nil then
-            return false, 0, "no_player_base"
+            return false, 0, companionFailure or "no_player_base"
         end
-        local changed = 0
+        local changed, firstFailure = 0, nil
         for _, residentId in ipairs(KnoxPersistence.getBaseResidentIds(base.id) or {}) do
-            local success = CompanionService.setBaseJobPreference(
+            local success, reason = CompanionService.setBaseJobPreference(
                 player, residentId, taskPreference
             )
+            if not success and firstFailure == nil then firstFailure = reason end
             if success then changed = changed + 1 end
         end
-        return changed > 0, changed, changed > 0 and "updated" or "no_residents"
+        return changed > 0, changed, changed > 0 and "updated" or firstFailure or companionFailure or "no_residents"
+    end
+    if companionFailure ~= nil and payload == nil then
+        return false, 0, companionFailure
     end
     if KnoxOrderCatalog.isDirective(normalizedKind) then
         local directive, result = KnoxOrderCatalog.makeDirective(normalizedKind, payload)
         if directive == nil then
             return false, 0, result
         end
-        local success, changed = CompanionService.issueDirectiveAll(player, directive)
-        return success, changed, success and "updated" or "no_companions"
+        local success, changed, reason = CompanionService.issueDirectiveAll(player, directive)
+        return success, changed, reason or (success and "updated" or "no_companions")
     end
     return false, 0, "order_not_party_executable"
 end
 
 function CompanionService.boardAllPlayerVehicle(player)
-    local boarded, waiting = 0, 0
+    local boarded, waiting, firstFailure = 0, 0, nil
     for _, survivorId in ipairs(CompanionService.getCompanionIds(player)) do
         local success, result = CompanionService.boardPlayerVehicle(player, survivorId)
+        if not success and firstFailure == nil then firstFailure = result end
         boarded = boarded + (success and 1 or 0)
         waiting = waiting + (result == "no_free_passenger_seat" and 1 or 0)
     end
@@ -1455,22 +1627,25 @@ function CompanionService.boardAllPlayerVehicle(player)
     elseif waiting > 0 then
         KnoxActivityFeed.event("No passenger seats are available.")
     end
-    return boarded > 0, boarded, waiting
+    return boarded > 0, boarded, waiting, boarded > 0 and "boarded" or firstFailure or "no_companions"
 end
 
 function CompanionService.exitAllVehicles(player)
-    local exited = 0
+    local exited, firstFailure = 0, nil
     for _, survivorId in ipairs(CompanionService.getCompanionIds(player)) do
-        local success = CompanionService.exitVehicle(player, survivorId)
+        local success, reason = CompanionService.exitVehicle(player, survivorId)
+        if not success and firstFailure == nil then firstFailure = reason end
         exited = exited + (success and 1 or 0)
     end
     if exited > 0 then
         KnoxActivityFeed.event("Party order: get out of the vehicle.")
     end
-    return exited > 0, exited
+    return exited > 0, exited, exited > 0 and "exited" or firstFailure or "no_companions"
 end
 
-function CompanionService.setFormation(player, survivorId, formation, spacing)
+function CompanionService.setFormation(player, survivorId, formation, spacing, batch)
+    local delivered, reason = CompanionService.deliverOrder(player, survivorId, "formation", batch, formation)
+    if not delivered then return false, reason end
     local playerId = CompanionService.getPlayerId(player)
     if playerId == nil or not KnoxPersistence.setCompanionFormation(
         survivorId, playerId, formation, spacing, worldAge()) then
@@ -1481,7 +1656,9 @@ function CompanionService.setFormation(player, survivorId, formation, spacing)
     return true, "formation_updated"
 end
 
-function CompanionService.setCombatStance(player, survivorId, stance)
+function CompanionService.setCombatStance(player, survivorId, stance, batch)
+    local delivered, reason = CompanionService.deliverOrder(player, survivorId, "combat_stance", batch, stance)
+    if not delivered then return false, reason end
     local playerId = CompanionService.getPlayerId(player)
     if playerId == nil or not KnoxPersistence.setCompanionCombatStance(
         survivorId, playerId, stance, worldAge()
@@ -1503,12 +1680,15 @@ function CompanionService.setCombatStance(player, survivorId, stance)
 end
 
 function CompanionService.setCombatStanceAll(player, stance)
+    local batch = {}
+    local firstFailure
     if stance ~= "passive" and stance ~= "defensive" and stance ~= "aggressive" then
-        return false, "invalid_stance"
+        return false, 0, "invalid_stance"
     end
     local changed = 0
     for _, survivorId in ipairs(CompanionService.getCompanionIds(player)) do
-        local success = CompanionService.setCombatStance(player, survivorId, stance)
+        local success, reason = CompanionService.setCombatStance(player, survivorId, stance, batch)
+        if not success and firstFailure == nil then firstFailure = reason end
         changed = changed + (success and 1 or 0)
     end
     if changed > 0 then
@@ -1519,10 +1699,12 @@ function CompanionService.setCombatStanceAll(player, stance)
         }
         KnoxActivityFeed.event("Party combat stance: " .. (labels[stance] or stance) .. ".")
     end
-    return changed > 0, changed
+    return changed > 0, changed, changed > 0 and "updated" or firstFailure or "no_companions"
 end
 
-function CompanionService.setWeaponPreference(player, survivorId, preference)
+function CompanionService.setWeaponPreference(player, survivorId, preference, batch)
+    local delivered, reason = CompanionService.deliverOrder(player, survivorId, "weapon_preference", batch, preference)
+    if not delivered then return false, reason end
     local playerId = CompanionService.getPlayerId(player)
     if playerId == nil or not KnoxPersistence.setCompanionWeaponPreference(
         survivorId, playerId, preference, worldAge()
@@ -1533,17 +1715,24 @@ function CompanionService.setWeaponPreference(player, survivorId, preference)
 end
 
 function CompanionService.setWeaponPreferenceAll(player, preference)
+    local batch = {}
+    local firstFailure
     if preference ~= "melee" and preference ~= "ranged" and preference ~= "auto" then
-        return false, "invalid_weapon_preference"
+        return false, 0, "invalid_weapon_preference"
     end
     local changed = 0
     for _, id in ipairs(CompanionService.getCompanionIds(player)) do
-        if CompanionService.setWeaponPreference(player, id, preference) then changed = changed + 1 end
+        local success, reason = CompanionService.setWeaponPreference(player, id, preference, batch)
+        if success then changed = changed + 1
+        elseif firstFailure == nil then firstFailure = reason end
     end
-    return changed > 0, changed
+    return changed > 0, changed, changed > 0 and "updated" or firstFailure or "no_companions"
 end
 
-function CompanionService.setAutoEquipment(player, survivorId, allowed, quiet)
+function CompanionService.setAutoEquipment(player, survivorId, allowed, quiet, batch)
+    local delivered, reason = CompanionService.deliverOrder(player, survivorId,
+        allowed == true and "enable_auto_equipment" or "disable_auto_equipment", batch)
+    if not delivered then return false, reason end
     local playerId = CompanionService.getPlayerId(player)
     if playerId == nil or (allowed ~= true and allowed ~= false)
         or KnoxPersistence.setPlayerAutoEquipment == nil
@@ -1560,6 +1749,8 @@ function CompanionService.setAutoEquipment(player, survivorId, allowed, quiet)
             controller:setAutoEquipmentPolicy(allowed)
         end
     end)
+    signalOrder(player, survivorId,
+        allowed and "enable_auto_equipment" or "disable_auto_equipment")
     if not quiet then
         local character = KnoxSurvivorRuntime.getCharacter(survivorId)
         if character ~= nil then
@@ -1567,19 +1758,21 @@ function CompanionService.setAutoEquipment(player, survivorId, allowed, quiet)
                 and "I'll improve my gear when I find something better."
                 or "I'll keep the gear I'm using.")
         end
-        signalOrder(player, survivorId,
-            allowed and "enable_auto_equipment" or "disable_auto_equipment")
+
     end
     return true, allowed and "auto_equipment_enabled" or "auto_equipment_disabled"
 end
 
 function CompanionService.setAutoEquipmentAll(player, allowed)
+    local batch = {}
+    local firstFailure
     if allowed ~= true and allowed ~= false then
         return false, 0, "invalid_auto_equipment_policy"
     end
     local changed, members = 0, {}
     for _, survivorId in ipairs(CompanionService.getCompanionIds(player)) do
-        local success = CompanionService.setAutoEquipment(player, survivorId, allowed, true)
+        local success, reason = CompanionService.setAutoEquipment(player, survivorId, allowed, true, batch)
+        if not success and firstFailure == nil then firstFailure = reason end
         if success then
             changed = changed + 1
             local character = KnoxSurvivorRuntime.getCharacter(survivorId)
@@ -1596,10 +1789,12 @@ function CompanionService.setAutoEquipmentAll(player, allowed)
                 allowed and "enable_auto_equipment" or "disable_auto_equipment")
         end
     end
-    return changed > 0, changed, changed > 0 and "updated" or "no_companions"
+    return changed > 0, changed, changed > 0 and "updated" or firstFailure or "no_companions"
 end
 
 function CompanionService.boardPlayerVehicle(player, survivorId)
+    local delivered, delivery = CompanionService.deliverOrder(player, survivorId, "enter_vehicle")
+    if not delivered then return false, delivery end
     if not isPlayerCompanion(player, survivorId) then return false, "not_companion" end
     local character, reason = validateInteraction(player, survivorId, 30 * 30)
     if character == nil then return false, reason end
@@ -1607,6 +1802,7 @@ function CompanionService.boardPlayerVehicle(player, survivorId)
     if vehicle == nil then return false, "player_not_in_vehicle" end
     local success, result = KnoxCompanionVehicles.board(character, vehicle)
     if success then
+        CompanionService.excludePartyDestinationRecipient(player, survivorId)
         local seat = tostring(result or ""):match("boarding_seat=(%d+)")
         KnoxActivityFeed.speak(character, seat ~= nil
             and "Taking passenger seat " .. seat .. "." or "Taking a passenger seat.")
@@ -1618,6 +1814,8 @@ function CompanionService.boardPlayerVehicle(player, survivorId)
 end
 
 function CompanionService.drivePlayerVehicle(player, survivorId)
+    local delivered, delivery = CompanionService.deliverOrder(player, survivorId, "drive_ahead")
+    if not delivered then return false, delivery end
     if not isPlayerCompanion(player, survivorId) then return false, "not_companion" end
     local character, reason = validateInteraction(player, survivorId, 30 * 30)
     if character == nil then return false, reason end
@@ -1629,12 +1827,15 @@ function CompanionService.drivePlayerVehicle(player, survivorId)
     end
     local success, result = KnoxCompanionVehicles.driveAhead(character, vehicle)
     if success then
+        CompanionService.excludePartyDestinationRecipient(player, survivorId)
         KnoxActivityFeed.speak(character, "Taking the driver's seat. I'll drive us ahead.")
     end
     return success, result
 end
 
 function CompanionService.drivePlayerVehicleTo(player,survivorId,x,y)
+    local delivered, delivery = CompanionService.deliverOrder(player, survivorId, "drive_ahead")
+    if not delivered then return false, delivery end
     if not isPlayerCompanion(player,survivorId) then return false,"not_companion" end
     local character,reason=validateInteraction(player,survivorId,30*30)
     if character==nil then return false,reason end
@@ -1647,17 +1848,21 @@ function CompanionService.drivePlayerVehicleTo(player,survivorId,x,y)
     local square=vehicle:getSquare()
     if square==nil then return false,"vehicle_unavailable" end
     local success,result=KnoxCompanionVehicles.driveTo(character,vehicle,x,y,square:getZ())
-    if success then KnoxActivityFeed.speak(character,"Taking the driver's seat. I'll drive us there.") end
+    if success then
+        CompanionService.excludePartyDestinationRecipient(player, survivorId) KnoxActivityFeed.speak(character,"Taking the driver's seat. I'll drive us there.") end
     return success,result
 end
 
 function CompanionService.driveNearestVehicle(player, survivorId)
+    local delivered, delivery = CompanionService.deliverOrder(player, survivorId, "drive_nearest_vehicle")
+    if not delivered then return false, delivery end
     if not isPlayerCompanion(player, survivorId) then return false, "not_companion" end
     if player == nil or player:getVehicle() ~= nil then return false, "player_in_vehicle" end
     local character, reason = validateInteraction(player, survivorId, 30 * 30)
     if character == nil then return false, reason end
     local success, result, vehicle = KnoxCompanionVehicles.driveNearest(character, 30)
     if success then
+        CompanionService.excludePartyDestinationRecipient(player, survivorId)
         KnoxActivityFeed.speak(character, "I'll take the nearest usable car and drive ahead.")
         signalOrder(player, survivorId, "drive_nearest_vehicle")
     end
@@ -1665,6 +1870,8 @@ function CompanionService.driveNearestVehicle(player, survivorId)
 end
 
 function CompanionService.stopPlayerVehicle(player,survivorId)
+    local delivered, delivery = CompanionService.deliverOrder(player, survivorId, "hold")
+    if not delivered then return false, delivery end
     if not isPlayerCompanion(player,survivorId) then return false,"not_companion" end
     local character,reason=validateInteraction(player,survivorId,30*30)
     if character==nil then return false,reason end
@@ -1760,18 +1967,24 @@ function CompanionService.unstick(player, survivorId)
 end
 
 function CompanionService.exitVehicle(player, survivorId)
+    local delivered, delivery = CompanionService.deliverOrder(player, survivorId, "exit_vehicle")
+    if not delivered then return false, delivery end
     if not isPlayerCompanion(player, survivorId) then return false, "not_companion" end
     local character, reason = validateInteraction(player, survivorId)
     if character == nil then return false, reason end
     local success, result = KnoxCompanionVehicles.exit(character)
     if success then
+        CompanionService.excludePartyDestinationRecipient(player, survivorId)
         KnoxActivityFeed.speak(character, "Getting out.")
         signalOrder(player, survivorId, "exit_vehicle")
     end
     return success, result
 end
 
-function CompanionService.setClimbing(player, survivorId, allowed)
+function CompanionService.setClimbing(player, survivorId, allowed, batch)
+    local delivered, reason = CompanionService.deliverOrder(player, survivorId,
+        allowed == true and "allow_climbing" or "disallow_climbing", batch)
+    if not delivered then return false, reason end
     local playerId = CompanionService.getPlayerId(player)
     if playerId == nil or not KnoxPersistence.setCompanionClimbing(
         survivorId,
@@ -1788,9 +2001,12 @@ function CompanionService.setClimbing(player, survivorId, allowed)
 end
 
 function CompanionService.setClimbingAll(player, allowed)
+    local batch = {}
+    local firstFailure
     local changed = 0
     for _, survivorId in ipairs(CompanionService.getCompanionIds(player)) do
-        local success = CompanionService.setClimbing(player, survivorId, allowed)
+        local success, reason = CompanionService.setClimbing(player, survivorId, allowed, batch)
+        if not success and firstFailure == nil then firstFailure = reason end
         changed = changed + (success and 1 or 0)
     end
     if changed > 0 then
@@ -1798,10 +2014,13 @@ function CompanionService.setClimbingAll(player, allowed)
             and "Party traversal: vaulting and climbing allowed."
             or "Party traversal: vaulting and climbing disabled.")
     end
-    return changed > 0, changed
+    return changed > 0, changed, changed > 0 and "updated" or firstFailure or "no_companions"
 end
 
-function CompanionService.setDoorOpening(player, survivorId, allowed, quiet)
+function CompanionService.setDoorOpening(player, survivorId, allowed, quiet, batch)
+    local delivered, reason = CompanionService.deliverOrder(player, survivorId,
+        allowed == true and "allow_doors" or "disallow_doors", batch)
+    if not delivered then return false, reason end
     local playerId = CompanionService.getPlayerId(player)
     if playerId == nil or not KnoxPersistence.setCompanionDoorOpening(
         survivorId,
@@ -1822,6 +2041,8 @@ function CompanionService.setDoorOpening(player, survivorId, allowed, quiet)
             controller:setDoorWindowOpeningPolicy(allowed == true)
         end
     end)
+    signalOrder(player, survivorId,
+        allowed == true and "allow_doors" or "disallow_doors")
     if not quiet then
         local character = KnoxSurvivorRuntime.getCharacter(survivorId)
         if character ~= nil then
@@ -1829,13 +2050,15 @@ function CompanionService.setDoorOpening(player, survivorId, allowed, quiet)
                 and "I'll use doors and windows."
                 or "I won't touch doors or windows.")
         end
-        signalOrder(player, survivorId,
-            allowed == true and "allow_doors" or "disallow_doors")
+
     end
     return true, allowed == true and "doors_allowed" or "doors_disabled"
 end
 
-function CompanionService.setAutoLoot(player, survivorId, allowed, quiet)
+function CompanionService.setAutoLoot(player, survivorId, allowed, quiet, batch)
+    local delivered, reason = CompanionService.deliverOrder(player, survivorId,
+        allowed == true and "enable_autoloot" or "disable_autoloot", batch)
+    if not delivered then return false, reason end
     local playerId = CompanionService.getPlayerId(player)
     if playerId == nil or not KnoxPersistence.setCompanionAutoLoot(
         survivorId,
@@ -1855,6 +2078,8 @@ function CompanionService.setAutoLoot(player, survivorId, allowed, quiet)
             controller:setAutoLootPolicy(allowed == true)
         end
     end)
+    signalOrder(player, survivorId,
+        allowed == true and "enable_autoloot" or "disable_autoloot")
     if not quiet then
         local character = KnoxSurvivorRuntime.getCharacter(survivorId)
         if character ~= nil then
@@ -1862,16 +2087,18 @@ function CompanionService.setAutoLoot(player, survivorId, allowed, quiet)
                 and "I'll pick up useful things nearby and look for food when we're settled."
                 or "I won't pick anything up.")
         end
-        signalOrder(player, survivorId,
-            allowed == true and "enable_autoloot" or "disable_autoloot")
+
     end
     return true, allowed == true and "autoloot_enabled" or "autoloot_disabled"
 end
 
 function CompanionService.setAutoLootAll(player, allowed)
+    local batch = {}
+    local firstFailure
     local changed, members = 0, {}
     for _, survivorId in ipairs(CompanionService.getCompanionIds(player)) do
-        local success = CompanionService.setAutoLoot(player, survivorId, allowed, true)
+        local success, reason = CompanionService.setAutoLoot(player, survivorId, allowed, true, batch)
+        if not success and firstFailure == nil then firstFailure = reason end
         if success then
             changed = changed + 1
             local character = KnoxSurvivorRuntime.getCharacter(survivorId)
@@ -1888,13 +2115,16 @@ function CompanionService.setAutoLootAll(player, allowed)
                 allowed == true and "enable_autoloot" or "disable_autoloot")
         end
     end
-    return changed > 0, changed
+    return changed > 0, changed, changed > 0 and "updated" or firstFailure or "no_companions"
 end
 
 function CompanionService.setDoorOpeningAll(player, allowed)
+    local batch = {}
+    local firstFailure
     local changed, members = 0, {}
     for _, survivorId in ipairs(CompanionService.getCompanionIds(player)) do
-        local success = CompanionService.setDoorOpening(player, survivorId, allowed, true)
+        local success, reason = CompanionService.setDoorOpening(player, survivorId, allowed, true, batch)
+        if not success and firstFailure == nil then firstFailure = reason end
         if success then
             changed = changed + 1
             local character = KnoxSurvivorRuntime.getCharacter(survivorId)
@@ -1911,10 +2141,10 @@ function CompanionService.setDoorOpeningAll(player, allowed)
                 allowed == true and "allow_doors" or "disallow_doors")
         end
     end
-    return changed > 0, changed
+    return changed > 0, changed, changed > 0 and "updated" or firstFailure or "no_companions"
 end
 
-function CompanionService.issueDirective(player, survivorId, directive, suppressSignal)
+function CompanionService.issueDirective(player, survivorId, directive, suppressSignal, batch)
     local playerId = CompanionService.getPlayerId(player)
     if type(directive) ~= "table" then
         return false, "invalid_directive"
@@ -1932,6 +2162,12 @@ function CompanionService.issueDirective(player, survivorId, directive, suppress
         canonical.kind = normalizedKind
         directive = canonical
     end
+    if KnoxSurvivorRuntime.canAcceptOrders ~= nil then
+        local accepted, reason = KnoxSurvivorRuntime.canAcceptOrders(survivorId)
+        if not accepted then return false, reason end
+    end
+    local delivered, delivery = CompanionService.deliverOrder(player, survivorId, directive.kind, batch)
+    if not delivered then return false, delivery end
     if playerId == nil or not KnoxPersistence.setCompanionDirective(
         survivorId,
         playerId,
@@ -1941,6 +2177,7 @@ function CompanionService.issueDirective(player, survivorId, directive, suppress
         return false, "not_your_companion"
     end
     CompanionService.excludePartyDestinationRecipient(player, survivorId)
+    CompanionService.rememberCommitment(player, survivorId)
     KnoxSurvivorRuntime.notifyDutyChanged(survivorId)
     local character = KnoxSurvivorRuntime.getCharacter(survivorId)
     if character ~= nil and KnoxActivityFeed ~= nil and KnoxActivityFeed.speak ~= nil then
@@ -1954,15 +2191,18 @@ function CompanionService.issueDirective(player, survivorId, directive, suppress
         }
         KnoxActivityFeed.speak(character, lines[directive.kind] or "I'll take care of it.")
     end
-    if not suppressSignal then signalOrder(player, survivorId, directive.kind) end
+    signalOrder(player, survivorId, directive.kind)
     return true, tostring(directive.kind)
 end
 
 function CompanionService.issueDirectiveAll(player, directive)
+    local batch = {}
+    local firstFailure
     local changed = 0
     local members = {}
     for _, survivorId in ipairs(CompanionService.getCompanionIds(player)) do
-        local success = CompanionService.issueDirective(player, survivorId, directive, true)
+        local success, reason = CompanionService.issueDirective(player, survivorId, directive, true, batch)
+        if not success and firstFailure == nil then firstFailure = reason end
         changed = changed + (success and 1 or 0)
         if success then
             local character = KnoxSurvivorRuntime.getCharacter(survivorId)
@@ -1977,37 +2217,47 @@ function CompanionService.issueDirectiveAll(player, directive)
             signals.group(player, members, directive.kind)
         end
     end
-    return changed > 0, changed
+    return changed > 0, changed, changed > 0 and "updated" or firstFailure or "no_companions"
 end
 
-function CompanionService.clearDirective(player, survivorId)
+function CompanionService.clearDirective(player, survivorId, batch)
     local playerId = CompanionService.getPlayerId(player)
+    local delivered, reason = CompanionService.deliverOrder(player, survivorId, "follow", batch)
+    if not delivered then return false, reason end
     if playerId == nil or not KnoxPersistence.clearCompanionDirective(
         survivorId, playerId, worldAge()
     ) then
         return false, "not_your_companion"
     end
+    CompanionService.excludePartyDestinationRecipient(player, survivorId)
+    CompanionService.rememberCommitment(player, survivorId)
     KnoxSurvivorRuntime.notifyDutyChanged(survivorId)
     local character = KnoxSurvivorRuntime.getCharacter(survivorId)
     if character ~= nil then
         KnoxActivityFeed.speak(character, "I'll get back to my usual orders.")
     end
+    signalOrder(player, survivorId, "follow")
     return true, "cleared"
 end
 
 function CompanionService.clearDirectiveAll(player)
+    local batch = {}
+    local firstFailure
     local changed = 0
     for _, survivorId in ipairs(CompanionService.getCompanionIds(player)) do
-        local success = CompanionService.clearDirective(player, survivorId)
+        local success, reason = CompanionService.clearDirective(player, survivorId, batch)
+        if not success and firstFailure == nil then firstFailure = reason end
         changed = changed + (success and 1 or 0)
     end
     if changed > 0 then
         KnoxActivityFeed.event("Party order cleared: resume normal duty.")
     end
-    return changed > 0, changed
+    return changed > 0, changed, changed > 0 and "updated" or firstFailure or "no_companions"
 end
 
 function CompanionService.sendToBase(player, survivorId, baseId)
+    local delivered, delivery = CompanionService.deliverOrder(player, survivorId, "return_to_base")
+    if not delivered then return false, delivery end
     local playerId = CompanionService.getPlayerId(player)
     local manager = rawget(_G, "KnoxBaseManager")
     local base = nil
@@ -2032,7 +2282,9 @@ function CompanionService.sendToBase(player, survivorId, baseId)
         worldAge()
     )
     if saved then
-        KnoxSurvivorRuntime.notifyDutyChanged(survivorId)
+        CompanionService.excludePartyDestinationRecipient(player, survivorId)
+        CompanionService.rememberCommitment(player, survivorId)
+    KnoxSurvivorRuntime.notifyDutyChanged(survivorId)
         if character ~= nil then
             KnoxActivityFeed.speak(character, "I'll head back and help out there.")
         end
@@ -2067,6 +2319,8 @@ local function resolveOwnedPlayerBase(playerId, requestedBaseId)
 end
 
 function CompanionService.setBaseJobPreference(player, survivorId, preference, requestedBaseId)
+    local delivered, delivery = CompanionService.deliverOrder(player, survivorId, "job")
+    if not delivered then return false, delivery end
     local normalizedPreference = KnoxOrderCatalog.normalizeBasePreference ~= nil
         and KnoxOrderCatalog.normalizeBasePreference(preference)
         or KnoxOrderCatalog.normalize(preference)
@@ -2121,7 +2375,9 @@ end
 
 -- Duty-schedule write boundary for the base-tab UI. Ownership and shape are
 -- enforced by persistence; a nil schedule clears back to "anything".
-function CompanionService.setBaseDutySchedule(player, survivorId, schedule, requestedBaseId)
+function CompanionService.setBaseDutySchedule(player, survivorId, schedule, requestedBaseId, batch)
+    local delivered, reason = CompanionService.deliverOrder(player, survivorId, "job", batch)
+    if not delivered then return false, reason end
     local playerId = CompanionService.getPlayerId(player)
     local base = resolveOwnedPlayerBase(playerId, requestedBaseId)
     if base == nil or not KnoxPersistence.setBaseDutySchedule(
@@ -2141,7 +2397,9 @@ end
 
 -- Work-priority write boundary for the priorities-tab UI. Ownership and
 -- shape are enforced by persistence; a nil map clears back to automatic.
-function CompanionService.setBaseWorkPreferences(player, survivorId, preferences, requestedBaseId)
+function CompanionService.setBaseWorkPreferences(player, survivorId, preferences, requestedBaseId, batch)
+    local delivered, reason = CompanionService.deliverOrder(player, survivorId, "job", batch)
+    if not delivered then return false, reason end
     local playerId = CompanionService.getPlayerId(player)
     local base = resolveOwnedPlayerBase(playerId, requestedBaseId)
     if base == nil or not KnoxPersistence.setBaseWorkPreferences(
@@ -2156,6 +2414,8 @@ end
 CompanionService.setBaseWorkPriorities = CompanionService.setBaseWorkPreferences
 
 function CompanionService.setBaseSupplyOrder(player, survivorId, kind)
+    local delivered, delivery = CompanionService.deliverOrder(player, survivorId, "base_supply")
+    if not delivered then return false, delivery end
     local normalized = KnoxOrderCatalog.normalize(kind)
     local playerId = CompanionService.getPlayerId(player)
     local duty = KnoxPersistence.getSurvivorDuty(survivorId) or {}
@@ -2184,6 +2444,8 @@ function CompanionService.setBaseSupplyOrder(player, survivorId, kind)
 end
 
 function CompanionService.clearBaseSupplyOrder(player, survivorId)
+    local delivered, delivery = CompanionService.deliverOrder(player, survivorId, "follow")
+    if not delivered then return false, delivery end
     local playerId = CompanionService.getPlayerId(player)
     local duty = KnoxPersistence.getSurvivorDuty(survivorId) or {}
     if playerId == nil or duty.mode ~= "base" or duty.baseId == nil
@@ -2206,7 +2468,9 @@ end
 -- Per-resident loot-run permission: the player decides who may leave the
 -- base on automatic shortage runs. There is no global switch; residents
 -- stay home unless explicitly allowed here.
-function CompanionService.setResidentLootRuns(player, survivorId, allowed)
+function CompanionService.setResidentLootRuns(player, survivorId, allowed, batch)
+    local delivered, reason = CompanionService.deliverOrder(player, survivorId, "base_supply", batch)
+    if not delivered then return false, reason end
     local playerId = CompanionService.getPlayerId(player)
     local duty = KnoxPersistence.getSurvivorDuty(survivorId) or {}
     if playerId == nil or duty.mode ~= "base" or duty.baseId == nil
@@ -2228,20 +2492,22 @@ function CompanionService.setResidentLootRuns(player, survivorId, allowed)
 end
 
 -- Base-to-base transfer for multi-home owners (Missions callbacks, base
--- picker flows). Clears any in-flight supply order, then moves the
--- resident record; claims requeue through the existing persistence
--- boundary. Ownership and base validity stay in persistence.
+-- picker flows). The existing persistence boundary validates the destination
+-- before replacing duty (including supply intent) and requeueing old claims.
+-- A rejected destination must leave current work intact.
 function CompanionService.transferBaseResident(player, survivorId, baseId)
+    local delivered, delivery = CompanionService.deliverOrder(player, survivorId, "return_to_base")
+    if not delivered then return false, delivery end
     local playerId = CompanionService.getPlayerId(player)
     if playerId == nil or type(baseId) ~= "string" then
         return false, "invalid_transfer"
     end
     local now = worldAge()
-    KnoxPersistence.clearBaseSupplyOrder(survivorId, playerId, nil, now)
     local saved, result = KnoxPersistence.setPlayerBaseResident(
         survivorId, playerId, baseId, now
     )
     if not saved then return false, result end
+    CompanionService.rememberCommitment(player, survivorId)
     KnoxSurvivorRuntime.notifyDutyChanged(survivorId)
     return true, "transferred"
 end
@@ -2265,6 +2531,8 @@ function CompanionService.recallToParty(player, survivorId)
     if #CompanionService.getCompanionIds(player) >= KnoxSettings.companionLimit() then
         return false, "companion_limit"
     end
+    local delivered, reason = CompanionService.deliverOrder(player, survivorId, "follow")
+    if not delivered then return false, reason end
     local saved, result = KnoxPersistence.setPlayerCompanion(
         survivorId,
         playerId,
@@ -2272,7 +2540,8 @@ function CompanionService.recallToParty(player, survivorId)
         worldAge()
     )
     if saved then
-        KnoxSurvivorRuntime.notifyDutyChanged(survivorId)
+        CompanionService.rememberCommitment(player, survivorId)
+    KnoxSurvivorRuntime.notifyDutyChanged(survivorId)
         local character = KnoxSurvivorRuntime.getCharacter(survivorId)
         if character ~= nil then
             KnoxActivityFeed.speak(character, "I'm joining your party.")
@@ -2306,7 +2575,8 @@ function CompanionService.dismiss(player, survivorId)
         KnoxActivityFeed.speak(character, "Understood. Take care of yourself.")
     end
     if saved then
-        KnoxSurvivorRuntime.notifyDutyChanged(survivorId)
+        CompanionService.rememberCommitment(player, survivorId)
+    KnoxSurvivorRuntime.notifyDutyChanged(survivorId)
         signalOrder(player, survivorId, "dismiss")
     end
     return saved, saved and "dismissed" or "save_failed"
@@ -2316,9 +2586,23 @@ function CompanionService.syncController(survivorId, controller)
     if controller == nil then
         return
     end
+    if controller.canApplyDutyChange ~= nil and not controller:canApplyDutyChange() then
+        return false
+    end
+    -- Retire the old task/action in its original base context before setters
+    -- project a newly accepted role or base. Persistence remains authoritative.
+    if controller.pendingDutyChange and controller.onDutyChanged ~= nil then
+        if controller:onDutyChanged() == false then return false end
+    end
     local previous = syncCache[controller]
     local duty = KnoxPersistence.getSurvivorDuty(survivorId)
     local previousPlayerId = previous ~= nil and previous.ownerId or nil
+    -- Mission expiry changes canonical duty without a direct player command.
+    -- Retire its old route/actions before projection or a cache can hide it.
+    if controller.awayTeamId ~= nil and (duty == nil or duty.mode ~= "away"
+        or duty.awayTeamId ~= controller.awayTeamId) and controller.onDutyChanged ~= nil then
+        if controller:onDutyChanged() == false then return false end
+    end
     if duty == nil or duty.mode ~= "companion" then
         local priorOwnerId = previousPlayerId
             or (duty ~= nil and duty.ownerKind == "player" and duty.ownerId or nil)
@@ -2351,6 +2635,22 @@ function CompanionService.syncController(survivorId, controller)
     if partyDestination ~= nil then
         partyDestination.partyDestinationSlot = formationSlot
     end
+    -- Compare canonical travel intent, excluding presentation, policies and
+    -- formation churn. A ground order must not strand a former party rider.
+    local vehicleIntent = table.concat({
+        tostring(duty ~= nil and duty.mode or "independent"),
+        tostring(duty ~= nil and duty.ownerId or ""),
+        tostring(duty ~= nil and duty.baseId or ""),
+        tostring(duty ~= nil and duty.order or ""),
+        tostring(duty ~= nil and duty.directive or ""),
+    }, "|")
+    local exitsPartyRide = previous ~= nil and previous.ownerId ~= nil
+        and previous.vehicleIntent ~= vehicleIntent
+        and (duty == nil or duty.mode ~= "companion" or duty.order ~= "follow"
+            or duty.directive ~= nil or duty.ownerId ~= previous.ownerId)
+    local ridingCharacter = controller.character
+    local ridingVehicle = exitsPartyRide and ridingCharacter ~= nil
+        and ridingCharacter.getVehicle ~= nil and ridingCharacter:getVehicle() or nil
     local cacheKey
     if controller.setWeaponPreference ~= nil then
         local policies = KnoxPersistence.getSurvivorPolicies(survivorId) or {}
@@ -2424,7 +2724,11 @@ function CompanionService.syncController(survivorId, controller)
         end
         -- A failed setter must be retried, including when reverting to an older
         -- duty after a partially applied update.
-        syncCache[controller] = nil
+        -- Keep only the prior ownership/intent for a failed projection retry;
+        -- no key remains that could skip partially applied setters.
+        syncCache[controller] = previous ~= nil and {
+            ownerId = previous.ownerId, vehicleIntent = previous.vehicleIntent,
+        } or nil
         controller:setWeaponPreference(policies.weaponPreference)
         if controller.setDoorWindowOpeningPolicy ~= nil then
             controller:setDoorWindowOpeningPolicy(opening)
@@ -2486,9 +2790,17 @@ function CompanionService.syncController(survivorId, controller)
             controller:setCompanionDirective(nil)
         end
     end
+    -- Projection setters above may cancel native leases. Publish exit intent
+    -- only afterwards, through the existing vehicle receipt/retry owner.
+    local vehicles = rawget(_G, "KnoxCompanionVehicles")
+    if ridingVehicle ~= nil and ridingCharacter:getVehicle() == ridingVehicle
+        and vehicles ~= nil and vehicles.exitAfterPlayer ~= nil then
+        vehicles.exitAfterPlayer(ridingCharacter, ridingVehicle)
+    end
     if cacheKey ~= nil then
         syncCache[controller] = {
             key = cacheKey, player = player, bridge = bridge,
+            vehicleIntent = vehicleIntent,
             ownerId = duty ~= nil and duty.mode == "companion" and duty.ownerId or nil,
         }
     end

@@ -28,6 +28,12 @@ end
 
 local function pickMouseSquare(player)
     if player == nil or getCell() == nil then return nil, nil, nil, nil end
+    local compat = rawget(_G, "KnoxViewpointCompatibility")
+    if compat ~= nil and require("KS_SurvivorUILayout").isPerspective() then
+        local sq = compat.targetSquare(player)
+        if sq ~= nil then return sq, sq:getX(), sq:getY(), sq:getZ() end
+        return nil, nil, nil, player:getZ()
+    end
     local z = player:getZ()
     local mx, my = getMouseX(), getMouseY()
     local ok1, wx = pcall(function() return screenToIsoX(player:getPlayerNum(), mx, my, z) end)
@@ -38,10 +44,15 @@ local function pickMouseSquare(player)
 end
 
 local function draftTick()
-    if activeSelection == nil or activeSelection.firstSquare == nil or activeSelection.pendingConfirm then return end
+    if activeSelection == nil then return end
     local player = activeSelection.player
+    if player == nil or (player.isDead ~= nil and player:isDead()) then
+        activeSelection:onSquareSelectedCancel()
+        return
+    end
+    if activeSelection.firstSquare == nil or activeSelection.pendingConfirm then return end
     if player == nil then return end
-    if getCell():getDrag(player:getPlayerNum()) ~= activeSelection.cursor then
+    if not activeSelection.perspective and getCell():getDrag(player:getPlayerNum()) ~= activeSelection.cursor then
         activeSelection:onSquareSelectedCancel()
         return
     end
@@ -94,6 +105,8 @@ local function hookTick(instance)
 end
 
 local function unhookTick(instance)
+    local compat = rawget(_G, "KnoxViewpointCompatibility")
+    if compat ~= nil then compat.endSelection(instance) end
     if activeSelection == instance then activeSelection = nil end
     if activeSelection == nil and tickHooked then
         pcall(function() Events.OnTick.Remove(draftTick) end)
@@ -138,6 +151,8 @@ function Selection:confirmCreate(secondSquare)
     self.pendingConfirm = true
     local prompt = "Set home boundary  " .. tostring(w) .. "x" .. tostring(h) .. " (" .. tostring(w * h) .. " tiles, all floors)?"
     local modal = ISModalDialog:new(0, 0, 380, 150, prompt, true, nil, function(_, button)
+        if self.cancelled or self.firstSquare == nil then return end
+        self.confirmationModal = nil
         self.pendingConfirm = false
         unhookTick(self)
         clearDraftHighlight(self)
@@ -153,11 +168,15 @@ function Selection:confirmCreate(secondSquare)
         end
         self.cursor = nil
         self.firstSquare = nil
-    end)
+    end, self.player:getPlayerNum())
+    self.confirmationModal = modal
     modal:initialise()
     modal:addToUIManager()
     modal.moveWithMouse = true
-    if getJoypadData(self.player:getPlayerNum()) then
+    local joypad = getJoypadData(self.player:getPlayerNum())
+    if joypad then
+        local previous = joypad.focus
+        modal.prevFocus = previous ~= nil and previous.isVisible ~= nil and previous:isVisible() and previous or nil
         modal:centerOnScreen(self.player:getPlayerNum())
         setJoypadFocus(self.player:getPlayerNum(), modal)
     end
@@ -173,14 +192,20 @@ function Selection:onSquareSelected(square)
         self.firstSquare = square
         KnoxActivityFeed.event("First corner set at " .. tostring(square:getX()) .. "," .. tostring(square:getY()) .. ". Now click opposite corner — highlighted area is preview. Right-click cancels.")
         hookTick(self)
-        self.cursor = newSelectionCursor(self)
-        getCell():setDrag(self.cursor, self.player:getPlayerNum())
+        if not self.perspective then
+            self.cursor = newSelectionCursor(self)
+            getCell():setDrag(self.cursor, self.player:getPlayerNum())
+        end
         return
     end
     self:confirmCreate(square)
 end
 
 function Selection:onSquareSelectedCancel()
+    self.cancelled = true
+    local modal = self.confirmationModal
+    self.confirmationModal = nil
+    if modal ~= nil then modal:destroy() end
     unhookTick(self)
     clearDraftHighlight(self)
     self.cursor = nil
@@ -190,7 +215,8 @@ function Selection:onSquareSelectedCancel()
 end
 
 function BaseTerritorySelector.start(player, baseId)
-    if player == nil or getCell() == nil or ISSelectCursor == nil then
+    local perspective = require("KS_SurvivorUILayout").isPerspective()
+    if player == nil or getCell() == nil or (ISSelectCursor == nil and not perspective) then
         if KnoxActivityFeed ~= nil then
             KnoxActivityFeed.event("Area selection is not available in this game build.")
         end
@@ -203,6 +229,8 @@ function BaseTerritorySelector.start(player, baseId)
         cursor = nil,
         pendingConfirm = false,
     }, Selection)
+    local compat = rawget(_G, "KnoxViewpointCompatibility")
+    if perspective and compat ~= nil and compat.beginSelection(selection, "Set home boundary") then return true end
     selection.cursor = newSelectionCursor(selection)
     getCell():setDrag(selection.cursor, player:getPlayerNum())
     KnoxActivityFeed.event("Set home boundary: click first corner, then opposite corner. Highlighted area is preview. Confirm size to save. Right-click cancels.")

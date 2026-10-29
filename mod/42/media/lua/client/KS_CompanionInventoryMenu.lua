@@ -41,6 +41,11 @@ local function displayName(id)
 end
 
 function InventoryMenu.give(_, player, target, survivorId, items)
+    local playerNum = player ~= nil and player:getPlayerNum() or nil
+    if playerNum == nil or not KnoxCompanionInventory.canManage(playerNum, survivorId, target) then
+        KnoxActivityFeed.event("Cannot give items: stay close to one of your available survivors.")
+        return
+    end
     if player == nil or target == nil or target:getCurrentSquare() == nil then return end
     local destination = target:getInventory()
     local moved = 0
@@ -78,7 +83,11 @@ local function canSawLogs(character)
         and KnoxBaseWoodcutting.findSaw(character) ~= nil
 end
 
-function InventoryMenu.sawLogs(_, character, survivorId)
+function InventoryMenu.sawLogs(_, character, survivorId, playerNum)
+    if playerNum == nil or not KnoxCompanionInventory.canManage(playerNum, survivorId, character) then
+        KnoxActivityFeed.event("Cannot give this work order: stay close to one of your available survivors.")
+        return
+    end
     if not canSawLogs(character) then
         KnoxActivityFeed.event(displayName(survivorId) .. " is missing a saw or log.")
         return
@@ -101,7 +110,7 @@ local function addSawLogsOptions(context, player, items, companions)
     for _, item in ipairs(ISInventoryPane.getActualItems(items) or {}) do
         local owner, survivorId = nil, nil
         if KnoxCompanionInventory.getSurvivorForItem ~= nil then
-            owner, survivorId = KnoxCompanionInventory.getSurvivorForItem(item)
+            owner, survivorId = KnoxCompanionInventory.getSurvivorForItem(item, player:getPlayerNum())
         end
         if owner ~= nil and canSawLogs(owner) then
             survivorId = KnoxSurvivorRuntime.idForCharacter(owner)
@@ -131,7 +140,7 @@ local function addSawLogsOptions(context, player, items, companions)
     context:addSubMenu(root, menu)
     for _, entry in ipairs(actors) do
         menu:addOption("Have " .. displayName(entry.id) .. " saw logs",
-            InventoryMenu, InventoryMenu.sawLogs, entry.character, entry.id)
+            InventoryMenu, InventoryMenu.sawLogs, entry.character, entry.id, player:getPlayerNum())
     end
 end
 

@@ -12,8 +12,19 @@ public final class KnoxBridgeBootstrap {
     private static final long POLL_MILLIS = 250L;
     private static final int REQUIRED_STABLE_POLLS = 4;
     private static final KnoxBridge BRIDGE = new KnoxBridge();
+    private static Object adapterEnvironment;
 
     private KnoxBridgeBootstrap() { }
+
+    /** Both integrations expose this one instance; it owns the only NPC registry. */
+    public static KnoxBridge getBridge() { return BRIDGE; }
+
+    public static synchronized KnoxBridge getBridgeForEnvironment(Object current) {
+        if (current == null) return null;
+        if (adapterEnvironment != null && adapterEnvironment != current) BRIDGE.abandonForEnvironmentChange();
+        adapterEnvironment = current;
+        return BRIDGE;
+    }
 
     /** Uses instrumentation to observe already-loaded game classes. */
     public static void start(Instrumentation instrumentation) {
@@ -27,7 +38,7 @@ public final class KnoxBridgeBootstrap {
         );
         watchdog.setDaemon(true);
         watchdog.start();
-        KnoxAgent.writeLog("Lua bridge watchdog started source=knoxbridge-instrumentation");
+        KnoxAgent.writeLog("Lua bridge watchdog started source=" + KnoxAgent.getRuntimeSource());
     }
 
     private static void exposeWhenReady(Instrumentation instrumentation) {

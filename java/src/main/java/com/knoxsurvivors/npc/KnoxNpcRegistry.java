@@ -91,6 +91,28 @@ public final class KnoxNpcRegistry {
         return runtime == null ? "IDLE" : runtime.tickMovement();
     }
 
+    /** Observe a native receipt without running or replacing a movement request. */
+    public synchronized String observeNativeAction(String id) {
+        KnoxNpcRuntime runtime = activeNpcs.get(id);
+        if (runtime == null) return "IDLE";
+        try {
+            KnoxNpcFactory.observeNativeAction(runtime.npc());
+            return "NATIVE_ACTION:" + runtime.npc().getTraversalInteractionStage();
+        } catch (ReflectiveOperationException failure) {
+            return "FAILED_NATIVE_ACTION:" + failure.getClass().getSimpleName();
+        }
+    }
+
+    /** Clear only stale attack input while native recovery retains the actor. */
+    public synchronized String observeNativeRecovery(String id) {
+        KnoxNpcRuntime runtime=activeNpcs.get(id);
+        if (runtime==null) return "IDLE";
+        try { return runtime.combat().observeNativeRecovery(runtime.npc()); }
+        catch (ReflectiveOperationException failure) {
+            return "FAILED_NATIVE_RECOVERY:"+failure.getClass().getSimpleName();
+        }
+    }
+
     public synchronized String cancelMove(String id) {
         KnoxNpcRuntime runtime = activeNpcs.get(id);
         return runtime == null ? "MOVE_CANCEL_FAILED NONE_ACTIVE" : runtime.cancelMovement();
@@ -112,6 +134,20 @@ public final class KnoxNpcRegistry {
         }
         npc.setDoorWindowOpeningAllowed(allowed);
         return true;
+    }
+
+    public synchronized String openDoor(String id, Object door) {
+        KnoxNpc npc = npc(id);
+        if (npc == null) return "FAILED_NONE_ACTIVE";
+        try { return KnoxNpcFactory.openNativeDoor(npc, door); }
+        catch (Throwable failure) { return failure("FAILED_DOOR_OPEN", failure); }
+    }
+
+    public synchronized String closeOpenedDoor(String id) {
+        KnoxNpc npc = npc(id);
+        if (npc == null) return "FAILED_NONE_ACTIVE";
+        KnoxNpcFactory.closeOpenedDoorBehind(npc);
+        return npc.hasOpenedDoor() ? "DOOR_PENDING" : "DOOR_RETIRED";
     }
 
     public synchronized boolean setProtectedArea(
@@ -299,6 +335,13 @@ public final class KnoxNpcRegistry {
             return "COMBAT_FAILED NONE_ACTIVE";
         }
         try {
+            if (KnoxNpcFactory.hasNativeTraversalOwner(runtime.npc())) {
+                KnoxNpcFactory.observeNativeAction(runtime.npc());
+                return "COMBAT_DEFERRED NATIVE_ACTION";
+            }
+            if (KnoxCombatController.hasNativeRecoveryOwner(runtime.npc())) {
+                return "COMBAT_DEFERRED NATIVE_RECOVERY";
+            }
             return runtime.combat().beginLockedDoor(
                 runtime.npc(),
                 runtime.npc().getTraversalInteractionTarget()
@@ -324,6 +367,13 @@ public final class KnoxNpcRegistry {
             return "COMBAT_FAILED NONE_ACTIVE";
         }
         try {
+            if (KnoxNpcFactory.hasNativeTraversalOwner(runtime.npc())) {
+                KnoxNpcFactory.observeNativeAction(runtime.npc());
+                return "COMBAT_DEFERRED NATIVE_ACTION";
+            }
+            if (KnoxCombatController.hasNativeRecoveryOwner(runtime.npc())) {
+                return "COMBAT_DEFERRED NATIVE_RECOVERY";
+            }
             // Combat takes exclusive ownership of pathfinding. A threat can interrupt
             // an ordinary Lua movement decision before tickMovement() observes its
             // terminal state; clear that request here so it cannot survive the fight
@@ -588,6 +638,26 @@ public final class KnoxNpcRegistry {
         }
     }
 
+    /** Wears an exact carried item and retains the ordinary native snapshot. */
+    public synchronized String wearOwnedItemById(String id, String fullType, long itemId) {
+        KnoxNpcRuntime runtime = activeNpcs.get(id);
+        if (runtime == null) {
+            return "WEAR_FAILED NONE_ACTIVE";
+        }
+        try {
+            String result = KnoxEquipmentController.wearOwnedItemById(
+                runtime.npc().getBody(), fullType, itemId
+            );
+            if (result.startsWith("WORN_OWNED")) {
+                runtime.setLastRecord(captureRecord(runtime.npc()));
+            }
+            logEquipmentResult(id, result);
+            return result;
+        } catch (Throwable throwable) {
+            return failure("WEAR_FAILED", throwable);
+        }
+    }
+
     /** Developer-only real-item kit used to verify the native reload/fire path. */
     public synchronized String seedFirearmTestKit(String id) {
         KnoxNpcRuntime runtime = activeNpcs.get(id);
@@ -790,6 +860,12 @@ public final class KnoxNpcRegistry {
         }
     }
 
+    /** One complete record validation/decode for all coordinates in a population scan. */
+    public synchronized Map<String, Integer> persistentRecordLocation(String encoded) {
+        KnoxSurvivorRecord record = KnoxSurvivorRecord.decode(encoded);
+        return Map.of("x", record.x, "y", record.y, "z", record.z);
+    }
+
     public synchronized int persistentRecordX(String encoded) {
         return KnoxSurvivorRecord.decode(encoded).x;
     }
@@ -831,11 +907,20 @@ public final class KnoxNpcRegistry {
     }
 
     public synchronized Map<String, Object> consumePersistentRecordSupply(String encoded, String kind, double amount) {
+        return consumePersistentRecordSupply(encoded, kind, amount, null, 1);
+    }
+
+    public synchronized Map<String, Object> consumePersistentRecordBaseSupply(String encoded, String kind, double amount, String baseId, int reserve) {
+        if (baseId == null || baseId.isBlank()) return null;
+        return consumePersistentRecordSupply(encoded, kind, amount, baseId, reserve);
+    }
+
+    private Map<String, Object> consumePersistentRecordSupply(String encoded, String kind, double amount, String baseId, int reserve) {
         try {
             KnoxSurvivorRecord record = KnoxSurvivorRecord.decode(encoded);
             if (activeNpcs.containsKey(record.id)) return null;
             KnoxInventorySnapshot.Consumption used = record.inventory.consumeSupply(
-                kind, amount, Class.forName("zombie.inventory.InventoryItem"));
+                kind, amount, Class.forName("zombie.inventory.InventoryItem"), baseId, reserve);
             if (used == null) return null;
             Map<String, Object> result = new LinkedHashMap<>();
             result.put("record", record.withInventory(used.inventory()));

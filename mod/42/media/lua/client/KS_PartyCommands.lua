@@ -65,113 +65,118 @@ local function player(playerNum)
     return getSpecificPlayer(n)
 end
 
+-- Feedback observes the existing service receipt; it does not own orders.
+local function issueParty(actor, kind, payload)
+    if KnoxOrderCatalog.withFeedback ~= nil then
+        return KnoxOrderCatalog.withFeedback(catalogLabel(kind) .. " (party)",
+            KnoxCompanionService.issueOrderAll, actor, kind, payload)
+    end
+    return KnoxCompanionService.issueOrderAll(actor, kind, payload)
+end
+
 function PartyCommands.followAll(_, playerNum)
-    KnoxCompanionService.issueOrderAll(player(playerNum), "follow")
+    issueParty(player(playerNum), "follow")
 end
 
 function PartyCommands.formationAll(_, playerNum, formation, spacing)
     local actor = player(playerNum)
     local changed = 0
     for _, id in ipairs(KnoxCompanionService.getCompanionIds(actor)) do
-        if KnoxCompanionService.setFormation(actor, id, formation, spacing) then changed = changed + 1 end
+        local apply = KnoxOrderCatalog.withFeedback or function(_, fn, ...) return fn(...) end
+        if apply("Formation", KnoxCompanionService.setFormation, actor, id, formation, spacing) then
+            changed = changed + 1
+        end
     end
-    if KnoxActivityFeed ~= nil then
+    if changed > 0 and KnoxActivityFeed ~= nil then
         KnoxActivityFeed.event("Formation updated for " .. tostring(changed) .. " companions.")
     end
 end
 
 function PartyCommands.holdAll(_, playerNum)
-    KnoxCompanionService.issueOrderAll(player(playerNum), "hold")
+    issueParty(player(playerNum), "hold")
 end
 
 function PartyCommands.relaxAll(_, playerNum)
-    KnoxCompanionService.issueOrderAll(player(playerNum), "relax")
+    issueParty(player(playerNum), "relax")
 end
 
 function PartyCommands.askNeedsAll(_, playerNum)
-    KnoxCompanionService.issueOrderAll(player(playerNum), "check_needs")
+    issueParty(player(playerNum), "check_needs")
 end
 
 function PartyCommands.returnAll(_, playerNum)
     local actor = player(playerNum)
-    KnoxCompanionService.issueOrderAll(actor, "return_to_base")
+    issueParty(actor, "return_to_base")
 end
 
 function PartyCommands.boardAll(_, playerNum)
-    KnoxCompanionService.issueOrderAll(player(playerNum), "enter_vehicle")
+    issueParty(player(playerNum), "enter_vehicle")
 end
 
 function PartyCommands.exitAll(_, playerNum)
-    KnoxCompanionService.issueOrderAll(player(playerNum), "exit_vehicle")
+    issueParty(player(playerNum), "exit_vehicle")
 end
 
 function PartyCommands.climbingAll(_, playerNum, allowed)
-    KnoxCompanionService.issueOrderAll(
+    issueParty(
         player(playerNum),
         allowed and "allow_climbing" or "disallow_climbing"
     )
 end
 
 function PartyCommands.doorsAll(_, playerNum, allowed)
-    KnoxCompanionService.issueOrderAll(
+    issueParty(
         player(playerNum),
         allowed and "allow_doors" or "disallow_doors"
     )
 end
 
 function PartyCommands.autoLootAll(_, playerNum, allowed)
-    KnoxCompanionService.issueOrderAll(
+    issueParty(
         player(playerNum),
         allowed and "enable_autoloot" or "disable_autoloot"
     )
 end
 
 function PartyCommands.combatStanceAll(_, playerNum, stance)
-    KnoxCompanionService.issueOrderAll(player(playerNum), "combat_stance", { stance = stance })
+    issueParty(player(playerNum), "combat_stance", { stance = stance })
 end
 
 function PartyCommands.weaponPreferenceAll(_, playerNum, preference)
-    KnoxCompanionService.issueOrderAll(player(playerNum), "weapon_preference", { preference = preference })
+    issueParty(player(playerNum), "weapon_preference", { preference = preference })
 end
 
 function PartyCommands.autoEquipmentAll(_, playerNum, allowed)
-    KnoxCompanionService.setAutoEquipmentAll(player(playerNum), allowed)
+    local apply = KnoxOrderCatalog.withFeedback or function(_, fn, ...) return fn(...) end
+    return apply("Automatic equipment", KnoxCompanionService.setAutoEquipmentAll, player(playerNum), allowed)
 end
 
 function PartyCommands.directiveAll(_, playerNum, directive)
     if directive ~= nil then
-        local ok, changed = KnoxCompanionService.issueOrderAll(
-            player(playerNum), directive.kind, directive
-        )
-        if not ok then
-            KnoxActivityFeed.event("Party order failed: no companion could take it.")
-        end
+        return issueParty(player(playerNum), directive.kind, directive)
     end
 end
 
 function PartyCommands.destinationAll(_, playerNum, directive)
-    if directive == nil then return end
-    local ok, count, reason = KnoxCompanionService.issueOrderAll(
-        player(playerNum), "go_to", directive
-    )
-    if not ok then
-        KnoxActivityFeed.event("Party destination failed: " .. tostring(reason or "unavailable") .. ".")
+    if directive ~= nil then
+        return issueParty(player(playerNum), "go_to", directive)
     end
 end
 
 function PartyCommands.cancelPartyDestination(_, playerNum)
-    KnoxCompanionService.cancelPartyDestination(player(playerNum))
+    local apply = KnoxOrderCatalog.withFeedback or function(_, fn, ...) return fn(...) end
+    return apply("Cancel destination", KnoxCompanionService.cancelPartyDestination, player(playerNum))
 end
 
 function PartyCommands.basePreferenceAll(_, playerNum, preference)
     local actor = player(playerNum)
     if actor ~= nil and preference ~= nil then
-        KnoxCompanionService.issueOrderAll(actor, preference)
+        issueParty(actor, preference)
     end
 end
 
 function PartyCommands.clearDirectiveAll(_, playerNum)
-    KnoxCompanionService.issueOrderAll(player(playerNum), "resume_normal_duty")
+    issueParty(player(playerNum), "resume_normal_duty")
 end
 
 function PartyCommands.openActivity()
@@ -371,12 +376,6 @@ local function populate(menu, playerNum, square)
             PartyCommands.directiveAll, playerNum, areaDirective("clean_inventory", square, 12))
     end
     end
-    if KnoxSettings ~= nil and KnoxSettings.showActivityFeed ~= nil
-        and KnoxSettings.showActivityFeed() then
-        menu:addOption(KnoxActivityFeed ~= nil and KnoxActivityFeed.isVisible ~= nil
-            and KnoxActivityFeed.isVisible() and "Hide Activity Feed"
-            or "Show Activity Feed", PartyCommands, PartyCommands.toggleActivity)
-    end
     local manageRoot = menu:addOption("Manage", nil, nil)
     local manageMenu = ISContextMenu:getNew(menu)
     menu:addSubMenu(manageRoot, manageMenu)
@@ -402,21 +401,26 @@ function PartyCommands.openMenu(playerNum, x, y, square)
 end
 
 local function onFillWorldObjectContextMenu(playerNum, context, worldObjects, test)
-    if not KnoxSettings.enabled() or not contextOrdersEnabled() then
-        return
-    end
     local actor = player(playerNum)
-    if actor == nil
-        or (#KnoxCompanionService.getCompanionIds(actor) == 0
-            and not hasPlayerBaseResidents(actor)) then
-        return
-    end
     local square = firstSquare(worldObjects)
     if square == nil then
         return
     end
     if test then
         return ISWorldObjectContextMenu.setTest()
+    end
+    if KnoxSettings ~= nil and KnoxSettings.enabled ~= nil
+        and KnoxSettings.enabled() and KnoxSettings.showActivityFeed ~= nil
+        and KnoxSettings.showActivityFeed() then
+        context:addOption(KnoxActivityFeed ~= nil and KnoxActivityFeed.isVisible ~= nil
+            and KnoxActivityFeed.isVisible() and "Hide Knox Events"
+            or "Show Knox Events", PartyCommands, PartyCommands.toggleActivity)
+    end
+    if KnoxSettings == nil or KnoxSettings.enabled == nil or not KnoxSettings.enabled()
+        or not contextOrdersEnabled() or actor == nil
+        or (#KnoxCompanionService.getCompanionIds(actor) == 0
+            and not hasPlayerBaseResidents(actor)) then
+        return
     end
     local root = context:addOption(catalogLabel("party_orders", "Party Orders"), nil, nil)
     local menu = ISContextMenu:getNew(context)

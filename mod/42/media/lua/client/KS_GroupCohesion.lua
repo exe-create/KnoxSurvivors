@@ -16,7 +16,7 @@ local function close(a,b)
         and finite(b.x) and finite(b.y) and finite(b.z) and a.z==b.z
         and (a.x-b.x)^2+(a.y-b.y)^2<=32*32
 end
-function Cohesion.record(group,before,members,hours)
+function Cohesion.record(group,before,members,hours,groupCandidates)
     if group==nil or group.factionId~=nil or not finite(hours) then return nil end
     local after=Cohesion.snapshot(members)
     -- Only the complete, canonical autonomous cohort can supply this evidence.
@@ -25,7 +25,7 @@ function Cohesion.record(group,before,members,hours)
     for _,id in ipairs(group.memberIds) do
         local duty=KnoxPersistence.getSurvivorDuty(id)
         local affiliation=KnoxPersistence.getSurvivorAffiliation(id)
-        local canonical=KnoxPersistence.getTravelGroupFor(id)
+        local canonical=KnoxPersistence.getTravelGroupFor(id,groupCandidates)
         if before[id]==nil or after[id]==nil or not KnoxPersistence.isSurvivorAlive(id)
             or duty==nil or duty.mode~="autonomous" or (affiliation~=nil and affiliation.kind=="player")
             or canonical==nil or canonical.id~=group.id then return nil end

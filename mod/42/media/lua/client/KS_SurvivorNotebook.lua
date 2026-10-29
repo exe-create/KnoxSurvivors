@@ -6,6 +6,7 @@ require "ISUI/ISComboBox"
 require "ISUI/ISScrollingListBox"
 require "ISUI/ISTickBox"
 require "ISUI/ISTextBox"
+require "ISUI/ISModalRichText"
 require "KS_Persistence"
 require "KS_SurvivorViewModel"
 require "KS_BaseManager"
@@ -231,6 +232,31 @@ local function readableReason(value)
     return string.upper(string.sub(reason,1,1))..string.sub(reason,2)
 end
 
+local function taskBlockerText(value)
+    return KnoxBaseTaskBoard.blockerText(value)
+end
+
+local function taskRequirementsText(task)
+    local items=task.requirements~=nil and task.requirements.items or nil
+    if type(items)~="table" then return nil end
+    local entries={}
+    for fullType,count in pairs(items) do
+        if tonumber(count)~=nil and tonumber(count)>0 then
+            local label=tostring(fullType)
+            if getScriptManager~=nil then
+                local ok,name=pcall(function()
+                    local item=getScriptManager():FindItem(fullType)
+                    return item~=nil and item:getDisplayName() or nil
+                end)
+                if ok and name~=nil and tostring(name)~="" then label=tostring(name) end
+            end
+            entries[#entries+1]=tostring(count).." x "..label
+        end
+    end
+    table.sort(entries)
+    return #entries>0 and ("Job requires: "..table.concat(entries,", ")) or nil
+end
+
 local function claimantName(survivorId)
     if survivorId==nil then return nil end
     local identity=KnoxPersistence.getSurvivorIdentity(survivorId) or {}
@@ -247,7 +273,12 @@ local function taskRowText(task, now)
         detail="active: "..tostring(claimantName(task.claimedBy))
     elseif state=="blocked" then
         detail="blocked"
-        local reason=readableReason(task.result or task.lastResult)
+        local reason=taskBlockerText(task.result or task.lastResult)
+        if task.result=="missing_required_materials_after_search"
+            or (task.result==nil and task.lastResult=="missing_required_materials_after_search") then
+            local requirements=taskRequirementsText(task)
+            if requirements~=nil then detail=detail.." | "..requirements end
+        end
         if reason~=nil then detail=detail..": "..reason end
         local retryAt=tonumber(task.retryAtHours)
         if retryAt~=nil and retryAt>(tonumber(now) or 0) then
@@ -334,6 +365,11 @@ function BaseView:createChildren()
     self.assignTaskBtn=ISButton:new(self.residentPicker:getRight()+6,y,96,BUTTON_HGT,"Assign",self,BaseView.onAssignTask)
     self.assignTaskBtn:initialise(); self.assignTaskBtn.borderColor={r=0.7,g=0.7,b=0.7,a=0.5}; self:addChild(self.assignTaskBtn)
     y=y+BUTTON_HGT+6
+    self.taskDetailsBtn=ISButton:new(UI_BORDER_SPACING,y,110,BUTTON_HGT,"Details",self,BaseView.onTaskDetails)
+    self.taskDetailsBtn:initialise(); self.taskDetailsBtn.tooltip="Full job status and requirements. Controller: X."; self:addChild(self.taskDetailsBtn)
+    self.taskList.joypadParent=self
+    self.taskList:setISButtonForX(self.taskDetailsBtn)
+    y=y+BUTTON_HGT+6
     self.storageLabel=ISLabel:new(UI_BORDER_SPACING,y,BUTTON_HGT,"Storage",1,1,1,1,UIFont.Small,true); self.storageLabel:initialise(); self:addChild(self.storageLabel)
     y=y+FONT_HGT_SMALL+4
     self.storageList=ISScrollingListBox:new(UI_BORDER_SPACING,y,self.width-UI_BORDER_SPACING*2,BUTTON_HGT*3)
@@ -377,11 +413,17 @@ function BaseView:onAssignTask()
     if playerId == nil then return end
     local base=self:selectedBase(self.playerNum, playerId)
     if base == nil then return end
-    local assigned,result=KnoxCompanionService.assignBaseTask(player, residentId, base.id, task.id)
-    if assigned ~= nil and result == "claimed" then
+    local assigned,result
+    local accepted=KnoxOrderCatalog.withFeedback("Assign job",function()
+        assigned,result=KnoxCompanionService.assignBaseTask(player, residentId, base.id, task.id)
+        -- Task assignment returns a task receipt, whereas shared feedback
+        -- expects explicit acceptance. Preserve that distinction on success.
+        return assigned ~= nil and result == "claimed",result
+    end)
+    if accepted and assigned ~= nil and result == "claimed" then
         KnoxActivityFeed.event("Assigned " .. KnoxOrderCatalog.label(task.type, "work") .. " to the selected resident.")
-        self:populate(self.playerNum)
     end
+    self:populate(self.playerNum)
 end
 function BaseView:onCancelTask()
     local index=self.taskList.selected or 0; local entry=index>0 and self.taskList.items[index] or nil; local task=entry and entry.item or nil
@@ -391,26 +433,79 @@ function BaseView:onCancelTask()
     local base=self:selectedBase(self.playerNum, playerId)
     if base == nil then return end
     local now=getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
-    local cancelled,result=KnoxPersistence.cancelBaseTask(base.id,task.id,now)
-    if cancelled ~= nil and result == "cancelled" then
+    local cancelled,result
+    local accepted=KnoxOrderCatalog.withFeedback("Cancel job",function()
+        cancelled,result=KnoxPersistence.cancelBaseTask(base.id,task.id,now)
+        return cancelled ~= nil and result == "cancelled",result
+    end)
+    if accepted and cancelled ~= nil and result == "cancelled" then
         KnoxActivityFeed.event("Base task cancelled: " .. KnoxOrderCatalog.label(task.type, "work") .. ".")
-        self:populate(self.playerNum)
     end
+    self:populate(self.playerNum)
 end
 function BaseView:onResumeTask()
     local index=self.taskList.selected or 0; local entry=index>0 and self.taskList.items[index] or nil; local task=entry and entry.item or nil
-    if task == nil or task.id == nil or task.state ~= "cancelled" then return end
+    if task == nil or task.id == nil
+        or (task.state ~= "cancelled" and task.state ~= "blocked") then return end
     local player=getSpecificPlayer(self.playerNum); local playerId=player and KnoxPersistence.ensurePlayerId(player) or nil
     if playerId == nil then return end
     local base=self:selectedBase(self.playerNum, playerId)
     if base == nil then return end
     local now=getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
-    local resumed,result=KnoxPersistence.resumeBaseTask(base.id,task.id,now)
-    if resumed ~= nil and result == "resumed" then
+    local resumed,result
+    local accepted=KnoxOrderCatalog.withFeedback("Resume job",function()
+        resumed,result=KnoxPersistence.resumeBaseTask(base.id,task.id,now)
+        return resumed ~= nil and result == "resumed",result
+    end)
+    if accepted and resumed ~= nil and result == "resumed" then
         KnoxActivityFeed.event("Base task resumed: " .. KnoxOrderCatalog.label(task.type, "work") .. ".")
-        self:populate(self.playerNum)
     end
+    self:populate(self.playerNum)
 end
+function BaseView:onTaskDetails()
+    local entry=self.taskList.items[self.taskList.selected or 0]
+    local selected=entry~=nil and entry.item or nil
+    if type(selected)~="table" or selected.id==nil then return end
+    local win=self:getWindow()
+    local playerNum=win~=nil and win.playerNum or self.playerNum
+    local player=playerNum~=nil and getSpecificPlayer(playerNum) or nil
+    local playerId=player~=nil and KnoxPersistence.ensurePlayerId(player) or nil
+    local base=playerId~=nil and self:selectedBase(playerNum,playerId) or nil
+    local task=base~=nil and base.tasks~=nil and base.tasks[selected.id] or nil
+    if task==nil then return end
+    local now=getGameTime():getWorldAgeHours()
+    local text=taskRowText(task,now)
+    local requirements=taskRequirementsText(task)
+    if requirements~=nil and not text:find(requirements,1,true) then
+        text=text.."\n\n"..requirements
+    end
+    -- Names and unknown reasons are plain data, never rich-text commands.
+    text=text:gsub("<","["):gsub(">","]"):gsub("\n"," <LINE> ")
+    local width=math.max(120,math.min(560,getCore():getScreenWidth()-40))
+    local height=math.max(100,math.min(320,getCore():getScreenHeight()-40))
+    local modal=ISModalRichText:new(20,20,width,height,text,false,nil,nil,playerNum)
+    modal.prevFocus=self
+    modal.onJoypadDirUp=function(dialog) dialog.chatText:onMouseWheel(-3) end
+    modal.onJoypadDirDown=function(dialog) dialog.chatText:onMouseWheel(3) end
+    modal.onJoypadDown=function(dialog,button)
+        if button==Joypad.BButton then dialog:destroy()
+        else ISModalRichText.onJoypadDown(dialog,button) end
+    end
+    modal.onKeyRelease=function(dialog,key)
+        if key==Keyboard.KEY_ESCAPE then dialog:destroy();return true end
+        return false
+    end
+    modal.isKeyConsumed=function(_,key) return key==Keyboard.KEY_ESCAPE end
+    modal:setWantKeyEvents(true)
+    modal:initialise(); modal:addToUIManager(); modal:setAlwaysOnTop(true)
+    if self.joyfocus~=nil then setJoypadFocus(playerNum,modal) end
+end
+
+function BaseView:onJoypadDown(button,joypadData)
+    if button==Joypad.XButton then self:onTaskDetails();return end
+    ISPanelJoypad.onJoypadDown(self,button,joypadData)
+end
+
 function BaseView:selectedBase(playerNum, pid)
     local win = self:getWindow()
     local baseId = notebookBaseId(win, playerNum, pid)
@@ -837,7 +932,21 @@ function CrewView:populate(playerNum)
     local base = baseId ~= nil and KnoxPersistence.getBase(baseId) or nil
     for _,s in ipairs(snaps) do addRow(self.partyList,s.id, s.displayName .. "  |  " .. (s.professionLabel or "Survivor") .. "  |  " .. (s.orderLabel or "") .. "  |  " .. (s.activity or "")); self.partyIds[#self.partyIds+1]=s.id end
     if #self.partyIds==0 then addRow(self.partyList,"none","No party — recruit survivors") end
-    if base then for _,id in ipairs(KnoxPersistence.getBaseResidentIds(base.id)) do
+    local residentRoster = base ~= nil and KnoxPersistence.getBaseResidentIds(base.id) or {}
+    if base ~= nil and pid ~= nil and KnoxPersistence.getKnownSurvivorIds ~= nil then
+        local included = {};for _,id in ipairs(residentRoster) do included[id]=true end
+        for _,id in ipairs(KnoxPersistence.getKnownSurvivorIds(pid)) do
+            local known=KnoxPersistence.getObserverKnowledge(pid,id)
+            local last=known ~= nil and known.seen or nil
+            if known ~= nil and known.commitment ~= nil and (last == nil or known.commitment.atHours >= last.atHours) then last=known.commitment end
+            local value=last ~= nil and last.value or nil
+            if value ~= nil and value.role=="resident" and value.duty ~= nil
+                and value.duty.baseId==base.id and not included[id] then
+                residentRoster[#residentRoster+1]=id; included[id]=true
+            end
+        end
+    end
+    if base then for _,id in ipairs(residentRoster) do
         local dup=false; for _,e in ipairs(self.partyIds) do if e==id then dup=true break end end
         if not dup then
             local ident=KnoxPersistence.getSurvivorIdentity(id) or {}
@@ -861,7 +970,10 @@ function CrewView:populate(playerNum)
             end
             local snapshot = KnoxSurvivorViewModel.getSurvivor ~= nil
                 and KnoxSurvivorViewModel.getSurvivor(id, playerNum) or nil
-            local currentStatus = snapshot ~= nil and snapshot.activity or taskLabel
+            if snapshot == nil or snapshot.knowledge == nil or snapshot.knowledge.current ~= true then
+                taskLabel, taskDetail, work = "Unknown", nil, nil
+            end
+            local currentStatus = snapshot ~= nil and snapshot.activity or "Out of contact"
             local currentLocation = snapshot ~= nil and snapshot.locationLabel or nil
             if taskDetail == nil and work ~= nil and work.taskType ~= nil
                 and snapshot ~= nil and currentStatus ~= taskLabel then
@@ -886,6 +998,13 @@ function CrewView:onView()
     local id = self:selectedCrewId()
     if id ~= nil then KnoxSurvivorCard.show(self.playerNum, id) end
 end
+local function crewRequest(label, callback, ...)
+    if KnoxOrderCatalog.withFeedback ~= nil then
+        return KnoxOrderCatalog.withFeedback(label, callback, ...)
+    end
+    return callback(...)
+end
+
 function CrewView:onSendHome()
     local p = getSpecificPlayer(self.playerNum)
     if not p then return end
@@ -902,25 +1021,23 @@ function CrewView:onSendHome()
         picker.choose(self.playerNum, "Send the party home to which base?", bases, function(baseId)
             if baseId == nil then return end
             for _, id in ipairs(companions) do
-                KnoxCompanionService.sendToBase(p, id, baseId)
+                crewRequest("Return to base", KnoxCompanionService.sendToBase, p, id, baseId)
             end
             self:populate(self.playerNum)
         end)
         return
     end
     for _, id in ipairs(companions) do
-        KnoxCompanionService.sendToBase(p, id)
+        crewRequest("Return to base", KnoxCompanionService.sendToBase, p, id)
     end
     self:populate(self.playerNum)
 end
 function CrewView:onJoinParty()
     local id=self:selectedCrewId(); local player=getSpecificPlayer(self.playerNum)
     if id == nil or player == nil then return end
-    local changed, reason = KnoxCompanionService.recallToParty(player, id)
+    local changed = crewRequest("Join party", KnoxCompanionService.recallToParty, player, id)
     if changed then
         self:populate(self.playerNum)
-    elseif KnoxActivityFeed ~= nil then
-        KnoxActivityFeed.event("Could not join party: " .. tostring(readableReason(reason) or "unavailable") .. ".")
     end
 end
 function CrewView:onSetJob()
@@ -934,7 +1051,7 @@ function CrewView:onSetJob()
     -- The notebook may be looking at a non-primary owned base. Pass that
     -- selected base through the existing service boundary so validation and
     -- persistence target the same resident context shown to the player.
-    local changed = KnoxCompanionService.setBaseJobPreference(
+    local changed = crewRequest("Base job preference", KnoxCompanionService.setBaseJobPreference,
         player, id, choice.value, base.id
     )
     if changed then
@@ -1018,13 +1135,29 @@ end
 function CrewView:scheduleDraftFor(residentId)
     self.scheduleDrafts = self.scheduleDrafts or {}
     if residentId == nil then return nil end
+    self.scheduleDraftBaselines = self.scheduleDraftBaselines or {}
+    local saved = KnoxPersistence.getDutySchedule ~= nil
+        and KnoxPersistence.getDutySchedule(residentId) or nil
+    local hours = KnoxPersistence.dutyWindowsToHours ~= nil
+        and KnoxPersistence.dutyWindowsToHours(saved) or {}
     local draft = self.scheduleDrafts[residentId]
-    if draft == nil then
-        local saved = KnoxPersistence.getDutySchedule ~= nil
-            and KnoxPersistence.getDutySchedule(residentId) or nil
-        draft = KnoxPersistence.dutyWindowsToHours ~= nil
-            and KnoxPersistence.dutyWindowsToHours(saved) or {}
+    local baseline = self.scheduleDraftBaselines[residentId]
+    local missing = draft == nil
+    local untouched, matchesSaved = baseline ~= nil, draft ~= nil
+    for hour = 1, 24 do
+        if (draft or {})[hour] ~= (baseline or {})[hour] then untouched = false end
+        if (draft or {})[hour] ~= hours[hour] then matchesSaved = false end
+    end
+    -- Opening a resident is not an edit. Refresh clean views from the current
+    -- accepted schedule, while keeping genuine unsaved/rejected hours intact.
+    if missing or untouched then
+        draft = hours
         self.scheduleDrafts[residentId] = draft
+    end
+    if baseline == nil or missing or untouched or matchesSaved then
+        local current = {}
+        for hour = 1, 24 do current[hour] = hours[hour] end
+        self.scheduleDraftBaselines[residentId] = current
     end
     return draft
 end
@@ -1163,21 +1296,19 @@ function CrewView:onCrewPriorityCell(button)
     if nextState == "normal" then map[group] = nil else map[group] = nextState end
     local any = false
     for _ in pairs(map) do any = true; break end
-    local player = getSpecificPlayer(self.playerNum or 0)
     local service = rawget(_G, "KnoxCompanionService")
-    local ok = false
     local player, base = self:schedulePlayerAndBase()
-    if player ~= nil and base ~= nil and service ~= nil
-        and service.setBaseWorkPreferences ~= nil then
-        ok = service.setBaseWorkPreferences(
+    local ok = crewRequest("Work preference", function()
+        if player == nil then return false, "invalid_player" end
+        if base == nil then return false, "no_base" end
+        if service == nil or service.setBaseWorkPreferences == nil then return false, "service_unavailable" end
+        return service.setBaseWorkPreferences(
             player, residentId, any and map or nil, base.id
         )
-    end
-    if ok then
+    end)
+    if ok == true then
         KnoxActivityFeed.event("Base work preference saved.")
         self:populate(self.playerNum or 0)
-    else
-        KnoxActivityFeed.event("Could not set work preference.")
     end
 end
 
@@ -1186,13 +1317,14 @@ function CrewView:onResetPriorities()
     local residentId = self:selectedCrewId()
     if player == nil or base == nil or residentId == nil then return end
     local service = rawget(_G, "KnoxCompanionService")
-    local ok = false
-    if service ~= nil and service.setBaseWorkPreferences ~= nil then
-        ok = service.setBaseWorkPreferences(player, residentId, nil, base.id)
+    local ok = crewRequest("Reset work preferences", function()
+        if service == nil or service.setBaseWorkPreferences == nil then return false, "service_unavailable" end
+        return service.setBaseWorkPreferences(player, residentId, nil, base.id)
+    end)
+    if ok == true then
+        KnoxActivityFeed.event("Work preferences reset to Normal.")
+        self:populate(self.playerNum or 0)
     end
-    KnoxActivityFeed.event(ok and "Work preferences reset to Normal."
-        or "Could not reset work preferences.")
-    if ok then self:populate(self.playerNum or 0) end
 end
 
 function CrewView:onSelectTool(button)
@@ -1302,13 +1434,12 @@ function CrewView:onSaveSchedule()
     local windows = KnoxPersistence.hoursToDutyWindows ~= nil
         and KnoxPersistence.hoursToDutyWindows(draft) or nil
     local service = rawget(_G, "KnoxCompanionService")
-    local ok = false
-    if service ~= nil and service.setBaseDutySchedule ~= nil then
-        ok = service.setBaseDutySchedule(player, residentId, windows, base.id)
-    end
-    KnoxActivityFeed.event(ok and "Schedule saved."
-        or "Could not save schedule.")
-    if ok then
+    local ok = crewRequest("Save schedule", function()
+        if service == nil or service.setBaseDutySchedule == nil then return false, "service_unavailable" end
+        return service.setBaseDutySchedule(player, residentId, windows, base.id)
+    end)
+    if ok == true then
+        KnoxActivityFeed.event("Schedule saved.")
         -- Drop the draft so the strip re-seeds from saved truth: display
         -- can never drift from what the scheduler honors.
         if self.scheduleDrafts ~= nil then
@@ -1459,9 +1590,8 @@ function MissionsView:onSupplyToParty()
     local id = self:selectedSupplyId()
     local player = getSpecificPlayer(self.playerNum or 0)
     if id == nil or player == nil then return end
-    local ok, reason = KnoxCompanionService.recallToParty(player, id)
-    KnoxActivityFeed.event(ok and "Recalled to the party."
-        or "Could not recall: " .. tostring(reason or "unavailable") .. ".")
+    local ok = crewRequest("Join party", KnoxCompanionService.recallToParty, player, id)
+    if ok then KnoxActivityFeed.event("Recalled to the party.") end
     if ok then self:populate(self.playerNum) end
 end
 
@@ -1469,11 +1599,8 @@ function MissionsView:onSupplyResume()
     local id = self:selectedSupplyId()
     local player = getSpecificPlayer(self.playerNum or 0)
     if id == nil or player == nil then return end
-    local pid = KnoxPersistence.ensurePlayerId(player)
-    local ok = KnoxPersistence.clearBaseSupplyOrder ~= nil
-        and KnoxPersistence.clearBaseSupplyOrder(id, pid, nil, self:missionNow())
-    KnoxActivityFeed.event(ok and "Supply order cleared — back to normal duty."
-        or "Could not clear the order.")
+    local ok = crewRequest("Resume duty", KnoxCompanionService.clearBaseSupplyOrder, player, id)
+    if ok then KnoxActivityFeed.event("Supply order cleared. Normal duty requested.") end
     if ok then self:populate(self.playerNum) end
 end
 
@@ -1487,13 +1614,12 @@ function MissionsView:onSupplyToBase()
     local function send(baseId)
         if baseId == nil then return end
         local service = rawget(_G, "KnoxCompanionService")
-        local ok, result = false, "unavailable"
+        local ok = false
         if service ~= nil and service.transferBaseResident ~= nil then
-            ok, result = service.transferBaseResident(player, id, baseId)
+            ok = crewRequest("Return to base", service.transferBaseResident, player, id, baseId)
         end
         local base = KnoxPersistence.getBase(baseId)
-        KnoxActivityFeed.event(ok and ("Called back to " .. tostring(base ~= nil and base.name or baseId) .. ".")
-            or "Could not send to that base: " .. tostring(result or "unavailable") .. ".")
+        if ok then KnoxActivityFeed.event("Called back to " .. tostring(base ~= nil and base.name or baseId) .. ".") end
         if ok then self:populate(self.playerNum) end
     end
     local picker = rawget(_G, "KnoxBasePicker")
@@ -1925,7 +2051,7 @@ function Window:new(playerNum)
     local window=ISCollapsableWindowJoypad:new(left+(sw-width)/2, top+(sh-height)/2, width, height)
     setmetatable(window,self); self.__index=self
     window.playerNum=playerNum; window.backgroundColor={r=0.06,g=0.06,b=0.06,a=0.94}; window.borderColor={r=0.28,g=0.28,b=0.28,a=0.95}
-    window:setTitle("Knox Survivors"); window:setResizable(false); return window
+    window:setTitle("Knox Survivors"); window:setResizable(false); UILayout.bindInteractionWindow(window); return window
 end
 
 function Window:fitToPlayerViewport(playerNum)

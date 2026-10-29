@@ -14,6 +14,10 @@ local KnoxNpcSearchContainerAction = ISBaseTimedAction:derive(
 )
 
 function KnoxNpcSearchContainerAction:isValid()
+    if self.knoxSearchGuard ~= nil then
+        local ok, allowed = pcall(self.knoxSearchGuard, self)
+        if not ok or allowed ~= true then return false end
+    end
     return self.container ~= nil and self.container:isExistYet()
 end
 
@@ -41,6 +45,11 @@ function KnoxNpcSearchContainerAction:start()
 end
 
 function KnoxNpcSearchContainerAction:perform()
+    if not self:isValid() then
+        ISBaseTimedAction.perform(self)
+        return
+    end
+    self.knoxSearchCompleted = true
     ISBaseTimedAction.perform(self)
 end
 
@@ -68,6 +77,10 @@ function KnoxNpcInventoryTransferAction:start()
 end
 
 function KnoxNpcInventoryTransferAction:isValid()
+    if self.knoxTransferGuard ~= nil then
+        local ok, allowed = pcall(self.knoxTransferGuard, self, self.item)
+        if not ok or allowed ~= true then return false end
+    end
     local events = rawget(_G, "KnoxEventRuntime")
     if self.knoxEventContext ~= nil and (events == nil or not events.lootTransferAllowed(
         self.knoxEventContext, self.character, self.srcContainer, self.destContainer)) then return false end
@@ -79,6 +92,9 @@ end
 
 function KnoxNpcInventoryTransferAction:canMergeAction(action)
     if action == nil then return false end
+    -- A plan's transient permission applies to one exact item/destination.
+    -- Native batching must not absorb an action with a different permission.
+    if self.knoxTransferGuard ~= nil or action.knoxTransferGuard ~= nil then return false end
     local first, other = self.knoxEventContext, action.knoxEventContext
     if (first == nil) ~= (other == nil) then return false end
     if first ~= nil and (first.eventId ~= other.eventId or first.memberId ~= other.memberId
@@ -87,6 +103,10 @@ function KnoxNpcInventoryTransferAction:canMergeAction(action)
 end
 
 function KnoxNpcInventoryTransferAction:transferItem(item)
+    if self.knoxTransferGuard ~= nil then
+        local ok, allowed = pcall(self.knoxTransferGuard, self, item)
+        if not ok or allowed ~= true then return end
+    end
     local events, context = rawget(_G, "KnoxEventRuntime"), self.knoxEventContext
     if context ~= nil and (events == nil or not events.lootTransferAllowed(
         context, self.character, self.srcContainer, self.destContainer)) then return end
@@ -111,7 +131,19 @@ function KnoxNpcInventoryTransferAction:new(character, item, source, destination
     )
 end
 
-function InventoryActions.queueTransfer(character, item, source, destination, duration)
+-- Native admission returns the character's registered queue, including when
+-- begin completes synchronously. Item receipt remains the caller's separate
+-- contract. Preserve native exceptions for existing controller error cleanup.
+local function admitAction(character, action, kind, result)
+    local queue = ISTimedActionQueue.add(action)
+    if queue == nil or ISTimedActionQueue.queues == nil
+        or queue ~= ISTimedActionQueue.queues[character] then
+        return nil, kind .. "_queue_refused"
+    end
+    return action, result
+end
+
+function InventoryActions.queueTransfer(character, item, source, destination, duration, guard)
     if character == nil or item == nil or source == nil or destination == nil then
         return nil, "missing_transfer_input"
     end
@@ -122,27 +154,28 @@ function InventoryActions.queueTransfer(character, item, source, destination, du
         destination,
         duration
     )
+    -- Install before admission: vanilla can start/complete synchronously.
+    action.knoxTransferGuard = guard
     local events = rawget(_G, "KnoxEventRuntime")
     if events ~= nil then action.knoxEventContext = events.captureLootContext(character, source, destination) end
-    ISTimedActionQueue.add(action)
-    return action, "queued"
+    return admitAction(character, action, "transfer", "queued")
 end
 
-function InventoryActions.queueSearch(character, container, duration)
+function InventoryActions.queueSearch(character, container, duration, guard)
     if character == nil or container == nil then
         return nil, "missing_search_input"
     end
     local action = KnoxNpcSearchContainerAction:new(character, container, duration)
-    ISTimedActionQueue.add(action)
-    return action, "queued_search"
+    action.knoxSearchGuard = guard
+    return admitAction(character, action, "search", "queued_search")
 end
 
-function InventoryActions.queueDrop(character, item)
+function InventoryActions.queueDrop(character, item, guard)
     if character == nil or item == nil or character:getCurrentSquare() == nil
         or character:getVehicle() ~= nil then return nil, "drop_unavailable" end
     -- Match ISInventoryPage.GetFloorContainer without borrowing a local player's
     -- indexed UI container. Native transfer places the actual item in the world.
     local floor = ItemContainer.new("floor", nil, nil)
     floor:setExplored(true)
-    return InventoryActions.queueTransfer(character, item, item:getContainer(), floor, nil)
+    return InventoryActions.queueTransfer(character, item, item:getContainer(), floor, nil, guard)
 end

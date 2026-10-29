@@ -18,8 +18,11 @@ function Planner.matchesRequirement(item, requirements)
     if type(fullType) ~= "string" or (tonumber(items[fullType]) or 0) <= 0 then return false end
     local rule = type(requirements.itemRules) == "table" and requirements.itemRules[fullType] or nil
     if type(rule) ~= "table" then return true end
-    if rule.usable == true and safe(function() return item:isBroken() end, false) == true then
-        return false
+    if rule.usable == true then
+        -- Declared tool usability requires readable native state. A missing or
+        -- throwing accessor is not evidence that an item is intact.
+        local inspected, broken = pcall(function() return item:isBroken() end)
+        if not inspected or broken ~= false then return false end
     end
     if rule.minUses ~= nil and (tonumber(safe(function() return item:getCurrentUses() end, 0)) or 0)
         < (tonumber(rule.minUses) or 0) then return false end

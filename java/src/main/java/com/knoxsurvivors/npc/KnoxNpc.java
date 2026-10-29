@@ -33,6 +33,8 @@ public final class KnoxNpc {
     private int lastOpenedDoorX;
     private int lastOpenedDoorY;
     private int lastOpenedDoorZ;
+    private boolean lastOpenedDoorNorth;
+    private boolean lastOpenedDoorFromPositiveSide;
     private boolean hasOpenedDoor;
     private boolean combatActive;
     private boolean hasProtectedArea;
@@ -210,11 +212,13 @@ public final class KnoxNpc {
         doorWindowOpeningAllowed = allowed;
     }
 
-    void rememberOpenedDoor(Object door, int x, int y, int z) {
+    void rememberOpenedDoor(Object door, int x, int y, int z, boolean north, boolean fromPositiveSide) {
         lastOpenedDoor = door;
         lastOpenedDoorX = x;
         lastOpenedDoorY = y;
         lastOpenedDoorZ = z;
+        lastOpenedDoorNorth = north;
+        lastOpenedDoorFromPositiveSide = fromPositiveSide;
         hasOpenedDoor = door != null;
     }
 
@@ -242,6 +246,10 @@ public final class KnoxNpc {
     int getOpenedDoorZ() {
         return lastOpenedDoorZ;
     }
+
+    boolean getOpenedDoorNorth() { return lastOpenedDoorNorth; }
+
+    boolean getOpenedDoorFromPositiveSide() { return lastOpenedDoorFromPositiveSide; }
 
     void setProtectedArea(int minX, int minY, int maxX, int maxY) {
         protectedMinX = Math.min(minX, maxX);

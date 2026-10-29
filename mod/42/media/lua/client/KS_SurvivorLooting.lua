@@ -34,6 +34,7 @@ local GROUP_MATERIALS = {
     ["Base.Plank"] = true,
     ["Base.Nails"] = true,
     ["Base.NailsBox"] = true,
+    ["Base.Glue"] = true,
     ["Base.Log"] = true,
     ["Base.Hinge"] = true,
     ["Base.Doorknob"] = true,
@@ -129,6 +130,65 @@ local function weaponScore(item)
         + condition * 5
         + safe(function() return item:getMaxRange() end, 0)
         + safe(function() return item:getBaseSpeed() end, 0)
+end
+
+-- Provenance lives on the real native item, whose ModData travels through
+-- InventoryItem.save/load and Knox's native inventory snapshot. This never
+-- represents stock or authorizes a transfer by itself.
+function Looting.settlementDeliveryMatches(item, baseId, survivorId)
+    local data = item ~= nil and safe(function() return item:getModData() end, nil) or nil
+    local mark = data ~= nil and data.KnoxBaseSupplyDelivery or nil
+    return type(mark) == "table" and mark.baseId == baseId
+        and type(mark.survivorId) == "string"
+        and (survivorId == nil or mark.survivorId == survivorId)
+end
+
+function Looting.markSettlementDelivery(character, item, source, baseId, survivorId)
+    if character == nil or source == nil or type(baseId) ~= "string"
+        or type(survivorId) ~= "string" then return false end
+    local inventory = character:getInventory()
+    if source == inventory or not safe(function() return inventory:contains(item) end, false)
+        or safe(function() return source:contains(item) end, true) then return false end
+    local data = safe(function() return item:getModData() end, nil)
+    if data == nil then return false end
+    data.KnoxBaseSupplyDelivery = { baseId = baseId, survivorId = survivorId }
+    return true
+end
+
+function Looting.clearSettlementDelivery(item, baseId, survivorId)
+    if not Looting.settlementDeliveryMatches(item, baseId, survivorId) then return false end
+    item:getModData().KnoxBaseSupplyDelivery = nil
+    return true
+end
+
+function Looting.findSettlementDelivery(character, baseId, survivorId)
+    local found
+    walkInventory(character:getInventory(), function(item)
+        local data = safe(function() return item:getModData() end, nil)
+        local mark = data ~= nil and data.KnoxBaseSupplyDelivery or nil
+        if type(mark) ~= "table" or mark.survivorId ~= survivorId then return end
+        local protectedBag = false
+        local source, seen = safe(function() return item:getContainer() end, nil), {}
+        while source ~= nil and source ~= character:getInventory() and not seen[source] do
+            seen[source] = true
+            local bag = safe(function() return source:getContainingItem() end, nil)
+            if bag == nil then break end
+            if safe(function() return bag:isFavorite() end, true) then protectedBag = true; break end
+            source = safe(function() return bag:getContainer() end, nil)
+        end
+        -- New player orders/ownership and personally reclaimed equipment win.
+        if mark.baseId ~= baseId
+            or protectedBag
+            or safe(function() return item:isBroken() end, false)
+            or (safe(function() return item:IsFood() end, false) and not safeFood(item))
+            or safe(function() return item:isFavorite() end, true)
+            or safe(function() return character:isEquipped(item) end, true)
+            or safe(function() return character:isHandItem(item) end, true)
+            or safe(function() return character:isAttachedItem(item) end, false) then
+            data.KnoxBaseSupplyDelivery = nil
+        elseif found == nil then found = item end
+    end)
+    return found
 end
 
 local function firearmScore(item)
@@ -352,15 +412,105 @@ function Looting.plan(character, container, maximumItems, forGroup, options)
     end
     local groupMode = forGroup == true
     local foodOnly = type(options) == "table" and options.foodOnly == true
+    local supplyNeeds = type(options) == "table" and options.supplyNeeds or nil
     local facts = inventoryFacts(character)
+    local function usableExact(item, fullType)
+        if safe(function() return item:isBroken() end, false) then return false end
+        if safe(function() return item:IsFood() end, false) and not safeFood(item) then return false end
+        local rules = supplyNeeds.typeRules ~= nil and supplyNeeds.typeRules[fullType] or nil
+        if rules == nil then return true end
+        local planner = rawget(_G, "KnoxBaseSupplyPlanner")
+        if planner == nil or planner.matchesRequirement == nil then return false end
+        for _, requirements in ipairs(rules) do
+            if planner.matchesRequirement(item, fullType, requirements) then return true end
+        end
+        return false
+    end
+    local function needMatch(item)
+        if type(supplyNeeds) ~= "table" then return false end
+        local fullType = itemType(item)
+        if fullType ~= nil and (tonumber(supplyNeeds.types ~= nil
+            and supplyNeeds.types[fullType] or nil) or 0) > 0
+            and usableExact(item, fullType) then return true end
+        local storage = rawget(_G, "KnoxBaseStorage")
+        for category, amount in pairs(supplyNeeds.categories or {}) do
+            if (tonumber(amount) or 0) > 0 and storage ~= nil
+                and storage.matchesCategory ~= nil
+                and storage.matchesCategory(item, category)
+                and not safe(function() return item:isBroken() end, false) then return true end
+        end
+        return false
+    end
+    local supplyCounts = { types = {}, categories = {} }
+    if type(supplyNeeds) == "table" then
+        for itemType, count in pairs(supplyNeeds.reservedCounts ~= nil
+            and supplyNeeds.reservedCounts.types or {}) do
+            supplyCounts.types[itemType] = (supplyCounts.types[itemType] or 0)
+                + math.max(0, tonumber(count) or 0)
+        end
+        for category, count in pairs(supplyNeeds.reservedCounts ~= nil
+            and supplyNeeds.reservedCounts.categories or {}) do
+            supplyCounts.categories[category] = (supplyCounts.categories[category] or 0)
+                + math.max(0, tonumber(count) or 0)
+        end
+        local scanned = {}
+        local function countCharacter(candidate)
+            if candidate == nil or scanned[candidate] then return end
+            scanned[candidate] = true
+            walkInventory(candidate:getInventory(), function(item)
+                if supplyNeeds.baseId ~= nil
+                    and not Looting.settlementDeliveryMatches(item, supplyNeeds.baseId) then return end
+                local fullType = itemType(item)
+                if fullType ~= nil and usableExact(item, fullType) then
+                    supplyCounts.types[fullType] = (supplyCounts.types[fullType] or 0) + 1
+                end
+                local storage = rawget(_G, "KnoxBaseStorage")
+                for category in pairs(supplyNeeds.categories or {}) do
+                    if storage ~= nil and storage.matchesCategory ~= nil
+                        and storage.matchesCategory(item, category)
+                        and not safe(function() return item:isBroken() end, false) then
+                        supplyCounts.categories[category] =
+                            (supplyCounts.categories[category] or 0) + 1
+                    end
+                end
+            end)
+        end
+        countCharacter(character)
+        for _, candidate in ipairs(options.supplyInventories or {}) do
+            countCharacter(candidate)
+        end
+    end
+    local function wantedBySupply(item)
+        if type(supplyNeeds) ~= "table" then return true end
+        local fullType = itemType(item)
+        if fullType ~= nil and (tonumber(supplyNeeds.types ~= nil
+            and supplyNeeds.types[fullType] or nil) or 0)
+            > (supplyCounts.types[fullType] or 0)
+            and usableExact(item, fullType) then return true end
+        local storage = rawget(_G, "KnoxBaseStorage")
+        for category, amount in pairs(supplyNeeds.categories or {}) do
+            if (tonumber(amount) or 0) > (supplyCounts.categories[category] or 0)
+                and storage ~= nil and storage.matchesCategory ~= nil
+                and storage.matchesCategory(item, category)
+                and not safe(function() return item:isBroken() end, false) then return true end
+        end
+        return false
+    end
+    local function score(item)
+        if type(supplyNeeds) == "table" and not wantedBySupply(item) then return nil, nil end
+        if type(supplyNeeds) == "table" and needMatch(item) then
+            return 75, "settlement_shortage"
+        end
+        return candidateScore(character, facts, item, groupMode)
+    end
     local candidates = {}
     local items = container:getItems()
     for index = 0, items:size() - 1 do
         local item = items:get(index)
         if not foodOnly or safeFood(item) then
-            local score, reason = candidateScore(character, facts, item, groupMode)
-            if score ~= nil then
-                candidates[#candidates + 1] = { item = item, score = score, reason = reason }
+            local itemScore, reason = score(item)
+            if itemScore ~= nil then
+                candidates[#candidates + 1] = { item = item, score = itemScore, reason = reason }
             end
         end
     end
@@ -375,12 +525,7 @@ function Looting.plan(character, container, maximumItems, forGroup, options)
         character:getInventory():getFreeCapacity(character)
     )
     for _, candidate in ipairs(candidates) do
-        local currentScore, currentReason = candidateScore(
-            character,
-            facts,
-            candidate.item,
-            groupMode
-        )
+        local currentScore, currentReason = score(candidate.item)
         local weight = math.max(0, safe(function()
             return candidate.item:getUnequippedWeight()
         end, math.huge))
@@ -396,6 +541,20 @@ function Looting.plan(character, container, maximumItems, forGroup, options)
                 categoryCounts[category] = alreadySelected + 1
                 remainingCapacity = math.max(0, remainingCapacity - weight)
                 applySelectedFacts(facts, candidate.item)
+                if type(supplyNeeds) == "table" then
+                    local fullType = itemType(candidate.item)
+                    if fullType ~= nil then
+                        supplyCounts.types[fullType] = (supplyCounts.types[fullType] or 0) + 1
+                    end
+                    local storage = rawget(_G, "KnoxBaseStorage")
+                    for category in pairs(supplyNeeds.categories or {}) do
+                        if storage ~= nil and storage.matchesCategory ~= nil
+                            and storage.matchesCategory(candidate.item, category) then
+                            supplyCounts.categories[category] =
+                                (supplyCounts.categories[category] or 0) + 1
+                        end
+                    end
+                end
                 if #selected >= limit then
                     break
                 end
@@ -519,19 +678,20 @@ function Looting.cleanupPlan(character, requirements, continuing, atBase)
         return {}, "comfortable_load"
     end
     local facts, candidates = inventoryFacts(character), {}
-    walkInventory(character:getInventory(), function(item)
+    local inventory = character:getInventory()
+    walkInventory(inventory, function(item)
         local source = item.getContainer ~= nil and item:getContainer() or nil
         -- Do not reach into a favorited/mission bag: its contents share its intent.
         local parent = source
         local protected, visited = false, {}
-        while parent ~= nil and parent ~= character:getInventory() and not visited[parent] do
+        while parent ~= nil and parent ~= inventory and not visited[parent] do
             visited[parent] = true
             local bag = parent.getContainingItem ~= nil and parent:getContainingItem() or nil
             if bag == nil then protected = true break end
             if safe(function() return bag:isFavorite() end, true) then protected = true break end
             parent = bag:getContainer()
         end
-        if parent ~= character:getInventory() then protected = true end
+        if parent ~= inventory then protected = true end
         if not protected then
             local value, reason, canDrop = Looting.itemUtility(character, item, facts, requirements, atBase)
             if value ~= nil then

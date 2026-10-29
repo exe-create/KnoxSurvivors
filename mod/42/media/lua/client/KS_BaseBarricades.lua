@@ -668,7 +668,14 @@ function Barricades.queueAction(character, target, base)
         local queue = queues ~= nil and queues[character] or nil
         if queue ~= nil and type(queue.queue) == "table" then queueDepth = #queue.queue end
     end)
-    ISTimedActionQueue.add(action)
+    -- Native begin may complete synchronously, so use its registered queue
+    -- return for admission rather than requiring action membership.
+    local admittedQueue = ISTimedActionQueue.add(action)
+    if admittedQueue == nil or ISTimedActionQueue.queues == nil
+        or admittedQueue ~= ISTimedActionQueue.queues[character] then
+        diag("queue_refused", { queueDepth = queueDepth })
+        return nil, "barricade_queue_refused"
+    end
     local pos = charPos(character)
     local log = rawget(_G, "KnoxDebugLog")
     if log ~= nil and log.once ~= nil then

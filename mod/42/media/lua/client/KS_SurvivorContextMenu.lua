@@ -36,7 +36,8 @@ local function runService(playerNum, callback, survivorId)
     if player == nil then
         return false, "player_unavailable"
     end
-    local success, result, reason = pcall(callback, player, survivorId)
+    local feedback = KnoxOrderCatalog.withFeedback or function(_, fn, ...) return fn(...) end
+    local success, result, reason = pcall(feedback, "Survivor request", callback, player, survivorId)
     if not success then
         print(
             "[KnoxSurvivors][ContextMenu] action failed survivor="
@@ -69,19 +70,6 @@ local function unavailable(option)
         option.notAvailable = true
     end
     return option
-end
-
--- Orders used to fail silently (a rejected directive just never executed).
--- Surface the reason so "they won't do it" is always explainable.
-local function feedOrder(ok, reason, action)
-    if ok then
-        return
-    end
-    local feedModule = rawget(_G, "KnoxActivityFeed")
-    if feedModule ~= nil and feedModule.event ~= nil then
-        feedModule.event("Order failed (" .. tostring(action) .. "): "
-            .. tostring(reason or "unknown reason") .. ".")
-    end
 end
 
 -- Right-click orders are an explicit alternate input mode. Never silently
@@ -183,13 +171,40 @@ function SurvivorContextMenu.medicalCheck(playerNum, survivorId)
         or not luautils.walkAdjTest(player, square)) then
         return medicalMessage(player, survivorId, "I need to get closer to check them.")
     end
-    -- Keep the existing explicit Hold for owned companions. Never call vanilla
-    -- canPerformMedicalCheck here: it queues the PATIENT to walk to the doctor.
-    runService(playerNum, function(p, id)
-        return KnoxCompanionService.issueOrder(p, id, "hold")
-    end, survivorId)
+    -- Temporarily hold a following companion while the doctor approaches and
+    -- during the native check. Restore Follow only if no newer player order
+    -- replaced this temporary Hold in the meantime.
+    local duty = KnoxPersistence.getSurvivorDuty ~= nil
+        and KnoxPersistence.getSurvivorDuty(survivorId) or nil
+    local resumeFollow = type(duty) == "table" and duty.mode == "companion"
+        and duty.order == "follow" and duty.directive == nil
+    local heldRevision = nil
+    if resumeFollow then
+        local held = runService(playerNum, function(p, id)
+            return KnoxCompanionService.issueOrder(p, id, "hold")
+        end, survivorId)
+        if held then
+            local heldDuty = KnoxPersistence.getSurvivorDuty(survivorId)
+            heldRevision = type(heldDuty) == "table" and tonumber(heldDuty.revision) or nil
+        else
+            resumeFollow = false
+        end
+    end
+    local restoredFollow = false
+    local function restoreFollow()
+        if not resumeFollow or restoredFollow then return end
+        local current = KnoxPersistence.getSurvivorDuty(survivorId)
+        if type(current) ~= "table" or current.mode ~= "companion"
+            or current.order ~= "hold"
+            or tonumber(current.revision) ~= heldRevision then return end
+        restoredFollow = true
+        runService(playerNum, function(p, id)
+            return KnoxCompanionService.issueOrder(p, id, "follow")
+        end, survivorId)
+    end
 
     if not sameCar and not luautils.walkAdj(player, square) then
+        restoreFollow()
         return medicalMessage(player, survivorId, "I can't reach them from here.")
     end
     local action = ISMedicalCheckAction:new(player, patient)
@@ -223,10 +238,33 @@ function SurvivorContextMenu.medicalCheck(playerNum, survivorId)
             medicalMessage(player, survivorId, "Medical check cancelled.")
         end
         nativeStop(self)
+        restoreFollow()
     end
     function action:perform()
-        if not self:isValid() then nativeStop(self); return end
+        if not self:isValid() then
+            nativeStop(self)
+            restoreFollow()
+            return
+        end
         nativePerform(self)
+        -- Vanilla Medical Check opens the real Health Panel and may keep the
+        -- patient stationary while the player treats them. Restore Follow
+        -- when that native panel leaves the UI, not when its opening action
+        -- merely completes.
+        local medicalAction = rawget(_G, "ISMedicalCheckAction")
+        local windows = medicalAction ~= nil and medicalAction.HealthWindows or nil
+        local healthWindow = type(windows) == "table" and windows[patient] or nil
+        if healthWindow ~= nil and type(healthWindow.removeFromUIManager) == "function" then
+            local nativeRemove = healthWindow.removeFromUIManager
+            healthWindow.removeFromUIManager = function(window, ...)
+                window.removeFromUIManager = nativeRemove
+                local result = nativeRemove(window, ...)
+                restoreFollow()
+                return result
+            end
+        else
+            restoreFollow()
+        end
         print("[KnoxSurvivors][Medical] survivor=" .. tostring(survivorId) .. " check_completed")
     end
     ISTimedActionQueue.add(action)
@@ -239,7 +277,10 @@ local function onMedicalCheck(_, playerNum, survivorId)
 end
 
 local function onManageInventory(_, playerNum, survivorId)
-    KnoxCompanionInventory.show(playerNum, survivorId)
+    if KnoxOrderCatalog.withFeedback ~= nil then
+        return KnoxOrderCatalog.withFeedback("Manage inventory", KnoxCompanionInventory.show, playerNum, survivorId)
+    end
+    return KnoxCompanionInventory.show(playerNum, survivorId)
 end
 
 local function onRecruit(_, playerNum, survivorId)
@@ -289,10 +330,9 @@ local function onWeaponPreference(_, playerNum, survivorId, preference)
 end
 
 local function onAutoEquipment(_, playerNum, survivorId, allowed)
-    local ok, reason = runService(playerNum, function(player, id)
+    runService(playerNum, function(player, id)
         return KnoxCompanionService.setAutoEquipment(player, id, allowed)
     end, survivorId)
-    feedOrder(ok, reason, "automatic equipment")
 end
 
 local function addAutoEquipmentMenu(parent, playerNum, survivorId)
@@ -311,19 +351,17 @@ local function addAutoEquipmentMenu(parent, playerNum, survivorId)
 end
 
 local function onClimbing(_, playerNum, survivorId, allowed)
-    local ok, reason = runService(playerNum, function(player, id)
+    runService(playerNum, function(player, id)
         return KnoxCompanionService.issueOrder(player, id,
             allowed and "allow_climbing" or "disallow_climbing")
     end, survivorId)
-    feedOrder(ok, reason, "climbing")
 end
 
 local function onDoors(_, playerNum, survivorId, allowed)
-    local ok, reason = runService(playerNum, function(player, id)
+    runService(playerNum, function(player, id)
         return KnoxCompanionService.issueOrder(player, id,
             allowed and "allow_doors" or "disallow_doors")
     end, survivorId)
-    feedOrder(ok, reason, "doors")
 end
 
 local function onUnstick(_, playerNum, survivorId)
@@ -333,31 +371,27 @@ local function onUnstick(_, playerNum, survivorId)
 end
 
 local function onBoardPlayerVehicle(_, playerNum, survivorId)
-    local ok, reason = runService(playerNum, function(player, id)
+    runService(playerNum, function(player, id)
         return KnoxCompanionService.issueOrder(player, id, "enter_vehicle")
     end, survivorId)
-    feedOrder(ok, reason, "enter vehicle")
 end
 
 local function onDriveAhead(_, playerNum, survivorId)
-    local ok, reason = runService(playerNum, function(player, id)
+    runService(playerNum, function(player, id)
         return KnoxCompanionService.issueOrder(player, id, "drive_ahead")
     end, survivorId)
-    feedOrder(ok, reason, "take driver seat")
 end
 
 local function onDriveNearestVehicle(_, playerNum, survivorId)
-    local ok, reason = runService(playerNum, function(player, id)
+    runService(playerNum, function(player, id)
         return KnoxCompanionService.issueOrder(player, id, "drive_nearest_vehicle")
     end, survivorId)
-    feedOrder(ok, reason, "drive nearest vehicle")
 end
 
 local function onExitVehicle(_, playerNum, survivorId)
-    local ok, reason = runService(playerNum, function(player, id)
+    runService(playerNum, function(player, id)
         return KnoxCompanionService.issueOrder(player, id, "exit_vehicle")
     end, survivorId)
-    feedOrder(ok, reason, "exit vehicle")
 end
 
 local function pointDirective(kind, square)
@@ -388,59 +422,53 @@ local function areaDirective(kind, square, radius)
 end
 
 local function onAutoLoot(_, playerNum, survivorId, allowed)
-    local ok, reason = runService(playerNum, function(player, id)
+    runService(playerNum, function(player, id)
         return KnoxCompanionService.issueOrder(player, id,
             allowed and "enable_autoloot" or "disable_autoloot")
     end, survivorId)
-    feedOrder(ok, reason, "auto-loot")
 end
 
 local function onNeedOrder(_, playerNum, survivorId, kind)
-    local ok, reason = runService(playerNum, function(player, id)
+    runService(playerNum, function(player, id)
         local directive = areaDirective(kind, player:getCurrentSquare(), 12)
-        return directive ~= nil
-            and KnoxCompanionService.issueOrder(player, id, kind, directive)
+        if directive == nil then return false, "destination_unavailable" end
+        return KnoxCompanionService.issueOrder(player, id, kind, directive)
     end, survivorId)
-    feedOrder(ok, reason, "find supplies")
 end
 
 local function onResidentLootRuns(_, playerNum, survivorId, allowed)
-    local ok, reason = runService(playerNum, function(player, id)
+    runService(playerNum, function(player, id)
         return KnoxCompanionService.setResidentLootRuns(player, id, allowed)
     end, survivorId)
-    feedOrder(ok, reason, "loot runs")
 end
 
 local function onMoveToPlayer(_, playerNum, survivorId)
-    local ok, reason = runService(playerNum, function(player, id)
+    runService(playerNum, function(player, id)
         local directive = pointDirective("go_to", player:getCurrentSquare())
-        return directive ~= nil
-            and KnoxCompanionService.issueOrder(player, id, "go_to", directive)
+        if directive == nil then return false, "destination_unavailable" end
+        return KnoxCompanionService.issueOrder(player, id, "go_to", directive)
     end, survivorId)
-    feedOrder(ok, reason, "move")
 end
 
 local function onGuardHere(_, playerNum, survivorId)
-    local ok, reason = runService(playerNum, function(player, id)
+    runService(playerNum, function(player, id)
         local character = KnoxSurvivorRuntime.getCharacter(id)
         local directive = pointDirective("guard",
             character ~= nil and character:getCurrentSquare() or nil)
-        return directive ~= nil
-            and KnoxCompanionService.issueOrder(player, id, "guard", directive)
+        if directive == nil then return false, "destination_unavailable" end
+        return KnoxCompanionService.issueOrder(player, id, "guard", directive)
     end, survivorId)
-    feedOrder(ok, reason, "guard")
 end
 
 local function onPatrolHere(_, playerNum, survivorId)
-    local ok, reason = runService(playerNum, function(player, id)
+    runService(playerNum, function(player, id)
         local character = KnoxSurvivorRuntime.getCharacter(id)
         local square = character ~= nil and character:getCurrentSquare()
             or player:getCurrentSquare()
         local directive = areaDirective("patrol_area", square, 10)
-        return directive ~= nil
-            and KnoxCompanionService.issueOrder(player, id, "patrol_area", directive)
+        if directive == nil then return false, "destination_unavailable" end
+        return KnoxCompanionService.issueOrder(player, id, "patrol_area", directive)
     end, survivorId)
-    feedOrder(ok, reason, "patrol")
 end
 
 local function onReturnToBase(_, playerNum, survivorId)
@@ -521,6 +549,8 @@ local function addRecruitOption(menu, player, survivorId, closeEnough)
         label = "Recruit (hostile)"
     elseif reason == "already_with_group" then
         label = "Recruit (already with a group)"
+    elseif reason == "no_contact" then
+        label = "Recruit (no clear contact)"
     elseif reason == "needs_time" then
         label = "Recruit (needs time)"
     elseif reason == "prefers_alone" then
@@ -535,7 +565,7 @@ local function addRecruitOption(menu, player, survivorId, closeEnough)
     return unavailable(menu:addOption(label, nil, nil))
 end
 
-function SurvivorContextMenu.populate(menu, playerNum, survivorId)
+function SurvivorContextMenu.populate(menu, playerNum, survivorId, surface)
     local player = getSpecificPlayer(playerNum)
     if menu == nil or player == nil or type(survivorId) ~= "string" then
         return false
@@ -545,7 +575,14 @@ function SurvivorContextMenu.populate(menu, playerNum, survivorId)
     local affiliation = KnoxPersistence.getSurvivorAffiliation(survivorId) or {}
     local duty = KnoxPersistence.getSurvivorDuty(survivorId) or {}
     local owned = affiliation.kind == "player" and affiliation.ownerId == playerId
-    if owned and (duty.mode == "companion" or duty.mode == "base") then
+    local commands = surface == "commands"
+    local showCommands = surface == "all" or commands or legacyCommandsVisible()
+    if not commands then
+        local interact = menu:addOption("Interact", SurvivorContextMenu, onOpenInteraction, playerNum, survivorId)
+        local distance = distanceToPlayer(player, survivorId)
+        if distance == nil or distance > CONVERSATION_DISTANCE then unavailable(interact) end
+    end
+    if not commands and owned and (duty.mode == "companion" or duty.mode == "base") then
         menu:addOption(
             "View Survivor",
             SurvivorContextMenu,
@@ -559,10 +596,11 @@ function SurvivorContextMenu.populate(menu, playerNum, survivorId)
     local closeEnough = distance ~= nil and distance <= CONVERSATION_DISTANCE
 
     if not owned then
+        if not commands and showCommands then addRecruitOption(menu, player, survivorId, closeEnough) end
         return true
     end
 
-    if duty.mode == "companion" then
+    if duty.mode == "companion" and not commands then
         local careMenu = menu
         if uiMenus then
             local careRoot = menu:addOption("Care", nil, nil)
@@ -591,6 +629,7 @@ function SurvivorContextMenu.populate(menu, playerNum, survivorId)
         -- Base residents can be temporarily activated as companions. Keep that
         -- transition explicit in the menu so it is not confused with the
         -- ordinary Follow command, which is already owned by companions.
+        if not commands then
         local residentCareMenu = menu
         if uiMenus then
             local careRoot = menu:addOption("Care", nil, nil)
@@ -611,7 +650,8 @@ function SurvivorContextMenu.populate(menu, playerNum, survivorId)
         local medical = residentCareMenu:addOption(medicalLabel, SurvivorContextMenu,
             onMedicalCheck, playerNum, survivorId)
         if not closeEnough then unavailable(medical) end
-        if legacyCommandsVisible() then
+        end
+        if showCommands then
         menu:addOption(KnoxOrderCatalog.label("follow"), SurvivorContextMenu,
             onFollow, playerNum, survivorId)
         local orders = menu:addOption("Orders", nil, nil)
@@ -643,19 +683,15 @@ function SurvivorContextMenu.populate(menu, playerNum, survivorId)
             onResumeNormalDuty, playerNum, survivorId
         )
         cancelSupply.notAvailable = duty.baseSupplyOrder == nil
-        local lootRuns = ordersMenu:addOption("Loot Runs", nil, nil)
-        local lootRunsMenu = ISContextMenu:getNew(ordersMenu)
-        ordersMenu:addSubMenu(lootRuns, lootRunsMenu)
-        for _, choice in ipairs({ { "Allow Loot Runs", true },
-            { "Stay Home", false } }) do
-            local option = lootRunsMenu:addOption(choice[1], SurvivorContextMenu,
-                onResidentLootRuns, playerNum, survivorId, choice[2])
-            lootRunsMenu:setOptionChecked(option,
-                (duty.allowLootRuns == true) == choice[2])
-        end
+        local stayHome = duty.allowLootRuns ~= true
+        local supplyOption = ordersMenu:addOption(
+            "Stay Home During Supply Runs",
+            SurvivorContextMenu, onResidentLootRuns, playerNum, survivorId, stayHome
+        )
+        ordersMenu:setOptionChecked(supplyOption, stayHome)
         end
     elseif duty.mode == "companion" then
-        if legacyCommandsVisible() then
+        if showCommands then
         local orders = menu:addOption("Orders", nil, nil)
         local ordersMenu = ISContextMenu:getNew(menu)
         menu:addSubMenu(orders, ordersMenu)
@@ -809,7 +845,7 @@ function SurvivorContextMenu.populate(menu, playerNum, survivorId)
         end
         end
     end
-    if legacyCommandsVisible() then
+    if showCommands then
         menu:addOption(KnoxOrderCatalog.label("dismiss"), SurvivorContextMenu, onDismiss, playerNum, survivorId)
     end
     return true
@@ -850,6 +886,15 @@ local function onFillWorldObjectContextMenu(playerNum, context, worldObjects, te
     end
     if test then
         return ISWorldObjectContextMenu.setTest()
+    end
+
+    local compat = rawget(_G, "KnoxViewpointCompatibility")
+    if compat ~= nil and compat.usesNativeAdapter ~= nil and compat.usesNativeAdapter() then
+        -- NPC harvesting supplies a square, not the aimed character. Supply
+        -- discovery only here; the registered provider resolves the exact body.
+        context:addOptionOnTop("Knox survivor interactions", SurvivorContextMenu,
+            function(_, pn) return compat.openAimed(pn) end, playerNum)
+        return
     end
 
     local snapshot = KnoxSurvivorViewModel.getSurvivor(survivorId, playerNum)

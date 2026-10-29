@@ -1,6 +1,8 @@
 require "TimedActions/ISChopTreeAction"
 require "TimedActions/ISTimedActionQueue"
 require "Entity/TimedActions/ISHandcraftAction"
+require "TimedActions/ISEquipWeaponAction"
+require "KS_SurvivorInventoryActions"
 
 local Woodcutting = rawget(_G, "KnoxBaseWoodcutting") or {}
 _G.KnoxBaseWoodcutting = Woodcutting
@@ -370,6 +372,17 @@ function Woodcutting.resolveTarget(base, target, character)
     return { square = square, tree = tree, axe = axe }, "resolved"
 end
 
+local function admitAction(character, action, kind, result)
+    -- Native begin can complete synchronously. Its registered queue return,
+    -- not membership or a constructed action, is the admission receipt.
+    local queue = ISTimedActionQueue.add(action)
+    if queue == nil or ISTimedActionQueue.queues == nil
+        or queue ~= ISTimedActionQueue.queues[character] then
+        return nil, kind .. "_queue_refused"
+    end
+    return action, result
+end
+
 function Woodcutting.queueAction(character, target)
     if target ~= nil and target.recipe ~= nil then
         local recipe, containers, reason = canSaw(character, target.log, target.saw)
@@ -381,17 +394,40 @@ function Woodcutting.queueAction(character, target)
         -- while preserving the recipe's normal container resolution.
         local action = ISHandcraftAction:new(character, recipe, containers,
             nil, nil, {}, nil, nil, 1)
-        target.action = action
-        ISTimedActionQueue.add(action)
-        return action, "queued_saw"
+        target.action = nil
+        local admitted, admissionResult = admitAction(character, action, "saw_logs", "queued_saw")
+        target.action = admitted
+        return admitted, admissionResult
     end
     if character == nil or target == nil or target.tree == nil or target.axe == nil then
         return nil, "missing_tree_or_axe"
     end
-    character:setPrimaryHandItem(target.axe)
+    -- Use the same physical tool preparation as a player. Discovery may find
+    -- an axe in a backpack; it is not yet a root-inventory equipped weapon.
+    local carried = false
+    walkItems(character:getInventory(), function(item)
+        if item == target.axe then carried = true end
+    end)
+    if not carried or safeCall(target.axe, "isBroken") == true
+        or ItemTag == nil or safeCall(target.axe, "hasTag", ItemTag.CHOP_TREE) ~= true then
+        return nil, "axe_no_longer_usable"
+    end
+    local source = safeCall(target.axe, "getContainer")
+    local inventory = character:getInventory()
+    if source == nil then return nil, "axe_no_longer_carried" end
+    if source ~= inventory then
+        local transfer, reason = KnoxInventoryActions.queueTransfer(
+            character, target.axe, source, inventory, nil)
+        if transfer == nil then return nil, reason end
+    end
+    if safeCall(character, "getPrimaryHandItem") ~= target.axe then
+        local equip = ISEquipWeaponAction:new(character, target.axe, 50, true,
+            safeCall(character, "getSecondaryHandItem") == nil)
+        local admitted, reason = admitAction(character, equip, "axe_equip", "queued_equip")
+        if admitted == nil then return nil, reason end
+    end
     local action = ISChopTreeAction:new(character, target.tree)
-    ISTimedActionQueue.add(action)
-    return action, "queued"
+    return admitAction(character, action, "chop_tree", "queued")
 end
 
 function Woodcutting.isComplete(target)

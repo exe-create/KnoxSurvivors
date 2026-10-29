@@ -374,4 +374,64 @@ function Catalog.makeDirective(kind, payload)
     return directive
 end
 
+-- Presentation only: the callback remains the existing service/action owner.
+-- Preserve both individual (ok, reason) and party (ok, count, reason) receipts.
+local FAILURE_TEXT = {
+    player_unavailable = "Your character is unavailable.",
+    invalid_player = "Your character is unavailable.",
+    unavailable = "They are unavailable right now.",
+    not_loaded = "They are not nearby. Get back in contact first.",
+    survivor_unavailable = "They are unavailable right now.",
+    companion_detached = "They cannot receive orders yet. Wait for them to return nearby.",
+    busy = "They are busy right now. Try again when they are free.",
+    no_companions = "No companion could take this order.",
+    no_eligible_companions = "No companion is available for this destination.",
+    no_directives = "There are no active orders to clear.",
+    no_player_base = "Claim a base before assigning this work.",
+    no_base = "Assign a home base first.",
+    not_your_survivor = "You can only manage your own survivors.",
+    not_your_base_resident = "Select one of your residents at this base.",
+    invalid_player_base = "That base is no longer available to you. Choose one of your bases.",
+    no_supply_order = "There is no supply order to clear.",
+    too_far_away = "Get closer and stay on the same floor before trying again.",
+    no_contact = "Get within clear sight or speaking distance before asking them to join.",
+    already_with_group = "They are already travelling with other people.",
+    not_your_companion = "You can only give this order to your own companions.",
+    task_target_required = "Choose a target for this job first.",
+    destination_unavailable = "Choose an available destination first.",
+    hostile = "They will not accept your request while hostile.",
+    companion_limit = "Your companion limit has been reached.",
+    needs_time = "They need more time before joining you.",
+    prefers_alone = "They prefer to travel alone.",
+    low_reputation = "They do not trust you enough yet.",
+    save_failed = "The change could not be saved. Try again.",
+    task_in_progress = "That job is already in progress. Wait for it to finish.",
+    already_cancelled = "That job is already cancelled.",
+    not_resumable = "That job can no longer be resumed. Refresh the task list.",
+    unknown_task = "That job is no longer available. Choose another job.",
+}
+
+function Catalog.failureText(reason)
+    return FAILURE_TEXT[reason] or "The request could not be accepted. Try again when they are available."
+end
+
+function Catalog.withFeedback(action, callback, ...)
+    local executed, accepted, result, reason = pcall(callback, ...)
+    if not executed then
+        print("[KnoxSurvivors][Orders] action=" .. tostring(action) .. " error=" .. tostring(accepted))
+    end
+    if not executed or accepted ~= true then
+        local code = executed and (type(result) == "string" and result or reason) or nil
+        -- deliverOrder already gives a named, knowledge-limited contact failure.
+        if code ~= "order_not_delivered" then
+            local feed = rawget(_G, "KnoxActivityFeed")
+            if feed ~= nil and feed.event ~= nil then
+                feed.event(tostring(action or "Request") .. ": " .. Catalog.failureText(code))
+            end
+        end
+    end
+    if not executed then return false, "action_failed" end
+    return accepted, result, reason
+end
+
 return Catalog

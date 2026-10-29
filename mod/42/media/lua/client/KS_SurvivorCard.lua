@@ -46,6 +46,13 @@ local VSCROLL_W = 18
 local windows = {}
 local nextRefreshAt = 0
 
+local function developerDiagnosticsEnabled()
+    local settings = rawget(_G, "KnoxSettings")
+    if settings == nil or settings.showDeveloperDiagnostics == nil then return false end
+    local ok, enabled = pcall(settings.showDeveloperDiagnostics)
+    return ok and enabled == true
+end
+
 local function clamp(value, minimum, maximum)
     return math.max(minimum, math.min(maximum, value))
 end
@@ -211,8 +218,19 @@ function KnoxPanel:prerender()
     -- These are shortcuts into the same survivor interaction paths exposed by
     -- the world context menu. Keep the card informational; inventory transfer
     -- and treatment stay wholly owned by the vanilla inventory/medical UI.
-    if self.inventoryButton ~= nil then self.inventoryButton:setEnable(snapshot.loaded == true) end
-    if self.medicalButton ~= nil then self.medicalButton:setEnable(snapshot.loaded == true) end
+    local survivorLoaded = snapshot.loaded == true
+    if self.inventoryButton ~= nil then
+        self.inventoryButton:setEnable(survivorLoaded)
+        local tooltip = not survivorLoaded
+            and "Inventory is available when this survivor is nearby." or nil
+        if self.inventoryButton.tooltip ~= tooltip then self.inventoryButton:setTooltip(tooltip) end
+    end
+    if self.medicalButton ~= nil then
+        self.medicalButton:setEnable(survivorLoaded)
+        local tooltip = not survivorLoaded
+            and "A medical check is available when this survivor is nearby." or nil
+        if self.medicalButton.tooltip ~= tooltip then self.medicalButton:setTooltip(tooltip) end
+    end
     local smallH = getTextManager():getFontHeight(UIFont.Small)
     local y = PADDING
     local w = self.width - PADDING * 2 - VSCROLL_W
@@ -247,7 +265,7 @@ function KnoxPanel:prerender()
     keyValue("Personality", snapshot.personalityLabel or "Unknown")
     local recentHistory = type(snapshot.recentHistory) == "table" and snapshot.recentHistory or {}
     if #recentHistory == 0 then
-        keyValue("Recent Memory", "None recorded")
+        keyValue("Recent Memory", "Not reported")
     else
         for index = 1, math.min(3, #recentHistory) do
             local entry = recentHistory[index]
@@ -281,9 +299,16 @@ function KnoxPanel:prerender()
         status = status .. " (" .. tostring(math.floor(snapshot.distanceTiles + 0.5)) .. " tiles)"
     end
     keyValue("Activity", status)
-    keyValue("Needs", snapshot.needSummary or "None urgent")
+    keyValue("Needs", snapshot.needSummary or "Not reported")
+    if snapshot.knowledge ~= nil and snapshot.knowledge.reportAtHours ~= nil then
+        local age = math.max(0,getGameTime():getWorldAgeHours()-snapshot.knowledge.reportAtHours)
+        keyValue("Needs report", tostring(math.floor(age*60)) .. " min ago (self-report)")
+    end
     y = y + 4
     sectionHeader("Condition")
+    if snapshot.knowledge ~= nil and snapshot.knowledge.reportAtHours ~= nil then
+        keyValue("Values", "Last self-report; current condition unknown")
+    end
     do
         local vitals = snapshot.vitals or {}
         local needs = snapshot.needs or {}
@@ -320,9 +345,9 @@ function KnoxPanel:prerender()
     y = y + 4
     sectionHeader("Relationship")
     keyValue("Faction", snapshot.factionName or "None")
-    local trustVal = snapshot.trust ~= nil and math.floor(snapshot.trust) or nil
-    local trustLabel = trustVal ~= nil and tostring(trustVal) or "Unknown"
-    local trustCol = trustVal ~= nil and (trustVal >= 70 and COL_ACCENT or (trustVal >= 40 and COL_VALUE or COL_DIM)) or COL_DIM
+    local trustLabel = snapshot.trustLabel or "Unknown"
+    local trustCol = trustLabel == "Trusting" and COL_ACCENT
+        or (trustLabel == "Cautious" and COL_VALUE or COL_DIM)
     keyValue("Trust", trustLabel, trustCol)
     keyValue("Meetings", snapshot.relationshipMeetings ~= nil
         and tostring(math.max(0, math.floor(snapshot.relationshipMeetings))) or nil)
@@ -503,8 +528,7 @@ local function ensureViews(window)
             kv("Time Alive", dayLabel(snap.daysSurvived))
             kv("Known", dayLabel(snap.daysKnown))
             kv("Faction", snap.factionName or "None")
-            local trustVal = snap.trust ~= nil and math.floor(snap.trust) or nil
-            kv("Trust", trustVal ~= nil and tostring(trustVal) or "Unknown")
+            kv("Trust", snap.trustLabel or "Unknown")
             kv("Meetings", snap.relationshipMeetings ~= nil
                 and tostring(math.max(0, math.floor(snap.relationshipMeetings))) or "Unknown")
             kv("Purpose", snap.lifeIntent and snap.lifeIntent.label or "Unknown")
@@ -826,6 +850,7 @@ function Window:new(playerNum)
     window.survivorId = nil
     window.snapshot = nil
     window.previousJoypadFocus = nil
+    UILayout.bindInteractionWindow(window)
     window.resizable = true
     window.minimumWidth = math.min(360, width)
     window.minimumHeight = math.min(260, height)
@@ -848,15 +873,17 @@ end
 
 function SurvivorCard.show(playerNum, survivorId)
     playerNum = tonumber(playerNum) or 0
-    -- Diagnostic (temporary): a card opening unprompted leaves its caller
-    -- in the traceback below. Remove once the phantom opener is found.
-    local trace = ""
-    if debug ~= nil and debug.traceback ~= nil then
-        local ok, result = pcall(debug.traceback, "", 2)
-        if ok and type(result) == "string" then trace = result end
+    -- Keep the temporary caller trace available for diagnosis without adding
+    -- a full traceback to the ordinary player-facing log on every open.
+    if developerDiagnosticsEnabled() then
+        local trace = ""
+        if debug ~= nil and debug.traceback ~= nil then
+            local ok, result = pcall(debug.traceback, "", 2)
+            if ok and type(result) == "string" then trace = result end
+        end
+        print("[KnoxSurvivors][Card] show survivor=" .. tostring(survivorId)
+            .. " player=" .. tostring(playerNum) .. " trace=" .. tostring(trace))
     end
-    print("[KnoxSurvivors][Card] show survivor=" .. tostring(survivorId)
-        .. " player=" .. tostring(playerNum) .. " trace=" .. tostring(trace))
     if getSpecificPlayer(playerNum) == nil or type(survivorId) ~= "string" then
         return nil
     end
