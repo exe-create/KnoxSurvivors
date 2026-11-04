@@ -264,7 +264,7 @@ function CombatTests.writeSnapshot()
     KnoxActivityFeed.event("Combat snapshot written to console.txt.")
 end
 
-function CombatTests.start(playerNum, scenario)
+function CombatTests.start(playerNum, scenario, aimLevel)
     local definition = definitions[scenario]
     local player = getSpecificPlayer(playerNum)
     if definition == nil or player == nil or getCell() == nil then
@@ -329,6 +329,22 @@ function CombatTests.start(playerNum, scenario)
         if controller ~= nil and controller.character ~= nil then
             active.survivorHealth[id] = characterHealth(controller.character)
             controller.character:setZombiesDontAttack(false)
+            -- The duel is a skill test, so the level is set on the real body:
+            -- the native Aiming perk then drives aim, settle and spread for
+            -- every shot the test measures. Unset means the rolled skill stays.
+            if aimLevel ~= nil then
+                local level = math.max(1, math.min(10, math.floor(tonumber(aimLevel) or 1)))
+                pcall(function()
+                    controller.character:getXp():setXPToLevel(Perks.Aiming, level)
+                end)
+                local reached = level
+                pcall(function()
+                    reached = tonumber(controller.character:getPerkLevel(Perks.Aiming)) or level
+                end)
+                print(TAG .. " aiming-set id=" .. tostring(id)
+                    .. " wanted=" .. tostring(level) .. " actual=" .. tostring(reached))
+                active.aimLevel = reached
+            end
         end
         if definition.firearm == true and bridge ~= nil
             and bridge.seedNpcFirearmTestKit ~= nil then

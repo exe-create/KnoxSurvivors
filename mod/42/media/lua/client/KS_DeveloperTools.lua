@@ -530,7 +530,21 @@ local function onFill(playerNum, context, worldObjects, test)
     local combatMenu = ISContextMenu:getNew(menu)
     menu:addSubMenu(combatOption, combatMenu)
     for _, definition in ipairs(COMBAT_SCENARIOS) do
-        combatMenu:addOption(definition[1], playerNum, KnoxCombatTestScenarios.start, definition[2])
+        if definition[2] == "firearm_duel" then
+            -- A duel only means something at a known Aiming level, so the
+            -- firearm test asks for one. Each choice spawns the pair and sets
+            -- that level on both bodies before the first shot.
+            local option = combatMenu:addOption(definition[1] .. " (choose aiming)", nil, nil)
+            local aimMenu = ISContextMenu:getNew(combatMenu)
+            combatMenu:addSubMenu(option, aimMenu)
+            for _, tier in ipairs({ { 1, "Aiming 1 - untrained" },
+                { 5, "Aiming 5 - competent" }, { 10, "Aiming 10 - expert" } }) do
+                aimMenu:addOption(tier[2], playerNum, KnoxCombatTestScenarios.start,
+                    definition[2], tier[1])
+            end
+        else
+            combatMenu:addOption(definition[1], playerNum, KnoxCombatTestScenarios.start, definition[2])
+        end
     end
     combatMenu:addOption("Write Combat Snapshot to Log", nil, KnoxCombatTestScenarios.writeSnapshot)
     combatMenu:addOption("Cleanup Combat Test", nil, KnoxCombatTestScenarios.cleanup)

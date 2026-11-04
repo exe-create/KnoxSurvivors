@@ -9,19 +9,11 @@ require "KS_Persistence"
 local BaseZoneSelector = rawget(_G, "KnoxBaseZoneSelector") or {}
 _G.KnoxBaseZoneSelector = BaseZoneSelector
 
--- Draft-cursor hues mirror KS_BaseHighlights one-to-one (same hues, softer
--- alpha) so a zone looks the same while drawing it and after placing it.
-local ZONE_HIGHLIGHT = {
-    guard       = { r = 0.88, g = 0.16, b = 0.16, a = 0.32 },
-    patrol      = { r = 0.92, g = 0.55, b = 0.12, a = 0.32 },
-    cooking     = { r = 0.80, g = 0.30, b = 0.50, a = 0.30 },
-    farming     = { r = 0.22, g = 0.75, b = 0.22, a = 0.30 },
-    woodcutting = { r = 0.55, g = 0.35, b = 0.15, a = 0.30 },
-    log_processing = { r = 0.82, g = 0.68, b = 0.16, a = 0.30 },
-    corpse      = { r = 0.50, g = 0.50, b = 0.58, a = 0.28 },
-    repair      = { r = 0.30, g = 0.32, b = 0.88, a = 0.30 },
-    general     = { r = 0.52, g = 0.52, b = 0.75, a = 0.28 },
-}
+-- The draft cursor reads the same palette the placed zone will use, so a zone
+-- looks the same while it is being drawn and after it is placed. Alpha is the
+-- only difference: a draft is a suggestion, so it is softer than the finished
+-- fill.
+local DRAFT_ALPHA = 0.32
 
 local Selection = {}
 Selection.__index = Selection
@@ -117,14 +109,14 @@ local function draftTick()
     local maxY = math.max(y1, wy)
     local base = KnoxPersistence.getBase(activeSelection.baseId)
     local valid = isValidWorkArea(minX, minY, maxX, maxY, z, base, activeSelection.zoneType)
-    local col = ZONE_HIGHLIGHT[activeSelection.zoneType] or ZONE_HIGHLIGHT.general
+    local col = KnoxBaseHighlights.workColour(activeSelection.zoneType, DRAFT_ALPHA)
     -- Preview uses the same external-area policy as persisted work zones.
     if not valid then
         local bad = getCore() and getCore():getBadHighlitedColor() or nil
         if bad ~= nil then
             col = { r = bad:getR(), g = bad:getG(), b = bad:getB(), a = 0.38 }
         else
-            col = { r = 0.90, g = 0.15, b = 0.15, a = 0.38 }
+            col = KnoxBaseHighlights.INVALID_COLOUR
         end
     end
     pcall(function()
@@ -146,13 +138,16 @@ local function draftTick()
                     local ix1 = math.max(minX, zx1); local ix2 = math.min(maxX, zx2)
                     local iy1 = math.max(minY, zy1); local iy2 = math.min(maxY, zy2)
                     if ix1 <= ix2 and iy1 <= iy2 then
-                        -- Contrast border over overlap — restrained white, not rainbow.
+                        -- Contrast edge over the overlap, then one thin conflict
+                        -- tint. Both come from the shared tokens, so the two
+                        -- selectors cannot drift apart.
+                        local edge = KnoxBaseHighlights.OVERLAP_COLOUR
+                        local conflict = KnoxBaseHighlights.CONFLICT_COLOUR
                         if addAreaHighlightForPlayer ~= nil then
-                            addAreaHighlightForPlayer(pn, ix1, iy1, ix2 + 1, iy2 + 1, z, 0.92, 0.92, 0.88, 0.18)
-                        end
-                        -- Thin Bad tint on the overlap itself keeps conflicts obvious.
-                        if addAreaHighlightForPlayer ~= nil then
-                            addAreaHighlightForPlayer(pn, ix1, iy1, ix2 + 1, iy2 + 1, z, 0.90, 0.55, 0.15, 0.10)
+                            addAreaHighlightForPlayer(pn, ix1, iy1, ix2 + 1, iy2 + 1, z,
+                                edge.r, edge.g, edge.b, edge.a)
+                            addAreaHighlightForPlayer(pn, ix1, iy1, ix2 + 1, iy2 + 1, z,
+                                conflict.r, conflict.g, conflict.b, conflict.a)
                         end
                     end
                 end

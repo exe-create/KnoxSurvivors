@@ -19,12 +19,18 @@ local function localOnly()
     return not isClient() and not isServer()
 end
 
-local function reachable(player, npc)
+local function reachable(player, npc, browsing)
     if player == nil or npc == nil or player:isDead() or npc:isDead()
         or player:getVehicle() ~= nil or npc:getVehicle() ~= nil then return false end
     local p, n = player:getCurrentSquare(), npc:getCurrentSquare()
+    local maxGap = browsing and 4 or 1
     if p == nil or n == nil or p:getZ() ~= n:getZ()
-        or math.abs(p:getX() - n:getX()) > 1 or math.abs(p:getY() - n:getY()) > 1 then return false end
+        or math.abs(p:getX() - n:getX()) > maxGap
+        or math.abs(p:getY() - n:getY()) > maxGap then return false end
+    if browsing and (math.abs(p:getX() - n:getX()) > 1
+        or math.abs(p:getY() - n:getY()) > 1) then
+        return safe(function() return player:CanSee(npc) end, false)
+    end
     return p == n or (not p:isSomethingTo(n) and not n:isSomethingTo(p))
 end
 
@@ -71,7 +77,9 @@ local function physicalCheck(action)
     if identity == nil or identity.playerId ~= action.playerId then return false, "player_changed" end
     if KnoxSurvivorRuntime.getCharacter(action.survivorId) ~= action.npc
         or not KnoxPersistence.isSurvivorAlive(action.survivorId) then return false, "survivor_changed" end
-    if not reachable(action.character, action.npc) then return false, "out_of_reach" end
+    if not reachable(action.character, action.npc, action.browsing == true) then
+        return false, "out_of_reach"
+    end
     if danger(action.character) or danger(action.npc) then return false, "danger" end
     if action.browsing and pendingActions(action.character) then return false, "player_busy" end
     if pendingActions(action.npc) then return false, "survivor_busy" end
@@ -272,7 +280,8 @@ function Trade.beginBrowse(player, survivorId)
     local valid
     valid, reason = physicalCheck(session)
     if not valid then return nil, reason end
-    if not KnoxSurvivorRuntime.beginTrade(survivorId, session) then return nil, "survivor_busy_or_threatened" end
+    local admitted, admissionReason = KnoxSurvivorRuntime.beginTrade(survivorId, session)
+    if not admitted then return nil, admissionReason or "survivor_busy_or_threatened" end
     return session, "browsing"
 end
 

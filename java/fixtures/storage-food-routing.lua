@@ -1,0 +1,93 @@
+local Storage=KnoxBaseStorage
+local oldItemTag=ItemTag
+local oldNeeds=KnoxSurvivorNeeds
+ItemTag={PRESERVED_FOOD="preserved_food"}
+KnoxSurvivorNeeds={isWaterItem=function() return false end,isSafeFood=function() return false end}
+local function preserved()
+    return {hasTag=function(_,tag) return tag==ItemTag.PRESERVED_FOOD end}
+end
+local canned={storageFilterVersion=1,storageFilters={canned=true}}
+local freshFood={storageFilterVersion=1,storageFilters={food=true}}
+assert(Storage.acceptsDeposit(canned,preserved()),"preserved foods use the explicit canned group")
+assert(not Storage.acceptsDeposit(freshFood,preserved()),"preserved foods do not leak into ordinary fresh food")
+assert(Storage.matchesCategory(preserved(),"canned"),"the common canned filter matches preserved-food tags")
+local function food(days,canAge)
+    return {IsFood=function() return true end,
+        getFullType=function() return "Base.TestFood" end,
+        getOffAgeMax=function() return days end,
+        canAge=canAge}
+end
+local fresh=food(7,function() return true end)
+local stable=food(1000000000,function() return false end)
+local perishable={storageFilterVersion=1,storageFilters={perishable=true}}
+local pantry={storageFilterVersion=1,storageFilters={nonperishable=true}}
+assert(Storage.acceptsDeposit(perishable,fresh) and not Storage.acceptsDeposit(pantry,fresh))
+assert(Storage.acceptsDeposit(pantry,stable) and not Storage.acceptsDeposit(perishable,stable),
+    "native never-rots food belongs in shelf-stable storage")
+local nativeOnly=food(nil,function() return false end)
+nativeOnly.getOffAgeMax=function() error("native canAge must own the result") end
+assert(Storage.acceptsDeposit(pantry,nativeOnly),"false is a valid native boolean, not an unavailable API")
+for _,days in ipairs({0,7,1000000000}) do
+    local wrapped=food(days,nil)
+    assert(Storage.acceptsDeposit(pantry,wrapped)==(days==1000000000))
+    assert(Storage.acceptsDeposit(perishable,wrapped)==(days~=1000000000))
+end
+for _,item in ipairs({{}, {IsFood=function() return false end,getOffAgeMax=function() return 1000000000 end},
+    food(0/0,nil),food(math.huge,nil),food(-math.huge,nil),food(nil,nil)}) do
+    assert(not Storage.acceptsDeposit(pantry,item) and not Storage.acceptsDeposit(perishable,item),
+        "unknown values and non-food must not become pantry supplies")
+end
+
+local oldPolicies,oldResolve,oldClassify=Storage.operationalPolicies,Storage.resolvePolicy,Storage.classifyItem
+local oldFinder=AdjacentFreeTileFinder
+local policies={}
+local function square(x)
+    return {getX=function() return x end,getY=function() return 0 end,getZ=function() return 0 end,
+        isSomethingTo=function() return false end}
+end
+local origin=square(0)
+local actor={getCurrentSquare=function() return origin end}
+local base={id="storage-test"}
+local container={hasRoomFor=function() return true end,isItemAllowed=function() return true end}
+Storage.operationalPolicies=function() return policies end
+Storage.classifyItem=function() return "food" end
+Storage.resolvePolicy=function(policy)
+    if policy.unloaded then return nil end
+    return {policy=policy,square=square(policy.x),container=policy.container or container}
+end
+AdjacentFreeTileFinder={Find=function(tile) return tile end}
+local function policy(key,filters,x)
+    return {key=key,x=x or 1,y=0,z=0,storageFilterVersion=1,storageFilters=filters or {general=true}}
+end
+local function expect(reason,excluded)
+    local target,result=Storage.findDepositTrip(base,actor,stable,excluded,100)
+    assert(target==nil and result==reason,"expected "..reason..", got "..tostring(result))
+    assert(type(Storage.depositBlockerText(result))=="string")
+end
+expect("no_reachable_storage",nil)
+policies={policy("medicine",{medical=true})};expect("no_matching_storage",nil)
+policies={policy("unloaded")};policies[1].unloaded=true;expect("storage_unavailable",nil)
+policies={policy("full")};policies[1].container={hasRoomFor=function() return false end};expect("storage_full",nil)
+policies={policy("reject")};policies[1].container={hasRoomFor=function() return true end,
+    isItemAllowed=function() return false end};expect("storage_item_disallowed",nil)
+policies={policy("blocked",nil,3)}
+AdjacentFreeTileFinder.Find=function() return nil end
+expect("storage_inaccessible",nil)
+expect("storage_retry_cooldown",{blocked=101})
+AdjacentFreeTileFinder.Find=function(tile) return tile end
+policies={policy("full"),policy("pantry",{nonperishable=true},4),policy("fallback")}
+policies[1].container={hasRoomFor=function() return false end}
+policies[3].transientContainer=true
+local target,reason=Storage.findDepositTrip(base,actor,stable,nil,100)
+assert(target.policy.key=="pantry" and reason=="nearby_storage",
+    "a usable filtered destination wins despite another full container")
+policies={policy("full"),policy("reject")}
+policies[1].container={hasRoomFor=function() return false end}
+policies[2].container={hasRoomFor=function() return true end,isItemAllowed=function() return false end}
+expect("storage_full",nil)
+policies={policies[2],policies[1]};expect("storage_full",nil)
+Storage.operationalPolicies,Storage.resolvePolicy,Storage.classifyItem=oldPolicies,oldResolve,oldClassify
+AdjacentFreeTileFinder=oldFinder
+ItemTag=oldItemTag
+KnoxSurvivorNeeds=oldNeeds
+print("Storage food/routing PASS native_spoilage=true unknown_rejected=true blockers=true valid_fallback=true")

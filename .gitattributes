@@ -3,6 +3,7 @@
 *.gradle text eol=lf
 *.kts text eol=lf
 *.lua text eol=lf
+*.sh text eol=lf
 
 # Keep engineering-only records in the repository for maintainers, but omit
 # them from downloadable source snapshots used by players.

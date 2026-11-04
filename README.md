@@ -7,3 +7,5 @@ Knox Survivors is a single-player survivor mod for Project Zomboid Build 42.21. 
 Copy `gradle.properties.example` to a private `local.properties` and set `pzHome` to the installed Project Zomboid directory. Then run `./gradlew.bat :java:build packageWorkshopCandidate` from the repository root. The result is under `build/workshop-candidate/KnoxSurvivors`. This does not install or publish the mod.
 
 Use either ZombieBuddy or KnoxBridge Runtime, never both in one game process. The separate Knox Survivors Launcher is retired. Test with a disposable save and back up existing saves first.
+
+Run `./gradlew.bat :java:check` for the offline checks. The vocabulary check requires Bash and Python on PATH. These checks cover compilation and offline contracts; native gameplay, save/load and performance still require testing in Project Zomboid.

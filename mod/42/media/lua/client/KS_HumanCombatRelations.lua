@@ -82,6 +82,29 @@ local function woundFlags(target)
     return flags
 end
 
+-- One projection for a faction's answer to a witnessed first strike. The
+-- caller supplies only loaded candidates and a perception test, so a group
+-- cannot learn about a blow nobody saw. The victim, player-owned people and
+-- anyone already hostile are never re-counted.
+function HumanCombat.factionWitnesses(victimId, factionId, candidates, perceives)
+    local witnesses = {}
+    if type(factionId) ~= "string" or factionId == ""
+        or type(candidates) ~= "table" then
+        return witnesses
+    end
+    for _, candidate in ipairs(candidates) do
+        if type(candidate) == "table" and candidate.id ~= nil
+            and tostring(candidate.id) ~= tostring(victimId)
+            and tostring(candidate.factionId or "") == factionId
+            and candidate.playerOwned ~= true
+            and candidate.hostile ~= true
+            and (perceives == nil or perceives(candidate) == true) then
+            witnesses[#witnesses + 1] = candidate.id
+        end
+    end
+    return witnesses
+end
+
 -- Native damage remains authoritative. This hook only records the social
 -- consequence after Build 42 confirms that a player actually hit a survivor.
 function HumanCombat.onWeaponHitCharacter(attacker, target, weapon)
@@ -147,6 +170,65 @@ function HumanCombat.onWeaponHitCharacter(attacker, target, weapon)
         KnoxActivityFeed.event(faction ~= nil and faction.kind ~= "player"
             and "Your attack has made an NPC faction hostile."
             or "A survivor has turned hostile.")
+        -- A faction answers for its own, but only the people who actually
+        -- saw the first blow. Self-defence against an already-hostile
+        -- member never reaches this branch, and player-owned or allied
+        -- people were excluded by canPlayerAttack above.
+        if faction ~= nil and faction.kind ~= "player" then
+            local affiliation = KnoxPersistence.getSurvivorAffiliation(survivorId)
+            local runtime = rawget(_G, "KnoxSurvivorRuntime")
+            local relationships = rawget(_G, "KnoxSurvivorRelationships")
+            if affiliation ~= nil and affiliation.factionId ~= nil
+                and runtime ~= nil and runtime.getCharacter ~= nil
+                and runtime.activeIds ~= nil
+                and relationships ~= nil
+                and relationships.canPerceiveHuman ~= nil then
+                local candidates = {}
+                for _, witnessId in ipairs(runtime.activeIds()) do
+                    local witness = runtime.getCharacter(witnessId)
+                    if witness ~= nil then
+                        local peer = KnoxPersistence.getSurvivorAffiliation(witnessId)
+                        candidates[#candidates + 1] = {
+                            id = witnessId,
+                            factionId = peer ~= nil and peer.factionId or nil,
+                            playerOwned = peer ~= nil and peer.kind == "player",
+                            hostile = KnoxPersistence.isSurvivorHostileToPlayer(
+                                witnessId, playerId),
+                            character = witness,
+                        }
+                    end
+                end
+                local witnesses = HumanCombat.factionWitnesses(
+                    survivorId, affiliation.factionId, candidates,
+                    function(candidate)
+                        return relationships.canPerceiveHuman(candidate.character, attacker)
+                            or relationships.canPerceiveHuman(candidate.character, target)
+                    end
+                )
+                local joined = false
+                for _, witnessId in ipairs(witnesses) do
+                    if KnoxPersistence.setSurvivorHostileToPlayer(
+                        witnessId, playerId, true) then joined = true end
+                end
+                if joined then
+                    KnoxActivityFeed.event(
+                        "Their group saw it and turned hostile.")
+                end
+            end
+            -- A witnessed attack is a war with the player's own group, not a
+            -- permanent sentence: the two factions are hostile on sight for a
+            -- bounded stretch of days and then lapse back to strangers.
+            local playerFaction = KnoxPersistence.getPlayerFaction(playerId)
+            if playerFaction ~= nil
+                and KnoxPersistence.setFactionRelationshipDisposition ~= nil then
+                local relation = KnoxPersistence.setFactionRelationshipDisposition(
+                    faction.id, playerFaction.id, "hostile", worldAge(),
+                    "player_attacked_member", KnoxPersistence.FACTION_WAR_HOURS)
+                if relation ~= nil then
+                    KnoxActivityFeed.event("They are at war with your group for now.")
+                end
+            end
+        end
     end
 end
 

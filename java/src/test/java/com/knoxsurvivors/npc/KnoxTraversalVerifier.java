@@ -13,12 +13,65 @@ public final class KnoxTraversalVerifier {
         verifyInteractionOwnershipAndRouteContinuation();
         verifyNativeTraversalOwnsMovement();
         verifyNativeWindowCompletionReceipt();
+        verifySparseWindowAndLanding();
         verifyCloseBehind();
         verifyRecoveryDoorAdmission();
         System.out.println(
             "KnoxTraversalVerifier PASS native=true nondestructive=true"
                 + " exactEdge=true continuation=true interruption=true"
         );
+    }
+
+    private static void verifySparseWindowAndLanding() {
+        try {
+            PendingWindowActor actor = new PendingWindowActor();
+            PendingWindow window = new PendingWindow();
+            actor.here.window = window;
+            KnoxNpc npc = new KnoxNpc("sparse-window", actor, 0, 0, 0);
+            npc.useTraversalInteractionTarget(window);
+            npc.setTraversalInteractionStage("CLIMB_ATTEMPTED");
+            var transition = KnoxNpcFactory.class.getDeclaredMethod(
+                "handleRouteTransition", KnoxNpc.class, Object.class, float[].class);
+            transition.setAccessible(true);
+            for (int i=0; i<3; i++) {
+                require("ManualRoute".equals(transition.invoke(null, npc, actor, new float[]{10.5f,.5f,0})),
+                    "long native segment must observe the pending window edge, never restart its climb");
+            }
+            require(actor.cell.queries == 3, "the first adjacent tile, not the distant path endpoint, is checked");
+            zombie.iso.IsoGridSquare landing = new zombie.iso.IsoGridSquare(1,0,0);
+            require(KnoxNpcFactory.windowLandingClear(actor,landing), "empty landing is usable");
+            WindowActor occupant = new WindowActor();
+            landing.moving.add(occupant);
+            require(!KnoxNpcFactory.windowLandingClear(actor,landing), "a live body blocks the landing");
+            occupant.dead = true;
+            require(KnoxNpcFactory.windowLandingClear(actor,landing), "dead bodies do not become a fabricated live threat");
+            System.out.println("Window edge PASS sparse_segment=true pending_climb_preserved=true occupied_landing_rejected=true");
+        } catch (ReflectiveOperationException failure) {
+            throw new AssertionError("sparse window fixture failed", failure);
+        }
+    }
+
+    public static final class PendingWindow {
+        public boolean IsOpen() { return true; }
+        public boolean isSmashed() { return false; }
+        public boolean isBarricaded() { return false; }
+    }
+    public static final class PendingWindowCell {
+        int queries;
+        public zombie.iso.IsoGridSquare getGridSquare(int x,int y,int z) {
+            require(x==1 && y==0 && z==0,"only adjacent sparse edge is queried");
+            queries++;
+            return new zombie.iso.IsoGridSquare(x,y,z);
+        }
+    }
+    public static final class PendingWindowActor {
+        final zombie.iso.IsoGridSquare here = new zombie.iso.IsoGridSquare(0,0,0);
+        final PendingWindowCell cell = new PendingWindowCell();
+        public float getX() { return .5f; }
+        public float getY() { return .5f; }
+        public zombie.iso.IsoGridSquare getCurrentSquare() { return here; }
+        public PendingWindowCell getCell() { return cell; }
+        public String getCurrentStateName() { return "IdleState"; }
     }
 
     private static void verifyNonDestructivePolicy() {

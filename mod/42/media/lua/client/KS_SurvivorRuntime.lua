@@ -366,7 +366,8 @@ function Runtime.beginTrade(id, action)
     local accepted, reason = Runtime.canInteract(id)
     if not accepted then return false, reason end
     local entry = getEntry(id)
-    return entry ~= nil and entry.controller:beginTrade(action) or false
+    if entry == nil then return false, "survivor_unavailable" end
+    return entry.controller:beginTrade(action)
 end
 
 function Runtime.ownsTrade(id, action)

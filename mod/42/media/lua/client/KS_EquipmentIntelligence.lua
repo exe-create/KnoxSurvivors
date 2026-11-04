@@ -52,6 +52,106 @@ function Equipment.isUsableMelee(item)
     return meleeScore(item) ~= nil
 end
 
+local function isUsableGun(item)
+    return usableItem(item)
+        and safe(function() return item:IsWeapon() end, false) == true
+        and safe(function() return item:isRanged() end, false) == true
+        and safe(function() return item:isBroken() end, true) == false
+end
+
+-- Role kit tags are vocabulary, not item ids. The policy only accepts a real
+-- carried instance that already satisfies the role's tag; it never creates or
+-- upgrades an item. Exact types are kept narrow where a broad category would
+-- let a cook take a hammer or a quartermaster take a weapon.
+local KIT_TYPES = {
+    can_opener = { ["Base.CanOpener"] = true },
+    clipboard = { ["Base.Clipboard"] = true },
+    hammer = { ["Base.Hammer"] = true },
+    saw = { ["Base.Saw"] = true },
+    wrench = { ["Base.Wrench"] = true, ["Base.LugWrench"] = true },
+    screwdriver = { ["Base.Screwdriver"] = true },
+    planks = { ["Base.Plank"] = true },
+    nails = { ["Base.Nails"] = true },
+    hoe = { ["Base.Hoe"] = true, ["Base.HandShovel"] = true,
+        ["Base.GardenFork"] = true, ["Base.GardenHoe"] = true },
+    disinfectant = { ["Base.BottleDisinfectant"] = true,
+        ["Base.AlcoholWipes"] = true, ["Base.Disinfectant"] = true },
+    painkiller = { ["Base.Pills"] = true, ["Base.PillsPainkiller"] = true },
+    fuel = { ["Base.PetrolCan"] = true, ["Base.EmptyPetrolCan"] = true,
+        ["Base.JerryCan"] = true },
+}
+
+local function fullTypeStarts(item, prefix)
+    local value = fullType(item)
+    return value ~= nil and string.sub(value, 1, #prefix) == prefix
+end
+
+local function hasKitTag(item, tag)
+    if not usableItem(item) then return false end
+    local full = fullType(item) or ""
+    local types = KIT_TYPES[tag]
+    if types ~= nil then
+        if types[full] == true then return true end
+        return tag == "fuel" and safe(function()
+            return item:hasTag(ItemTag.FUEL)
+        end, false) == true
+    end
+    if tag == "melee" then return isMelee(item) end
+    if tag == "firearm" then return isUsableGun(item) end
+    if tag == "ammo" then
+        return fullTypeStarts(item, "Base.Bullets")
+            or fullTypeStarts(item, "Base.ShotgunShells")
+            or safe(function()
+                return item:hasTag(ItemTag.AMMO)
+            end, false) == true
+    end
+    if tag == "bandage" then
+        return safe(function() return item:isCanBandage() end, false) == true
+    end
+    if tag == "water" then
+        local needs = rawget(_G, "KnoxSurvivorNeeds")
+        return needs ~= nil and needs.isWaterItem ~= nil
+            and safe(function() return needs.isWaterItem(item, false) end, false) == true
+    end
+    if tag == "bag" then
+        return safe(function() return item:IsInventoryContainer() end, false) == true
+    end
+    if tag == "knife" then
+        return safe(function() return item:getCategory() end, "") == "Knife"
+            or string.find(full, "Knife", 1, true) ~= nil
+    end
+    if tag == "light" then
+        local display = safe(function() return item:getDisplayCategory() end, "")
+        return display == "Light" or string.find(full, "Flashlight", 1, true) ~= nil
+            or string.find(full, "Lighter", 1, true) ~= nil
+            or string.find(full, "Lantern", 1, true) ~= nil
+    end
+    if tag == "seeds" then return fullTypeStarts(item, "Base.Seed") end
+    if tag == "parts" then
+        return safe(function() return item:getDisplayCategory() end, "")
+            == "VehicleMaintenance"
+    end
+    return false
+end
+
+function Equipment.roleKitMatches(tag, item)
+    return type(tag) == "string" and hasKitTag(item, tag)
+end
+
+-- "Could this survivor fight with what is in their hands right now?" One
+-- definition shared by the equipment chooser and the combat report, so a
+-- survivor is never called defenceless while holding a weapon the chooser
+-- considers usable, or called armed while holding a broken one.
+function Equipment.isArmedWeapon(item)
+    return Equipment.isUsableMelee(item) or isUsableGun(item)
+end
+
+function Equipment.isArmed(character)
+    if character == nil then return false end
+    local primary = safe(function() return character:getPrimaryHandItem() end, nil)
+    return Equipment.isArmedWeapon(primary)
+end
+
 function Equipment.isMeaningfulMeleeUpgrade(character, item)
     local candidateScore = meleeScore(item)
     if candidateScore == nil then return false end
@@ -143,6 +243,48 @@ local function rootItems(character)
     return result
 end
 
+local function walkCarriedItems(container, visitor, seen)
+    seen = seen or {}
+    if container == nil or seen[container] then return end
+    seen[container] = true
+    local items = safe(function() return container:getItems() end, nil)
+    if items == nil then return end
+    for index = 0, safe(function() return items:size() end, 0) - 1 do
+        local item = safe(function() return items:get(index) end, nil)
+        if usableItem(item) then
+            visitor(item)
+            if isContainer(item) then
+                walkCarriedItems(safe(function() return item:getInventory() end, nil),
+                    visitor, seen)
+            end
+        end
+    end
+end
+
+-- Return the role's missing tags in catalogue order. A carried stack counts as
+-- present; this is a readiness answer, not a stock count. `available` lets the
+-- caller exclude a claim without changing what the body actually carries.
+function Equipment.roleKitMissing(character, gear, available)
+    if character == nil or type(gear) ~= "table" then return {} end
+    local inventory = safe(function() return character:getInventory() end, nil)
+    local found = {}
+    walkCarriedItems(inventory, function(item)
+        for _, tag in ipairs(gear) do
+            if not found[tag] and Equipment.roleKitMatches(tag, item)
+                and (available == nil or safe(function()
+                    return available(tag, item)
+                end, false) == true) then
+                found[tag] = true
+            end
+        end
+    end)
+    local missing = {}
+    for _, tag in ipairs(gear) do
+        if not found[tag] then missing[#missing + 1] = tag end
+    end
+    return missing
+end
+
 local function actionActive(character)
     -- Unknown native ownership cannot authorize a passive gear change.
     if safe(function() return character:getCharacterActions():isEmpty() end, nil) ~= true then return true end
@@ -186,9 +328,7 @@ function Equipment.choose(character, available)
     if character == nil then return nil end
     local candidates = rootItems(character)
     local primary = safe(function() return character:getPrimaryHandItem() end, nil)
-    local primaryIsUsableGun = safe(function()
-        return primary ~= nil and primary:IsWeapon() and primary:isRanged() and not primary:isBroken()
-    end, false)
+    local primaryIsUsableGun = isUsableGun(primary)
     local bestMelee, bestMeleeScore = nil, -math.huge
     local bestWear, bestWearGain = nil, 0
 
@@ -244,6 +384,22 @@ function Equipment.reconsider(id, character, bridge, ticks, force, available)
         return false, "equipment_action_active"
     end
     state.nextAt = (ticks or 0) + EVALUATION_TICKS
+    -- A broken primary is a real event. Say it once per item through the
+    -- dialogue owner's voice selection; the chooser still owns whether to
+    -- swap. A skipped line (cooldown, speech off) is retried next evaluation.
+    local held = safe(function() return character:getPrimaryHandItem() end, nil)
+    if usableItem(held) and safe(function() return held:isBroken() end, false) == true then
+        local heldId = safe(function() return held:getID() end, nil)
+        state.brokenSpoken = state.brokenSpoken or {}
+        local key = tostring(heldId or "unknown")
+        if state.brokenSpoken[key] ~= true then
+            local dialogue = rawget(_G, "KnoxSurvivorDialogue")
+            if dialogue ~= nil and dialogue.say ~= nil then
+                local ok, spoke = pcall(dialogue.say, character, id, "weapon_broken", ticks)
+                if ok and spoke == true then state.brokenSpoken[key] = true end
+            end
+        end
+    end
     local decision = Equipment.choose(character, available)
     if decision == nil then return false, "equipment_stable" end
     local typeName = fullType(decision.item)

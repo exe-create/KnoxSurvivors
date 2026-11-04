@@ -130,7 +130,11 @@ public final class KnoxLocomotionVerifier {
         KnoxTravelAwareness.Observation empty = new KnoxTravelAwareness.Observation(0,Float.POSITIVE_INFINITY,false);
         awareness.update(now+300_000_000L,0,0,0,empty);
         require(awareness.shouldSneak(now+400_000_000L,true,false), "brief sight loss cannot toggle posture every frame");
-        require(!awareness.shouldSneak(now+1_600_000_000L,true,false), "quiet memory expires after leaving danger");
+        require(awareness.shouldSneak(now+1_600_000_000L,true,false), "cautious travel stays crouched through a clear stretch");
+        KnoxTravelAwareness cold = new KnoxTravelAwareness();
+        cold.update(now,0,0,0,empty);
+        require(cold.shouldSneak(now,true,false), "an ordinary travel leg crouches before anything is seen");
+        require(!cold.shouldSneak(now,false,false), "an ordinary pace is not a stealth posture in clear terrain");
         require(awareness.shouldSneak(now+1_600_000_000L,false,true), "an explicit leader sneak still applies in clear terrain");
         quiet.target=observer;
         KnoxTravelAwareness.Observation detected=KnoxNpcFactory.scanTravelThreats(observer,threats,canSee,0,0,0);
@@ -153,8 +157,8 @@ public final class KnoxLocomotionVerifier {
         proxy.proxy=false; proxy.target=null;
         require(KnoxNpcFactory.scanTravelThreats(observer,threats,canSee,0,0,0).visible()==1,
             "a real reanimated zombie is still visible danger");
-        awareness.update(now+4_000_000_000L,0,0,1,empty);
-        require(!awareness.shouldSneak(now+4_000_000_000L,true,false), "moving upstairs drops old-floor caution");
+        awareness.update(now+4_000_000_000L,0,0,1,detected);
+        require(!awareness.shouldSneak(now+4_000_000_000L,true,false), "being spotted on the new floor still releases the crouch");
     }
 
     private static KnoxLocomotionPolicy.Decision decide(String pace, float distance) {

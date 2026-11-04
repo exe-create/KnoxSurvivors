@@ -251,6 +251,29 @@ function BaseJobs.workforceSummary(base)
     return summary
 end
 
+function BaseJobs.waterSourceState()
+    local planner = rawget(_G, "KnoxBaseSupplyPlanner")
+    if planner == nil or planner.waterSourceState == nil then return "unknown" end
+    local days = nil
+    local time = getGameTime ~= nil and getGameTime() or nil
+    if time ~= nil and time.getWorldAgeDaysSinceBegin ~= nil then
+        local ok, value = pcall(function() return time:getWorldAgeDaysSinceBegin() end)
+        if ok then days = tonumber(value) end
+    end
+    local modifier = nil
+    local options = rawget(_G, "SandboxOptions")
+    local instance = options ~= nil and options.instance or nil
+    if instance ~= nil and instance.getWaterShutModifier ~= nil then
+        local ok, value = pcall(function() return instance:getWaterShutModifier() end)
+        if ok then modifier = tonumber(value) end
+    end
+    if modifier == nil then
+        local sandbox = rawget(_G, "SandboxVars")
+        if type(sandbox) == "table" then modifier = tonumber(sandbox.WaterShutModifier) end
+    end
+    return planner.waterSourceState(days, modifier)
+end
+
 -- Read-only settlement overview shared by management UI and diagnostics. All
 -- values come from the existing task board, resident duties, security zones,
 -- and real loaded containers. It never creates work, claims a task, or invents
@@ -266,18 +289,32 @@ function BaseJobs.settlementSummary(base, worldAgeHours)
         security = security,
         storage = storage,
         stockKnown = (tonumber(storage.loadedPolicies) or 0) > 0,
+        waterSource = BaseJobs.waterSourceState(),
         reserves = {},
         shortages = {},
+        storageProblems = {},
         tasks = {
             total = 0, queued = 0, claimed = 0, blocked = 0,
             cancelled = 0, complete = 0, retrying = 0,
         },
     }
     if result.stockKnown and KnoxBaseSupplyPlanner ~= nil then
+        local targets = type(base) == "table" and base.reserveTargets or nil
+        -- Loose items on the storage floor are stock too. Counting them here
+        -- stops a supply run for something already lying in the room, while
+        -- the storage summary still reports the floor separately.
+        local totals = KnoxBaseSupplyPlanner.stockTotals ~= nil
+            and KnoxBaseSupplyPlanner.stockTotals(storage) or storage.totals
         result.reserves = KnoxBaseSupplyPlanner.reserveStatus(
-            storage.totals, workforce.residents)
+            totals, workforce.residents, targets, result.waterSource)
         result.shortages = KnoxBaseSupplyPlanner.shortages(
-            storage.totals, workforce.residents)
+            totals, workforce.residents, targets, result.waterSource)
+    end
+    -- Hauls nobody could shelve are open problems, not history: the controller
+    -- records and clears them, and this overview only reads them.
+    if type(base) == "table" and KnoxPersistence ~= nil
+        and KnoxPersistence.getBaseStorageProblems ~= nil then
+        result.storageProblems = KnoxPersistence.getBaseStorageProblems(base.id)
     end
     local now = tonumber(worldAgeHours)
     if now == nil and getGameTime ~= nil and getGameTime() ~= nil then
@@ -405,6 +442,73 @@ local function taskTarget(zone)
     }
 end
 
+local function sameAutomaticZoneTarget(current, updated)
+    if type(current) ~= "table" or type(updated) ~= "table" then return false end
+    return tostring(current.autoZoneId or "") == tostring(updated.autoZoneId or "")
+        and tostring(current.zoneType or "") == tostring(updated.zoneType or "")
+        and (tonumber(current.x1) or 0) == updated.x1
+        and (tonumber(current.y1) or 0) == updated.y1
+        and (tonumber(current.x2) or 0) == updated.x2
+        and (tonumber(current.y2) or 0) == updated.y2
+        and (tonumber(current.z) or 0) == updated.z
+end
+
+-- A persisted recurring task follows its work area when the player edits it.
+-- Never rewrite a claimed task's target: its executor may still own the old
+-- destination. The next preparation after its receipt applies the new target.
+function BaseJobs.reconcileAutomaticZoneTask(task, zone, now)
+    local target = task ~= nil and task.target or nil
+    if task == nil or type(target) ~= "table" or target.autoZoneId == nil
+        or task.manual == true then return "not_automatic" end
+    if task.state == "claimed" then return "in_progress" end
+    if task.state == "cancelled" then return "already_cancelled" end
+    now = tonumber(now) or worldAge()
+    if zone == nil or zone.enabled == false then
+        if task.state == "cancelled" then return "already_cancelled" end
+        local cancelled = KnoxPersistence.cancelBaseTask ~= nil
+            and KnoxPersistence.cancelBaseTask(task.baseId, task.id, now) or nil
+        return cancelled ~= nil and "zone_removed" or "cancel_failed"
+    end
+    local zoneType = canonicalZoneType(zone.type)
+    -- A work area retyped to a discovery/overlay label (farming, woodcutting,
+    -- cooking, corpse and similar) no longer owns a recurring task of its own.
+    -- Retire the old assignment here; that zone's finder emits the concrete
+    -- finite jobs against the new label. Leaving the record queued with a type
+    -- no executor serves would hold a resident on a job that cannot finish.
+    if BaseJobs.AUTOMATIC_TYPES[zoneType] ~= true then
+        local cancelled = KnoxPersistence.cancelBaseTask ~= nil
+            and KnoxPersistence.cancelBaseTask(task.baseId, task.id, now) or nil
+        return cancelled ~= nil and "zone_type_retired" or "cancel_failed"
+    end
+    local updated = taskTarget(zone)
+    local changed = not sameAutomaticZoneTarget(target, updated)
+        or task.type ~= updated.zoneType
+        or (tonumber(task.priority) or 50) ~= (tonumber(zone.priority) or 50)
+    if not changed then return "unchanged" end
+    task.target = updated
+    task.type = updated.zoneType
+    -- Keep the durable dedupe signature aligned with the retyped job; otherwise
+    -- the record still advertises the previous job type and destination to
+    -- persistence and migration callers.
+    if type(task.signature) == "string" then
+        local targetSignature = KnoxPersistence.baseTaskTargetSignature ~= nil
+            and KnoxPersistence.baseTaskTargetSignature(updated) or nil
+        if targetSignature ~= nil then
+            task.signature = tostring(task.type) .. ":" .. targetSignature
+        end
+    end
+    task.priority = tonumber(zone.priority) or 50
+    task.basePriority = task.priority
+    if task.state == "blocked" or task.state == "complete" then
+        task.retryAtHours = now
+        if KnoxPersistence.requeueBaseTask ~= nil then
+            local queued = KnoxPersistence.requeueBaseTask(task.baseId, task.id, now)
+            if queued ~= nil then return "moved_and_requeued" end
+        end
+    end
+    return "moved"
+end
+
 local function itemRequirements(...)
     local items = {}
     local hasItems = false
@@ -461,28 +565,29 @@ local function availableWorkFilter(base, now, family)
     end
 end
 
+-- Player bases board windows only after consent: automatic discovery spends
+-- planks and nails. NPC faction bases keep automatic defense boarding. One
+-- function, read by the scheduler and the Base & Work control.
+function BaseJobs.automaticBarricadeAllowed(base)
+    if base == nil then return false end
+    local settings = type(base.settings) == "table" and base.settings or nil
+    local explicit = settings ~= nil and settings.autoBarricade or nil
+    if explicit ~= nil then return explicit == true end
+    return base.ownerKind ~= "player"
+end
+
 local function ensureBarricadeTask(base, now, character)
     local priority = 95
-    -- Player bases board windows only on player order (right-click order or
-    -- Notebook assignment): automatic discovery would spend the player's
-    -- planks/nails without being asked. NPC faction bases keep automatic
-    -- defense boarding. Overridable per base via settings.autoBarricade.
-    local autoSetting = base ~= nil and base.settings ~= nil
-        and base.settings.autoBarricade or nil
-    local allowAuto = (base == nil or base.ownerKind ~= "player")
-    if autoSetting ~= nil then
-        allowAuto = autoSetting == true
-    end
-    if not allowAuto then
+    if not BaseJobs.automaticBarricadeAllowed(base) then
         return nil, "manual_barricade_only"
     end
     if character == nil or not KnoxBaseBarricades.canPrepare(character, base) then
         return nil, "missing_barricade_materials"
     end
-    local target = KnoxBaseBarricades.findTarget(base, character,
+    local target, targetReason = KnoxBaseBarricades.findTarget(base, character,
         availableWorkFilter(base, now, { repair = true, barricade = true }))
     if target == nil then
-        return nil, "no_unbarricaded_window"
+        return nil, targetReason or "no_unbarricaded_window"
     end
     local hammer = KnoxBaseBarricades.findHammer(character, base)
     local hammerType = hammer ~= nil and hammer:getFullType() or "Base.Hammer"
@@ -807,6 +912,13 @@ function BaseJobs.scheduleAssignment(survivorId)
     if type(duty) ~= "table" or duty.mode ~= "base" then
         return "anything"
     end
+    -- A temporary block order outranks the saved rota, but is read through the
+    -- persistence getter so expiry and ownership cannot be bypassed here.
+    local override = persistence.getDutyScheduleOverride ~= nil
+        and persistence.getDutyScheduleOverride(survivorId, worldAge()) or nil
+    if type(override) == "table" and override.assignment ~= nil then
+        return override.assignment
+    end
     local schedule = duty.schedule
     if schedule == nil and persistence.getSurvivorAffiliation ~= nil
         and persistence.ensureAutoDutySchedule ~= nil then
@@ -836,6 +948,46 @@ local TASK_SKILL_HINTS = {
     farm_plow = "Farming", guard = "Aiming", patrol = "Aiming",
     haul_corpse = "Strength", cook = "Cooking",
 }
+
+-- Leader intent is a bounded selection weight over the existing task types.
+-- It never creates work, changes eligibility, or outranks a direct order.
+local INTENT_TASK_WEIGHTS = {
+    security = { guard = 10, patrol = 10, barricade = 6 },
+    stockpile = { cook = 6, farm_harvest = 6, farm_water = 5,
+        farm_plow = 4, farm_seed = 4, saw_logs = 4, haul_corpse = 3 },
+    shelter = { repair = 10, barricade = 8, cook = 2 },
+    health = { cook = 8, farm_harvest = 5, farm_water = 5 },
+    growth = { farm_plow = 6, farm_seed = 6, farm_water = 6,
+        repair = 3, cook = 2 },
+    trade = { saw_logs = 6, farm_harvest = 6, cook = 4, repair = 3 },
+    vengeance = { patrol = 10, guard = 8, barricade = 3 },
+}
+
+function BaseJobs.intentAffinity(intent, taskType)
+    local weights = INTENT_TASK_WEIGHTS[tostring(intent or "")]
+    if weights == nil then return 0 end
+    local canonical = canonicalTaskType(taskType)
+    return tonumber(weights[tostring(canonical or "")]) or 0
+end
+
+-- A base's kind is a bounded selection weight over the same task types. It
+-- never creates work and never outranks priority, a direct order or an
+-- explicit resident role: a checkpoint holds its road, so guard and patrol
+-- come first there, and a storehouse keeps producing and repairing the stock
+-- it is for. Transport itself stays with the supply planner, which already
+-- owns runner parties; this only biases the work board.
+local KIND_TASK_WEIGHTS = {
+    outpost = { guard = 4, patrol = 4, repair = 3, cook = 3 },
+    storage = { saw_logs = 6, farm_harvest = 5, cook = 4, repair = 4, barricade = 3 },
+    checkpoint = { guard = 12, patrol = 12, barricade = 6 },
+}
+
+function BaseJobs.kindAffinity(kind, taskType)
+    local weights = KIND_TASK_WEIGHTS[tostring(kind or "")]
+    if weights == nil then return 0 end
+    local canonical = canonicalTaskType(taskType)
+    return tonumber(weights[tostring(canonical or "")]) or 0
+end
 
 local function skillAffinity(survivorId, taskType)
     local canonicalType = KnoxOrderCatalog ~= nil
@@ -926,6 +1078,10 @@ function BaseJobs.selectEligibleTask(tasks, survivorId, baseId, preference, canP
         local residentIds = KnoxPersistence.getBaseResidentIds(baseId)
         residentCount = type(residentIds) == "table" and #residentIds or 0
     end
+    local baseIntent = persistedBase ~= nil and persistedBase.intent or nil
+    local baseKind = persistedBase ~= nil
+        and KnoxPersistence.getBaseKind ~= nil
+        and KnoxPersistence.getBaseKind(baseId) or nil
     local activeSecurity = (activeByType.guard or 0) + (activeByType.patrol or 0)
     -- A resident's last completed/claimed duty is a soft rotation hint. It
     -- keeps an automatic workforce from handing the same person the same
@@ -963,6 +1119,30 @@ function BaseJobs.selectEligibleTask(tasks, survivorId, baseId, preference, canP
     -- Small camps need one watch; established bases get a second watcher so a
     -- single resident can take a break or handle another urgent task.
     local desiredSecurity = residentCount >= 4 and 2 or 1
+    -- An inbound raid is not a preference: the posts the player actually placed
+    -- are staffed before routine work, bounded by the real roster. The warning
+    -- owner supplies the fact; the task board still performs the one atomic
+    -- claim, and an explicit non-security role stays player-authoritative.
+    local alertPosts = 0
+    local events = rawget(_G, "KnoxEvents")
+    if events ~= nil and events.inboundRaidForBase ~= nil
+        and baseId ~= nil and persistedBase ~= nil then
+        local ok, raid = pcall(events.inboundRaidForBase, baseId, worldAge())
+        if ok and type(raid) == "table" then
+            for _, zone in pairs(persistedBase.zones or {}) do
+                if type(zone) == "table" and zone.enabled ~= false then
+                    local zoneType = zone.type
+                    if zoneType == "patrol_area" then zoneType = "patrol" end
+                    if zoneType == "guard" or zoneType == "patrol" then
+                        alertPosts = alertPosts + 1
+                    end
+                end
+            end
+        end
+    end
+    if alertPosts > 0 then
+        desiredSecurity = math.max(desiredSecurity, math.min(alertPosts, residentCount))
+    end
     local preferredSecurityType = (activeByType.guard or 0) <= (activeByType.patrol or 0)
         and "guard" or "patrol"
     -- Automatic workers fill the settlement's minimum watch before taking
@@ -1004,6 +1184,8 @@ function BaseJobs.selectEligibleTask(tasks, survivorId, baseId, preference, canP
                 local eligible = survivorId == nil or canPerform(survivorId, baseId, task)
                 if eligible and preferenceExcluded ~= true then
                     local score = tonumber(task.priority) or 0
+                    score = score + BaseJobs.intentAffinity(baseIntent, taskType)
+                    score = score + BaseJobs.kindAffinity(baseKind, taskType)
                     local activeOfType = activeByType[tostring(taskType or "")] or 0
                     score = score - math.min(12, activeOfType * 4)
                     score = score + skillAffinity(survivorId, taskType)
@@ -1069,6 +1251,9 @@ local function workforceSignature(base)
         if type(zone) == "table" then
             parts[#parts + 1] = "z:" .. tostring(zone.id or key)
                 .. ":" .. tostring(zone.type) .. ":" .. tostring(zone.enabled ~= false)
+                .. ":" .. tostring(zone.x1 or "") .. ":" .. tostring(zone.y1 or "")
+                .. ":" .. tostring(zone.x2 or "") .. ":" .. tostring(zone.y2 or "")
+                .. ":" .. tostring(zone.z or "") .. ":" .. tostring(zone.priority or "")
         end
     end
     for key, task in pairs(base ~= nil and base.tasks or {}) do
@@ -1119,6 +1304,18 @@ function BaseJobs.prepareWorkforce(base, character, now)
             task.state, task.claimedBy, task.reason = "cancelled", nil, "central_cupboard_replaced_sorting"
         end
     end
+    local zonesById = {}
+    for _, zone in pairs(base.zones or {}) do
+        if zone ~= nil and zone.id ~= nil then zonesById[tostring(zone.id)] = zone end
+    end
+    for _, task in pairs(base.tasks or {}) do
+        local target = task ~= nil and task.target or nil
+        if type(target) == "table" and target.autoZoneId ~= nil then
+            BaseJobs.reconcileAutomaticZoneTask(
+                task, zonesById[tostring(target.autoZoneId)], now
+            )
+        end
+    end
     if discover then
         if jobTests ~= nil and jobTests.prepareDiscovery ~= nil then
             jobTests.prepareDiscovery(base, character)
@@ -1136,6 +1333,7 @@ function BaseJobs.prepareWorkforce(base, character, now)
         local existing = taskForZone(base, zone)
         if existing ~= nil then
             existing.baseId = base.id
+            BaseJobs.reconcileAutomaticZoneTask(existing, zone, now)
             if existing.state ~= "queued" and existing.state ~= "claimed" then
                 reopenWhenReady(existing, now)
             end

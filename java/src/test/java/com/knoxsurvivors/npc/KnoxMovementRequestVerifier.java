@@ -8,7 +8,10 @@ public final class KnoxMovementRequestVerifier {
     public static void main(String[] args) {
         verifyOwnershipMetadata();
         verifyZLevelGeometry();
+        verifySparseRouteEdges();
         verifyRuntimeLifecycle();
+        verifyPendingTransitionRecovery();
+        verifyRouteStartDoesNotReverse();
         verifyDutyArea();
         System.out.println(
             "KnoxMovementRequestVerifier PASS duplicate=true replacement=true cleanup=true"
@@ -65,11 +68,34 @@ public final class KnoxMovementRequestVerifier {
         require(npc.movementArea==null, "cancellation never leaves a stale duty area");
     }
 
+    private static void verifySparseRouteEdges() {
+        float[][] cases = {
+            { .5f, .5f, 10.5f, .5f, 1, 0 },
+            { .5f, .5f, -10.5f, .5f, -1, 0 },
+            { .9f, .2f, 5.5f, 3.5f, 1, 0 },
+            { .2f, .9f, 3.5f, 5.5f, 0, 1 },
+            { .5f, .5f, 9.5f, 9.5f, 1, 1 },
+            { -.2f, -.8f, -9.5f, -2.5f, -2, -1 },
+            { .2f, .2f, .8f, .8f, 0, 0 },
+            { 0, .5f, -10, .5f, -1, 0 },
+        };
+        for (float[] c : cases) {
+            int[] next = KnoxMovementGeometry.nextRouteTile(c[0], c[1], c[2], c[3]);
+            require(next[0] == (int)c[4] && next[1] == (int)c[5],
+                "sparse path checks its first real tile edge before applying movement");
+        }
+        System.out.println("Sparse route edges PASS long_segments=true cardinal_and_corner=true negative_coordinates=true");
+    }
+
     private static void verifyZLevelGeometry() {
         require(KnoxMovementGeometry.arrived(10.5f, 20.5f, 1, 10.5f, 20.5f, 1, 0.65f),
             "same XYZ within tolerance arrives");
         require(!KnoxMovementGeometry.arrived(10.5f, 20.5f, 0, 10.5f, 20.5f, 1, 0.65f),
             "same XY on the wrong floor does not arrive");
+        require(!KnoxMovementGeometry.arrived(.95f,.5f,0,1.5f,.5f,0,.65f),
+            "distance tolerance cannot claim arrival across an adjacent wall/window edge");
+        require(!KnoxMovementGeometry.arrived(-.05f,.5f,0,.5f,.5f,0,.65f),
+            "tile containment uses floor coordinates, including negatives");
         require(!KnoxMovementGeometry.nodeReached(
             10.5f, 20.5f, 0, 10.5f, 20.5f, 1, 0.35f
         ), "stair node is retained until its floor is reached");
@@ -173,6 +199,48 @@ public final class KnoxMovementRequestVerifier {
             "explicit interruption cancels request");
         require("IDLE".equals(runtime.tickMovement()),
             "interruption leaves no orphaned owner");
+    }
+
+    private static void verifyPendingTransitionRecovery() {
+        for (String transition : java.util.List.of("Transition:TURNING_TO_WINDOW",
+                "Transition:STARTED_WINDOW_CLIMB", "Transition:ManualRoute")) {
+            FakeMovementEngine engine=new FakeMovementEngine();
+            engine.x=.95f; engine.tickResult=transition;
+            KnoxNpcRuntime runtime=new KnoxNpcRuntime(new KnoxNpc("transition",new Object(),0,0,0),engine);
+            require(runtime.beginMove(new Target(1,0,0),false).startsWith("MOVE_STARTED") && engine.starts==1,
+                "a nearby destination across the tile edge still requires native movement");
+            for(int tick=0;tick<179;tick++) require(runtime.tickMovement().equals(transition),
+                "pending input gets a bounded grace period");
+            require(runtime.tickMovement().startsWith("FailedTransitionStalled") && engine.cancels==1,
+                "unadmitted transition must fail through ordinary cleanup");
+            require(runtime.tickMovement().equals("IDLE"),"failed transition releases movement ownership");
+        }
+        FakeMovementEngine engine=new FakeMovementEngine();
+        engine.tickResult="Transition:CLIMBING";
+        KnoxNpcRuntime runtime=new KnoxNpcRuntime(new KnoxNpc("native-climb",new Object(),0,0,0),engine);
+        runtime.beginMove(new Target(4,0,2),false);
+        for(int tick=0;tick<400;tick++) require(runtime.tickMovement().equals("Transition:CLIMBING"),
+            "real native crossing cannot be cancelled by the pending-input watchdog");
+        engine.tickResult="Working";
+        for(int tick=0;tick<44;tick++) require(runtime.tickMovement().equals("Working"),"locomotion gets its own progress window");
+        engine.z=1;
+        for(int tick=0;tick<44;tick++) require(runtime.tickMovement().equals("Working"),"vertical floor progress resets the stuck budget");
+        require(engine.cancels==0,"native crossing and floor progress preserve the same route");
+        System.out.println("Movement recovery PASS pending_transitions_bounded=true native_crossing_preserved=true floor_progress=true no_cross_wall_arrival=true");
+    }
+
+    private static void verifyRouteStartDoesNotReverse() {
+        KnoxNpc npc=new KnoxNpc("moving-follower",new Object(),0,0,0);
+        float[] start={.5f,.5f,0}, forward={2.5f,.5f,0};
+        require(KnoxNpcFactory.acceptMovementRoute(npc,.95f,.5f,0,java.util.List.of(start,forward))
+            && npc.currentMovementNode()==forward,"moving follower skips a backward start-tile marker");
+        KnoxNpcFactory.acceptMovementRoute(npc,.95f,.5f,0,java.util.List.of(start));
+        require(npc.currentMovementNode()==start,"final work target in the current tile is retained");
+        KnoxNpcFactory.acceptMovementRoute(npc,.95f,.5f,0,java.util.List.of(start,new float[]{2.5f,.5f,1}));
+        require(npc.currentMovementNode()==start,"stair entry marker is preserved");
+        KnoxNpcFactory.acceptMovementRoute(npc,.95f,.5f,0,java.util.List.of(start,new float[]{-2.5f,.5f,0}));
+        require(npc.currentMovementNode()==start,"real reverse route still turns toward its destination");
+        System.out.println("Follow route start PASS no_artificial_reverse=true final_goal=true stairs=true actual_reverse=true");
     }
 
     private static final class Target {

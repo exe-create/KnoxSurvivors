@@ -44,6 +44,7 @@ local function screenDirection(fromX, fromY, toX, toY)
     return sx / length, sy / length
 end
 
+-- COMPASS (pure)
 -- Eight-wind compass on world deltas (map convention: north is -y),
 -- independent of the screen projection used for the arrow itself.
 local function compass(dx, dy)
@@ -53,6 +54,19 @@ local function compass(dx, dy)
     if dx > 0 then return dy > 0 and "SE" or "NE" end
     return dy > 0 and "SW" or "NW"
 end
+
+local COMPASS_WORDS = {
+    N = "north", NE = "northeast", E = "east", SE = "southeast",
+    S = "south", SW = "southwest", W = "west", NW = "northwest",
+}
+
+-- A full word for spoken reports. The arrow keeps the short code; both read
+-- this one eight-wind rule.
+function Indicators.compassWord(dx, dy)
+    if dx == 0 and dy == 0 then return nil end
+    return COMPASS_WORDS[compass(dx, dy)]
+end
+-- END COMPASS
 
 local function drawArrow(panel, cx, cy, dx, dy, dist, r, g, b)
     -- Shaft toward the speaker plus a two-line head, then the distance. Keep

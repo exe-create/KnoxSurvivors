@@ -5,6 +5,10 @@ require "KS_SurvivorNeeds"
 require "KS_SurvivorRuntime"
 require "KS_OrderCatalog"
 local SurvivorNames = require "KS_SurvivorNames"
+local ReputationView = require "KS_ReputationView"
+if type(ReputationView) ~= "table" then
+    ReputationView = rawget(_G, "KnoxReputationView") or {}
+end
 
 local ViewModel = rawget(_G, "KnoxSurvivorViewModel") or {}
 _G.KnoxSurvivorViewModel = ViewModel
@@ -117,6 +121,94 @@ local function liveCharacter(id)
 end
 
 
+-- CONDITION ROWS (pure)
+-- The card's Condition tab reads the same body state as the Needs line. Pain is
+-- a fraction for the bar; a bleed count is a word, because "2 parts" is not a
+-- percentage. Both are projections over the self-report the snapshot already
+-- carries; neither infers a wound the survivor did not report.
+local function painFraction(pain)
+    local value = tonumber(pain)
+    if value == nil or value ~= value then return nil end
+    return math.max(0, math.min(1, value / 100))
+end
+local function bleedingWord(count)
+    local value = math.max(0, math.floor(tonumber(count) or 0))
+    if value == 0 then return nil end
+    return value == 1 and "1 part" or (tostring(value) .. " parts")
+end
+-- The card's one medical button names the condition above it, without
+-- promising a treatment the native check may not perform.
+local function medicalLabel(bleedingParts)
+    local count = math.max(0, math.floor(tonumber(bleedingParts) or 0))
+    return count > 0 and "Check Bleeding" or "Medical Check"
+end
+-- The bite is the condition that changes the whole plan. Only the engine's own
+-- boolean names it; a clean or unreadable body spends no row.
+local function infectionWord(bitten)
+    return bitten == true and "Bitten" or nil
+end
+-- END CONDITION ROWS
+
+-- ORDER ROW (pure)
+-- The card keeps the accepted order and adds the one fact that changes what
+-- the player can ask for next. A steady or unknown person changes nothing.
+local function orderRowLabel(label, willingness)
+    local text = tostring(label or "")
+    if willingness == "wary" then
+        return text ~= "" and (text .. " - won't take new orders")
+            or "Won't take new orders"
+    end
+    if willingness == "hostile" then
+        return text ~= "" and (text .. " - hostile") or "Hostile"
+    end
+    return label
+end
+-- END ORDER ROW
+
+-- WEAPON WORD (pure)
+-- A weapon's condition is the warning before the break, not a second
+-- durability model. Sound weapons spend no words; only the two worn bands do.
+local function conditionWord(current, maximum)
+    local value = tonumber(current)
+    local max = tonumber(maximum)
+    if value == nil or max == nil or max <= 0 then return nil end
+    value = math.max(0, math.min(max, value))
+    local ratio = value / max
+    if ratio >= 0.75 then return nil end
+    if ratio >= 0.4 then return "Worn" end
+    if value > 0 then return "Fragile" end
+    return nil
+end
+-- The card names what is in the hand. A broken weapon says so, because the
+-- inventory is the only other place that fact is visible. A worn one adds one
+-- word before it becomes unusable. The rule is pure so the suffix and the
+-- empty-name case can be driven without a body.
+local function weaponWord(rawName, broken, condition)
+    local name = tostring(rawName or ""):gsub("%s+", " ")
+    name = name:gsub("^%s+", ""):gsub("%s+$", "")
+    if name == "" then return nil end
+    if broken == true then
+        name = name .. " (broken)"
+    elseif condition == "Worn" or condition == "Fragile" then
+        name = name .. " - " .. condition
+    end
+    return name
+end
+-- The held gun's rounds are the same kind of projection: the engine's count,
+-- not a guess. A chambered round is still a shot when the magazine reads zero,
+-- so it is named rather than called empty; an unreadable or non-ranged item
+-- spends no row at all.
+local function ammoWord(rounds, chambered)
+    local count = tonumber(rounds)
+    if count == nil or count ~= count then return nil end
+    count = math.max(0, math.floor(count))
+    if count > 1 then return tostring(count) .. " rounds" end
+    if count == 1 then return "1 round" end
+    if chambered == true then return "1 chambered" end
+    return "Empty"
+end
+-- END WEAPON WORD
+
 local function weaponName(character)
     if character == nil then
         return "Equipment unavailable"
@@ -130,7 +222,35 @@ local function weaponName(character)
     local nameOk, name = pcall(function()
         return item:getDisplayName()
     end)
-    return nameOk and cleanNamePart(name) ~= "" and tostring(name) or "Unarmed"
+    local broken = false
+    if success then
+        pcall(function() broken = item:isBroken() == true end)
+    end
+    local condition = nil
+    if nameOk and not broken then
+        local currentOk, current = pcall(function() return item:getCondition() end)
+        local maxOk, maximum = pcall(function() return item:getConditionMax() end)
+        if currentOk and maxOk then
+            condition = conditionWord(current, maximum)
+        end
+    end
+    return nameOk and weaponWord(name, broken, condition) or "Unarmed"
+end
+
+local function ammoName(character)
+    if character == nil then return nil end
+    local success, item = pcall(function()
+        return character:getPrimaryHandItem() or character:getSecondaryHandItem()
+    end)
+    if not success or item == nil then return nil end
+    local ranged = false
+    pcall(function() ranged = item:isRanged() == true end)
+    if not ranged or item.getCurrentAmmoCount == nil then return nil end
+    local countOk, count = pcall(function() return item:getCurrentAmmoCount() end)
+    if not countOk then return nil end
+    local chambered = false
+    pcall(function() chambered = item:isRoundChambered() == true end)
+    return ammoWord(count, chambered)
 end
 
 local function roleFor(affiliation, duty)
@@ -326,7 +446,9 @@ local function needSummary(state, available)
     local labels = {}
     local thresholds = KnoxSurvivorNeeds.thresholds
     -- A bite is‐the death sentence: surface it first, ahead of bleeding.
-    if state.bitten == true then labels[#labels + 1] = "Bitten!" end
+    -- No exclamation marks in player copy (UI.md law 8): a bite is already the
+    -- first, critical entry in this list and reads in the red tone.
+    if state.bitten == true then labels[#labels + 1] = "Bitten" end
     if (tonumber(state.bleedingParts) or 0) > 0 then labels[#labels + 1] = "Bleeding" end
     if (tonumber(state.bleedingParts) or 0) == 0 and (tonumber(state.health) or 100) < 75 then
         labels[#labels + 1] = "Hurt"
@@ -408,11 +530,19 @@ function ViewModel.resolveLiveCharacter(id)
 end
 
 -- Preserve the existing card's trust bands without exposing a private score.
+-- The band itself lives in KS_ReputationView so the card, Talk and any later
+-- roster cannot describe the same relationship differently.
 local function trustLabelFor(relationship)
     local trust = relationship ~= nil and tonumber(relationship.trust) or nil
     if trust == nil or trust ~= trust then return "Unknown" end
+    if ReputationView.personalLabel ~= nil then
+        return ReputationView.personalLabel(trust)
+    end
     return trust >= 70 and "Trusting" or (trust >= 40 and "Cautious" or "Wary")
 end
+-- The Talk panel's standing line is the same read-out as the card's, so one
+-- relationship cannot be described two different ways.
+ViewModel.trustLabelFor = trustLabelFor
 
 function ViewModel.getSurvivor(id, playerNum)
     if type(id) ~= "string" or id == "" then
@@ -456,6 +586,26 @@ function ViewModel.getSurvivor(id, playerNum)
     local relationship = playerId ~= nil
         and KnoxPersistence.getPlayerRelationshipSnapshot(playerId, id)
         or nil
+    local orderWillingness = nil
+    if playerId ~= nil and type(affiliation) == "table"
+        and affiliation.kind == "player" then
+        local service = rawget(_G, "KnoxCompanionService")
+        if service ~= nil and service.orderWillingness ~= nil then
+            local ok, verdict = pcall(service.orderWillingness, id, playerId)
+            if ok and type(verdict) == "string" then orderWillingness = verdict end
+        end
+    end
+    local orderLabel = character ~= nil and orderLabelFor(duty, id) or "Last accepted order"
+    local hostile = false
+    if playerId ~= nil and KnoxPersistence.isSurvivorHostileToPlayer ~= nil then
+        local hostileOk, flag = pcall(KnoxPersistence.isSurvivorHostileToPlayer,
+            id, playerId)
+        hostile = hostileOk and flag == true
+    end
+    local standing = ReputationView.personal ~= nil
+        and ReputationView.personal(relationship, hostile) or nil
+    local factionStanding = ReputationView.factionFor ~= nil
+        and ReputationView.factionFor(playerId, id) or nil
     local playerData = player ~= nil and player.getModData ~= nil and player:getModData() or nil
     local spouseStart = playerData ~= nil and playerData.KnoxSurvivors ~= nil
         and playerData.KnoxSurvivors.spouseStart or nil
@@ -475,9 +625,20 @@ function ViewModel.getSurvivor(id, playerNum)
         alive = alive and not (success and dead == true)
     end
     local deathEvidence = nil
+    local deathCauseLabel = nil
     if character ~= nil and not alive then
         local sq = character:getCurrentSquare()
         deathEvidence = {x=sq:getX(), y=sq:getY(), z=sq:getZ(), locationSource="observed"}
+        -- The body is where the person fell; why they fell is already on the
+        -- death evidence the death owner stored. Reading it here keeps the card
+        -- and the map marker on the same record the death line printed.
+        local stored = KnoxPersistence.getSurvivorDeathEvidence ~= nil
+            and KnoxPersistence.getSurvivorDeathEvidence(id) or nil
+        local cause = type(stored) == "table" and stored.cause or nil
+        deathEvidence.cause = cause
+        local needs = rawget(_G, "KnoxSurvivorNeeds")
+        deathCauseLabel = needs ~= nil and needs.deathCauseLabel ~= nil
+            and needs.deathCauseLabel(cause) or nil
     end
     local deathLocationLabel = "Deceased - witnessed"
 
@@ -494,7 +655,9 @@ function ViewModel.getSurvivor(id, playerNum)
         personalityLabel = identity.personalityLabel,
         traits = capabilities.traitIds or {},
         skills = capabilities.skills or {},
-        trustLabel = trustLabelFor(relationship),
+        trustLabel = standing ~= nil and standing.label or trustLabelFor(relationship),
+        standing = standing,
+        factionStanding = factionStanding,
         relationshipMeetings = relationship ~= nil and tonumber(relationship.meetings) or nil,
         recentHistory = recentHistory,
         latestMemory = recentHistory[1] ~= nil and recentHistory[1].label or nil,
@@ -505,7 +668,10 @@ function ViewModel.getSurvivor(id, playerNum)
         daysKnown = wholeDaysSince(knownSince, nowHours),
         locationLabel = character ~= nil and (alive and locationLabelFor(duty, character, distance, sameLevel) or deathLocationLabel) or "Location unknown",
         deathEvidence = deathEvidence,
-        orderLabel = character ~= nil and orderLabelFor(duty, id) or "Last accepted order",
+        deathCauseLabel = deathCauseLabel,
+        orderLabel = orderLabel,
+        orderDisplayLabel = orderRowLabel(orderLabel, orderWillingness),
+        orderWillingness = orderWillingness,
         order = tostring(duty.order or "survive"),
         activity = character ~= nil and activityFor(duty, {}, true, alive, currentActivity) or "Out of contact",
         needSummary = needSummary(state, vitalsAvailable),
@@ -517,7 +683,10 @@ function ViewModel.getSurvivor(id, playerNum)
         loaded = character ~= nil,
         alive = alive,
         health = vitalsAvailable and clamp01((tonumber(state.health) or 100) / 100) or nil,
+        infectionLabel = vitalsAvailable and infectionWord(state.bitten) or nil,
         bleedingParts = math.max(0, tonumber(state.bleedingParts) or 0),
+        bleedingLabel = vitalsAvailable and bleedingWord(state.bleedingParts) or nil,
+        medicalActionLabel = vitalsAvailable and medicalLabel(state.bleedingParts) or "Medical Check",
         needs = {
             food = vitalsAvailable and (1 - clamp01(state.hunger)) or nil,
             water = vitalsAvailable and (1 - clamp01(state.thirst)) or nil,
@@ -535,9 +704,10 @@ function ViewModel.getSurvivor(id, playerNum)
             fatigue = vitalsAvailable and clamp01(state.fatigue) or nil,
             endurance = vitalsAvailable and clamp01(state.endurance) or nil,
             bleedingParts = vitalsAvailable and math.max(0, tonumber(state.bleedingParts) or 0) or nil,
-            pain = vitalsAvailable and tonumber(state.pain) or nil,
+            pain = vitalsAvailable and painFraction(state.pain) or nil,
         },
         weaponName = weaponName(character),
+        ammoName = ammoName(character),
         distanceTiles = distance,
         sameLevel = sameLevel,
         affiliation = {
@@ -573,7 +743,7 @@ function ViewModel.getSurvivor(id, playerNum)
         atHours=character ~= nil and nowHours or nil, reportAtHours=report ~= nil and report.atHours or nil,
         reportSource=report ~= nil and report.source or nil, current=character ~= nil}
     local keys = {"alive", "role", "roleLabel", "duty", "order", "orderLabel", "activity",
-        "locationLabel", "weaponName", "deathEvidence", "position", "affiliation", "factionName",
+        "locationLabel", "weaponName", "ammoName", "deathEvidence", "deathCauseLabel", "position", "affiliation", "factionName",
         "skills", "traits", "daysSurvived"}
     if character ~= nil then
         local sq = character:getCurrentSquare()
@@ -599,6 +769,7 @@ function ViewModel.getSurvivor(id, playerNum)
         snapshot.locationLabel = seen ~= nil and "Last seen - " .. tostring(math.floor(math.max(0,
             nowHours-seen.atHours)*60)) .. " min ago" or "Location unknown"
         snapshot.weaponName = previous.weaponName or "Equipment unavailable"
+        snapshot.ammoName = previous.ammoName
         snapshot.distanceTiles, snapshot.sameLevel = nil, nil
         snapshot.knowledge.source = seen ~= nil and seen.source or "unknown"
         snapshot.knowledge.atHours = seen ~= nil and seen.atHours or nil
@@ -653,5 +824,213 @@ function ViewModel.getForPlayer(playerNum)
     end)
     return snapshots
 end
+
+-- PARTY STRIP SUMMARY (pure)
+-- The compact and expanded strips share one readable projection. It reads
+-- reported needs, visible activity, health and the alive flag; it adds no
+-- physiological thresholds and never invents an observation.
+local PARTY_NEED_CONDITIONS = {
+    { token = "Bitten", label = "Bitten", tone = "critical" },
+    { token = "Bleeding", label = "Bleeding", tone = "critical" },
+    { token = "Starving", label = "Starving", tone = "critical" },
+    { token = "Dehydrated", label = "Dehydrated", tone = "critical" },
+    { token = "Critical exhaustion", label = "Exhausted", tone = "critical" },
+    { token = "Hurt", label = "Hurt", tone = "warn" },
+    { token = "Pain", label = "In pain", tone = "warn" },
+    { token = "Water", label = "Thirsty", tone = "warn" },
+    { token = "Food", label = "Hungry", tone = "warn" },
+    { token = "Catch breath", label = "Winded", tone = "warn" },
+    { token = "Sleep", label = "Tired", tone = "warn" },
+}
+
+local PARTY_ACTIVITY_CONDITIONS = {
+    ["Hurt"] = { label = "Hurt", tone = "warn" },
+    ["Needs water"] = { label = "Thirsty", tone = "warn" },
+    ["Needs food"] = { label = "Hungry", tone = "warn" },
+    ["Catching breath"] = { label = "Winded", tone = "warn" },
+    ["Tired"] = { label = "Tired", tone = "warn" },
+    ["Falling back"] = { label = "Withdrawing", tone = "warn" },
+    ["Regrouping"] = { label = "Regrouping", tone = "warn" },
+    ["Retreating"] = { label = "Withdrawing", tone = "warn" },
+    ["Dead"] = { label = "Dead", tone = "critical" },
+    ["Dead (witnessed)"] = { label = "Dead", tone = "critical" },
+}
+
+local function cleanNeedText(snapshot)
+    local summary = tostring(snapshot.needSummary or "")
+    local clean = summary:gsub("^Last reported %([^%)]*%): ", "")
+    if clean == "" or clean == "Needs not reported"
+        or clean == "Condition unavailable" then
+        return nil, false
+    end
+    return clean, true
+end
+
+function ViewModel.partyCondition(snapshot)
+    if type(snapshot) ~= "table" then
+        return { label = "Unknown", tone = "muted" }
+    end
+    if snapshot.alive == false then
+        return { label = "Dead", tone = "critical" }
+    end
+    local clean, known = cleanNeedText(snapshot)
+    if known then
+        for _, entry in ipairs(PARTY_NEED_CONDITIONS) do
+            if string.find(clean, entry.token, 1, true) ~= nil then
+                return { label = entry.label, tone = entry.tone }
+            end
+        end
+    end
+    local health = tonumber(snapshot.health)
+    if health ~= nil and health < 0.75 then
+        return { label = "Hurt", tone = "warn" }
+    end
+    -- A dry gun during a fight is the fact that changes the next move. Only a
+    -- visible body whose own engine count said Empty earns the word; an
+    -- offscreen memory, a holstered gun or a melee fighter says nothing here.
+    -- A wound or a reported need above already outranks it.
+    if snapshot.loaded == true and snapshot.ammoName == "Empty" then
+        local doing = tostring(snapshot.activity or "")
+        if doing == "Fighting" or doing == "Retreating"
+            or doing == "Falling back" then
+            return { label = "Out of ammo", tone = "warn" }
+        end
+    end
+    local activity = PARTY_ACTIVITY_CONDITIONS[tostring(snapshot.activity or "")]
+    if activity ~= nil then return activity end
+    if known or health ~= nil then
+        return { label = "Fine", tone = "good" }
+    end
+    return { label = "Unknown", tone = "muted" }
+end
+
+-- A crew roster row has room for one condition word only when it is a problem.
+-- The strip's own projection decides what that word is, so a bitten resident
+-- cannot read Fine in the notebook and Bitten in the HUD. A clean or unknown
+-- body spends no column.
+function ViewModel.rosterCondition(snapshot)
+    local condition = ViewModel.partyCondition(snapshot)
+    if condition.tone == "warn" or condition.tone == "critical" then
+        return condition.label
+    end
+    return nil
+end
+
+-- Hover replaces the row's condition word with a lower-priority detail line.
+-- It must not hide the fact that changes the plan: a critical word is already
+-- the answer to "what is wrong?".
+function ViewModel.hoverKeepsCondition(tone)
+    return tone == "critical"
+end
+
+-- The party strip's one refusal badge reads the same order gate the order
+-- commands do. Only a real refusal earns it; steady and unknown spend nothing.
+function ViewModel.partyRefusal(willingness)
+    if willingness == "wary" then
+        return { label = "Wary", tone = "warn" }
+    end
+    if willingness == "hostile" then
+        return { label = "Hostile", tone = "critical" }
+    end
+    return nil
+end
+
+-- One short line for a hovered strip row: the fact the row itself has no
+-- room for. It reads only what this file already projected for the snapshot —
+-- a need that crossed its threshold, or the last known place for someone out
+-- of contact. It is not a reason and never guesses why something happened.
+function ViewModel.partyDetail(snapshot)
+    if type(snapshot) ~= "table" then return nil end
+    if snapshot.alive == false then return "Dead" end
+    -- Out of contact, the place is the actionable fact. A need on that report
+    -- describes the body last seen, not the one in front of the player.
+    if snapshot.loaded == false then
+        local where = tostring(snapshot.locationLabel or "")
+        if where == "" then return "Away" end
+        -- The producer already frames an offscreen body: it overwrites the
+        -- label with "Last seen - N min ago" or "Location unknown", and the
+        -- duty branch can supply its own "Away - assigned to ...". Prefixing
+        -- any of those would report the same absence twice.
+        if string.sub(where, 1, 9) == "Last seen"
+            or string.sub(where, 1, 13) == "Last reported"
+            or where == "Location unknown"
+            or string.sub(where, 1, 4) == "Away" then
+            return where
+        end
+        return "Away - " .. where
+    end
+    local clean, known = cleanNeedText(snapshot)
+    -- "All right" is what the offscreen projection stores when nothing crossed a
+    -- threshold, so prefixing it with Needs: would read "Needs: All right".
+    if known and clean ~= nil and clean ~= "" and clean ~= "All right" then
+        return "Needs: " .. clean
+    end
+    return nil
+end
+
+function ViewModel.partyProblemCount(snapshots)
+    local count = 0
+    for _, snapshot in ipairs(type(snapshots) == "table" and snapshots or {}) do
+        local condition = ViewModel.partyCondition(snapshot)
+        if condition.tone == "warn" or condition.tone == "critical" then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+-- The strip's one-line state, shared by the expanded header and the compact
+-- row. It reports only the conditions already projected above; it never adds
+-- a new need threshold or invents an observation.
+function ViewModel.partyHeadline(snapshots, compact)
+    local list = type(snapshots) == "table" and snapshots or {}
+    local total = #list
+    if total == 0 then return "No one with you" end
+    local problems = ViewModel.partyProblemCount(list)
+    if compact == true then
+        if problems > 0 then
+            return tostring(total) .. " with you · " .. tostring(problems)
+                .. (problems == 1 and " problem" or " problems")
+        end
+        return tostring(total) .. " with you"
+    end
+    if problems > 0 then
+        return tostring(total) .. " · " .. tostring(problems)
+            .. (problems == 1 and " needs you" or " need you")
+    end
+    local unreported = 0
+    for _, snapshot in ipairs(list) do
+        if ViewModel.partyCondition(snapshot).tone == "muted" then
+            unreported = unreported + 1
+        end
+    end
+    if unreported > 0 then
+        return tostring(total) .. " · " .. tostring(unreported) .. " unreported"
+    end
+    return tostring(total) .. " · all clear"
+end
+
+-- The strongest condition in the party, used for the compact row's one accent
+-- and the header. `good` wins only when at least one person is known to be
+-- fine; an all-unknown party stays muted rather than claiming an all-clear.
+function ViewModel.partyTone(snapshots)
+    local list = type(snapshots) == "table" and snapshots or {}
+    if #list == 0 then return "muted" end
+    local hasGood, hasWarn, hasUnknown = false, false, false
+    for _, snapshot in ipairs(list) do
+        local condition = ViewModel.partyCondition(snapshot)
+        if condition.tone == "critical" then return "critical" end
+        if condition.tone == "warn" then hasWarn = true end
+        if condition.tone == "good" then hasGood = true end
+        if condition.tone == "muted" then hasUnknown = true end
+    end
+    if hasWarn then return "warn" end
+    if hasUnknown then return "muted" end
+    if hasGood then return "good" end
+    return "muted"
+end
+-- END PARTY STRIP SUMMARY
+
+-- END PARTY STRIP SUMMARY
 
 return ViewModel

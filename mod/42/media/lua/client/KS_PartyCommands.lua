@@ -5,6 +5,7 @@ require "KS_ActivityFeed"
 require "KS_Settings"
 require "KS_SurvivorNotebook"
 require "KS_OrderCatalog"
+require "KS_HouseClearing"
 -- Optional radial bridge: fail-closed and dormant when the vanilla radial API
 -- is absent. Context order menus are separately controlled by their Sandbox option.
 pcall(require, "KS_RadialOrders")
@@ -106,6 +107,23 @@ end
 
 function PartyCommands.returnAll(_, playerNum)
     local actor = player(playerNum)
+    -- Several homes: the player picks once for the whole party. The old path
+    -- fell through to the owner's first base without saying so.
+    local picker = rawget(_G, "KnoxBasePicker")
+    local bases = actor ~= nil and KnoxCompanionService.baseChoicesFor ~= nil
+        and KnoxCompanionService.baseChoicesFor(actor) or {}
+    if #bases > 1 and picker ~= nil and picker.choose ~= nil then
+        picker.choose(playerNum, "Send the party home to which base?", bases,
+            function(baseId)
+                if baseId == nil then return end
+                local apply = KnoxOrderCatalog.withFeedback
+                    or function(_, fn, ...) return fn(...) end
+                for _, id in ipairs(KnoxCompanionService.getCompanionIds(actor)) do
+                    apply("Return to base", KnoxCompanionService.sendToBase, actor, id, baseId)
+                end
+            end)
+        return
+    end
     issueParty(actor, "return_to_base")
 end
 
@@ -175,8 +193,47 @@ function PartyCommands.basePreferenceAll(_, playerNum, preference)
     end
 end
 
+-- One base's work preference, applied to that base's residents only. The
+-- aggregate path used issueOrderAll, which resolves the owner's first base, so
+-- a second settlement could never be given a different order from this menu.
+function PartyCommands.basePreferenceFor(_, playerNum, baseId, preference)
+    local actor = player(playerNum)
+    if actor == nil or type(baseId) ~= "string" or preference == nil then return end
+    if KnoxPersistence.getBaseResidentIds == nil then return end
+    local apply = KnoxOrderCatalog.withFeedback or function(_, fn, ...) return fn(...) end
+    local changed = 0
+    for _, residentId in ipairs(KnoxPersistence.getBaseResidentIds(baseId) or {}) do
+        if apply("Base work order", KnoxCompanionService.setBaseJobPreference,
+            actor, residentId, preference, baseId) then
+            changed = changed + 1
+        end
+    end
+    if changed > 0 and KnoxActivityFeed ~= nil then
+        KnoxActivityFeed.event("Work order set for " .. tostring(changed) .. " resident(s).")
+    end
+end
+
 function PartyCommands.clearDirectiveAll(_, playerNum)
     issueParty(player(playerNum), "resume_normal_duty")
+end
+
+-- PT-12: the party sweep is a bounded coordinator over the same
+-- loot_building/guard directives, not another order vocabulary. The module
+-- owns the transient room plan; this menu only opens or closes it.
+function PartyCommands.clearHouse(_, playerNum)
+    local actor = player(playerNum)
+    local house = rawget(_G, "KnoxHouseClearing")
+    if actor ~= nil and house ~= nil and house.issue ~= nil then
+        house.issue(actor)
+    end
+end
+
+function PartyCommands.cancelHouse(_, playerNum)
+    local actor = player(playerNum)
+    local house = rawget(_G, "KnoxHouseClearing")
+    if actor ~= nil and house ~= nil and house.cancel ~= nil then
+        house.cancel(actor, "cancelled")
+    end
 end
 
 function PartyCommands.openActivity()
@@ -193,27 +250,47 @@ function PartyCommands.openNotebook(_, playerNum)
     KnoxSurvivorNotebook.show(playerNum)
 end
 
+-- The work preference every resident of one base shares, or nil when the base
+-- is empty or split. Read-only, so drawing the menu cannot change duty.
+local function sharedBasePreference(baseId)
+    if KnoxPersistence.getBaseResidentIds == nil
+        or KnoxPersistence.getSurvivorDuty == nil then return nil end
+    local shared, set = nil, false
+    for _, residentId in ipairs(KnoxPersistence.getBaseResidentIds(baseId) or {}) do
+        local duty = KnoxPersistence.getSurvivorDuty(residentId) or {}
+        local preference = KnoxOrderCatalog.normalizeBasePreference ~= nil
+            and KnoxOrderCatalog.normalizeBasePreference(duty.jobPreference or "auto")
+            or KnoxOrderCatalog.normalize(duty.jobPreference or "auto")
+            or "auto"
+        if not set then
+            shared, set = preference, true
+        elseif shared ~= preference then
+            return nil
+        end
+    end
+    return shared
+end
+
+local function addBasePreferenceOptions(menu, playerNum, baseId, sharedPreference)
+    for _, preference in ipairs(KnoxOrderCatalog.basePreferenceOrder or {}) do
+        local entry = KnoxOrderCatalog.basePreferences[preference]
+        if entry ~= nil then
+            local label = preference == "hauling" and "Move Corpses" or entry.label
+            local option = menu:addOption(label, PartyCommands,
+                PartyCommands.basePreferenceFor, playerNum, baseId, preference)
+            menu:setOptionChecked(option, sharedPreference == preference)
+        end
+    end
+end
+
 local function populate(menu, playerNum, square)
     local actor = player(playerNum)
     if contextOrdersEnabled() then
-    local common = {}
-    for index, id in ipairs(KnoxCompanionService.getCompanionIds(actor)) do
-        local duty = KnoxPersistence.getSurvivorDuty(id) or {}
-        local policies = KnoxPersistence.getSurvivorPolicies(id) or {}
-        local doors = policies.allowDoorOpening
-        if doors == nil and KnoxSettings ~= nil
-            and KnoxSettings.allowSurvivorDoorWindowOpening ~= nil then
-            doors = KnoxSettings.allowSurvivorDoorWindowOpening() ~= false
-        end
-        local values = { order = duty.order or "follow", stance = duty.combatStance or "defensive",
-            climbing = policies.allowClimbing ~= false, doors = doors ~= false,
-            weapon = policies.weaponPreference or "auto",
-            autoEquipment = policies.autoEquipment ~= false }
-        for key, value in pairs(values) do
-            if index == 1 then common[key] = value
-            elseif common[key] ~= value then common[key] = nil end
-        end
-    end
+    -- One read-out for the whole menu: the companion service owns the durable
+    -- duty/policy defaults, so a checkmark here and the label on the wheel
+    -- cannot report different settings for the same party.
+    local common = type(KnoxCompanionService.commonTactics) == "function"
+        and KnoxCompanionService.commonTactics(actor) or {}
     -- Everyday party orders in one place instead of scattered top-level rows.
     local ordersRoot = menu:addOption("Orders", nil, nil)
     local ordersMenu = ISContextMenu:getNew(menu)
@@ -250,32 +327,22 @@ local function populate(menu, playerNum, square)
         local baseOrders = menu:addOption(catalogLabel("base_work_orders", "Base Work Orders"), nil, nil)
         local baseOrderMenu = ISContextMenu:getNew(menu)
         menu:addSubMenu(baseOrders, baseOrderMenu)
-        local sharedPreference = nil
-        local sharedPreferenceSet = false
-        if KnoxPersistence.getBaseResidentIds ~= nil
-            and KnoxPersistence.getSurvivorDuty ~= nil then
-            for _, residentId in ipairs(KnoxPersistence.getBaseResidentIds(base.id) or {}) do
-                local duty = KnoxPersistence.getSurvivorDuty(residentId) or {}
-                local preference = KnoxOrderCatalog.normalizeBasePreference ~= nil
-                    and KnoxOrderCatalog.normalizeBasePreference(duty.jobPreference or "auto")
-                    or KnoxOrderCatalog.normalize(duty.jobPreference or "auto")
-                    or "auto"
-                if not sharedPreferenceSet then
-                    sharedPreference, sharedPreferenceSet = preference, true
-                elseif sharedPreference ~= preference then
-                    sharedPreference = nil
-                    break
+        local bases = KnoxCompanionService.baseChoicesFor ~= nil
+            and KnoxCompanionService.baseChoicesFor(actor) or {}
+        if #bases == 0 then bases = { base } end
+        for _, candidate in ipairs(bases) do
+            if type(candidate) == "table" and candidate.id ~= nil then
+                local sharedPreference = sharedBasePreference(candidate.id)
+                if #bases == 1 then
+                    addBasePreferenceOptions(baseOrderMenu, playerNum, candidate.id, sharedPreference)
+                else
+                    local name = type(candidate.name) == "string" and candidate.name ~= ""
+                        and candidate.name or tostring(candidate.id)
+                    local root = baseOrderMenu:addOption(name, nil, nil)
+                    local perBase = ISContextMenu:getNew(baseOrderMenu)
+                    baseOrderMenu:addSubMenu(root, perBase)
+                    addBasePreferenceOptions(perBase, playerNum, candidate.id, sharedPreference)
                 end
-            end
-        end
-        for _, preference in ipairs(KnoxOrderCatalog.basePreferenceOrder or {}) do
-            local entry = KnoxOrderCatalog.basePreferences[preference]
-            if entry ~= nil then
-                local label = preference == "hauling" and "Move Corpses"
-                    or entry.label
-                local option = baseOrderMenu:addOption(label, PartyCommands,
-                    PartyCommands.basePreferenceAll, playerNum, preference)
-                baseOrderMenu:setOptionChecked(option, sharedPreference == preference)
             end
         end
     end
@@ -311,8 +378,10 @@ local function populate(menu, playerNum, square)
     tacticsMenu:addSubMenu(formation, formationMenu)
     for _, shape in ipairs({ { "Paired", "paired" }, { "Single File", "single_file" } }) do
         for spacing = 1, 3 do
-            formationMenu:addOption(shape[1] .. " - spacing " .. tostring(spacing), PartyCommands,
+            local option = formationMenu:addOption(shape[1] .. " - spacing " .. tostring(spacing), PartyCommands,
                 PartyCommands.formationAll, playerNum, shape[2], spacing)
+            formationMenu:setOptionChecked(option, common.formation == shape[2]
+                and common.spacing == spacing)
         end
     end
     local combat = tacticsMenu:addOption(catalogLabel("combat_stance", "Combat Stance"), nil, nil)
@@ -340,7 +409,7 @@ local function populate(menu, playerNum, square)
         { "Keep Current Equipment", false } }) do
         local option = equipmentMenu:addOption(choice[1], PartyCommands,
             PartyCommands.autoEquipmentAll, playerNum, choice[2])
-        equipmentMenu:setOptionChecked(option, common.autoEquipment == choice[2])
+        equipmentMenu:setOptionChecked(option, common.equipment == choice[2])
     end
     if square ~= nil then
         local location = menu:addOption("Orders for This Location", nil, nil)
@@ -355,10 +424,30 @@ local function populate(menu, playerNum, square)
         local loot = locationMenu:addOption(catalogLabel("loot_orders", "Auto-Loot"), nil, nil)
         local lootMenu = ISContextMenu:getNew(locationMenu)
         locationMenu:addSubMenu(loot, lootMenu)
-        lootMenu:addOption(KnoxOrderCatalog.label("enable_autoloot"), PartyCommands, PartyCommands.autoLootAll,
-            playerNum, true)
-        lootMenu:addOption(KnoxOrderCatalog.label("disable_autoloot"), PartyCommands, PartyCommands.autoLootAll,
-            playerNum, false)
+        local lootOn = lootMenu:addOption(KnoxOrderCatalog.label("enable_autoloot"), PartyCommands,
+            PartyCommands.autoLootAll, playerNum, true)
+        local lootOff = lootMenu:addOption(KnoxOrderCatalog.label("disable_autoloot"), PartyCommands,
+            PartyCommands.autoLootAll, playerNum, false)
+        lootMenu:setOptionChecked(lootOn, common.loot == true)
+        lootMenu:setOptionChecked(lootOff, common.loot == false)
+        local house = rawget(_G, "KnoxHouseClearing")
+        local inBuilding = square ~= nil and square.getBuilding ~= nil
+            and square:getBuilding() ~= nil
+        if house ~= nil and inBuilding then
+            if house.activeFor ~= nil and house.activeFor(actor) then
+                locationMenu:addOption("Cancel House Sweep", PartyCommands,
+                    PartyCommands.cancelHouse, playerNum)
+            else
+                local can, reason = false, nil
+                if house.canIssue ~= nil then can, reason = house.canIssue(actor, square) end
+                local label = can and "Clear This House"
+                    or ("Clear This House (" .. tostring(house.shortReason ~= nil
+                        and house.shortReason(reason) or "not available here") .. ")")
+                local option = locationMenu:addOption(label, PartyCommands,
+                    PartyCommands.clearHouse, playerNum)
+                if not can then option.notAvailable = true end
+            end
+        end
         local survival = locationMenu:addOption(catalogLabel("survival_orders", "Survival Orders"), nil, nil)
         local survivalMenu = ISContextMenu:getNew(locationMenu)
         locationMenu:addSubMenu(survival, survivalMenu)
@@ -412,9 +501,10 @@ local function onFillWorldObjectContextMenu(playerNum, context, worldObjects, te
     if KnoxSettings ~= nil and KnoxSettings.enabled ~= nil
         and KnoxSettings.enabled() and KnoxSettings.showActivityFeed ~= nil
         and KnoxSettings.showActivityFeed() then
-        context:addOption(KnoxActivityFeed ~= nil and KnoxActivityFeed.isVisible ~= nil
-            and KnoxActivityFeed.isVisible() and "Hide Knox Events"
-            or "Show Knox Events", PartyCommands, PartyCommands.toggleActivity)
+        -- No key of its own: this menu entry is how the digest opens.
+        context:addOption((KnoxActivityFeed ~= nil and KnoxActivityFeed.isVisible ~= nil
+            and KnoxActivityFeed.isVisible() and "Hide recent events" or "Recent events"),
+            PartyCommands, PartyCommands.toggleActivity)
     end
     if KnoxSettings == nil or KnoxSettings.enabled == nil or not KnoxSettings.enabled()
         or not contextOrdersEnabled() or actor == nil

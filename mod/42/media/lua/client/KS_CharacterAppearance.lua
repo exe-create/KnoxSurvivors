@@ -139,3 +139,101 @@ function KnoxCharacterAppearance.randomizeNewSurvivor(bridge, id, capabilities, 
             .. " worn=" .. tostring(worn)
             .. " bag=" .. bag
 end
+
+-- Creator look. The randomizer rolls clothes from the same definitions vanilla
+-- uses; a player-made look is not a roll, so each chosen item is worn in order
+-- with the same bridge call and the first refusal is reported instead of being
+-- swallowed into a half-dressed body.
+function KnoxCharacterAppearance.applyLook(bridge, id, items)
+    if type(items) ~= "table" or #items == 0 then return true, "no_look" end
+    local worn = 0
+    for _, fullType in ipairs(items) do
+        local ok, result = wear(bridge, id, fullType, true)
+        if not ok then return false, tostring(result) end
+        worn = worn + 1
+    end
+    return true, "worn=" .. tostring(worn)
+end
+
+-- A created person's face, clothes, weapon and skills. Hair and beard are the
+-- engine's own HumanVisual models, so the body wears what the preview showed;
+-- clothing still goes through the one item-wear path above, and every level is
+-- written through the character's own experience owner.
+function KnoxCharacterAppearance.applyCreator(bridge, id, character, record)
+    if type(record) ~= "table" then return true, "no_record" end
+    local faceEvidence = "face=none"
+    if type(record.hair) == "string" or type(record.beard) == "string" then
+        local ok, result = pcall(function()
+            if character == nil or character.getHumanVisual == nil then
+                return false
+            end
+            local visual = character:getHumanVisual()
+            if visual == nil then return false end
+            if type(record.hair) == "string" then
+                visual:setHairModel(record.hair ~= "" and record.hair or nil)
+            end
+            if type(record.beard) == "string" then
+                visual:setBeardModel(record.beard ~= "" and record.beard or nil)
+            end
+            local rgb = type(record.hairColour) == "string"
+                and KnoxCreator ~= nil and KnoxCreator.colourOf(record.hairColour)
+                or nil
+            if rgb ~= nil and ImmutableColor ~= nil then
+                local colour = ImmutableColor.new(rgb[1], rgb[2], rgb[3])
+                visual:setHairColor(colour)
+                visual:setBeardColor(colour)
+                visual:setNaturalHairColor(colour)
+                visual:setNaturalBeardColor(colour)
+            end
+            return true
+        end)
+        faceEvidence = ok and result ~= false and "face=set" or "face=refused"
+    end
+    local clothesEvidence = "look=none"
+    if record.look ~= nil and KnoxCreator ~= nil then
+        -- The preset with the person's per-slot choices swapped in. The model
+        -- owns that merge, so the same list is what the card previewed.
+        local lookOk, lookResult = KnoxCharacterAppearance.applyLook(
+            bridge, id, KnoxCreator.lookItemsFromRecord(record))
+        if not lookOk then return false, tostring(lookResult) end
+        clothesEvidence = "look=" .. tostring(lookResult)
+    end
+    -- Skills are written only where the experience owner exists, so a body that
+    -- is still loading is reported instead of being silently levelled later.
+    -- A bag is worn, not dressed: the randomizer already puts a starter bag on
+    -- a body with this exact call, so the creator uses the same one. It is read
+    -- from the record, or from the slot table an older record already carries.
+    local bagEvidence = "bag=none"
+    local bag = type(record.bag) == "string" and record.bag or nil
+    if bag == nil and type(record.slots) == "string" and KnoxCreator ~= nil
+        and KnoxCreator.bagFromSlots ~= nil then
+        local choice = KnoxCreator.bagFromSlots(KnoxCreator.decodeSlots(record.slots))
+        bag = choice ~= nil and choice.fullType or nil
+    end
+    if bag ~= nil and bag ~= "" then
+        local bagOk, bagResult = wear(bridge, id, bag, false)
+        if not bagOk then return false, "bag=" .. tostring(bagResult) end
+        bagEvidence = "bag=" .. bag
+    end
+    local skillsEvidence = "skills=none"
+    if type(record.skills) == "string" and record.skills ~= ""
+        and character ~= nil and character.getXp ~= nil and Perks ~= nil
+        and KnoxCreator ~= nil then
+        local applied = 0
+        for perkId, level in pairs(KnoxCreator.decodeSkills(record.skills)) do
+            local ok = pcall(function()
+                local perk = Perks.FromString(perkId)
+                if perk ~= nil then
+                    character:getXp():setXPToLevel(perk, level)
+                    applied = applied + 1
+                end
+            end)
+            if not ok then return false, "skill_refused=" .. tostring(perkId) end
+        end
+        skillsEvidence = "skills=" .. tostring(applied)
+    end
+    return true, faceEvidence .. " " .. clothesEvidence .. " "
+        .. bagEvidence .. " " .. skillsEvidence
+end
+
+return KnoxCharacterAppearance

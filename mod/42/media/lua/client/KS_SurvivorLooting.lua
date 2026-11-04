@@ -376,6 +376,43 @@ local function candidateScore(character, facts, item, forGroup)
     return nil, nil
 end
 
+-- A mission's cargo belongs to the settlement, not to the carrier's own
+-- stock, so a purpose match scores even for a survivor who already has enough.
+-- Nothing outside the purpose is taken: a food run does not strip the tools,
+-- and a material run does not empty the medicine cabinet.
+local function missionScore(item, purpose)
+    local fullType = itemType(item)
+    if purpose == "food" then
+        if safeFood(item) then return 46, "mission_food" end
+        if waterItem(item, false) then return 44, "mission_water" end
+        return nil, nil
+    end
+    if purpose == "medicine" then
+        if canBandage(item) then return 46, "mission_medical" end
+        if fullType ~= nil and MEDICAL_TYPES[fullType] then return 44, "mission_medical" end
+        return nil, nil
+    end
+    if purpose == "tools" then
+        if fullType ~= nil and ESSENTIAL_TOOLS[fullType]
+            and not safe(function() return item:isBroken() end, false) then
+            return 44, "mission_tools"
+        end
+        return nil, nil
+    end
+    if purpose == "weapons" then
+        if isAmmo(item) then return 46, "mission_ammunition" end
+        if isMagazine(item) then return 44, "mission_magazine" end
+        if firearmScore(item) ~= nil then return 42, "mission_firearm" end
+        if weaponScore(item) ~= nil then return 41, "mission_weapon" end
+        return nil, nil
+    end
+    if purpose == "building" then
+        if fullType ~= nil and GROUP_MATERIALS[fullType] then return 44, "mission_material" end
+        return nil, nil
+    end
+    return nil, nil
+end
+
 local function applySelectedFacts(facts, item)
     local weapon = weaponScore(item)
     if weapon ~= nil then
@@ -412,6 +449,10 @@ function Looting.plan(character, container, maximumItems, forGroup, options)
     end
     local groupMode = forGroup == true
     local foodOnly = type(options) == "table" and options.foodOnly == true
+    -- An ordered mission names what it came for. When a purpose is present it
+    -- replaces personal preference scoring entirely, so the container is
+    -- searched for that cargo and nothing else.
+    local purpose = type(options) == "table" and options.purpose or nil
     local supplyNeeds = type(options) == "table" and options.supplyNeeds or nil
     local facts = inventoryFacts(character)
     local function usableExact(item, fullType)
@@ -497,6 +538,7 @@ function Looting.plan(character, container, maximumItems, forGroup, options)
         return false
     end
     local function score(item)
+        if purpose ~= nil then return missionScore(item, purpose) end
         if type(supplyNeeds) == "table" and not wantedBySupply(item) then return nil, nil end
         if type(supplyNeeds) == "table" and needMatch(item) then
             return 75, "settlement_shortage"

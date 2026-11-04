@@ -78,11 +78,15 @@ function Navigation.geometry(vehicle)
         maxCurvature=math.tan(steeringLimit)*0.75/wheelbase}
 end
 
-function Navigation.context(vehicle,geometry,driver)
+-- lightweight skips the other-vehicle enumeration. An approach search only
+-- asks whether a square and a pose are free; it does not reason about traffic,
+-- so paying for every vehicle in the cell there is wasted work.
+function Navigation.context(vehicle,geometry,driver,lightweight)
     local cell=getCell()
     if cell==nil then return nil end
     local others={}
-    local vehicles=cell.getVehicles~=nil and cell:getVehicles() or nil
+    local vehicles=nil
+    if not lightweight and cell.getVehicles~=nil then vehicles=cell:getVehicles() end
     local function add(other)
         if other~=vehicle and other~=nil then others[#others+1]=other end
     end
@@ -128,6 +132,122 @@ local function finite(value)
 end
 local function distance(ax,ay,bx,by) return math.sqrt((ax-bx)^2+(ay-by)^2) end
 local function clamp(value,low,high) return math.max(low,math.min(high,value)) end
+
+-- Surface knowledge. These numbers are planning preferences, not physics:
+-- native handling still owns traction, and no speed here is applied to the
+-- controller directly. Names come from the floor sprite when the build exposes
+-- one; every unreadable case falls back to a mid cost, so uncertain ground is
+-- never mistaken for the best road.
+local SURFACES = {
+    asphalt = { weight = 1.00, speed = 1.00 },
+    gravel  = { weight = 1.12, speed = 0.85 },
+    dirt    = { weight = 1.28, speed = 0.70 },
+    trail   = { weight = 1.45, speed = 0.55 },
+    grass   = { weight = 1.65, speed = 0.60 },
+    unknown = { weight = 1.35, speed = 0.80 },
+}
+Navigation.SURFACES = SURFACES
+
+-- Order matters: "dirtroad" is dirt, not a road, and a "gravel" name wins over
+-- a generic "road" substring. Longest-meaning first.
+local SURFACE_ORDER = {
+    { "trail",   { "trail" } },
+    { "dirt",    { "dirt", "mud", "soil" } },
+    { "gravel",  { "gravel", "shingle" } },
+    { "asphalt", { "street", "road", "pavement", "sidewalk", "kerb", "tarmac", "asphalt" } },
+    { "grass",   { "grass", "vegetation", "lawn", "meadow", "natural" } },
+}
+
+local function floorName(square)
+    if square == nil or square.getFloor == nil then return nil end
+    local ok, floor = pcall(function() return square:getFloor() end)
+    if not ok or floor == nil or floor.getSpriteName == nil then return nil end
+    local named, name = pcall(function() return floor:getSpriteName() end)
+    if not named or type(name) ~= "string" or name == "" then return nil end
+    return string.lower(name)
+end
+
+-- Unread window. When a floor name matches nothing, the plan was made from a
+-- guess. Each distinct name is recorded once through the existing diagnostics
+-- owner, so one real drive reports exactly which tiles the classifier does not
+-- know instead of the owner hunting sprite names by hand. Bounded: this is a
+-- report, not an accumulating log.
+local UNKNOWN_LIMIT = 24
+local unknownGround = {}
+local unknownGroundCount = 0
+
+local function noteUnknownGround(name)
+    if name == nil then return end
+    local record = unknownGround[name]
+    if record == nil then
+        if unknownGroundCount >= UNKNOWN_LIMIT then return end
+        unknownGround[name] = { count = 1 }
+        unknownGroundCount = unknownGroundCount + 1
+        local log = rawget(_G, "KnoxDebugLog")
+        if log ~= nil and log.once ~= nil then
+            pcall(log.once, "vehicles", name, "surface_unknown", { sprite = name })
+        end
+        return
+    end
+    record.count = record.count + 1
+end
+
+-- "name x count" from most to least seen, plus how many distinct names there
+-- are. Returns an empty string when every surface read so far was understood.
+function Navigation.unknownGround()
+    local rows = {}
+    for name, record in pairs(unknownGround) do
+        rows[#rows + 1] = { name = name, count = record.count }
+    end
+    table.sort(rows, function(a, b)
+        if a.count ~= b.count then return a.count > b.count end
+        return a.name < b.name
+    end)
+    local parts = {}
+    for _, row in ipairs(rows) do
+        parts[#parts + 1] = row.name .. "x" .. tostring(row.count)
+    end
+    return table.concat(parts, ", "), #rows
+end
+
+function Navigation.resetUnknownGround()
+    unknownGround = {}
+    unknownGroundCount = 0
+end
+
+-- Returns the surface name and its entry. Read-only and never raising: a
+-- missing square, a missing floor or a failing reader is "unknown" ground.
+function Navigation.surface(square)
+    local name = floorName(square)
+    if name == nil then return "unknown", SURFACES.unknown end
+    for _, entry in ipairs(SURFACE_ORDER) do
+        for _, word in ipairs(entry[2]) do
+            if string.find(name, word, 1, true) ~= nil then
+                return entry[1], SURFACES[entry[1]]
+            end
+        end
+    end
+    noteUnknownGround(name)
+    return "unknown", SURFACES.unknown
+end
+
+function Navigation.speedFactor(name)
+    local surface = SURFACES[name] or SURFACES.unknown
+    return surface.speed
+end
+
+-- The planning cost of one step. Pure, so the preference can be exercised
+-- without a vehicle: distance on that ground, the price of changing surface
+-- (a route that hops between pavement and grass is worse than one that stays),
+-- and the price of asking for a turn.
+function Navigation.linkCost(length, surfaceWeight, previousWeight, turn)
+    local weight = finite(surfaceWeight) and math.max(0.5, surfaceWeight) or SURFACES.unknown.weight
+    local cost = length * weight
+    if finite(previousWeight) and math.abs(previousWeight - weight) > 0.001 then
+        cost = cost + 0.6
+    end
+    return cost + math.abs(finite(turn) and turn or 0) * 0.4
+end
 
 -- Certify the whole oriented body, including nose and rear overhang. Checking
 -- only a centre corridor misses the outside corner of a turning car.
@@ -213,6 +333,51 @@ function Navigation.clear(context,ax,ay,bx,by,z)
     return Navigation.arcClear(context,ax,ay,heading,0,length,z)
 end
 
+-- Where to actually stop at a destination plot. A centre is often inside the
+-- house or behind a fence, so the edges are tried first, and a square only wins
+-- when the whole car body fits on it at some heading. Falls back to nothing: the
+-- caller decides what to do when there is no drivable approach.
+function Navigation.approach(context,area,z,fromX,fromY)
+    if context==nil or area==nil then return nil end
+    local minX,minY=tonumber(area.minX or area.x),tonumber(area.minY or area.y)
+    if minX==nil or minY==nil then return nil end
+    local width,height=tonumber(area.width or area.w),tonumber(area.height or area.h)
+    local maxX=tonumber(area.maxX) or (width~=nil and minX+width-1 or minX)
+    local maxY=tonumber(area.maxY) or (height~=nil and minY+height-1 or minY)
+    z=tonumber(z) or tonumber(area.z) or 0
+    fromX,fromY=tonumber(fromX) or minX,tonumber(fromY) or minY
+    local midX,midY=math.floor((minX+maxX)/2),math.floor((minY+maxY)/2)
+    local candidates={
+        {x=midX,y=minY},{x=midX,y=maxY},{x=minX,y=midY},{x=maxX,y=midY},
+        {x=minX,y=minY},{x=maxX,y=minY},{x=minX,y=maxY},{x=maxX,y=maxY},
+        {x=midX,y=midY},
+    }
+    local best,bestDistance=nil,nil
+    for _,candidate in ipairs(candidates) do
+        local square=tile(context,candidate.x,candidate.y,z)
+        if square~=nil then
+            local fitted=false
+            for _,angle in ipairs({0,math.pi/2,math.pi,-math.pi/2}) do
+                if Navigation.poseClear(context,candidate.x+0.5,candidate.y+0.5,angle,z) then
+                    fitted=true;break
+                end
+            end
+            if fitted then
+                local dx,dy=candidate.x-fromX,candidate.y-fromY
+                local distance=dx*dx+dy*dy
+                -- A road-side stop beats a nearer field edge: pavement is where a
+                -- car can be left and driven away from. Unread ground is not
+                -- punished twice, it just has to be clearly closer to win.
+                if Navigation.surface(square)~="asphalt" then distance=distance*2 end
+                if bestDistance==nil or distance<bestDistance then
+                    best,bestDistance=candidate,distance
+                end
+            end
+        end
+    end
+    return best
+end
+
 local function connection(node,x,y,geometry)
     local dx,dy=x-node.x,y-node.y
     local fx,fy=math.cos(node.heading),math.sin(node.heading)
@@ -260,7 +425,9 @@ function Navigation.plan(vehicle,x,y,z,geometry,driver)
     if context==nil or tile(context,x,y,z)==nil or not Navigation.poseClear(context,ax,ay,heading,z) then
         return nil,"destination_unavailable"
     end
-    local start={x=ax,y=ay,heading=heading,g=0,key=keyFor(ax,ay,heading)}
+    local originSurfaceName,originSurface=Navigation.surface(origin)
+    local start={x=ax,y=ay,heading=heading,g=0,key=keyFor(ax,ay,heading),
+        surfaceWeight=originSurface.weight,surface=originSurfaceName}
     local open,best,closed={start},{[start.key]=start},{}
     local final,expanded=nil,0
     -- Original Knox forward arc search. Heading is part of every state, and a
@@ -283,13 +450,17 @@ function Navigation.plan(vehicle,x,y,z,geometry,driver)
                 curvature,length=turn*geometry.maxCurvature,4
                 local nx,ny,angle=Navigation.advance(node.x,node.y,node.heading,curvature,length,geometry)
                 local key=keyFor(nx,ny,angle)
-                local cost=node.g+length+math.abs(turn)*0.4
+                local stepSquare=context.cell:getGridSquare(math.floor(nx),math.floor(ny),z)
+                local stepSurfaceName,stepSurface=Navigation.surface(stepSquare)
+                local cost=node.g+Navigation.linkCost(length,stepSurface.weight,
+                    node.surfaceWeight,turn)
                     + math.abs(curvature-(node.curvature or 0))*3
                 if not closed[key] and distance(ax,ay,nx,ny)<=Navigation.MAX_DISTANCE
                     and (best[key]==nil or cost<best[key].g)
                     and Navigation.arcClear(context,node.x,node.y,node.heading,curvature,length,z) then
                     local nextNode={key=key,x=nx,y=ny,heading=angle,g=cost,
-                        curvature=curvature,length=length,parent=node}
+                        curvature=curvature,length=length,parent=node,
+                        surfaceWeight=stepSurface.weight,surface=stepSurfaceName}
                     best[key]=nextNode;open[#open+1]=nextNode
                 end
             end

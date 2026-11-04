@@ -93,6 +93,8 @@ local PARTY_WEAPONS = {
 }
 local PARTY_VEHICLES = {
     { kind = "enter_vehicle", label = "Enter My Vehicle", fallbackIcon = "group" },
+    { kind = "let_companion_drive", label = "Let a Companion Drive", fallbackIcon = "moveout" },
+    { kind = "take_wheel", label = "Take the Wheel", fallbackIcon = "stop" },
     { kind = "exit_vehicle", label = "Exit Vehicle", fallbackIcon = "back" },
 }
 local PARTY_PICKUP = {
@@ -107,6 +109,7 @@ local PARTY_SURVIVAL = {
     { kind = "find_tools", label = "Find Useful Tools", fallbackIcon = "tools" },
 }
 local PARTY_SEARCH_MORE = {
+    { kind = "clear_house", label = "Clear This House", fallbackIcon = "supplies" },
     { kind = "loot_area", label = "Search Nearby", fallbackIcon = "supplies" },
     { kind = "loot_corpses", label = "Search Dead Bodies", fallbackIcon = "supplies" },
     { kind = "clean_inventory", label = "Organize Carried Items", fallbackIcon = "gear" },
@@ -213,6 +216,7 @@ local SURVIVAL_FOLLOWER_SEARCH = { "loot_area", "loot_corpses", "clean_inventory
 local SURVIVAL_RESIDENT = { "find_food", "find_water", "find_medical", "find_weapon" }
 local SURVIVAL_RESIDENT_MORE = {
     "find_wood", "find_tools", "find_materials", "find_clothing", "find_ammo",
+    "find_fuel",
 }
 
 -- Nearby survivors use the same eligibility-aware interaction window as the
@@ -256,6 +260,56 @@ local function orderLabel(kind, fallback)
     return fallback or tostring(kind)
 end
 
+-- Active settings on the wheel. Slices have no checkbox, so an entry that
+-- matches the live setting says so in its own label. The values come from the
+-- companion service read-out (duty + policies), never from a default written
+-- here, so the wheel and the right-click menu report the same state.
+local ACTIVE_SUFFIX = " (active)"
+
+-- Kept public for offline contract tests.
+local function markedLabel(label, active, suffix)
+    if active ~= true then return tostring(label) end
+    return tostring(label) .. (suffix or ACTIVE_SUFFIX)
+end
+Radial.markedLabel = markedLabel
+
+local function tacticsOf(survivorId)
+    local service = rawget(_G, "KnoxCompanionService")
+    if service == nil or service.survivorTactics == nil then return nil end
+    local ok, values = pcall(service.survivorTactics, survivorId)
+    return ok and type(values) == "table" and values or nil
+end
+
+local function partyTactics(playerNum)
+    local service = rawget(_G, "KnoxCompanionService")
+    local player = playerFor(playerNum)
+    if service == nil or service.commonTactics == nil or player == nil then return {} end
+    local ok, common = pcall(service.commonTactics, player)
+    return ok and type(common) == "table" and common or {}
+end
+
+local STANCE_NAMES = { aggressive = "Aggressive", defensive = "Defensive", passive = "Passive" }
+local FORMATION_NAMES = { paired = "Paired", single_file = "Single File" }
+
+-- One line naming the party's current tactics, shown on the tactics page
+-- because the wheel otherwise only offers choices and never the state.
+local function tacticsSummary(common)
+    local parts = {}
+    if common.stance ~= nil then
+        parts[#parts + 1] = STANCE_NAMES[common.stance] or tostring(common.stance)
+    end
+    if common.formation ~= nil and common.spacing ~= nil then
+        parts[#parts + 1] = (FORMATION_NAMES[common.formation] or tostring(common.formation))
+            .. " " .. tostring(common.spacing)
+    end
+    if common.doors ~= nil then
+        parts[#parts + 1] = common.doors and "Doors On" or "Doors Off"
+    end
+    if #parts == 0 then return "Party Tactics" end
+    return "Now: " .. table.concat(parts, " - ")
+end
+Radial.tacticsSummary = tacticsSummary
+
 local function iconFor(name)
     local emoteMenu = rawget(_G, "ISEmoteRadialMenu")
     if emoteMenu ~= nil and emoteMenu.icons ~= nil then
@@ -278,6 +332,7 @@ local ORDER_ICON_FILES = {
     weapon_melee = "melee", weapon_ranged = "firearm", weapon_auto = "gear",
     find_tools = "tools", tools = "tools", find_wood = "wood", woodwork = "wood",
     find_materials = "tools", find_clothing = "clothing", find_ammo = "ammo",
+    find_fuel = "supplies",
     clean_inventory = "supplies", formation = "regroup", gear = "gear",
     enable_autoequipment = "gear", disable_autoequipment = "denied",
     enable_auto_equipment = "gear", disable_auto_equipment = "denied",
@@ -291,8 +346,10 @@ local ORDER_ICON_FILES = {
     climb_off = "denied", allow_doors = "door_open", doors_on = "door_open",
     disallow_doors = "door_closed", doors_off = "door_closed",
     enter_vehicle = "vehicle", exit_vehicle = "vehicle", drive_ahead = "vehicle",
+    let_companion_drive = "vehicle", take_wheel = "vehicle",
     drive_nearest_vehicle = "vehicle", vehicles = "vehicle",
     loot_area = "supplies", loot_corpses = "supplies", search = "supplies",
+    clear_house = "supplies",
     unstick = "unstick", barricade = "wood", repair = "tools", cooking = "food",
     farming = "wood", hauling = "supplies", auto = "work", work = "work",
     guard_work = "guard", patrol_work = "patrol", survival = "supplies",
@@ -663,6 +720,9 @@ function Radial.orderPartyMore(radialSelf, level)
         or level == "perms" or level == "vehicles" or level == "pickup"
         or level == "formation" or level == "equipment" or level == "utility"
         or level == "survival") then
+        -- Gear and upgrades live on one page now; an older wheel callback
+        -- that still says "equipment" lands there instead of on the root.
+        if level == "equipment" then level = "utility" end
         Radial.fillKnox(radialSelf, "pm:" .. level)
         return
     end
@@ -752,6 +812,21 @@ function Radial.orderPartySearch(radialSelf, kind)
     local playerNum = radialSelf ~= nil and radialSelf.playerNum or 0
     local player = playerFor(playerNum)
     if player == nil then return end
+    if kind == "clear_house" then
+        -- Room assignment is a party plan, not a single directive; the
+        -- coordinator dispatches its own room-scoped directives through the
+        -- same service boundary.
+        local house = rawget(_G, "KnoxHouseClearing")
+        if house ~= nil then
+            if house.activeFor ~= nil and house.activeFor(player) then
+                house.cancel(player, "cancelled")
+            elseif house.issue ~= nil then
+                house.issue(player)
+            end
+        end
+        Radial.fillKnox(radialSelf, "pm:search")
+        return
+    end
     orderFeedback(kind, service.issueOrderAll, player, kind)
     local detail = false
     for _, entry in ipairs(PARTY_SEARCH_MORE) do
@@ -1060,8 +1135,13 @@ end
 -- Mirrors the vanilla fill contract (clear, add slices, display).
 local function fillPartyPage(radialSelf, key, playerNum, menu)
         if key == "knox_party" then
+            local common = partyTactics(playerNum)
             for _, entry in ipairs(PARTY_ORDERS) do
-                menu:addSlice(orderLabel(entry.kind, entry.label),
+                local label = orderLabel(entry.kind, entry.label)
+                if entry.kind == "follow" or entry.kind == "hold" or entry.kind == "relax" then
+                    label = markedLabel(label, common.order == entry.kind)
+                end
+                menu:addSlice(label,
                     iconForOrder(entry.kind, entry.fallbackIcon), Radial.orderParty,
                     radialSelf, entry.kind)
             end
@@ -1086,6 +1166,10 @@ local function fillPartyPage(radialSelf, key, playerNum, menu)
             addBack(menu, radialSelf, "knox_party_more")
             return true
         elseif key == "pm:tactics" or key == "pm:perms" then
+            -- The summary slice is the wheel's only place that states the
+            -- current settings; tapping it just redraws this page.
+            menu:addSlice(tacticsSummary(partyTactics(playerNum)),
+                iconForOrder("tactics", "defensive"), Radial.fillKnox, radialSelf, "pm:tactics")
             menu:addSlice("Combat Stance", iconForOrder("aggressive", "stop"),
                 Radial.fillKnox, radialSelf, "pm:stance")
             menu:addSlice("Weapon Preference", iconForOrder("weapon_auto", "group"),
@@ -1095,8 +1179,10 @@ local function fillPartyPage(radialSelf, key, playerNum, menu)
             addBack(menu, radialSelf, "knox_party_more")
             return true
         elseif key == "pm:stance" then
+            local common = partyTactics(playerNum)
             for _, entry in ipairs(PARTY_TACTICS) do
-                menu:addSlice(orderLabel(entry.kind, entry.label),
+                menu:addSlice(markedLabel(orderLabel(entry.kind, entry.label),
+                        common.stance == entry.kind),
                     iconForOrder(entry.kind, entry.fallbackIcon), Radial.orderPartyStance,
                     radialSelf, entry.kind)
             end
@@ -1104,15 +1190,28 @@ local function fillPartyPage(radialSelf, key, playerNum, menu)
             return true
         elseif key == "pm:access" or key == "pm:weapons" then
             local entries = key == "pm:access" and PARTY_ACCESS or PARTY_WEAPONS
+            local common = partyTactics(playerNum)
             for _, entry in ipairs(entries) do
                 local callback, arg = Radial.orderPartyPerm, entry.kind
+                local active = nil
                 if entry.kind == "weapon_melee" or entry.kind == "weapon_ranged"
                     or entry.kind == "weapon_auto" then
                     callback = Radial.orderPartyWeapon
                     arg = entry.kind == "weapon_melee" and "melee"
                         or entry.kind == "weapon_ranged" and "ranged" or "auto"
+                    active = common.weapon == arg
+                else
+                    local on = entry.kind == "allow_climbing" or entry.kind == "allow_doors"
+                    local setting = common.doors
+                    if entry.kind:find("climb", 1, true) ~= nil then
+                        setting = common.climbing
+                    end
+                    active = setting == on
                 end
-                menu:addSlice(orderLabel(entry.kind, entry.label),
+                -- Each slice stands alone on the wheel, so it carries the
+                -- catalogue's state label ("Doors: Allowed") with the mark
+                -- showing which setting is already active.
+                menu:addSlice(markedLabel(entry.label, active),
                     iconForOrder(entry.kind, entry.fallbackIcon), callback,
                     radialSelf, arg)
             end
@@ -1128,8 +1227,15 @@ local function fillPartyPage(radialSelf, key, playerNum, menu)
             addBack(menu, radialSelf, "knox_party_more")
             return true
         elseif key == "pm:search" then
+            local house = rawget(_G, "KnoxHouseClearing")
+            local houseActive = house ~= nil and house.activeFor ~= nil
+                and house.activeFor(playerFor(playerNum)) == true
             for _, entry in ipairs(PARTY_SEARCH_MORE) do
-                menu:addSlice(entry.label, iconForOrder(entry.kind, entry.fallbackIcon),
+                local label = entry.label
+                if entry.kind == "clear_house" and houseActive then
+                    label = "Cancel House Sweep"
+                end
+                menu:addSlice(label, iconForOrder(entry.kind, entry.fallbackIcon),
                     Radial.orderPartySearch, radialSelf, entry.kind)
             end
             addBack(menu, radialSelf, "pm:survival")
@@ -1142,35 +1248,41 @@ local function fillPartyPage(radialSelf, key, playerNum, menu)
             addBack(menu, radialSelf, "knox_party_more")
             return true
         elseif key == "pm:pickup" then
+            local common = partyTactics(playerNum)
             for _, entry in ipairs(PARTY_PICKUP) do
-                menu:addSlice(entry.label, iconForOrder(entry.kind, entry.fallbackIcon), Radial.orderParty,
+                local on = entry.kind == "enable_autoloot"
+                menu:addSlice(markedLabel(entry.label, common.loot == on),
+                    iconForOrder(entry.kind, entry.fallbackIcon), Radial.orderParty,
                     radialSelf, entry.kind)
             end
             addBack(menu, radialSelf, "knox_party_more")
             return true
         elseif key == "pm:utility" then
+            -- One gear page. Pickup and upgrade used to be listed twice, on
+            -- both this page and an unreachable `pm:equipment` copy.
+            local common = partyTactics(playerNum)
             for _, entry in ipairs(PARTY_PICKUP) do
-                menu:addSlice(entry.label, iconForOrder(entry.kind, entry.fallbackIcon), Radial.orderParty,
+                local on = entry.kind == "enable_autoloot"
+                menu:addSlice(markedLabel(entry.label, common.loot == on),
+                    iconForOrder(entry.kind, entry.fallbackIcon), Radial.orderParty,
                     radialSelf, entry.kind)
             end
             for _, entry in ipairs(PARTY_EQUIPMENT) do
-                menu:addSlice(entry.label, iconForOrder(entry.kind, entry.fallbackIcon), Radial.orderPartyEquipment,
-                    radialSelf, entry.kind == "enable_auto_equipment")
+                local on = entry.kind == "enable_auto_equipment"
+                menu:addSlice(markedLabel(entry.label, common.equipment == on),
+                    iconForOrder(entry.kind, entry.fallbackIcon), Radial.orderPartyEquipment,
+                    radialSelf, on)
             end
             addBack(menu, radialSelf, "knox_party_more")
             return true
         elseif key == "pm:formation" then
+            local common = partyTactics(playerNum)
             for _, entry in ipairs(FOLLOWER_FORMATION) do
-                menu:addSlice(entry.label, iconForOrder("formation", "group"), Radial.orderPartyFormation,
+                local active = common.formation == entry.formation
+                    and common.spacing == entry.spacing
+                menu:addSlice(markedLabel(entry.label, active),
+                    iconForOrder("formation", "group"), Radial.orderPartyFormation,
                     radialSelf, entry.formation, entry.spacing)
-            end
-            addBack(menu, radialSelf, "knox_party_more")
-            return true
-        elseif key == "pm:equipment" then
-            for _, entry in ipairs(PARTY_EQUIPMENT) do
-                local kind = entry.kind
-                menu:addSlice(entry.label, iconForOrder(kind, entry.fallbackIcon), Radial.orderPartyEquipment,
-                    radialSelf, entry.kind == "enable_auto_equipment")
             end
             addBack(menu, radialSelf, "knox_party_more")
             return true
@@ -1274,8 +1386,12 @@ local function fillFollowerPage(radialSelf, key, playerNum, menu)
             if not memberIn(followerMembers(playerNum), id) then
                 Radial.fillKnox(radialSelf, "knox_followers"); return true
             end
+            local tactics = tacticsOf(id) or {}
             for _, entry in ipairs(FOLLOWER_FORMATION) do
-                menu:addSlice(entry.label, iconForOrder("formation", "group"), Radial.orderFormationF,
+                local active = tactics.formation == entry.formation
+                    and tactics.spacing == entry.spacing
+                menu:addSlice(markedLabel(entry.label, active),
+                    iconForOrder("formation", "group"), Radial.orderFormationF,
                     radialSelf, id, entry.formation, entry.spacing)
             end
             addBack(menu, radialSelf, "fmore:" .. id)
@@ -1296,8 +1412,11 @@ local function fillFollowerPage(radialSelf, key, playerNum, menu)
             if not memberIn(followerMembers(playerNum), id) then
                 Radial.fillKnox(radialSelf, "knox_followers"); return true
             end
+            local tactics = tacticsOf(id) or {}
             for _, entry in ipairs(FOLLOWER_EQUIPMENT) do
-                menu:addSlice(entry.label, iconForOrder(entry.kind, entry.fallbackIcon), Radial.orderGearF,
+                local on = entry.kind == "enable_autoequipment"
+                menu:addSlice(markedLabel(entry.label, tactics.equipment == on),
+                    iconForOrder(entry.kind, entry.fallbackIcon), Radial.orderGearF,
                     radialSelf, id, entry.kind)
             end
             addBack(menu, radialSelf, "fg:" .. id)
@@ -1307,8 +1426,11 @@ local function fillFollowerPage(radialSelf, key, playerNum, menu)
             if not memberIn(followerMembers(playerNum), id) then
                 Radial.fillKnox(radialSelf, "knox_followers"); return true
             end
+            local tactics = tacticsOf(id) or {}
             for _, entry in ipairs(FOLLOWER_PICKUP) do
-                menu:addSlice(entry.label, iconForOrder(entry.kind, entry.fallbackIcon), Radial.orderGearF,
+                local on = entry.kind == "enable_autoloot"
+                menu:addSlice(markedLabel(entry.label, tactics.loot == on),
+                    iconForOrder(entry.kind, entry.fallbackIcon), Radial.orderGearF,
                     radialSelf, id, entry.kind)
             end
             addBack(menu, radialSelf, "fg:" .. id)
@@ -1348,8 +1470,18 @@ local function fillResidentPage(radialSelf, key, playerNum, menu)
             if not memberIn(residentMembers(playerNum), id) then
                 Radial.fillKnox(radialSelf, "knox_residents"); return true
             end
+            local work = (tacticsOf(id) or {}).work or "auto"
+            local catalog = rawget(_G, "KnoxOrderCatalog")
+            local function workMatches(preference)
+                if catalog == nil or catalog.normalizeBasePreference == nil then
+                    return work == preference
+                end
+                return catalog.normalizeBasePreference(work) == preference
+            end
             for _, preference in ipairs(RESIDENT_WORK) do
-                menu:addSlice(KnoxOrderCatalog.label(preference, preference), iconForOrder(preference, "group"),
+                menu:addSlice(markedLabel(KnoxOrderCatalog.label(preference, preference),
+                        workMatches(preference)),
+                    iconForOrder(preference, "group"),
                     Radial.orderResidentPreference, radialSelf, id, preference)
             end
             menu:addSlice("More Work", iconForOrder("work", "moveout"), Radial.fillKnox,
@@ -1361,8 +1493,18 @@ local function fillResidentPage(radialSelf, key, playerNum, menu)
             if not memberIn(residentMembers(playerNum), id) then
                 Radial.fillKnox(radialSelf, "knox_residents"); return true
             end
+            local work = (tacticsOf(id) or {}).work or "auto"
+            local catalog = rawget(_G, "KnoxOrderCatalog")
+            local function workMatches(preference)
+                if catalog == nil or catalog.normalizeBasePreference == nil then
+                    return work == preference
+                end
+                return catalog.normalizeBasePreference(work) == preference
+            end
             for _, preference in ipairs(RESIDENT_WORK_MORE) do
-                menu:addSlice(KnoxOrderCatalog.label(preference, preference), iconForOrder(preference, "group"),
+                menu:addSlice(markedLabel(KnoxOrderCatalog.label(preference, preference),
+                        workMatches(preference)),
+                    iconForOrder(preference, "group"),
                     Radial.orderResidentPreference, radialSelf, id, preference)
             end
             addBack(menu, radialSelf, "rw:" .. id)
@@ -1372,18 +1514,17 @@ local function fillResidentPage(radialSelf, key, playerNum, menu)
             if not memberIn(residentMembers(playerNum), id) then
                 Radial.fillKnox(radialSelf, "knox_residents"); return true
             end
-            local persistence = rawget(_G, "KnoxPersistence")
-            local duty = persistence ~= nil and persistence.getSurvivorDuty ~= nil
-                and persistence.getSurvivorDuty(id) or {}
-            local stayHome = duty.allowLootRuns ~= true
+            local tactics = tacticsOf(id) or {}
+            local stayHome = tactics.lootRuns ~= true
             local entries = {
                 { stayHome and "Join Supply Runs" or "Stay Home During Supply Runs",
-                    stayHome and "loot_runs_on" or "loot_runs_off" },
-                { "Upgrade Gear", "equipment_on" }, { "Keep Current Gear", "equipment_off" },
+                    stayHome and "loot_runs_on" or "loot_runs_off", true },
+                { "Upgrade Gear", "equipment_on", tactics.equipment == true },
+                { "Keep Current Gear", "equipment_off", tactics.equipment == false },
             }
             for _, entry in ipairs(entries) do
-                menu:addSlice(entry[1], iconForOrder(entry[2], "signalok"), Radial.orderResidentPolicy,
-                    radialSelf, id, entry[2])
+                menu:addSlice(markedLabel(entry[1], entry[3]), iconForOrder(entry[2], "signalok"),
+                    Radial.orderResidentPolicy, radialSelf, id, entry[2])
             end
             addBack(menu, radialSelf, "r:" .. id)
             return true
@@ -1430,6 +1571,8 @@ local function fillResidentPage(radialSelf, key, playerNum, menu)
                 Radial.fillKnox(radialSelf, "knox_followers")
                 return true
             end
+            menu:addSlice(tacticsSummary(tacticsOf(id) or {}),
+                iconForOrder("tactics", "defensive"), Radial.fillKnox, radialSelf, "ft:" .. id)
             menu:addSlice("Combat Stance", iconForOrder("aggressive", "stop"),
                 Radial.fillKnox, radialSelf, "fts:" .. id)
             menu:addSlice("Weapon Preference", iconForOrder("weapon_auto", "group"),
@@ -1443,8 +1586,12 @@ local function fillResidentPage(radialSelf, key, playerNum, menu)
             if not memberIn(followerMembers(playerNum), id) then
                 Radial.fillKnox(radialSelf, "knox_followers"); return true
             end
+            local tactics = tacticsOf(id) or {}
+            local stanceOf = { stance_aggressive = "aggressive",
+                stance_defensive = "defensive", stance_passive = "passive" }
             for _, entry in ipairs(FOLLOWER_STANCES) do
-                menu:addSlice(orderLabel(entry.kind, entry.label),
+                menu:addSlice(markedLabel(orderLabel(entry.kind, entry.label),
+                        tactics.stance == stanceOf[entry.kind]),
                     iconForOrder(entry.kind, entry.fallbackIcon), Radial.orderTacticsF,
                     radialSelf, id, entry.kind)
             end
@@ -1455,8 +1602,11 @@ local function fillResidentPage(radialSelf, key, playerNum, menu)
             if not memberIn(followerMembers(playerNum), id) then
                 Radial.fillKnox(radialSelf, "knox_followers"); return true
             end
+            local tactics = tacticsOf(id) or {}
+            local weaponOf = { weapon_melee = "melee", weapon_ranged = "ranged", weapon_auto = "auto" }
             for _, entry in ipairs(FOLLOWER_WEAPONS) do
-                menu:addSlice(entry.label, iconForOrder(entry.kind, entry.fallbackIcon), Radial.orderGearF,
+                menu:addSlice(markedLabel(entry.label, tactics.weapon == weaponOf[entry.kind]),
+                    iconForOrder(entry.kind, entry.fallbackIcon), Radial.orderGearF,
                     radialSelf, id, entry.kind)
             end
             addBack(menu, radialSelf, "ft:" .. id)
@@ -1466,8 +1616,14 @@ local function fillResidentPage(radialSelf, key, playerNum, menu)
             if not memberIn(followerMembers(playerNum), id) then
                 Radial.fillKnox(radialSelf, "knox_followers"); return true
             end
+            local tactics = tacticsOf(id) or {}
             for _, entry in ipairs(FOLLOWER_ACCESS) do
-                menu:addSlice(orderLabel(entry.kind, entry.label),
+                local on = entry.kind == "climb_on" or entry.kind == "doors_on"
+                local setting = tactics.doors
+                if entry.kind:find("climb", 1, true) ~= nil then
+                    setting = tactics.climbing
+                end
+                menu:addSlice(markedLabel(entry.label, setting == on),
                     iconForOrder(entry.kind, entry.fallbackIcon), Radial.orderTacticsF,
                     radialSelf, id, entry.kind)
             end

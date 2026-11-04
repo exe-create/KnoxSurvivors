@@ -104,6 +104,7 @@ local BASE_SUPPLY_ORDERS = {
     find_materials = true,
     find_clothing = true,
     find_ammo = true,
+    find_fuel = true,
 }
 
 local function isPlayerCompanion(player, survivorId)
@@ -258,11 +259,28 @@ local function contactChannel(player, character)
     return false, "order_not_delivered"
 end
 
+-- Whether this person will take an order right now, read from the trust the
+-- same ledger already holds. A target only turns hostile when an act is aimed at
+-- them; a bystander who has watched enough reaches the same place through
+-- witnessing, so both arrive at one answer. No new field, no second score.
+function CompanionService.orderWillingness(survivorId, playerId)
+    if survivorId == nil or playerId == nil then return nil end
+    if KnoxPersistence.getPlayerRelationship == nil then return nil end
+    local relation = KnoxPersistence.getPlayerRelationship(playerId, survivorId)
+    if type(relation) ~= "table" then return nil end
+    return CompanionService.witnessLadder(relation.trust)
+end
+
 function CompanionService.orderContact(player, survivorId)
     local owner = CompanionService.getPlayerId(player)
     local affiliation = KnoxPersistence.getSurvivorAffiliation(survivorId)
     if owner == nil or affiliation == nil or affiliation.kind ~= "player"
         or affiliation.ownerId ~= owner then return false, "not_your_survivor" end
+    -- Willingness is asked before reachability: a person who has decided about
+    -- you does not become willing because you managed to shout loud enough.
+    local willingness = CompanionService.orderWillingness(survivorId, owner)
+    if willingness == "hostile" then return false, "hostile" end
+    if willingness == "wary" then return false, "unwilling" end
     if KnoxSurvivorRuntime.canAcceptOrders ~= nil then
         local accepted, reason = KnoxSurvivorRuntime.canAcceptOrders(survivorId)
         if not accepted then return false, reason end
@@ -305,6 +323,22 @@ function CompanionService.deliverOrder(player, survivorId, kind, batch, detail)
         end
         channel = "order_not_delivered"
     end
+    -- A refusal is spoken, not a silent failure to reach them, and it says who
+    -- is refusing rather than blaming the radio.
+    if channel == "unwilling" or channel == "hostile" then
+        local dialogue = rawget(_G, "KnoxSurvivorDialogue")
+        local character = KnoxSurvivorRuntime.getCharacter(survivorId)
+        if channel == "unwilling" and dialogue ~= nil and dialogue.say ~= nil and character ~= nil then
+            dialogue.say(character, survivorId, "order_refused_wary",
+                getTimestamp ~= nil and getTimestamp() or 0, 1800)
+        end
+        if KnoxActivityFeed ~= nil and KnoxActivityFeed.event ~= nil then
+            KnoxActivityFeed.event(channel == "hostile"
+                and displayName(survivorId) .. " has no intention of taking your orders."
+                or displayName(survivorId) .. " will not take an order from you right now.")
+        end
+        return false, channel
+    end
     if channel == "order_not_delivered" and KnoxActivityFeed ~= nil and KnoxActivityFeed.event ~= nil then
         KnoxActivityFeed.event("No contact with " .. displayName(survivorId) .. ". Existing orders continue.")
     end
@@ -337,6 +371,86 @@ end
 function CompanionService.getCompanionIds(player)
     local playerId = CompanionService.getPlayerId(player)
     return playerId ~= nil and KnoxPersistence.getCompanionIds(playerId) or {}
+end
+
+-- Effective tactical settings for one survivor, read from the durable fields
+-- the setters above write (duty + policies). Menus ask this instead of
+-- re-deriving a default of their own, so the wheel, the right-click menu and
+-- the Crew tab cannot disagree about what is currently set for a person.
+-- Returns nil when the survivor has no durable record, never a guessed state.
+local TACTIC_DEFAULTS = {
+    order = "follow",
+    stance = "defensive",
+    formation = "paired",
+    spacing = 2,
+    weapon = "auto",
+    work = "auto",
+}
+
+function CompanionService.survivorTactics(survivorId)
+    if type(survivorId) ~= "string" or survivorId == "" then return nil end
+    local persistence = rawget(_G, "KnoxPersistence")
+    if persistence == nil or persistence.getSurvivorDuty == nil then return nil end
+    -- Duty reads create a record for an unknown id, so a menu asking about a
+    -- stale or foreign survivor must not invent one; existence is checked on
+    -- the read-only accessor first.
+    if persistence.isSurvivorAlive ~= nil
+        and persistence.isSurvivorAlive(survivorId) ~= true then
+        return nil
+    end
+    local duty = persistence.getSurvivorDuty(survivorId)
+    if duty == nil then return nil end
+    local policies = persistence.getSurvivorPolicies ~= nil
+        and persistence.getSurvivorPolicies(survivorId) or nil
+    policies = type(policies) == "table" and policies or {}
+    -- Door handling has a sandbox default that the persisted policy may not
+    -- set; resolve it here once so every caller reads the same answer.
+    local doors = policies.allowDoorOpening
+    if doors == nil then
+        local settings = rawget(_G, "KnoxSettings")
+        doors = not (settings ~= nil and settings.allowSurvivorDoorWindowOpening ~= nil
+            and settings.allowSurvivorDoorWindowOpening() == false)
+    end
+    local spacing = math.floor(tonumber(duty.followerSpacing) or TACTIC_DEFAULTS.spacing)
+    if spacing < 1 then spacing = 1 elseif spacing > 3 then spacing = 3 end
+    return {
+        mode = duty.mode,
+        order = duty.order or TACTIC_DEFAULTS.order,
+        stance = duty.combatStance or TACTIC_DEFAULTS.stance,
+        formation = duty.followerFormation or TACTIC_DEFAULTS.formation,
+        spacing = spacing,
+        climbing = policies.allowClimbing ~= false,
+        doors = doors == true,
+        weapon = policies.weaponPreference or TACTIC_DEFAULTS.weapon,
+        loot = policies.autoLoot == true,
+        equipment = policies.autoEquipment ~= false,
+        lootRuns = duty.allowLootRuns == true,
+        work = duty.jobPreference or TACTIC_DEFAULTS.work,
+    }
+end
+
+-- The settings every companion currently shares. A mixed setting is simply
+-- absent from the result, so a menu marks a choice only when the whole party
+-- really has it instead of showing the first member's value for everyone.
+-- Returns (commonSettings, membersRead, membersOwned).
+function CompanionService.commonTactics(player)
+    local ids = CompanionService.getCompanionIds(player) or {}
+    local common, read = nil, 0
+    for _, survivorId in ipairs(ids) do
+        local values = CompanionService.survivorTactics(survivorId)
+        if values ~= nil then
+            read = read + 1
+            if common == nil then
+                common = {}
+                for key, value in pairs(values) do common[key] = value end
+            else
+                for key, value in pairs(common) do
+                    if values[key] ~= value then common[key] = nil end
+                end
+            end
+        end
+    end
+    return common or {}, read, #ids
 end
 
 local function playerPartyMemberIds(playerId)
@@ -540,7 +654,14 @@ function CompanionService.talk(player, survivorId)
         KnoxActivityFeed.speak(character, "Give me a minute.")
         return false, result
     end
-    local line = TALK_LINES[((relation.meetings - 1) % #TALK_LINES) + 1]
+    -- The meeting count picks the line, and the pair remembers the last one so
+    -- the same sentence never lands twice in a row.
+    local lineIndex = ((relation.meetings - 1) % #TALK_LINES) + 1
+    if TALK_LINES[lineIndex] == relation.lastTalkLine then
+        lineIndex = (lineIndex % #TALK_LINES) + 1
+    end
+    local line = TALK_LINES[lineIndex]
+    relation.lastTalkLine = line
     KnoxActivityFeed.event("Talked to " .. displayName(survivorId) .. ".")
     if KnoxActivityFeed.reputation ~= nil then
         KnoxActivityFeed.reputation(character, (tonumber(relation.trust) or previousTrust) - previousTrust)
@@ -694,6 +815,256 @@ function CompanionService.askNeedsAll(player)
     return answered > 0, answered, answered > 0 and "checked" or firstFailure or "no_companions"
 end
 
+-- Questions a survivor can actually answer, used by the Talk panel's Ask tab.
+-- Every answer is composed from state that really exists: the clock, the
+-- weather, their affiliation, their group, their own body and the encounter
+-- history already recorded in their ledger. Asking never moves trust, so a
+-- player cannot farm standing by interrogating somebody about the weather.
+local ASK_TOPICS = { day = true, home = true, group = true, health = true,
+    need = true, travels = true, standing = true }
+local ASK_QUESTIONS = {
+    day = "How's the day treating you?",
+    home = "Where are you staying?",
+    group = "Who are you with?",
+    health = "How are you holding up?",
+    need = "What do you need?",
+    travels = "What have you seen or heard out there?",
+    standing = "Where do we stand?",
+}
+local STORAGE_PROBLEM_LINES = {
+    full = "Our stores are full and there is still a haul in somebody's pack.",
+    filtered = "The shelves will not take what we are carrying.",
+    unreachable = "We cannot get to our own storage.",
+    unavailable = "The storage is right there and we cannot use it.",
+    no_storage = "Nobody has set up storage at our base yet.",
+}
+
+local function clockHour()
+    local hour = nil
+    pcall(function() hour = tonumber(getGameTime():getHour()) end)
+    return hour
+end
+
+local function weatherLine()
+    local raining, snowy = false, false
+    pcall(function()
+        local climate = getClimateManager()
+        raining = climate:isRaining() == true
+        snowy = climate:isSnowing() == true
+    end)
+    if raining then return "The rain makes every step loud." end
+    if snowy then return "Snow covers the noise, which cuts both ways." end
+    return nil
+end
+
+local function answerDay()
+    local hour = clockHour()
+    local text = "Hard to keep track of time lately."
+    if hour ~= nil then
+        if hour < 5 then
+            text = "Middle of the night. I keep my back to a wall."
+        elseif hour < 11 then
+            text = "Morning. The light is on my side for a few hours."
+        elseif hour < 15 then
+            text = "Afternoon. It is a long walk to dark from here."
+        elseif hour < 19 then
+            text = "Evening. I want four walls and a door before it gets dark."
+        else
+            text = "Late. Anything out there hears you before it sees you."
+        end
+    end
+    local weather = weatherLine()
+    return weather ~= nil and (text .. " " .. weather) or text
+end
+
+local function answerHome(survivorId, playerId)
+    local affiliation = KnoxPersistence.getSurvivorAffiliation(survivorId)
+    if type(affiliation) ~= "table" then
+        return "No walls of my own. I move when I have to."
+    end
+    if affiliation.kind == "player" then
+        local base = affiliation.baseId ~= nil and KnoxPersistence.getBase ~= nil
+            and KnoxPersistence.getBase(affiliation.baseId) or nil
+        if base ~= nil and base.ownerKind == "player"
+            and base.ownerId == playerId then
+            local manager = rawget(_G, "KnoxBaseManager")
+            local status = manager ~= nil and manager.homeStatus ~= nil
+                and manager.homeStatus(base, playerId) or nil
+            local name = tostring(base.name or "The base")
+            if status == nil or manager.standingOrderText == nil then
+                return "I stay at " .. name .. ". I cannot read the house from here."
+            end
+            local intent = KnoxPersistence.getBaseIntent ~= nil
+                and KnoxPersistence.getBaseIntent(base.id) or nil
+            local catalog = rawget(_G, "KnoxBaseContextMenu")
+            local labels = catalog ~= nil and catalog.BASE_INTENT_LABELS or nil
+            local label = intent ~= nil
+                and ((labels ~= nil and labels[intent]) or intent) or nil
+            return manager.standingOrderText(label, status, name)
+        end
+        return "I am with you. That is the plan as long as it holds."
+    end
+    if affiliation.baseId ~= nil then
+        local base = KnoxPersistence.getBase(affiliation.baseId)
+        local name = base ~= nil and tostring(base.name or "") or ""
+        if name ~= "" then
+            return "I stay at " .. name .. ". Better than the open road."
+        end
+        return "We hold a place down the road. Not home, but it is walls."
+    end
+    local faction = KnoxPersistence.getFactionForSurvivor ~= nil
+        and KnoxPersistence.getFactionForSurvivor(survivorId) or nil
+    if faction ~= nil then
+        return "No fixed address. I run with " .. tostring(faction.name or "my people") .. "."
+    end
+    return "Nowhere. A house just makes you a target if you cannot hold it."
+end
+
+local function answerGroup(survivorId)
+    local affiliation = KnoxPersistence.getSurvivorAffiliation(survivorId)
+    if type(affiliation) == "table" and affiliation.kind == "player" then
+        return "I am with you. That is enough for now."
+    end
+    local faction = KnoxPersistence.getFactionForSurvivor ~= nil
+        and KnoxPersistence.getFactionForSurvivor(survivorId) or nil
+    if faction ~= nil then
+        local count = type(faction.memberIds) == "table" and #faction.memberIds or 0
+        if count > 1 then
+            return tostring(count) .. " of us under "
+                .. tostring(faction.name or "one name") .. "."
+        end
+        return "It is just " .. tostring(faction.name or "me") .. " most days."
+    end
+    local group = KnoxPersistence.getTravelGroupFor ~= nil
+        and KnoxPersistence.getTravelGroupFor(survivorId) or nil
+    if type(group) == "table" and type(group.memberIds) == "table"
+        and #group.memberIds > 1 then
+        return "Travelling with " .. tostring(#group.memberIds) .. " others. It is temporary."
+    end
+    return "On my own. Fewer people, fewer arguments."
+end
+
+local function statValue(character, stat)
+    local value = nil
+    pcall(function() value = tonumber(character:getStats():get(stat)) end)
+    return value
+end
+
+local function answerHealth(character)
+    -- Infection outranks every ache: a person who has been bitten knows what it
+    -- means and says it before they report a bruise.
+    local needs = rawget(_G, "KnoxSurvivorNeeds")
+    if needs ~= nil and needs.infectionBand ~= nil then
+        local ok, band = pcall(needs.infectionBand, character)
+        if ok and band == "bitten" then
+            return "I got bit. I am not going to pretend it is nothing."
+        end
+    end
+    local health = nil
+    pcall(function() health = tonumber(character:getHealth()) end)
+    if health ~= nil and health < 35 then
+        return "Not good. I am hurt and I need to sit down."
+    end
+    local hunger = statValue(character, CharacterStat.HUNGER)
+    if hunger ~= nil and hunger > 0.75 then
+        return "Hungry. I have been putting it off too long."
+    end
+    local thirst = statValue(character, CharacterStat.THIRST)
+    if thirst ~= nil and thirst > 0.75 then
+        return "Thirsty. I would trade almost anything for clean water."
+    end
+    local fatigue = statValue(character, CharacterStat.FATIGUE)
+    if fatigue ~= nil and fatigue > 0.85 then
+        return "Tired. I have been awake longer than I should."
+    end
+    return "Still standing. That is the whole report."
+end
+
+local function answerNeed(character, survivorId)
+    local affiliation = KnoxPersistence.getSurvivorAffiliation(survivorId)
+    if type(affiliation) == "table" and affiliation.baseId ~= nil
+        and KnoxPersistence.getBaseStorageProblems ~= nil then
+        local problems = KnoxPersistence.getBaseStorageProblems(affiliation.baseId)
+        local first = problems[1]
+        local cause = first ~= nil and first.cause ~= nil and tostring(first.cause) or nil
+        if cause ~= nil and STORAGE_PROBLEM_LINES[cause] ~= nil then
+            return STORAGE_PROBLEM_LINES[cause]
+        end
+    end
+    local health = nil
+    pcall(function() health = tonumber(character:getHealth()) end)
+    if health ~= nil and health < 50 then return "A medic. Soon." end
+    local hunger = statValue(character, CharacterStat.HUNGER)
+    if hunger ~= nil and hunger > 0.6 then return "Food. Anything with calories in it." end
+    local thirst = statValue(character, CharacterStat.THIRST)
+    if thirst ~= nil and thirst > 0.6 then return "Water. Clean water." end
+    return "Nothing right now. Ask me again after dark."
+end
+
+-- Only recorded encounters are retold. The wording comes from the dialogue
+-- owner's recount formatter, so a spoken memory and the campfire version of
+-- the same ledger entry cannot disagree, and an empty ledger is honest. A
+-- hearsay entry keeps the name of the person who told them, so a second-hand
+-- event is never passed off as something they saw themselves.
+local function answerTravels(survivorId)
+    local dialogue = rawget(_G, "KnoxSurvivorDialogue")
+    if dialogue == nil or dialogue.recountLines == nil then
+        return "Nothing worth telling. Not yet."
+    end
+    local ok, lines = pcall(dialogue.recountLines, survivorId)
+    if not ok or type(lines) ~= "table" or #lines == 0 then
+        return "Nothing worth telling. Not yet."
+    end
+    local answer = tostring(lines[1] or "")
+    if answer == "" then return "Nothing worth telling. Not yet." end
+    if #lines > 1 and type(lines[2]) == "string" and lines[2] ~= "" then
+        answer = answer .. " " .. lines[2]
+    end
+    return answer
+end
+
+local ASK_ANSWERS = {
+    day = function(_, _) return answerDay() end,
+    standing = function(_, survivorId, playerId)
+        return CompanionService.answerStanding(survivorId, playerId)
+    end,
+    home = function(_, survivorId, playerId) return answerHome(survivorId, playerId) end,
+    group = function(_, survivorId) return answerGroup(survivorId) end,
+    health = function(character) return answerHealth(character) end,
+    need = function(character, survivorId) return answerNeed(character, survivorId) end,
+    travels = function(_, survivorId) return answerTravels(survivorId) end,
+}
+
+function CompanionService.askAbout(player, survivorId, topic)
+    if type(topic) ~= "string" or ASK_TOPICS[topic] ~= true then
+        return false, "unknown_question"
+    end
+    local character, availability = validateInteraction(player, survivorId)
+    local playerId = CompanionService.getPlayerId(player)
+    if character == nil or playerId == nil then return false, availability end
+    if CompanionService.isSociallyHostileToPlayer(survivorId, playerId) then
+        return false, "hostile"
+    end
+    -- A question needs the same clear contact an order does; asking through a
+    -- wall would answer with knowledge that was never spoken.
+    local bridge = rawget(_G, "KnoxJavaBridge")
+    if bridge ~= nil and bridge.canHearOrder ~= nil then
+        local reached, heard = pcall(function() return bridge:canHearOrder(player, character) end)
+        if not reached or heard ~= true then return false, "too_far_away" end
+    end
+    local question = ASK_QUESTIONS[topic]
+    if question ~= nil then
+        pcall(function() player:Say(question) end)
+        local feed = rawget(_G, "KnoxActivityFeed")
+        if feed ~= nil and feed.playerSays ~= nil then
+            feed.playerSays(player, question)
+        end
+    end
+    local answer = ASK_ANSWERS[topic](character, survivorId, playerId)
+    socialSpeech(character, survivorId, "player_ask_" .. topic, answer)
+    return true, answer
+end
+
 -- Sims-style social menu. Trust deltas run through the shared reputation
 -- ledger; emotes use only vanilla radial-menu keys. Hostile acts on a
 -- stranger with low trust can turn them hostile, exactly like a bad lure.
@@ -705,10 +1076,241 @@ local SOCIAL_ACTS = {
     funny_face = { trust = 3, cooldown = 0.5, emote = "shrug",
         lines = { "What was that face?! Okay, that got me.", "You are ridiculous. I like it.", "Ha! Do it again." } },
     insult = { trust = -12, cooldown = 1, emote = "insult",
-        lines = { "Say that again and we have a problem.", "You just made an enemy.", "Watch your mouth." } },
+        lines = { "Say that again and we have a problem.", "You just made an enemy.",
+            "Watch your mouth.", "Do not talk to me like that.",
+            "I have buried people for less.", "You are not worth the breath.",
+            "Keep it up and see what happens." } },
     slap = { trust = -20, cooldown = 2, emote = "thumbsdown",
-        lines = { "You just earned a fight.", "That is the last mistake you make near me.", "Now we settle this." } },
+        lines = { "You just earned a fight.", "That is the last mistake you make near me.",
+            "Now we settle this.", "Try that again. I dare you.",
+            "You picked the wrong person.", "I will remember your face." } },
+    mock = { trust = -9, cooldown = 1, emote = "insult",
+        lines = { "Go on then, say it to my face.", "You think that was clever?",
+            "Laugh it up. See how far that gets you.",
+            "One day that mouth writes a cheque you cannot cash." } },
+    blame = { trust = -11, cooldown = 1, emote = "thumbsdown",
+        lines = { "You were not there. Do not put that on me.",
+            "Everything is my fault now?", "I did what you asked. Remember that.",
+            "Say it again in front of the others." } },
+    threaten = { trust = -15, cooldown = 2, emote = "stop",
+        lines = { "Take a step back.", "You want to rethink that?",
+            "Try it. See what it costs you.",
+            "I have killed for less and slept fine." } },
 }
+
+-- A social choice is interpreted by the person hearing it. Keep reactions
+-- stable for an identity so the same survivor does not change personality
+-- between conversations or across a save/load.
+local SOCIAL_REACTIONS = {
+    frightened = { mock = { -19, "Please stop. Please." },
+        blame = { -15, "I did not do anything. I swear it." },
+        threaten = { -20, "Do not. Please do not." },
+        joke = { -2, "I cannot laugh about this right now." },
+        compliment = { 2, "Thanks. I needed to hear that." },
+        insult = { -16, "Please leave me alone." },
+        slap = { -22, "Do not touch me. Do not come near me again." } },
+    guarded = { joke = { 0, "Maybe another time." },
+        compliment = { 0, "I will believe it when I see it." },
+        funny_face = { -2, "What are you trying to do?" },
+        insult = { -14, "I was right about you." },
+        slap = { -20, "That is how it is going to be, then." } },
+    loner = { joke = { -1, "I prefer some quiet." },
+        compliment = { 1, "Thanks. I still need my space." },
+        insult = { -13, "We are done talking." },
+        slap = { -19, "Touch me again and you will regret it." } },
+    sociable = { joke = { 6, "That was good. Tell me another." },
+        funny_face = { 5, "You made me laugh." },
+        insult = { -10, "That was uncalled for. I was being friendly." },
+        slap = { -18, "I did not deserve that." } },
+    predatory = { mock = { -15, "Keep talking. I am counting." },
+        blame = { -12, "Careful who you accuse." },
+        threaten = { -13, "Wrong person to say that to." },
+        compliment = { -2, "Flattery will not get you far." },
+        insult = { -18, "Careful what you say next." },
+        slap = { -24, "You have made this simple." },
+        joke = { -1, "You are wasting my time." } },
+    gunner = { funny_face = { -1, "Keep your eyes on the street." },
+        insult = { -15, "Say it where I can hear you properly." },
+        slap = { -21, "Hands off the weapon and hands off me." } },
+    brutal = { joke = { -3, "Nothing about this is funny." },
+        compliment = { -1, "I do not need your approval." },
+        insult = { -18, "One more word and I will end it." },
+        mock = { -16, "Say one more word. Please." },
+        blame = { -15, "I do not answer to you." },
+        threaten = { -20, "Then do it. Stop talking about it." },
+        slap = { -25, "You just chose how this ends." } },
+    deserter = { joke = { 1, "I could use a reason to smile." },
+        compliment = { 3, "You are not like the others." },
+        insult = { -14, "I left one army already. Do not make me your enemy too." },
+        mock = { -11, "I have been laughed at by better men than you." },
+        blame = { -13, "I followed orders once. Never again." },
+        threaten = { -17, "Threats. That is all any of you have." },
+        slap = { -22, "I will not be hit again. Not by anyone." } },
+}
+
+local function socialReaction(survivorId, act, definition)
+    local identity = KnoxPersistence.getSurvivorIdentity(survivorId) or {}
+    local personality = SOCIAL_REACTIONS[tostring(identity.personality or "")]
+    local reaction = personality ~= nil and personality[act] or nil
+    return reaction ~= nil and reaction[1] or definition.trust,
+        reaction ~= nil and reaction[2] or nil
+end
+
+-- A mean act does not stop at the person it was aimed at. Anyone the player
+-- has brought along remembers it, through the same ledger and the same kind of
+-- record: the target always minds most, and a second and third witness care
+-- less. Nobody who merely walks past the county remembers anything, because a
+-- stranger did not see it and no position is guessed to pretend they did.
+local WITNESS_CAP = 6
+local WITNESS_LIMIT = 3
+
+function CompanionService.witnessReaction(act, trustDelta, index)
+    if type(act) ~= "string" or act == "" then return nil end
+    local delta = tonumber(trustDelta) or 0
+    if delta >= 0 then return nil end
+    local place = tonumber(index) or 0
+    if place < 1 or place > WITNESS_LIMIT then return nil end
+    local shared = math.min(WITNESS_CAP, math.floor(-delta * 0.4))
+    return -math.max(1, math.floor(shared / place))
+end
+
+-- A ladder, not a cliff. One bad afternoon costs standing; a person who has
+-- watched the player be cruel once too often decides the same way a badly
+-- handled stranger does, through the hostility the rest of the mod already
+-- reads. The bands match the ones Talk uses, so nothing new is stored.
+function CompanionService.witnessLadder(trust)
+    local value = tonumber(trust)
+    if value == nil then return nil end
+    if value <= 10 then return "hostile" end
+    if value <= 25 then return "wary" end
+    return nil
+end
+
+-- The same words land differently on somebody the player has already hurt. This
+-- reads the standing the ledger already keeps - the same bands the order gate
+-- uses - and answers over the archetype's line, so a compliment from a wary
+-- companion is not the compliment from a friendly one. It changes an act's
+-- wording, never its cost, so a bad history cannot be talked away.
+CompanionService.STANDING_REACTIONS = {
+    joke = { "I am not laughing. Not at anything you say.",
+        "I will pass. Jokes need the right company." },
+    compliment = { "I do not believe a word of it.",
+        "Kind words do not undo what you did to me." },
+    funny_face = { "I am not in the mood.", "Do not do that. Not at me." },
+    insult = { "I am past words with you.",
+        "I already know what you think of me." },
+    mock = { "I heard you the first time.", "Say it. I am listening." },
+    blame = { "You have blamed me for less than this.",
+        "I know how this goes with you." },
+}
+
+function CompanionService.standingReaction(trust, act)
+    if CompanionService.witnessLadder(trust) ~= "wary" then return nil end
+    return CompanionService.STANDING_REACTIONS[tostring(act or "")]
+end
+
+-- A body in pain answers before personality does. The band comes from the same
+-- reading the plate uses, so a person whose second line says hurt also speaks
+-- like somebody hurt. Mean acts keep their own weight: being wounded does not
+-- make an insult land softer.
+CompanionService.HURT_REACTIONS = {
+    joke = { "Not now. Laughing hurts me.",
+        "I cannot. It pulls at something." },
+    compliment = { "That is kind. I am not much use right now.",
+        "Thank you. I ache all over." },
+    funny_face = { "Do not make me laugh. It hurts.",
+        "Not now. I am barely holding on." },
+}
+
+function CompanionService.hurtReaction(band, act)
+    if band ~= "bad" and band ~= "severe" then return nil end
+    return CompanionService.HURT_REACTIONS[tostring(act or "")]
+end
+
+-- One rule for choosing the sentence: what the pair is, then what the body is,
+-- then the archetype's answer. Kept separate from the call site so a fixture can
+-- drive the same decision the conversation makes.
+function CompanionService.socialResponse(trust, act, meetings, fallback, hurt)
+    local lines = CompanionService.standingReaction(trust, act)
+    if lines == nil then lines = CompanionService.hurtReaction(hurt, act) end
+    if lines == nil then return fallback end
+    local place = math.max(1, tonumber(meetings) or 1)
+    return lines[((place - 1) % #lines) + 1]
+end
+
+-- A player who can see the warning and hear the refusal should also be able to
+-- ask. The answer comes from the same ladder the plate and the order gate read,
+-- so no surface can claim a standing the others deny. A hostile person is not
+-- answered at all: askAbout refuses before this is reached.
+CompanionService.STANDING_ANSWERS = {
+    wary = { "I am still here. That is not the same as forgiving you.",
+        "I am watching. That is all I will say." },
+    steady = { "We are good. I would tell you if we were not.",
+        "No complaints. Ask me again when it matters." },
+    stranger = { "We have not spoken enough for me to say.",
+        "Ask me again once we have been through something." },
+}
+
+function CompanionService.answerStanding(survivorId, playerId)
+    local relation = KnoxPersistence.getPlayerRelationship(playerId, survivorId)
+    local trust = relation ~= nil and tonumber(relation.trust) or nil
+    if trust == nil then return CompanionService.STANDING_ANSWERS.stranger[1] end
+    local band = CompanionService.witnessLadder(trust)
+    if band == "hostile" then return nil end
+    local lines = CompanionService.STANDING_ANSWERS[band == "wary" and "wary" or "steady"]
+    local meetings = math.max(1, tonumber(relation.meetings) or 1)
+    return lines[((meetings - 1) % #lines) + 1]
+end
+
+local function recordWitnesses(playerId, targetId, act, trustDelta, now)
+    local ids = KnoxPersistence.getSurvivorIds ~= nil
+        and KnoxPersistence.getSurvivorIds() or {}
+    local seen, spoken = 0, 0
+    local dialogue = rawget(_G, "KnoxSurvivorDialogue")
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    for _, id in ipairs(ids) do
+        if seen >= WITNESS_LIMIT then break end
+        if tostring(id) ~= tostring(targetId) and hasPlayerAffiliation(id)
+            and KnoxPersistence.isSurvivorAlive(id) then
+            local delta = CompanionService.witnessReaction(act, trustDelta, seen + 1)
+            if delta ~= nil then
+                local recorded = KnoxPersistence.recordPlayerSocialAct(
+                    playerId, id, "witnessed_" .. act, delta, 1, now)
+                if recorded ~= nil then
+                    seen = seen + 1
+                    -- A witness with a body says it to the player's face; the
+                    -- ledger entry is the same either way, so an offscreen
+                    -- companion still remembers what it did not get to say.
+                    local body = runtime ~= nil and runtime.getCharacter ~= nil
+                        and runtime.getCharacter(id) or nil
+                    local ticks = getTimestamp ~= nil and getTimestamp()
+                        or math.floor(now * 3600)
+                    if CompanionService.witnessLadder(recorded.trust) == "hostile" then
+                        -- The same decision a bad lure reaches, so orders, trade
+                        -- and the talk panel all read it without new wiring.
+                        KnoxPersistence.setSurvivorHostileToPlayer(id, playerId, true)
+                        KnoxActivityFeed.event("One of yours has had enough of you.")
+                        if dialogue ~= nil and dialogue.sayWitness ~= nil and body ~= nil
+                            and dialogue.sayWitness(body, id, targetId, ticks, 1800,
+                                "witness_enough") then
+                            spoken = spoken + 1
+                        end
+                    elseif dialogue ~= nil and dialogue.sayWitness ~= nil and body ~= nil
+                        and dialogue.sayWitness(body, id, targetId, ticks, 1800) then
+                        spoken = spoken + 1
+                    end
+                end
+            end
+        end
+    end
+    -- Only report it on the notice rail when nobody was there to say it, so the
+    -- player never reads the same moment twice.
+    if spoken == 0 and seen > 0 then
+        KnoxActivityFeed.event(seen == 1 and "Someone you brought along saw that."
+            or "The people you brought along saw that.")
+    end
+    return seen
+end
 
 function CompanionService.socialActs()
     local names = {}
@@ -737,8 +1339,9 @@ function CompanionService.socialAct(player, survivorId, act)
     end
     local relation = socialRelation(playerId, survivorId) or {}
     local before = tonumber(relation.trust) or 30
+    local trustDelta, personalLine = socialReaction(survivorId, act, definition)
     local recorded, result = KnoxPersistence.recordPlayerSocialAct(
-        playerId, survivorId, act, definition.trust, definition.cooldown, worldAge()
+        playerId, survivorId, act, trustDelta, definition.cooldown, worldAge()
     )
     if recorded == nil then
         KnoxSurvivorRuntime.endPlayerConversation(survivorId, player)
@@ -753,7 +1356,18 @@ function CompanionService.socialAct(player, survivorId, act)
     end
     local after = tonumber(recorded.trust) or before
     signalOrder(player, survivorId, act)
-    local line = definition.lines[((recorded.meetings - 1) % #definition.lines) + 1]
+    local witnessed = definition.trust < 0
+        and recordWitnesses(playerId, survivorId, act, trustDelta, worldAge()) or 0
+    local line = personalLine or definition.lines[((recorded.meetings - 1) % #definition.lines) + 1]
+    -- A wary or wounded companion answers the act, not the archetype: the same
+    -- joke comes back from the person the player actually made.
+    local hurt = nil
+    local needs = rawget(_G, "KnoxSurvivorNeeds")
+    if needs ~= nil and needs.painBand ~= nil and needs.snapshot ~= nil then
+        local ok, snapshot = pcall(needs.snapshot, character)
+        if ok and snapshot ~= nil then hurt = needs.painBand(snapshot) end
+    end
+    line = CompanionService.socialResponse(before, act, recorded.meetings, line, hurt)
     if protectedTeam and (act == "insult" or act == "slap") then
         line = act == "slap" and "Do not touch me." or "Do not speak to me like that."
     end
@@ -769,12 +1383,25 @@ function CompanionService.socialAct(player, survivorId, act)
         return false, "hostile"
     end
     print("[KnoxSurvivors][Companions] social survivor=" .. survivorId
-        .. " player=" .. playerId .. " act=" .. tostring(act)
-        .. " trust=" .. tostring(before) .. "->" .. tostring(after))
+        .. " player=" .. playerId        .. " act=" .. tostring(act)
+        .. " trust=" .. tostring(before) .. "->" .. tostring(after)
+        .. " witnessed=" .. tostring(witnessed))
     return true, recorded
 end
 
-function CompanionService.canRecruit(player, survivorId)
+-- A refusal by the survivor has a durable cost: the same person will not be
+-- asked again for a couple of game hours. Capacity and mod-state refusals are
+-- not personal choices, so they are not recorded and never impose a wait.
+local RECRUIT_REFUSAL_COOLDOWN_HOURS = 2
+-- Joining is a decision about the player, not a coin flip on first sight. The
+-- gate sits above the starting trust of 30, so a recruit needs real contact.
+local RECRUIT_TRUST_MINIMUM = 45
+local RECRUIT_COOLDOWN_REASONS = {
+    needs_time = true, low_reputation = true, prefers_alone = true,
+    dangerous = true, hostile = true,
+}
+
+function CompanionService.canRecruit(player, survivorId, options)
     if not KnoxSettings.enabled() then
         return false, "mod_disabled"
     end
@@ -798,11 +1425,22 @@ function CompanionService.canRecruit(player, survivorId)
     if not KnoxPersistence.isIndependentSurvivor(survivorId) then
         return false, "not_independent"
     end
-    if #KnoxPersistence.getCompanionIds(playerId) >= KnoxSettings.companionLimit() then
+    -- A base resident is not a follower, so the party cap must not decide who
+    -- may move in. Every other recruitment gate still applies.
+    if (options == nil or options.forBase ~= true)
+        and #KnoxPersistence.getCompanionIds(playerId) >= KnoxSettings.companionLimit() then
         return false, "companion_limit"
     end
     local social = playerSocialDisposition(playerId, survivorId)
     local relation = socialRelation(playerId, survivorId) or {}
+    -- The other half of recordPlayerRecruitRefusal: the wait it writes is
+    -- enforced here, so a refused ask is not instantly re-askable.
+    local nowHours = getGameTime ~= nil and getGameTime() ~= nil
+        and tonumber(getGameTime():getWorldAgeHours()) or nil
+    if nowHours ~= nil
+        and (tonumber(relation.nextRecruitHours) or 0) > nowHours then
+        return false, "cooling_off"
+    end
     if social == "attack_on_sight" then return false, "dangerous" end
     if social == "independent" then return false, "prefers_alone" end
     if social == "warm_up"
@@ -819,7 +1457,7 @@ function CompanionService.canRecruit(player, survivorId)
     -- means contact rules alone decide, as before.
     if KnoxSettings.useReputation ~= nil and KnoxSettings.useReputation() then
         local trust = tonumber(relation.trust) or 30
-        if trust < 20 then return false, "low_reputation" end
+        if trust < RECRUIT_TRUST_MINIMUM then return false, "low_reputation" end
     end
     return true, "ready"
 end
@@ -830,6 +1468,15 @@ function CompanionService.recruit(player, survivorId)
     local character = KnoxSurvivorRuntime.getCharacter(survivorId)
     if not ready then
         if reason == "no_contact" then return false, reason end
+        -- Only a personal refusal is remembered. A full party or a dead mod is
+        -- not the survivor's decision, and storing it would punish the player
+        -- for a limit they can fix.
+        if playerId ~= nil and RECRUIT_COOLDOWN_REASONS[reason] == true
+            and KnoxPersistence.recordPlayerRecruitRefusal ~= nil
+            and getGameTime ~= nil and getGameTime() ~= nil then
+            pcall(KnoxPersistence.recordPlayerRecruitRefusal, playerId, survivorId,
+                getGameTime():getWorldAgeHours(), RECRUIT_REFUSAL_COOLDOWN_HOURS)
+        end
         if character ~= nil then
             local line = reason == "already_with_group"
                 and "I'm already travelling with people."
@@ -843,6 +1490,8 @@ function CompanionService.recruit(player, survivorId)
                 and "I know somewhere quiet. Come with me."
                 or reason == "dangerous"
                 and "You should have kept walking."
+                or reason == "cooling_off"
+                and "Ask me again in a while. Not now."
                 or "I can't come with you right now."
             if reason == "low_reputation" then
                 recordSocialEvent(playerId, survivorId, "recruit_attempt")
@@ -897,6 +1546,188 @@ function CompanionService.recruit(player, survivorId)
             .. " player=" .. playerId
     )
     return true, "recruited"
+end
+
+-- What a resident says when a base invitation is refused. The panel carries
+-- the player-facing sentence; this is the person's own voice, and both read the
+-- same reason string so they cannot disagree.
+local BASE_INVITE_REFUSALS = {
+    already_with_group = "I'm already staying with people.",
+    ambiguous_base = "Which place do you mean? I'm not guessing.",
+    busy = "Not now.",
+    character_dead = "...",
+    dangerous = "Keep your distance.",
+    hostile = "Keep your distance.",
+    low_reputation = "You have not earned that kind of trust yet.",
+    lure = "I know somewhere quieter. Come with me.",
+    already_resident = "I already live at your place.",
+    needs_time = "I need more time before I move in with anyone.",
+    no_base = "Where would I even stay?",
+    not_companion = "I don't travel with you.",
+    no_contact = "...",
+    not_independent = "I'm not looking to settle down.",
+    prefers_alone = "I am staying on my own.",
+    too_far_away = "Say that to my face.",
+    unknown_base = "That isn't one of your homes.",
+}
+
+-- The homes this player may offer a newcomer. One base needs no question;
+-- two or more is the player's choice to make, so every caller asks through
+-- KnoxBasePicker instead of letting the mod resolve it. Another owner's
+-- settlement is never offered, whichever square the player stands on.
+function CompanionService.baseChoicesFor(player, playerId)
+    if KnoxPersistence == nil or KnoxPersistence.getBasesForOwner == nil then
+        return {}
+    end
+    local id = playerId
+    if id == nil and player ~= nil then id = CompanionService.getPlayerId(player) end
+    if id == nil then return {} end
+    local ok, bases = pcall(KnoxPersistence.getBasesForOwner, "player", id)
+    if not ok or type(bases) ~= "table" then return {} end
+    local list = {}
+    for _, base in ipairs(bases) do
+        if type(base) == "table" and base.id ~= nil then list[#list + 1] = base end
+    end
+    return list
+end
+
+-- The base a newcomer would move into. `baseId` is the player's answer; without
+-- one a single home needs no question, and several homes are never resolved by
+-- guessing -- not even the one the player happens to be standing in, because
+-- that is how a move-in landed at the wrong settlement.
+function CompanionService.inviteBaseFor(player, playerId, baseId)
+    local bases = CompanionService.baseChoicesFor(player, playerId)
+    if #bases == 0 then return nil, "no_base" end
+    if baseId ~= nil then
+        for _, base in ipairs(bases) do
+            if tostring(base.id) == tostring(baseId) then return base, "chosen" end
+        end
+        return nil, "unknown_base"
+    end
+    if #bases > 1 then return nil, "ambiguous_base" end
+    return bases[1], "only_base"
+end
+
+-- `baseId` is the player's explicit choice. Without one, one home resolves
+-- directly and several homes answer `choose_base`, which tells the caller to
+-- ask (KnoxBasePicker) rather than treating the question as a refusal.
+function CompanionService.canInviteToBase(player, survivorId, baseId)
+    local available, reason = CompanionService.canRecruit(player, survivorId, { forBase = true })
+    if not available then return false, reason end
+    local base, baseReason = CompanionService.inviteBaseFor(player, nil, baseId)
+    if base ~= nil then return true, "ready", base end
+    if baseId == nil and baseReason == "ambiguous_base" then return true, "choose_base" end
+    return false, baseReason
+end
+
+-- Base invitations are the second half of the talk direction: recruiting was
+-- the only way to gain a member, so a survivor who joined became a follower and
+-- a settlement could only grow through followers. This reuses the one
+-- affiliation writer (setPlayerCompanion) and the one resident-duty writer
+-- (setPlayerBaseResident) rather than inventing a membership path, so the new
+-- resident is immediately an ordinary resident to every other owner.
+function CompanionService.inviteToBase(player, survivorId, baseId)
+    local available, reason, base = CompanionService.canInviteToBase(player, survivorId, baseId)
+    local character = KnoxSurvivorRuntime.getCharacter(survivorId)
+    if not available then
+        if character ~= nil then
+            if reason == "low_reputation" or reason == "needs_time" then
+                recordSocialEvent(
+                    CompanionService.getPlayerId(player), survivorId, "recruit_attempt"
+                )
+            elseif reason == "dangerous" then
+                KnoxPersistence.setSurvivorHostileToPlayer(
+                    survivorId, CompanionService.getPlayerId(player), true
+                )
+                socialSpeech(character, survivorId, "player_attack_warning", "Keep your distance.")
+                return false, "dangerous"
+            end
+            KnoxActivityFeed.speak(
+                character, BASE_INVITE_REFUSALS[reason] or "I can't do that right now."
+            )
+        end
+        return false, reason
+    end
+    -- A caller that skipped the chooser gets a refusal instead of a posting to
+    -- whichever base happened to be first.
+    if base == nil then return false, "ambiguous_base" end
+    local playerId = CompanionService.getPlayerId(player)
+    local saved, result = KnoxPersistence.setPlayerCompanion(
+        survivorId, playerId, "follow", worldAge()
+    )
+    if not saved then return false, result end
+    local homed = KnoxPersistence.setPlayerBaseResident(
+        survivorId, playerId, base.id, worldAge()
+    )
+    CompanionService.rememberCommitment(player, survivorId)
+    KnoxSurvivorRuntime.notifyDutyChanged(survivorId)
+    local place = type(base.name) == "string" and base.name ~= "" and base.name or "your base"
+    if character ~= nil then
+        KnoxActivityFeed.speak(character, "All right. I'll move in.")
+    end
+    if homed then
+        KnoxActivityFeed.event(displayName(survivorId) .. " moved into " .. place .. ".")
+        print("[KnoxSurvivors][Companions] base invite survivor=" .. survivorId
+            .. " player=" .. playerId .. " base=" .. tostring(base.id))
+        return true, "resident"
+    end
+    -- They accepted the invitation; only the posting failed. Saying so keeps a
+    -- follower rather than a silent half-membership.
+    KnoxActivityFeed.event(displayName(survivorId)
+        .. " joined you, but has no place at " .. place .. " yet.")
+    return true, "companion_only"
+end
+
+-- A follower who already travels with the player can be offered a home. The
+-- affiliation is already correct, so this is only the resident-duty write; the
+-- gates are the ones a companion order needs plus the same base resolution.
+function CompanionService.canMoveIntoBase(player, survivorId, baseId)
+    if not KnoxSettings.enabled() then return false, "mod_disabled" end
+    local playerId = CompanionService.getPlayerId(player)
+    local character, availability = validateInteraction(player, survivorId)
+    if not KnoxPersistence.isSurvivorAlive(survivorId) then return false, "character_dead" end
+    if playerId == nil then return false, "player_unavailable" end
+    if character == nil then return false, availability end
+    if not contactChannel(player, character) then return false, "no_contact" end
+    local affiliation = KnoxPersistence.getSurvivorAffiliation(survivorId)
+    if type(affiliation) ~= "table" or affiliation.kind ~= "player"
+        or tostring(affiliation.ownerId) ~= tostring(playerId) then
+        return false, "not_companion"
+    end
+    local duty = KnoxPersistence.getSurvivorDuty(survivorId)
+    if type(duty) == "table" and duty.mode == "base" then
+        return false, "already_resident"
+    end
+    local base, baseReason = CompanionService.inviteBaseFor(player, nil, baseId)
+    if base ~= nil then return true, "ready", base end
+    if baseId == nil and baseReason == "ambiguous_base" then return true, "choose_base" end
+    return false, baseReason
+end
+
+function CompanionService.moveIntoBase(player, survivorId, baseId)
+    local available, reason, base = CompanionService.canMoveIntoBase(player, survivorId, baseId)
+    local character = KnoxSurvivorRuntime.getCharacter(survivorId)
+    if not available then
+        if character ~= nil then
+            KnoxActivityFeed.speak(character, BASE_INVITE_REFUSALS[reason] or "I can't do that right now.")
+        end
+        return false, reason
+    end
+    if base == nil then return false, "ambiguous_base" end
+    local playerId = CompanionService.getPlayerId(player)
+    local saved, result = KnoxPersistence.setPlayerBaseResident(
+        survivorId, playerId, base.id, worldAge()
+    )
+    if not saved then return false, result end
+    KnoxSurvivorRuntime.notifyDutyChanged(survivorId)
+    local place = type(base.name) == "string" and base.name ~= "" and base.name or "your base"
+    if character ~= nil then
+        KnoxActivityFeed.speak(character, "All right. I'll settle in.")
+    end
+    KnoxActivityFeed.event(displayName(survivorId) .. " moved into " .. place .. ".")
+    print("[KnoxSurvivors][Companions] moved in survivor=" .. survivorId
+        .. " player=" .. playerId .. " base=" .. tostring(base.id))
+    return true, "resident"
 end
 
 function CompanionService.command(player, survivorId, order, suppressSignal, batch)
@@ -1039,6 +1870,9 @@ function CompanionService.issueOrder(player, survivorId, kind, payload)
     end
     if normalizedKind == "drive_ahead" then
         return CompanionService.drivePlayerVehicle(player, survivorId)
+    end
+    if normalizedKind == "let_companion_drive" then
+        return CompanionService.letCompanionDrive(player, survivorId)
     end
     if normalizedKind == "drive_nearest_vehicle" then
         return CompanionService.driveNearestVehicle(player, survivorId)
@@ -1469,6 +2303,14 @@ function CompanionService.issueOrderAll(player, kind, payload)
         local success, changed, waiting, reason = CompanionService.boardAllPlayerVehicle(player)
         return success, changed, reason
     end
+    if normalizedKind == "let_companion_drive" then
+        local success, reason = CompanionService.letCompanionDrive(player)
+        return success, success and 1 or 0, reason
+    end
+    if normalizedKind == "take_wheel" then
+        local success, reason = CompanionService.takeWheel(player)
+        return success, success and 1 or 0, reason
+    end
     if normalizedKind == "exit_vehicle" then
         return CompanionService.exitAllVehicles(player)
     end
@@ -1853,6 +2695,31 @@ function CompanionService.drivePlayerVehicleTo(player,survivorId,x,y)
     return success,result
 end
 
+-- Fetch order: the player is on foot, so there is no car to take the wheel of.
+-- A companion brings the nearest car they can actually drive to the point the
+-- player picked, using the same drive run and admission as every other trip.
+-- No vehicle is spawned, moved or unlocked here.
+function CompanionService.sendVehicleTo(player,survivorId,x,y,z)
+    if player==nil or player:getVehicle()~=nil then return false,"player_in_vehicle" end
+    local ok,delivered,delivery=pcall(CompanionService.deliverOrder,player,survivorId,"drive_ahead")
+    if not ok then return false,"order_unavailable" end
+    if not delivered then return false,delivery end
+    if not isPlayerCompanion(player,survivorId) then return false,"not_companion" end
+    local character=KnoxSurvivorRuntime.getCharacter(survivorId)
+    if character==nil or character:isDead() then return false,"survivor_unavailable" end
+    local travel=rawget(_G,"KnoxNpcVehicleTravel")
+    if travel==nil or travel.readyVehicleNear==nil then return false,"vehicle_state_unknown" end
+    local vehicle,reason=travel.readyVehicleNear(character)
+    if vehicle==nil then return false,reason end
+    local square=vehicle:getSquare()
+    if square==nil then return false,"vehicle_unavailable" end
+    local success,result=KnoxCompanionVehicles.driveTo(character,vehicle,x,y,tonumber(z) or square:getZ())
+    if success and KnoxActivityFeed~=nil then
+        KnoxActivityFeed.speak(character,"I'm bringing a car over.")
+    end
+    return success,result
+end
+
 function CompanionService.driveNearestVehicle(player, survivorId)
     local delivered, delivery = CompanionService.deliverOrder(player, survivorId, "drive_nearest_vehicle")
     if not delivered then return false, delivery end
@@ -1867,6 +2734,77 @@ function CompanionService.driveNearestVehicle(player, survivorId)
         signalOrder(player, survivorId, "drive_nearest_vehicle")
     end
     return success, result, vehicle
+end
+
+-- The player keeps the seat decision. This service only asks a real companion
+-- to wait for the driver seat and records the order; the companion boards only
+-- after the player switches to a passenger seat with the native control.
+function CompanionService.letCompanionDrive(player, survivorId)
+    if player == nil or player:getVehicle() == nil then
+        return false, "player_not_in_vehicle"
+    end
+    local vehicle = player:getVehicle()
+    if vehicle.isDriver ~= nil and not vehicle:isDriver(player) then
+        return false, "player_not_driving"
+    end
+    local batch = {}
+    if survivorId ~= nil then
+        if not isPlayerCompanion(player, survivorId) then return false, "not_companion" end
+        local character, reason = validateInteraction(player, survivorId, 18 * 18)
+        if character == nil then return false, reason end
+        local delivered, delivery = CompanionService.deliverOrder(
+            player, survivorId, "drive_ahead", batch)
+        if not delivered then return false, delivery end
+        local success, result = KnoxCompanionVehicles.beginHandoff(player, character, vehicle)
+        if success then
+            CompanionService.excludePartyDestinationRecipient(player, survivorId)
+            signalOrder(player, survivorId, "drive_ahead")
+        end
+        return success, result
+    end
+    local firstFailure
+    for _, id in ipairs(CompanionService.getCompanionIds(player)) do
+        local character, reason = validateInteraction(player, id, 18 * 18)
+        if character ~= nil then
+            local success, result = KnoxCompanionVehicles.beginHandoff(player, character, vehicle)
+            if success then
+                CompanionService.excludePartyDestinationRecipient(player, id)
+                signalOrder(player, id, "drive_ahead")
+                return true, result
+            end
+            if firstFailure == nil then firstFailure = result end
+        elseif firstFailure == nil then
+            firstFailure = reason
+        end
+    end
+    return false, firstFailure or "no_companions"
+end
+
+-- The companion releases the wheel through the native seat switch. This owner
+-- only accepts a driver the player already owns; a stranger's car is not
+-- commandeered by a party order.
+function CompanionService.takeWheel(player)
+    if player == nil then return false, "invalid_player" end
+    local vehicle = player:getVehicle()
+    if vehicle == nil and KnoxCompanionVehicles.findDrivenVehicleNear ~= nil then
+        vehicle = KnoxCompanionVehicles.findDrivenVehicleNear(player, 5)
+    end
+    if vehicle == nil then return false, "vehicle_unavailable" end
+    local driver = vehicle.getDriver ~= nil and vehicle:getDriver() or nil
+    if driver == nil then return false, "no_driver" end
+    if driver == player then return false, "already_driving" end
+    local driverId = KnoxSurvivorRuntime.idForCharacter(driver)
+    local playerId = CompanionService.getPlayerId(player)
+    local duty = driverId ~= nil and KnoxPersistence.getSurvivorDuty(driverId) or nil
+    if driverId == nil or playerId == nil or duty == nil or duty.ownerId ~= playerId
+        or (duty.mode ~= "companion" and duty.mode ~= "base") then
+        return false, "not_your_survivor"
+    end
+    local success, result = KnoxCompanionVehicles.beginTakeover(player, driver, vehicle)
+    if success and KnoxActivityFeed ~= nil and KnoxActivityFeed.event ~= nil then
+        KnoxActivityFeed.event("The driver is moving over. Take the wheel.")
+    end
+    return success, result
 end
 
 function CompanionService.stopPlayerVehicle(player,survivorId)
@@ -1957,6 +2895,21 @@ function CompanionService.unstick(player, survivorId)
         pcall(function() log.log("movement", survivorId, "unstuck", {
             x = fx, y = fy, z = fz,
         }) end)
+    end
+    -- Unstick is a reset, not only a reposition. The decision that put her
+    -- here still owns her posture, her queued actions and her reservations, so
+    -- moving the body without dropping it leaves her just as stuck two tiles
+    -- over. The controller's existing abandon path owns that cleanup: it
+    -- cancels the move, clears the timed-action queue, wakes a seated
+    -- survivor and releases the rest spot. Identity, clothing, needs, skills
+    -- and inventory are untouched.
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    local controller = runtime ~= nil and runtime.getController ~= nil
+        and runtime.getController(survivorId) or nil
+    if controller ~= nil and controller.abandonCurrentDecision ~= nil then
+        pcall(function()
+            controller:abandonCurrentDecision(controller.currentTicks or 0, "unstuck")
+        end)
     end
     KnoxSurvivorRuntime.notifyDutyChanged(survivorId)
     if KnoxActivityFeed ~= nil and KnoxActivityFeed.speak ~= nil then
@@ -2364,6 +3317,14 @@ function CompanionService.setBaseJobPreference(player, survivorId, preference, r
             hauling = "I'll move the bodies to the drop area.",
 
             repair = "I'll handle maintenance.",
+            scavenger = "I'll find what we need.",
+            cook = "I'll keep the kitchen going.",
+            farmer = "I'll tend the crops.",
+            builder = "I'll fix what's broken.",
+            medic = "I'll keep the bandages ready.",
+            mechanic = "I'll keep the engines running.",
+            quartermaster = "I'll keep the stores counted.",
+            runner = "I'll carry word and supplies.",
             rest = "I'll rest and recover for now.",
         }
         KnoxActivityFeed.speak(character, lines[normalizedPreference]
@@ -2393,6 +3354,33 @@ function CompanionService.setBaseDutySchedule(player, survivorId, schedule, requ
             or "I'll keep to the new hours.")
     end
     return true, "schedule_updated"
+end
+
+-- Temporary current-block override. The saved rota is untouched; nil clears it.
+function CompanionService.setBaseDutyScheduleOverride(player, survivorId, assignment, requestedBaseId)
+    local delivered, reason = CompanionService.deliverOrder(player, survivorId, "job")
+    if not delivered then return false, reason end
+    local playerId = CompanionService.getPlayerId(player)
+    local base = resolveOwnedPlayerBase(playerId, requestedBaseId)
+    local saved
+    if assignment == nil then
+        saved = base ~= nil and KnoxPersistence.clearBaseDutyScheduleOverride(
+            survivorId, playerId, base.id, worldAge()
+        )
+    else
+        saved = base ~= nil and KnoxPersistence.setBaseDutyScheduleOverride(
+            survivorId, playerId, base.id, assignment, worldAge()
+        )
+    end
+    if not saved then return false, "not_your_base_resident" end
+    KnoxSurvivorRuntime.notifyDutyChanged(survivorId)
+    local character = KnoxSurvivorRuntime.getCharacter(survivorId)
+    if character ~= nil and KnoxActivityFeed ~= nil and KnoxActivityFeed.speak ~= nil then
+        KnoxActivityFeed.speak(character, assignment == nil
+            and "Back on the saved hours."
+            or "I'll take the watch until the next block.")
+    end
+    return true, assignment == nil and "schedule_override_cleared" or "schedule_override_set"
 end
 
 -- Work-priority write boundary for the priorities-tab UI. Ownership and
@@ -2531,6 +3519,14 @@ function CompanionService.recallToParty(player, survivorId)
     if #CompanionService.getCompanionIds(player) >= KnoxSettings.companionLimit() then
         return false, "companion_limit"
     end
+    -- A resident out on a base supply order is still yours to call back. The
+    -- order was left open, which is why she kept reporting a supply run she
+    -- never finished and why every order menu offered only Cancel Supply Order.
+    -- Recall outranks routine work, so the order is closed before she is asked
+    -- to follow, and the claim it held goes back to the queue.
+    if type(duty.baseSupplyOrder) == "table" and KnoxPersistence.clearBaseSupplyOrder ~= nil then
+        KnoxPersistence.clearBaseSupplyOrder(survivorId, playerId, duty.baseId, worldAge())
+    end
     local delivered, reason = CompanionService.deliverOrder(player, survivorId, "follow")
     if not delivered then return false, reason end
     local saved, result = KnoxPersistence.setPlayerCompanion(
@@ -2554,6 +3550,136 @@ end
 
 -- Compatibility for callers that used the old internal name.  The public
 -- recall boundary above adds ownership, duty, life-state and capacity checks.
+-- STRANDED COMPANIONS
+-- A companion who falls behind stays behind because nobody is simulating them
+-- once they are unloaded. Two exits exist and both are real: if the player and
+-- the survivor each carry a walkie, the survivor hears the call and walks back
+-- to the player; if not, they survive where they were left and eventually make
+-- their own way to the nearest base, where they stay as a resident rather than
+-- remaining a companion nobody can reach.
+CompanionService.STRANDED_DISTANCE = 80      -- tiles before "left behind"
+CompanionService.STRANDED_WALKIE_HOURS = 2   -- hearing the radio
+CompanionService.STRANDED_ALONE_HOURS = 36   -- day and a half alone
+local RADIO_PREFIX = "Base.WalkieTalkie"
+local function strandedCharacter(id)
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    if runtime == nil then return nil end
+    for _, name in ipairs({ "getCharacter", "characterFor", "get" }) do
+        local lookup = runtime[name]
+        if type(lookup) == "function" then
+            local ok, value = pcall(lookup, id)
+            if ok and value ~= nil then return value end
+        end
+    end
+    return nil
+end
+
+local function say(text)
+    local feed = rawget(_G, "KnoxActivityFeed")
+    if feed ~= nil and feed.event ~= nil then feed.event(tostring(text)) end
+end
+
+function CompanionService.hasRadio(character)
+    if character == nil then return false end
+    local ok, inventory = pcall(function() return character:getInventory() end)
+    if not ok or inventory == nil then return false end
+    local found = false
+    pcall(function()
+        local items = inventory:getItems()
+        if items == nil then return end
+        for index = 0, items:size() - 1 do
+            local item = items:get(index)
+            local fullType = item ~= nil and tostring(item:getFullType()) or ""
+            if fullType:sub(1, #RADIO_PREFIX) == RADIO_PREFIX then
+                found = true
+                return
+            end
+        end
+    end)
+    return found
+end
+
+-- Pure rule: what, if anything, should happen to a companion this far away for
+-- this long. Nil means "still within reach, leave them alone".
+function CompanionService.strandedPlan(distance, hoursApart, playerRadio, survivorRadio)
+    local gap = tonumber(distance)
+    if gap == nil or gap <= CompanionService.STRANDED_DISTANCE then return nil end
+    local hours = tonumber(hoursApart) or 0
+    if playerRadio == true and survivorRadio == true then
+        if hours >= CompanionService.STRANDED_WALKIE_HOURS then return "call_back" end
+        return nil
+    end
+    if hours >= CompanionService.STRANDED_ALONE_HOURS then return "go_home" end
+    return nil
+end
+
+-- Called on a slow cadence from the service's own tick. Every write goes
+-- through the existing persistence setters; this decides, it does not store.
+function CompanionService.reconcileStranded(player)
+    local playerId = CompanionService.getPlayerId(player)
+    if playerId == nil then return 0 end
+    local now = worldAge()
+    local playerRadio = CompanionService.hasRadio(player)
+    local handled = 0
+    for _, id in ipairs(KnoxPersistence.getCompanionIds(playerId) or {}) do
+        local character = strandedCharacter(id)
+        local distance = nil
+        if character ~= nil then
+            local dx = player:getX() - character:getX()
+            local dy = player:getY() - character:getY()
+            distance = math.sqrt(dx * dx + dy * dy)
+        end
+        if distance == nil then
+            -- Unloaded is the case this exists for: no body is being simulated,
+            -- so distance is unknown and the survivor counts as left behind.
+            distance = math.huge
+        end
+        if distance <= CompanionService.STRANDED_DISTANCE then
+            KnoxPersistence.clearCompanionStranded(id)
+        else
+            local since = KnoxPersistence.getCompanionStrandedSince(id)
+                or KnoxPersistence.noteCompanionStranded(id, now) or now
+            local duty = KnoxPersistence.getSurvivorDuty(id)
+            local plan = CompanionService.strandedPlan(distance, now - since, playerRadio,
+                character ~= nil and CompanionService.hasRadio(character) or false)
+            if plan == "call_back" then
+                if duty == nil or duty.order ~= "follow" then
+                    KnoxPersistence.setPlayerCompanion(id, playerId, "follow", now)
+                    say(displayName(id) .. " heard the radio and is coming back to you.")
+                    handled = handled + 1
+                end
+                KnoxPersistence.clearCompanionStranded(id)
+            elseif plan == "go_home" then
+                local bases = KnoxPersistence.getBasesForOwner("player", playerId) or {}
+                local base = bases[1]
+                if base ~= nil then
+                    local saved = KnoxPersistence.setPlayerBaseResident(id, playerId, base.id, now)
+                    if saved then
+                        KnoxPersistence.clearCompanionStranded(id)
+                        say(displayName(id) .. " made it back to "
+                            .. tostring(base.name or "the base") .. " and is living there now.")
+                        handled = handled + 1
+                    end
+                end
+            end
+        end
+    end
+    return handled
+end
+
+local strandedNextCheck = 0
+local function strandedTick()
+    local clock = getTimestampMs ~= nil and getTimestampMs() or 0
+    if clock < strandedNextCheck then return end
+    strandedNextCheck = clock + 30000
+    local player = getSpecificPlayer(0)
+    if player ~= nil and KnoxSettings ~= nil and KnoxSettings.enabled ~= nil
+        and KnoxSettings.enabled() == true then
+        pcall(CompanionService.reconcileStranded, player)
+    end
+end
+if Events ~= nil and Events.OnTick ~= nil then Events.OnTick.Add(strandedTick) end
+
 function CompanionService.activateFromBase(player, survivorId)
     return CompanionService.recallToParty(player, survivorId)
 end
@@ -2617,8 +3743,17 @@ function CompanionService.syncController(survivorId, controller)
     end
     local eventRuntime = rawget(_G, "KnoxEventRuntime")
     if eventRuntime ~= nil and controller.setEventAssignment ~= nil then
+        local stampBefore = KnoxPersistence.getSurvivorDutyRevision ~= nil
+            and KnoxPersistence.getSurvivorDutyRevision(survivorId) or nil
         eventRuntime.syncController(survivorId, controller)
-        duty = KnoxPersistence.getSurvivorDuty(survivorId)
+        -- Re-read only when the event runtime actually rewrote the duty: every
+        -- read allocates a copy, and this path runs for every active survivor on
+        -- every tick.
+        local stampAfter = KnoxPersistence.getSurvivorDutyRevision ~= nil
+            and KnoxPersistence.getSurvivorDutyRevision(survivorId) or nil
+        if stampBefore == nil or stampAfter == nil or stampAfter ~= stampBefore then
+            duty = KnoxPersistence.getSurvivorDuty(survivorId)
+        end
     end
     local bridge = rawget(_G, "KnoxJavaBridge")
     local player = duty ~= nil and duty.mode == "companion"

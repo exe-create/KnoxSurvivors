@@ -1467,43 +1467,6 @@ local function formInitialGroups(startingIds, worldAgeHours, state)
     return created
 end
 
--- Replacements normally enter alone, but a world that has suffered deaths
--- should not slowly lose all of its human clusters.  Give a new identity one
--- modest, deterministic chance to join a nearby independent survivor.  This
--- only links existing persisted identities; it never teleports or fabricates
--- a body, and the normal encounter/faction rules still govern later growth.
-local function formRefillGroup(id, worldAgeHours)
-    if id == nil or KnoxPersistence.getSurvivorOrigin == nil
-        or KnoxPersistence.getAllWorldSurvivorIds == nil
-        or KnoxPersistence.getTravelGroupFor == nil
-        or KnoxPersistence.isIndependentSurvivor == nil
-        or KnoxPersistence.createTravelGroup == nil then
-        return nil
-    end
-    if stableHash(tostring(id) .. ":refill-group:" .. tostring(worldAgeHours or 0)) % 100 >= 40 then
-        return nil
-    end
-    local origin = currentPopulationLocation(id)
-    if origin == nil then return nil end
-    local nearest, nearestDistance = nil, 64 * 64 + 1
-    for _, otherId in ipairs(KnoxPersistence.getAllWorldSurvivorIds() or {}) do
-        if otherId ~= id and KnoxPersistence.isIndependentSurvivor(otherId)
-            and KnoxPersistence.getTravelGroupFor(otherId) == nil then
-            local other = currentPopulationLocation(otherId)
-            if other ~= nil and (tonumber(other.z) or 0) == (tonumber(origin.z) or 0) then
-                local dx = (tonumber(other.x) or 0) - (tonumber(origin.x) or 0)
-                local dy = (tonumber(other.y) or 0) - (tonumber(origin.y) or 0)
-                local distance = dx * dx + dy * dy
-                if distance < nearestDistance then
-                    nearest, nearestDistance = otherId, distance
-                end
-            end
-        end
-    end
-    if nearest == nil then return nil end
-    return KnoxPersistence.createTravelGroup({ id, nearest }, worldAgeHours)
-end
-
 local function allocateOne(catalog, worldAgeHours, state, used, counts)
     local cursor = math.max(0, math.floor(tonumber(state.allocationCursor) or 0))
     local origin, regionKey = chooseBalancedOrigin(catalog, used, counts, cursor)
@@ -1641,7 +1604,8 @@ local function maintainCore(worldAgeHours, options)
                 break
             end
             result.addedIds[#result.addedIds+1] = id
-            formRefillGroup(id, now)
+            -- New arrivals remain independent until the existing encounter
+            -- system observes a meeting and confirms a mutual join.
             living = living+1
             state.expansionRemaining = state.expansionRemaining-1
         end
@@ -1696,10 +1660,8 @@ local function maintainCore(worldAgeHours, options)
     state.nextRefillHours = now + refillHours
     result.nextRefillHours = state.nextRefillHours
     if id ~= nil then
-        local refillGroup = formRefillGroup(id, now)
         result.status = uncapped and "arrived" or "refilled"
         result.addedIds[1] = id
-        result.groupId = refillGroup ~= nil and refillGroup.id or nil
         result.living = living + 1
         if result.living >= target and not uncapped then
             state.belowTargetSinceHours = nil
@@ -1917,10 +1879,16 @@ function WorldPopulation.findFirstMaterializationSquare(origin, options)
     return nil, "no_safe_hidden_loaded_square"
 end
 
+local recordLocationCache, recordLocationKeys, recordLocationSlot = {}, {}, 1
 local function recordLocation(bridge, record)
     if bridge == nil then
         return nil, nil, nil, "bridge_unavailable"
     end
+    -- Portable records are immutable strings. Re-decoding the same large
+    -- inventory just to read XYZ on every activation scan adds no information.
+    -- Bound this transient cache independently of the world's population.
+    local cached = recordLocationCache[record]
+    if cached ~= nil and cached.bridge == bridge then return cached.x, cached.y, cached.z, nil end
     local success, x, y, z = pcall(function()
         if bridge.getNpcRecordLocation ~= nil then
             local point = bridge:getNpcRecordLocation(record)
@@ -1933,7 +1901,15 @@ local function recordLocation(bridge, record)
     if not success or not finite(tonumber(x)) or not finite(tonumber(y)) or not finite(tonumber(z)) then
         return nil, nil, nil, "record_location_unavailable"
     end
-    return math.floor(tonumber(x)), math.floor(tonumber(y)), math.floor(tonumber(z)), nil
+    x, y, z = math.floor(tonumber(x)), math.floor(tonumber(y)), math.floor(tonumber(z))
+    if cached == nil then
+        local expired = recordLocationKeys[recordLocationSlot]
+        if expired ~= nil then recordLocationCache[expired] = nil end
+        recordLocationKeys[recordLocationSlot] = record
+        recordLocationSlot = recordLocationSlot % 256 + 1
+    end
+    recordLocationCache[record] = {bridge=bridge,x=x,y=y,z=z}
+    return x, y, z, nil
 end
 
 local function materializeVirtualLocation(id, bridge, record, players, maximumDistance)

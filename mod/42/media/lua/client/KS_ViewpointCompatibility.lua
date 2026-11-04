@@ -7,6 +7,11 @@ require "ISUI/ISButton"
 local Compat = rawget(_G, "KnoxViewpointCompatibility") or {}
 _G.KnoxViewpointCompatibility = Compat
 local installed, selection = false, nil
+local interactionsRegistered, hubRegistered = false, false
+-- Forward declaration. The registration below ran before the local function
+-- that follows it, so it captured the *global* name and registered a nil
+-- callback: Viewpoint then had no Knox actions to show at all.
+local collect
 
 local function ui() return rawget(_G, "ViewpointUI") end
 local function enabled()
@@ -56,8 +61,25 @@ function Compat.targetSquare(player)
     local square = target ~= nil and target.square or nil
     return near(player, square) and square or nil
 end
+-- Area, work-zone and territory selection place a tile under the cursor, so
+-- they need the classic isometric view. Viewpoint's own setter is asked for by
+-- name and existence-checked; if the installed build does not expose one, the
+-- player is told to switch rather than handed a selector that cannot work.
+function Compat.ensureIsoView()
+    if not Layout.isPerspective() then return true end
+    local vp = rawget(_G, "Viewpoint") or rawget(_G, "ViewpointUI") or rawget(_G, "VPUI")
+    local setter = vp ~= nil and vp.View ~= nil and vp.View.set or nil
+    if type(setter) == "function" then
+        pcall(setter, "isometric")
+        if not Layout.isPerspective() then return true end
+    end
+    feedback("Switch to the classic isometric view to select tiles for an area.")
+    return false
+end
+
 function Compat.beginSelection(owner, label)
     if not Layout.isPerspective() then return false end
+    if not Compat.ensureIsoView() then return false end
     if selection ~= nil and selection ~= owner then selection:onSquareSelectedCancel() end
     selection = owner
     owner.perspective = true
@@ -94,10 +116,123 @@ local function harvest(player, builder)
         return builder(menu, pn) or menu
     end)
 end
-local function survivorActions(player, id)
-    local menu = rawget(_G, "KnoxSurvivorContextMenu")
-    if menu == nil then return {} end
-    return harvest(player, function(context, pn) menu.populate(context, pn, id, "all") end)
+local function visibleSurvivor(player, character)
+    if player == nil or character == nil or player:isDead() or character:isDead() then return false end
+    local square = character:getCurrentSquare()
+    if square == nil or player:getZ() ~= character:getZ() then return false end
+    local dx, dy = player:getX() - character:getX(), player:getY() - character:getY()
+    if dx * dx + dy * dy > 16 then return false end
+    if player.CanSee == nil then return true end
+    local ok, seen = pcall(function() return player:CanSee(character) end)
+    return not ok or seen == true
+end
+-- The aimed survivor, resolved without trusting one descriptor shape. Viewpoint
+-- builds have handed over {object=...}, {character=...} and bare bodies, and a
+-- build that hands over neither used to leave the crosshair with nothing of ours
+-- on it while the vanilla player shell still offered its own broken row.
+local function aimedCharacter(player)
+    local target = currentTarget()
+    if target == nil then return nil end
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    if runtime == nil or runtime.idForCharacter == nil then return nil end
+    -- The body is a Java userdata, not a Lua table; filtering on type(table)
+    -- skipped every real character and left the crosshair with no Knox rows.
+    for _, candidate in ipairs({ target.object, target.character, target.player, target }) do
+        if candidate ~= nil then
+            local ok, id = pcall(runtime.idForCharacter, candidate)
+            if ok and id ~= nil then return candidate, id end
+        end
+    end
+    return nil
+end
+
+--- The person under the crosshair as an interaction target, or nil. One
+--- resolver for the key, the crosshair rows and any later caller.
+function Compat.aimedTarget(player)
+    if player == nil then return nil end
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    local character, id = aimedCharacter(player)
+    local target = currentTarget()
+    if id == nil and target ~= nil and target.square ~= nil and runtime ~= nil
+        and runtime.nearestToSquare ~= nil then
+        -- The descriptor carried no body. The square under the crosshair still
+        -- names the person standing on it, and nobody else.
+        local ok, found = pcall(runtime.nearestToSquare, target.square, 0.75)
+        if ok then id = found end
+    end
+    if character == nil and id ~= nil and runtime ~= nil and runtime.getCharacter ~= nil then
+        local ok, live = pcall(runtime.getCharacter, id)
+        if ok then character = live end
+    end
+    if character == nil or not visibleSurvivor(player, character) then return nil end
+    local view = rawget(_G, "KnoxSurvivorViewModel")
+    local snapshot = view ~= nil and view.getSurvivor ~= nil
+        and view.getSurvivor(id, player:getPlayerNum()) or nil
+    return { id = id, character = character,
+        name = snapshot ~= nil and snapshot.displayName or "Survivor" }
+end
+
+local function directSurvivorActions(player, id, character, add)
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    local function addAction(label, primary, run)
+        add({ id = "knox.survivor:" .. id .. ":" .. label,
+            label = label, primary = primary, run = function(p)
+                if runtime == nil or runtime.getCharacter(id) ~= character
+                    or not visibleSurvivor(p, character) then return false end
+                return run(p)
+            end })
+    end
+    addAction("Talk", true, function(p)
+        local interaction = rawget(_G, "KnoxSurvivorInteractionUI")
+        if interaction == nil or interaction.open == nil then return false end
+        local view = rawget(_G, "KnoxSurvivorViewModel")
+        local snapshot = view ~= nil and view.getSurvivor ~= nil
+            and view.getSurvivor(id, p:getPlayerNum()) or nil
+        return interaction.open(p:getPlayerNum(), { id = id, character = character,
+            name = snapshot ~= nil and snapshot.displayName or "Survivor" }, p)
+    end)
+    -- The aim list is the fast way to act on the person in front of you, so it
+    -- carries the order desk as well as the conversation: one press opens the
+    -- panel already on the order list, where follow/guard/scavenge live.
+    addAction("Orders", false, function(p)
+        local interaction = rawget(_G, "KnoxSurvivorInteractionUI")
+        if interaction == nil or interaction.open == nil then return false end
+        local view = rawget(_G, "KnoxSurvivorViewModel")
+        local snapshot = view ~= nil and view.getSurvivor ~= nil
+            and view.getSurvivor(id, p:getPlayerNum()) or nil
+        local opened = interaction.open(p:getPlayerNum(), { id = id, character = character,
+            name = snapshot ~= nil and snapshot.displayName or "Survivor" }, p)
+        return opened ~= nil and opened ~= false
+    end)
+    local persistence = rawget(_G, "KnoxPersistence")
+    local affiliation = persistence ~= nil and persistence.getSurvivorAffiliation ~= nil
+        and persistence.getSurvivorAffiliation(id) or nil
+    if affiliation ~= nil and affiliation.kind ~= "player" then
+        addAction("Trade", false, function(p)
+            local trade = rawget(_G, "KnoxTradeUI")
+            return trade ~= nil and trade.show ~= nil and trade.show(p:getPlayerNum(), id) ~= nil
+        end)
+        addAction("Give Item", false, function(p)
+            local trade = rawget(_G, "KnoxTradeUI")
+            return trade ~= nil and trade.showGift ~= nil and trade.showGift(p:getPlayerNum(), id) ~= nil
+        end)
+    elseif affiliation ~= nil and affiliation.kind == "player" then
+        addAction("Manage Inventory", false, function(p)
+            local inventory = rawget(_G, "KnoxCompanionInventory")
+            -- request() reports the shared refusal sentence; show() alone would
+            -- leave the crosshair action with only a generic failure.
+            return inventory ~= nil and inventory.request ~= nil
+                and inventory.request(p:getPlayerNum(), id) == true
+        end)
+    end
+    addAction("Medical Check", false, function(p)
+        local menu = rawget(_G, "KnoxSurvivorContextMenu")
+        return menu ~= nil and menu.medicalCheck ~= nil and menu.medicalCheck(p:getPlayerNum(), id)
+    end)
+    addAction("View Stats & Skills", false, function(p)
+        local card = rawget(_G, "KnoxSurvivorCard")
+        return card ~= nil and card.show ~= nil and card.show(p:getPlayerNum(), id) ~= nil
+    end)
 end
 local function invokeFresh(player, rows, label)
     for _, row in ipairs(rows) do
@@ -106,8 +241,21 @@ local function invokeFresh(player, rows, label)
     feedback("That action is no longer available.")
     return false
 end
-local function collect(target, player, add)
+collect = function(target, player, add)
+    -- Viewpoint calls this with its own target descriptor. A build that hands
+    -- us something unexpected must not break its crosshair list.
+    if target == nil or player == nil or type(add) ~= "function" then return end
     if not Compat.usesNativeAdapter() then return end
+    -- One line per session: which target Viewpoint handed us and whether it
+    -- resolved to a survivor. Without it a silent crosshair cannot be told
+    -- apart from an unaimed one between playtests.
+    if not Compat.reportedFirstTarget then
+        Compat.reportedFirstTarget = true
+        print("[KnoxSurvivors][Viewpoint] first target kind=" .. tostring(target.kind)
+            .. " object=" .. tostring(target.object ~= nil)
+            .. " square=" .. tostring(target.square ~= nil)
+            .. " resolved=" .. tostring(Compat.aimedTarget(player) ~= nil))
+    end
     if selection ~= nil then
         if selection.player == player and not selection.pendingConfirm and near(player, target.square) then
             local square, owner = target.square, selection
@@ -120,19 +268,19 @@ local function collect(target, player, add)
         return
     end
     local runtime = rawget(_G, "KnoxSurvivorRuntime")
-    local id = runtime ~= nil and runtime.idForCharacter ~= nil and runtime.idForCharacter(target.object) or nil
+    local aimed = Compat.aimedTarget(player)
+    local id = aimed ~= nil and aimed.id or nil
     if id ~= nil then
-        for _, row in ipairs(survivorActions(player, id)) do
-            local label, object = row.label, target.object
-            add({ id = "knox.commands:" .. id .. ":" .. label,
-                label = label == "Interact" and "Knox survivor interactions" or label,
-                primary = label == "Interact", enabled = row.enabled,
-                run = function(p)
-                    if runtime.getCharacter(id) ~= object or not near(p, object:getCurrentSquare())
-                        or not p:CanSee(object) then return false end
-                    return invokeFresh(p, survivorActions(p, id), label)
-                end })
-        end
+        -- Validate the body that was actually resolved, not the descriptor.
+        -- Viewpoint often hands over { square = ... } with no body, which is
+        -- exactly the case aimedTarget exists to solve. Checking target.object
+        -- here meant that case resolved a survivor and then failed visibility,
+        -- so the crosshair showed no Knox rows at all on a person.
+        local body = aimed.character or target.object
+        if not visibleSurvivor(player, body) then return end
+        -- The crosshair carries the few things worth doing to a person. The
+        -- order book belongs in the panel these open, not in the aim list.
+        directSurvivorActions(player, id, aimed.character, add)
     elseif target.object == nil and near(player, target.square) then
         -- Viewpoint already harvests world-object callbacks. Ground targets have
         -- no object to harvest, so adapt only this missing case; no duplicate actions.
@@ -228,20 +376,64 @@ local function createTab(screen)
     end
     return tab
 end
+-- Viewpoint is another mod with its own history. A build may expose
+-- Interactions and Hub and no Util.Harvest at all, so registration must not
+-- depend on the harvest helper: one missing convenience table used to remove
+-- every Knox action from the crosshair while Viewpoint's own harvest still
+-- showed the single vanilla option it could read. Each entry point is attempted
+-- on its own, and a failure is reported once with the shape actually present.
 function Compat.install()
     local vp = ui()
-    if installed then return true end
-    if vp == nil or vp.Interactions == nil or vp.Hub == nil
-        or vp.Util == nil or vp.Util.Harvest == nil then return false end
-    vp.Interactions.register({ id = "knoxsurvivors.commands", priority = 20, collect = collect })
-    vp.Hub.register({ id = "knoxsurvivors", label = "Knox Survivors", order = 95,
-        visible = function() return enabled() end, create = createTab })
-    installed = true
-    return true
+    if vp == nil then
+        -- Silence here cost a playtest: the crosshair had no rows and nothing
+        -- in the console said whether Viewpoint was absent or our provider
+        -- was rejected. Say which, once.
+        if not Compat.reportedMissingUI then
+            Compat.reportedMissingUI = true
+            print("[KnoxSurvivors][Viewpoint] ViewpointUI is not loaded; crosshair actions unavailable")
+        end
+        return false
+    end
+    if interactionsRegistered and hubRegistered then
+        installed = true
+        return true
+    end
+    if not interactionsRegistered and vp.Interactions ~= nil
+        and vp.Interactions.register ~= nil then
+        local ok = pcall(vp.Interactions.register, {
+            id = "knoxsurvivors.commands",
+            priority = 20,
+            collect = function(target, player, add) return collect(target, player, add) end,
+        })
+        interactionsRegistered = ok == true
+    end
+    if not hubRegistered and vp.Hub ~= nil and vp.Hub.register ~= nil then
+        local ok = pcall(vp.Hub.register, {
+            id = "knoxsurvivors", label = "Knox Survivors", order = 95,
+            visible = function() return enabled() end, create = createTab,
+        })
+        hubRegistered = ok == true
+    end
+    installed = interactionsRegistered
+    if not installed and not Compat.reportedInstallFailure then
+        Compat.reportedInstallFailure = true
+        print("[KnoxSurvivors][Viewpoint] crosshair adapter not installed"
+            .. " interactions=" .. tostring(vp.Interactions ~= nil)
+            .. " register=" .. tostring(vp.Interactions ~= nil
+                and vp.Interactions.register ~= nil)
+            .. " hub=" .. tostring(vp.Hub ~= nil)
+            .. " harvest=" .. tostring(vp.Util ~= nil and vp.Util.Harvest ~= nil))
+    end
+    return installed
 end
 if Events ~= nil then
     Events.OnGameStart.Add(Compat.install)
     Events.OnTick.Add(function()
+        -- Idle fast path. This handler runs on every frame; with nothing
+        -- selected there is nothing to cancel, and re-checking the install
+        -- state is only worth doing while the adapter is still missing.
+        if installed and selection == nil then return end
+        if not installed then Compat.install() end
         if selection ~= nil and (selection.player:isDead() or not Layout.isPerspective()) then
             selection:onSquareSelectedCancel()
         end

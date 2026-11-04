@@ -15,7 +15,7 @@ final class KnoxCombatController {
     private static final int ATTACK_RECOVERY_TICKS = 24;
     private static final int MELEE_RECOVERY_TICKS = 30;
     private static final float ATTACK_ENTRY_BUFFER = 0.05f;
-    private static final float REAPPROACH_BUFFER = 0.20f;
+    private static final float REAPPROACH_BUFFER = 0.25f;
     private static final int RANGED_REPOSITION_COOLDOWN_TICKS = 60;
     private static final int APPROACH_REFRESH_TICKS = 30;
     private static final int DAMAGE_LOG_INTERVAL_TICKS = 60;
@@ -52,6 +52,15 @@ final class KnoxCombatController {
     private float approachTargetX;
     private float approachTargetY;
     private int stationaryApproachRetries;
+    // Measurements for the two combat complaints that cannot be seen offline:
+    // a swing that reads as slow, and a first swing that starts at the edge of
+    // reach. These are observations only; no timing or range rule reads them.
+    private int firstSwingTick = -1;
+    private float distanceAtFirstSwing = -1.0f;
+    private float distanceAtLastSwing = -1.0f;
+    private int swingCount;
+    private int approachSteps;
+    private int approachRefreshes;
 
     String begin(KnoxNpc activeNpc, Object zombie, Object approachSquare)
         throws ReflectiveOperationException {
@@ -371,6 +380,9 @@ final class KnoxCombatController {
         boolean attackAnimation = (Boolean) body.getClass()
             .getMethod("isPerformingAttackAnimation").invoke(body);
         boolean attackActive = attackStarted || attacking || attackAnimation;
+        if (recoverIdleAttackLatch(body)) {
+            return "COMBAT_RECOVERING_STALE_ATTACK targetHealth=" + currentHealth;
+        }
         float minimumRangedDistance = minimumRangedDistance(desiredAttackRange);
         if (shouldRepositionRanged(
             rangedWeapon,
@@ -429,6 +441,7 @@ final class KnoxCombatController {
                 // Replacing it with pathToCharacter() every few ticks sends the shell
                 // into the target's occupied space, then repeatedly invalidates its
                 // own route as the target and animation graph move.
+                approachSteps++;
                 String movement = KnoxNpcFactory.tickMovement(npc, targetDistance, "run");
                 if (movement.startsWith("Failed")) {
                     phase = "FAILED";
@@ -438,6 +451,7 @@ final class KnoxCombatController {
                     targetX, targetY, approachTargetX, approachTargetY
                 );
                 if (shouldRefreshApproach(movement, targetMoved, ticks - lastApproachTick)) {
+                    approachRefreshes++;
                     stationaryApproachRetries = targetMoved ? 0 : stationaryApproachRetries + 1;
                     if (stationaryApproachRetries > 2) {
                         return finish("COMBAT_FAILED APPROACH_OUT_OF_RANGE distance="
@@ -461,6 +475,7 @@ final class KnoxCombatController {
             clearMovementIntent();
             stationaryApproachRetries = 0;
         } else if ("APPROACHING".equals(phase)) {
+            approachSteps++;
             String movement = KnoxNpcFactory.tickMovement(npc);
             if (movement.startsWith("Failed")) {
                 phase = "FAILED";
@@ -535,7 +550,11 @@ final class KnoxCombatController {
         }
 
         boolean aimAtFloor = targetOnFloor;
-        applyCombatStance(body, false, aimAtFloor, rangedWeapon);
+        // The Lua hook has admitted this ranged attack through pressedAttack.
+        // Preserve that pending input in the AI component until its graph starts;
+        // clearing it on the next tick can leave audio without an actual shot.
+        applyCombatStance(body, rangedWeapon && attackStarted && !attackAnimation,
+            aimAtFloor, rangedWeapon);
 
         if ("AIMING".equals(phase)) {
             aimTicks++;
@@ -593,6 +612,16 @@ final class KnoxCombatController {
             && ticks - lastAttackTick >= ATTACK_RETRY_TICKS) {
             requestAttack(body, aimAtFloor, rangedWeapon);
             attackRequests++;
+            swingCount++;
+            if (firstSwingTick < 0) {
+                firstSwingTick = ticks;
+                distanceAtFirstSwing = targetDistance;
+                KnoxAgent.writeLog("NPC combat FIRST_SWING tick=" + ticks
+                    + " distance=" + targetDistance
+                    + " desiredRange=" + desiredAttackRange
+                    + " weaponMaxRange=" + weaponMaxRange);
+            }
+            distanceAtLastSwing = targetDistance;
             lastAttackTick = ticks;
             attackAnimationObserved = false;
             directStateFallbackUsed = false;
@@ -660,7 +689,8 @@ final class KnoxCombatController {
                 + " bodyState=" + body.getClass().getMethod("getCurrentStateName").invoke(body)
                 + " bodyAction="
                 + body.getClass().getMethod("getCurrentActionContextStateName").invoke(body)
-                + " attackType=" + body.getClass().getMethod("getAttackType").invoke(body);
+                + " attackType=" + body.getClass().getMethod("getAttackType").invoke(body)
+                + metricsSuffix();
         } catch (ReflectiveOperationException exception) {
             return "COMBAT_DIAGNOSTICS_FAILED " + exception.getClass().getSimpleName()
                 + ": " + exception.getMessage();
@@ -721,6 +751,12 @@ final class KnoxCombatController {
         approachTargetX = 0.0f;
         approachTargetY = 0.0f;
         stationaryApproachRetries = 0;
+        firstSwingTick = -1;
+        distanceAtFirstSwing = -1.0f;
+        distanceAtLastSwing = -1.0f;
+        swingCount = 0;
+        approachSteps = 0;
+        approachRefreshes = 0;
         lastRangedRepositionTick = -RANGED_REPOSITION_COOLDOWN_TICKS;
     }
 
@@ -808,8 +844,21 @@ final class KnoxCombatController {
     }
 
     private String finish(String result) {
+        // One line per finished encounter: how many swings were actually
+        // requested, how far away the first one was, and how much approach work
+        // came before it. Nothing reads these back into a decision.
+        KnoxAgent.writeLog("NPC combat END " + metricsSuffix());
         reset();
         return result;
+    }
+
+    private String metricsSuffix() {
+        return " swing=" + swingCount
+            + " firstSwingTick=" + firstSwingTick
+            + " firstSwingDistance=" + distanceAtFirstSwing
+            + " lastSwingDistance=" + distanceAtLastSwing
+            + " approachSteps=" + approachSteps
+            + " approachRefreshes=" + approachRefreshes;
     }
 
     private static boolean combatantUnavailable(Object body)
@@ -948,6 +997,24 @@ final class KnoxCombatController {
         return nativeInjuryOwnsBody(body,
             String.valueOf(body.getClass().getMethod("getCurrentStateName").invoke(body)),
             String.valueOf(body.getClass().getMethod("getCurrentActionContextStateName").invoke(body)));
+    }
+
+    private boolean recoverIdleAttackLatch(Object body) throws ReflectiveOperationException {
+        if (attackRequests == 0 || ticks - lastAttackTick <= 180
+            || !"idle".equalsIgnoreCase(String.valueOf(body.getClass()
+                .getMethod("getCurrentActionContextStateName").invoke(body)))
+            || !"IdleState".equalsIgnoreCase(String.valueOf(body.getClass()
+                .getMethod("getCurrentStateName").invoke(body)))
+            || nativeAttackOwnsBody(body)) return false;
+        boolean started = (Boolean) body.getClass().getMethod("isAttackStarted").invoke(body);
+        String type = String.valueOf(body.getClass().getMethod("getAttackType").invoke(body));
+        if (!started && (type.isEmpty() || "NONE".equalsIgnoreCase(type))) return false;
+        // Old request flags are not an animation owner. Recover even after an
+        // earlier shot animated or hit; those observations used to disable the watchdog.
+        clearNativeRecoveryInput(body);
+        attackAnimationObserved = false;
+        directStateFallbackUsed = false;
+        return true;
     }
 
     private static boolean nativeAttackOwnsBody(Object body) throws ReflectiveOperationException {

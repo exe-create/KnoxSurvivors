@@ -12,6 +12,29 @@ local KS_SafeCall = require "KS_SafeCall"
 local Firearms = rawget(_G, "KnoxFirearmSupport") or {}
 _G.KnoxFirearmSupport = Firearms
 local FIREARM_SWITCH_MARGIN = 1.5
+local efzModules
+
+-- EFZ registers its ammunition and magazine families with Gunworks. Read that
+-- registry only when the optional setting is on and EFZ actually loaded.
+-- The normal native path remains authoritative for vanilla and other mods.
+local function efzSupport(gun)
+    local settings = rawget(_G, "KnoxSettings")
+    if settings == nil or settings.efzFirearmCompatibility == nil
+        or not settings.efzFirearmCompatibility() then return nil end
+    local ok, full = pcall(function() return gun:getFullType() end)
+    if not ok then return nil end
+    if type(full) ~= "string" or full:sub(1, 26) ~= "EscapeFromZomboidFirearms." then
+        return nil
+    end
+    if type(rawget(_G, "TWAmmoFamily")) ~= "function" then return nil end
+    if efzModules == nil then
+        local ammoOk, ammo = pcall(require, "WeaponSystems/Utils/Ammo")
+        local magOk, magazine = pcall(require, "WeaponSystems/Utils/Magazine")
+        if not ammoOk or not magOk then return nil end
+        efzModules = { ammo = ammo, magazine = magazine }
+    end
+    return efzModules
+end
 -- Forward declaration: exact-weapon melee helpers are defined after the
 -- inventory walkers that classify them.
 local isUsableMelee
@@ -19,10 +42,16 @@ local isUsableMelee
 -- hook a local player uses; it never substitutes for vanilla ballistics or
 -- changes a weapon's ammunition/chamber state.
 local successfulNativeShots = setmetatable({}, { __mode = "k" })
+-- Five tiers from useless to deadly. The number is added to the survivor's real
+-- Aiming level for the AI's own decision and settle time only; it never touches
+-- the perk, the XP or the engine's shot calculation, so a high tier makes an
+-- untrained survivor commit and settle like a trained one, not hit like a laser.
 local AIMING_ASSIST_BONUS = {
-    [1] = 0,
-    [2] = 2,
-    [3] = 4,
+    [1] = -3,   -- Cannot hit anything
+    [2] = -1,   -- Almost good enough
+    [3] = 1,    -- Balanced
+    [4] = 3,    -- Hard
+    [5] = 5,    -- Insanely accurate
 }
 
 local function safe(call, fallback)
@@ -163,6 +192,22 @@ local function canPrepare(character, item)
             if needsRack or hasLoadedMagazine or hasAmmo then
                 return true
             end
+            local efz = efzSupport(item)
+            if efz ~= nil then
+                local compatibleMagazine = safe(function()
+                    return efz.magazine.getBestMagazineForGun(character, item)
+                end, nil)
+                if compatibleMagazine ~= nil then
+                    if safe(function() return compatibleMagazine:getCurrentAmmoCount() > 0 end, false)
+                        or safe(function()
+                            return efz.ammo.GetAutomaticReloadAmmoType(character, compatibleMagazine)
+                        end, nil) ~= nil then return true end
+                elseif safe(function()
+                    return efz.ammo.GetAutomaticReloadAmmoType(character, item)
+                end, nil) ~= nil then
+                    return true
+                end
+            end
         end
         return false
 end
@@ -220,8 +265,11 @@ local function equipExactCarriedMelee(id, character, bridge)
     local weapon = Firearms.findCarriedMelee(character)
     if weapon == nil then return nil, "no_carried_melee" end
     local inventory = safe(function() return character:getInventory() end, nil)
-    if inventory ~= nil then
+    if inventory ~= nil and not topLevelContains(character, weapon) then
         pcall(function() inventory:AddItem(weapon) end)
+    end
+    if not topLevelContains(character, weapon) then
+        return nil, "melee_not_at_root"
     end
     local itemId = tonumber(safe(function() return weapon:getID() end, nil))
     if itemId ~= nil and bridge ~= nil and bridge.equipNpcOwnedWeaponById ~= nil then
@@ -258,7 +306,7 @@ function Firearms.aimingAssistLevel()
     local configured = settings ~= nil and settings.survivorAimingAssist ~= nil
         and settings.survivorAimingAssist() or 1
     configured = tonumber(configured) or 1
-    return math.max(1, math.min(3, math.floor(configured)))
+    return math.max(1, math.min(5, math.floor(configured)))
 end
 
 -- This is an AI decision level only. It never changes the character's native
@@ -373,6 +421,20 @@ function Firearms.wantsRanged(id, character, target, retainRanged)
     if retainRanged == true and distance >= 4 then
         return true, "survivor_choice_retained"
     end
+    -- An equipped or carried EFZ gun with real compatible rounds is a viable
+    -- choice even when the survivor's Aiming level is low. Explicit melee
+    -- orders and close-range melee still take precedence.
+    local settings = rawget(_G, "KnoxSettings")
+    if distance >= 9 and settings ~= nil
+        and settings.efzFirearmCompatibility ~= nil
+        and settings.efzFirearmCompatibility()
+        and rawget(_G, "TWAmmoFamily") ~= nil then
+        local efzGun = carriedGuns(character, function(item)
+            return efzSupport(item) ~= nil
+                and (canShoot(character, item) or canPrepare(character, item))
+        end)
+        if efzGun ~= nil then return true, "efz_compatible_weapon" end
+    end
     -- Novices normally keep noise down. A trained shot with room to aim may
     -- choose a gun; close-pressure fallback remains owned by native combat.
     return aiming >= 4 and distance >= 9, "survivor_choice"
@@ -478,6 +540,64 @@ function Firearms.prepareForThreat(id, character, bridge, target, retainRanged)
     return "melee", preparation .. " " .. Firearms.fallbackToMelee(id, bridge, character)
 end
 
+-- Read-only ammunition state for the card and the dry-gun call. A chambered
+-- round is still one shot when the magazine reads zero. A broken or non-ranged
+-- item is not ammunition information and stays out of this read.
+function Firearms.ammoState(character)
+    local gun = character ~= nil
+        and safe(function() return character:getPrimaryHandItem() end, nil) or nil
+    if not isFunctionalGun(gun) then return "not_firearm", nil end
+    if gun.getCurrentAmmoCount == nil then return "unknown", nil end
+    local rounds = safe(function() return gun:getCurrentAmmoCount() end, nil)
+    if type(rounds) ~= "number" or rounds ~= rounds then return "unknown", nil end
+    rounds = math.max(0, math.floor(rounds))
+    local chambered = safe(function() return gun:isRoundChambered() end, false) == true
+    if rounds > 0 or chambered then return "loaded", rounds end
+    return "dry", 0
+end
+
+local function bodyPosition(body)
+    if body == nil then return nil end
+    local ok, x, y, z = pcall(function()
+        return body:getX(), body:getY(), body:getZ()
+    end)
+    if not ok then return nil end
+    x, y, z = tonumber(x), tonumber(y), tonumber(z)
+    if x == nil or y == nil or z == nil then return nil end
+    return x, y, z
+end
+
+-- Read-only line-of-fire test. Returns the body blocking the shot, or nil.
+-- Only a friendly in front of the muzzle, before the target, inside the narrow
+-- corridor counts; a body behind the shooter or past the target does not.
+function Firearms.friendlyInLineOfFire(character, target, friendlies)
+    if character == nil or target == nil or type(friendlies) ~= "table" then
+        return nil
+    end
+    local x1, y1, z1 = bodyPosition(character)
+    local x2, y2, z2 = bodyPosition(target)
+    if x1 == nil or x2 == nil or z1 ~= z2 then return nil end
+    local dx, dy = x2 - x1, y2 - y1
+    local lengthSq = dx * dx + dy * dy
+    if lengthSq <= 0.0001 then return nil end
+    for _, friendly in ipairs(friendlies) do
+        if friendly ~= nil and friendly ~= character and friendly ~= target then
+            local fx, fy, fz = bodyPosition(friendly)
+            if fx ~= nil and fz == z1 then
+                local t = ((fx - x1) * dx + (fy - y1) * dy) / lengthSq
+                if t > 0.10 and t < 0.95 then
+                    local px, py = x1 + dx * t, y1 + dy * t
+                    local offX, offY = fx - px, fy - py
+                    if offX * offX + offY * offY <= 0.81 then
+                        return friendly
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
 function Firearms.isReady(character, gun)
     return canShoot(character, gun)
 end
@@ -541,6 +661,18 @@ function Firearms.fireNative(character)
         })
         return false, "firearm_not_ready"
     end
+    -- The native hook silently returns before DoAttack when this IsoPlayer
+    -- authorization gate is closed. A successful pcall would otherwise be
+    -- counted as a shot despite no projectile or ammunition use.
+    if safe(function() return character:isAttackStarted() end, false) then
+        return false, "native_attack_already_started"
+    end
+    if not safe(function() return character:isAuthorizeMeleeAction() end, false) then
+        diagFirearm(resolveId(character, nil), "attack_gate_closed", {
+            gun = safe(function() return gun:getFullType() end, "unknown"),
+        })
+        return false, "native_attack_gate_closed"
+    end
     -- Preserve the native charge argument. The installed ranged attackHook
     -- calls DoAttack(0); chargeDelta only affects its melee/shove branch.
     local charge = 36.0
@@ -568,7 +700,7 @@ function Firearms.fireNative(character)
     successfulNativeShots[character] = (successfulNativeShots[character] or 0) + 1
     local log = rawget(_G, "KnoxDebugLog")
     if log ~= nil and log.log ~= nil then
-        pcall(function() log.log("firearm", resolveId(character, nil), "shot_fired", {
+        pcall(function() log.log("firearm", resolveId(character, nil), "attack_hook_called", {
             gun = safe(function() return gun:getFullType() end, "unknown"),
             total = successfulNativeShots[character],
         }) end)

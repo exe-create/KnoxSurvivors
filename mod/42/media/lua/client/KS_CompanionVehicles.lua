@@ -25,6 +25,11 @@ local DRIVER_DISTANCE = 18
 local DRIVER_STOP_DISTANCE = 2.5
 local DRIVER_TIMEOUT_MS = 180000
 local PLAYER_SYNC_DISTANCE_SQUARED = 30 * 30
+local HANDOFF_DRIVER_DISTANCE = 18
+local HANDOFF_WAIT_MS = 10000
+local TAKEOVER_DISTANCE = 5
+local wheelHandoffs = setmetatable({}, { __mode = "k" })
+local takeoverRequests = setmetatable({}, { __mode = "k" })
 
 local function sameFloorAndNear(character, vehicle, maxDistanceSquared)
     if character == nil or vehicle == nil or character.getCurrentSquare == nil
@@ -585,6 +590,214 @@ function CompanionVehicles.syncPlayerExited(player, vehicle, members)
         cancelled = cancelled, rejected = rejected }
 end
 
+local function freeSeatForSwitch(vehicle, character)
+    if vehicle == nil or vehicle.getMaxPassengers == nil then return nil end
+    for seat = 1, vehicle:getMaxPassengers() - 1 do
+        if not vehicle:isSeatOccupied(seat)
+            and (vehicle.isSeatInstalled == nil or vehicle:isSeatInstalled(seat))
+            and not reserved(vehicle, seat, character) then
+            return seat
+        end
+    end
+    return nil
+end
+
+local function adjacentToVehicle(character, vehicle, limit)
+    if character == nil or vehicle == nil then return false end
+    if character:getVehicle() == vehicle then return true end
+    return sameFloorAndNear(character, vehicle, (limit or TAKEOVER_DISTANCE) ^ 2)
+end
+
+-- Player driving -> a companion takes the wheel. The player still switches to a
+-- passenger seat with the native control; this owner only waits, then asks the
+-- companion to enter seat zero through the existing driver path. It never moves
+-- the player.
+function CompanionVehicles.beginHandoff(player, companion, vehicle)
+    if KnoxSettings == nil or KnoxSettings.enableExperimentalNpcDriving == nil
+        or not KnoxSettings.enableExperimentalNpcDriving() then
+        return false, "npc_driving_disabled"
+    end
+    if player == nil or companion == nil or player == companion then
+        return false, "survivor_unavailable"
+    end
+    vehicle = vehicle or player:getVehicle()
+    if vehicle == nil or player:getVehicle() ~= vehicle then
+        return false, "player_not_in_vehicle"
+    end
+    if vehicle.isDriver == nil or not vehicle:isDriver(player) then
+        return false, "player_not_driving"
+    end
+    if math.abs(vehicle:getCurrentSpeedKmHour()) > 1 then return false, "vehicle_moving" end
+    if companion:getVehicle() ~= nil then return false, "already_in_vehicle" end
+    if not sameFloorAndNear(companion, vehicle, HANDOFF_DRIVER_DISTANCE ^ 2) then
+        return false, "too_far"
+    end
+    if freeSeatForSwitch(vehicle, player) == nil then return false, "no_free_passenger_seat" end
+    local travel = rawget(_G, "KnoxNpcVehicleTravel")
+    if travel == nil or travel.keyAdmission == nil then return false, "vehicle_state_unknown" end
+    local keyed, keyReason = travel.keyAdmission(vehicle, companion)
+    if not keyed then return false, keyReason end
+    wheelHandoffs[player] = { vehicle = vehicle, companion = companion,
+        deadline = getTimestampMs() + HANDOFF_WAIT_MS, phase = "waiting" }
+    if KnoxActivityFeed ~= nil and KnoxActivityFeed.speak ~= nil then
+        KnoxActivityFeed.speak(companion, "Move over. I'll drive.")
+    end
+    return true, "waiting_for_player_seat"
+end
+
+-- Companion driving -> the player wants the wheel. The companion stops the run
+-- and moves to a real passenger seat with the native switch; the player then
+-- takes seat zero with the native control. No seat is assigned by force.
+function CompanionVehicles.beginTakeover(player, companion, vehicle)
+    if KnoxSettings == nil or KnoxSettings.enableExperimentalNpcDriving == nil
+        or not KnoxSettings.enableExperimentalNpcDriving() then
+        return false, "npc_driving_disabled"
+    end
+    if player == nil or companion == nil or player == companion then
+        return false, "survivor_unavailable"
+    end
+    vehicle = vehicle or companion:getVehicle()
+    if vehicle == nil then return false, "vehicle_unavailable" end
+    if vehicle.getDriver == nil or vehicle:getDriver() ~= companion then
+        return false, "driver_changed"
+    end
+    if vehicle.isDriver ~= nil and vehicle:isDriver(player) then
+        return false, "already_driving"
+    end
+    if not adjacentToVehicle(player, vehicle, TAKEOVER_DISTANCE) then
+        return false, "too_far"
+    end
+    if math.abs(vehicle:getCurrentSpeedKmHour()) > 1 then return false, "vehicle_moving" end
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    if runtime == nil or runtime.idForCharacter == nil
+        or runtime.idForCharacter(companion) == nil then
+        return false, "survivor_unavailable"
+    end
+    local seat = freeSeatForSwitch(vehicle, companion)
+    if seat == nil then return false, "no_free_passenger_seat" end
+    if ISTimedActionQueue == nil or ISSwitchVehicleSeat == nil then
+        return false, "vanilla_vehicle_actions_unavailable"
+    end
+    -- Stop the run first so a moving car never gets a seat switch. The driver
+    -- stays aboard; passengers are deliberately kept.
+    CompanionVehicles.stopDriving(companion)
+    local built, action = pcall(function()
+        return assert(ISSwitchVehicleSeat:new(companion, seat, 0))
+    end)
+    if not built then return false, "vehicle_action_failed" end
+    local queued, reason = queueActions(companion, vehicle, seat, { action })
+    if not queued then return false, reason end
+    takeoverRequests[companion] = { vehicle = vehicle, seat = seat, player = player,
+        deadline = getTimestampMs() + ACTION_TIMEOUT_MS }
+    return true, "seat_clearing"
+end
+
+function CompanionVehicles.findDrivenVehicleNear(player, maxDistance)
+    if player == nil or player.getCurrentSquare == nil
+        or player:getCurrentSquare() == nil then return nil end
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    if runtime == nil or runtime.idForCharacter == nil then return nil end
+    local limit = (tonumber(maxDistance) or TAKEOVER_DISTANCE)
+    local best, bestDistance = nil, nil
+    for _, vehicle in ipairs(loadedVehicles()) do
+        local driver = vehicle.getDriver ~= nil and vehicle:getDriver() or nil
+        if driver ~= nil and driver ~= player and runtime.idForCharacter(driver) ~= nil
+            and sameFloorAndNear(player, vehicle, limit * limit) then
+            local distance = distanceSquaredToVehicle(player, vehicle)
+            if best == nil or distance < bestDistance then
+                best, bestDistance = vehicle, distance
+            end
+        end
+    end
+    return best
+end
+
+local function tickWheelHandoffs(now)
+    local entries = {}
+    for player, handoff in pairs(wheelHandoffs) do
+        entries[#entries + 1] = { player = player, handoff = handoff }
+    end
+    for _, entry in ipairs(entries) do
+        local player, handoff = entry.player, entry.handoff
+        if wheelHandoffs[player] ~= handoff then
+            -- replaced or cancelled elsewhere
+        elseif player == nil or (player.isDead ~= nil and player:isDead()) then
+            wheelHandoffs[player] = nil
+        elseif handoff.phase == "waiting" then
+            if player:getVehicle() ~= handoff.vehicle then
+                wheelHandoffs[player] = nil
+                if KnoxActivityFeed ~= nil and KnoxActivityFeed.event ~= nil then
+                    KnoxActivityFeed.event("The handoff was cancelled.")
+                end
+            elseif not handoff.vehicle:isDriver(player) then
+                -- The player has moved. Give the companion one bounded boarding
+                -- window instead of retrying a pending native action forever.
+                if handoff.seatFreedAt == nil then
+                    handoff.seatFreedAt, handoff.deadline = now, now + ACTION_TIMEOUT_MS
+                end
+                if now >= handoff.deadline then
+                    wheelHandoffs[player] = nil
+                    if KnoxActivityFeed ~= nil and KnoxActivityFeed.event ~= nil then
+                        KnoxActivityFeed.event("The handoff could not start.")
+                    end
+                else
+                    local started, reason = CompanionVehicles.driveAhead(
+                        handoff.companion, handoff.vehicle)
+                    if started then
+                        handoff.phase, handoff.deadline = "boarding", now + ACTION_TIMEOUT_MS
+                    elseif reason ~= "vehicle_action_pending" then
+                        wheelHandoffs[player] = nil
+                        if KnoxActivityFeed ~= nil and KnoxActivityFeed.event ~= nil then
+                            KnoxActivityFeed.event("The handoff could not start.")
+                        end
+                    end
+                end
+            elseif now >= handoff.deadline then
+                wheelHandoffs[player] = nil
+                if KnoxActivityFeed ~= nil and KnoxActivityFeed.event ~= nil then
+                    KnoxActivityFeed.event("You're still in the driver seat.")
+                end
+            end
+        elseif handoff.phase == "boarding" then
+            if handoff.companion:getVehicle() == handoff.vehicle
+                and handoff.vehicle:isDriver(handoff.companion) then
+                wheelHandoffs[player] = nil
+                if KnoxActivityFeed ~= nil and KnoxActivityFeed.speak ~= nil then
+                    KnoxActivityFeed.speak(handoff.companion, "I have the wheel.")
+                end
+            elseif now >= handoff.deadline then
+                wheelHandoffs[player] = nil
+                if KnoxActivityFeed ~= nil and KnoxActivityFeed.event ~= nil then
+                    KnoxActivityFeed.event("The handoff could not start.")
+                end
+            end
+        end
+    end
+end
+
+local function tickTakeovers(now)
+    local entries = {}
+    for companion, request in pairs(takeoverRequests) do
+        entries[#entries + 1] = { companion = companion, request = request }
+    end
+    for _, entry in ipairs(entries) do
+        local companion, request = entry.companion, entry.request
+        if takeoverRequests[companion] ~= request then
+            -- replaced or cancelled elsewhere
+        elseif companion == nil or companion:getVehicle() ~= request.vehicle then
+            takeoverRequests[companion] = nil
+        elseif now >= request.deadline then
+            takeoverRequests[companion] = nil
+        elseif not request.vehicle:isSeatOccupied(0)
+            and request.vehicle:getSeat(companion) == request.seat then
+            takeoverRequests[companion] = nil
+            if KnoxActivityFeed ~= nil and KnoxActivityFeed.event ~= nil then
+                KnoxActivityFeed.event("The driver seat is free. Take the wheel.")
+            end
+        end
+    end
+end
+
 function CompanionVehicles.driveNearest(character, maxDistance)
     if KnoxSettings == nil or KnoxSettings.enableExperimentalNpcDriving == nil
         or not KnoxSettings.enableExperimentalNpcDriving() then
@@ -639,9 +852,75 @@ function CompanionVehicles.exit(character)
     return true, "exiting"
 end
 
+-- The motor pool was a durable record with no writer and no reader. The
+-- driver run is the one place that already knows who is in the car, so the
+-- assignment mirrors that fact instead of inventing a second ownership: it is
+-- written when a run starts and released when the run ends.
+local function recordAssignment(character, vehicle, role)
+    local persistence = rawget(_G, "KnoxPersistence")
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    if persistence == nil or persistence.setVehicleAssignment == nil
+        or runtime == nil or runtime.idForCharacter == nil then return end
+    local id = runtime.idForCharacter(character)
+    local key = id ~= nil and persistence.vehicleKeyFor ~= nil
+        and persistence.vehicleKeyFor(vehicle) or nil
+    if id == nil or key == nil then return end
+    local affiliation = persistence.getSurvivorAffiliation ~= nil
+        and persistence.getSurvivorAffiliation(id) or nil
+    local ownerKind, ownerId = "player", nil
+    if type(affiliation) == "table"
+        and tostring(affiliation.factionId or "") ~= "" then
+        ownerKind, ownerId = "faction", tostring(affiliation.factionId)
+    elseif getSpecificPlayer ~= nil and getSpecificPlayer(0) ~= nil
+        and persistence.ensurePlayerId ~= nil then
+        ownerId = tostring(persistence.ensurePlayerId(getSpecificPlayer(0)) or "")
+    end
+    if ownerId == nil or ownerId == "" then return end
+    local hours = getGameTime ~= nil and getGameTime() ~= nil
+        and tonumber(getGameTime():getWorldAgeHours()) or 0
+    pcall(persistence.setVehicleAssignment, {
+        vehicleKey = key, ownerKind = ownerKind, ownerId = ownerId,
+        driverId = id, passengerIds = {}, role = role or "transport",
+        createdAtHours = hours,
+    }, hours)
+end
+
+local function releaseAssignment(character, vehicle)
+    local persistence = rawget(_G, "KnoxPersistence")
+    if persistence == nil or persistence.clearVehicleAssignment == nil then return end
+    local key = vehicle ~= nil and persistence.vehicleKeyFor ~= nil
+        and persistence.vehicleKeyFor(vehicle) or nil
+    if key == nil then
+        local runtime = rawget(_G, "KnoxSurvivorRuntime")
+        local id = runtime ~= nil and runtime.idForCharacter ~= nil
+            and runtime.idForCharacter(character) or nil
+        local record = id ~= nil
+            and persistence.getVehicleAssignmentForSurvivor ~= nil
+            and persistence.getVehicleAssignmentForSurvivor(id) or nil
+        key = type(record) == "table" and record.vehicleKey or nil
+    end
+    if key ~= nil then
+        pcall(persistence.clearVehicleAssignment, key, "run_ended")
+    end
+end
+
 local function startDrive(character,vehicle,destination)
     if KnoxSettings==nil or not KnoxSettings.enableExperimentalNpcDriving() then return false,"npc_driving_disabled" end
     if character==nil or vehicle==nil then return false,"vehicle_unavailable" end
+    -- One survivor belongs to one vehicle. A live assignment for a different
+    -- car is refused here rather than silently shadowed, which is the whole
+    -- point of the record existing.
+    local assignedId = KnoxSurvivorRuntime~=nil and KnoxSurvivorRuntime.idForCharacter~=nil
+        and KnoxSurvivorRuntime.idForCharacter(character) or nil
+    if assignedId~=nil and KnoxPersistence~=nil
+        and KnoxPersistence.getVehicleAssignmentForSurvivor~=nil then
+        local other=KnoxPersistence.getVehicleAssignmentForSurvivor(assignedId)
+        local thisKey=KnoxPersistence.vehicleKeyFor~=nil
+            and KnoxPersistence.vehicleKeyFor(vehicle) or nil
+        if type(other)=="table" and thisKey~=nil and other.vehicleKey~=thisKey then
+            return false,"already_assigned_elsewhere"
+        end
+    end
     local occupied=character:getVehicle()
     if occupied~=nil and occupied~=vehicle then return false,"already_in_vehicle" end
     if CompanionVehicles.isBusy(character) then return false,"vehicle_action_pending" end
@@ -650,29 +929,15 @@ local function startDrive(character,vehicle,destination)
     if driver~=character and math.abs(vehicle:getCurrentSpeedKmHour())>1 then return false,"vehicle_moving" end
     if not vehicle:isEngineRunning() then return false,"vehicle_engine_off" end
     if not vehicle:isDriveable() then return false,"vehicle_not_driveable" end
+    -- One admission owner. If the shared travel module is absent there is no
+    -- audited key/fuel/lock verdict, so driving fails closed instead of growing
+    -- a second inline copy of the rules.
     local travel = rawget(_G, "KnoxNpcVehicleTravel")
-    if travel ~= nil and travel.assessReadiness ~= nil then
-        local ready, reason = travel.assessReadiness(vehicle)
-        if not ready then return false, reason end
-    else
-        -- Unit-test contexts that never load KS_NpcVehicleTravel still need
-        -- the same fuel/lock gate. Keep these two checks identical to
-        -- VehicleTravel.assessReadiness above; production always resolves the
-        -- shared definition through the loaded travel module.
-        if vehicle.getRemainingFuelPercentage == nil then
-            return false, "vehicle_state_unknown"
-        end
-        local fueled, percent = pcall(function() return vehicle:getRemainingFuelPercentage() end)
-        if not fueled or (tonumber(percent) or 0) < 1 then
-            return false, "vehicle_low_fuel"
-        end
-        if vehicle.areAllDoorsLocked == nil then
-            return false, "vehicle_state_unknown"
-        end
-        local checked, allLocked = pcall(function() return vehicle:areAllDoorsLocked() end)
-        if not checked then return false, "vehicle_state_unknown" end
-        if allLocked then return false, "vehicle_doors_locked" end
+    if travel == nil or travel.assessReadiness == nil then
+        return false, "vehicle_state_unknown"
     end
+    local ready, reason = travel.assessReadiness(vehicle, character)
+    if not ready then return false, reason end
     if vehicle.getVehicleTowing~=nil and vehicle:getVehicleTowing()~=nil
         or vehicle.getVehicleTowedBy~=nil and vehicle:getVehicleTowedBy()~=nil then
         return false,"towing_not_supported"
@@ -698,8 +963,12 @@ local function startDrive(character,vehicle,destination)
             if occupied==vehicle then
                 return {assert(ISSwitchVehicleSeat:new(character,0,vehicle:getSeat(character)))}
             end
-            return {assert(ISPathFindAction:pathToVehicleSeat(character,vehicle,0)),
-                assert(ISEnterVehicle:new(character,vehicle,0))}
+            -- Reuse the passenger door/key flow for seat zero: a locked door
+            -- with a real key unlocks, and a key left on the door is taken by
+            -- the native action before entry.
+            local result={assert(ISPathFindAction:pathToVehicleSeat(character,vehicle,0))}
+            appendDoorEntryActions(character,vehicle,0,result)
+            return result
         end)
         if not built then return false,"vehicle_action_failed" end
         local queued,result=queueActions(character,vehicle,0,actions)
@@ -710,6 +979,7 @@ local function startDrive(character,vehicle,destination)
     driverRuns[character]={vehicle=vehicle,route=route,index=1,goal=route[#route],
         geometry=geometry,phase=phase,deadline=getTimestampMs()+DRIVER_TIMEOUT_MS,
         health=health(character),lastProgress=getTimestampMs(),lastX=vehicle:getX(),lastY=vehicle:getY()}
+    recordAssignment(character,vehicle,"transport")
     return true,destination~=nil and "driving_to_destination" or "driving_ahead"
 end
 
@@ -721,9 +991,11 @@ function CompanionVehicles.driveTo(character,vehicle,x,y,z)
 end
 function CompanionVehicles.stopDriving(character)
     local active=driverRuns[character]~=nil
+    local ended=driverRuns[character]
     -- Player takeover preserves the passengers: they keep riding with the
     -- new driver instead of being settled by the abort path below.
     CompanionVehicles.cancel(character, true)
+    releaseAssignment(character,ended~=nil and ended.vehicle or nil)
     return active
 end
 function CompanionVehicles.driverStatus(character)
@@ -746,9 +1018,12 @@ function CompanionVehicles.setRunPassengers(character, vehicle, roster)
 end
 
 local function finishDrive(character,reason)
+    -- The assignment mirrors the run, so it is released with it.
+    local ended=driverRuns[character]
     -- cancel() settles the attached passenger roster as part of teardown,
     -- so every abort and arrival shares one rollback owner.
     CompanionVehicles.cancel(character)
+    releaseAssignment(character,ended~=nil and ended.vehicle or nil)
     if KnoxActivityFeed~=nil and KnoxActivityFeed.speak~=nil then
         KnoxActivityFeed.speak(character,reason=="arrived" and "We've arrived."
             or "I'm stopping here. I can't safely continue.")
@@ -802,6 +1077,20 @@ local function tickDrive(character,run,now)
     local dot=(fx*dx+fy*dy)/math.max(0.1,distance)
     local cross=(fx*dy-fy*dx)/math.max(0.1,distance)
     local limit=KnoxSettings.npcDrivingSpeed~=nil and KnoxSettings.npcDrivingSpeed() or 20
+    -- Loose ground is slower ground: pavement keeps the full cruise, gravel,
+    -- dirt, trail and grass lower it. Native handling still owns traction; this
+    -- only lowers the speed the planner asks the controller for.
+    local surfaceName=nav.surface(current)
+    run.surface=surfaceName
+    if surfaceName=="unknown" and not run.surfaceWarned then
+        -- One line per trip, not per tick: the driver admits the ground is
+        -- unread and slows down rather than pretending to know it.
+        run.surfaceWarned=true
+        if KnoxActivityFeed~=nil and KnoxActivityFeed.speak~=nil then
+            KnoxActivityFeed.speak(character,"I don't know this ground. I'll take it slow.")
+        end
+    end
+    limit=limit*nav.speedFactor(surfaceName)
     local command,desired=nav.controls(speed,tracking.remaining,dot,cross,limit,run.geometry,distance,tracking.curvature)
     local nativeLimit=vehicle:getScript():getSteeringClamp(speed)
     command.steering=math.max(-nativeLimit,math.min(nativeLimit,command.steering))
@@ -858,5 +1147,8 @@ function CompanionVehicles.tick()
         end
     end
     retryAwaitingExits()
+    local now = getTimestampMs()
+    tickWheelHandoffs(now)
+    tickTakeovers(now)
 end
 return CompanionVehicles

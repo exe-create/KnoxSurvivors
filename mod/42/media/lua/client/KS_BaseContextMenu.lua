@@ -9,22 +9,69 @@ require "KS_SurvivorAutonomy"
 require "KS_BaseBarricades"
 require "KS_BaseTaskBoard"
 require "KS_BaseStorageFilterUI"
+require "KS_BaseCompound"
 
 local BaseContextMenu = rawget(_G, "KnoxBaseContextMenu") or {}
 _G.KnoxBaseContextMenu = BaseContextMenu
+
+BaseContextMenu.BASE_INTENTS = {
+    { key = "security", label = "Security" },
+    { key = "stockpile", label = "Stockpile" },
+    { key = "shelter", label = "Shelter" },
+    { key = "health", label = "Health" },
+    { key = "growth", label = "Growth" },
+    { key = "trade", label = "Trade" },
+    { key = "vengeance", label = "Vengeance" },
+}
+local BASE_INTENTS = BaseContextMenu.BASE_INTENTS
+BaseContextMenu.BASE_INTENT_LABELS = {}
+local BASE_INTENT_LABELS = BaseContextMenu.BASE_INTENT_LABELS
+for _, entry in ipairs(BASE_INTENTS) do BASE_INTENT_LABELS[entry.key] = entry.label end
+
+-- Base kind: what the place is for. Identity, unlike the weekly intent, and it
+-- only ever changes the owner's own record.
+BaseContextMenu.BASE_KINDS = {
+    { key = "main", label = "Main Base" },
+    { key = "outpost", label = "Outpost" },
+    { key = "storage", label = "Storage Base" },
+    { key = "checkpoint", label = "Checkpoint" },
+}
+local BASE_KINDS = BaseContextMenu.BASE_KINDS
+BaseContextMenu.BASE_KIND_LABELS = {}
+local BASE_KIND_LABELS = BaseContextMenu.BASE_KIND_LABELS
+for _, entry in ipairs(BASE_KINDS) do BASE_KIND_LABELS[entry.key] = entry.label end
+
+local LAYOUT_REASONS = {
+    base_missing = "No base record to lay out.",
+    not_player_base = "Only a player-owned base can take a layout proposal.",
+    no_building = "This square is not inside a readable building.",
+    not_home_building = "This building is not the home of this base.",
+    no_rooms = "This floor of this building reports no rooms; try another floor or a different building.",
+    no_new_rooms = "No new work areas or storage assignments were suggested; existing choices are kept.",
+    no_entries = "No proposed work areas or storage assignments to apply.",
+    invalid_entry = "A proposed area was invalid and was skipped.",
+    invalid_storage_entry = "A proposed storage assignment was invalid and was skipped.",
+    existing = "That work area already exists.",
+    existing_storage = "That storage category is already assigned.",
+    overlaps_existing_work_area = "That area overlaps an existing work area.",
+    unknown_zone_type = "That kind of work area is not supported.",
+    unknown_storage_category = "That storage category is not supported.",
+    not_a_container = "That object has no storage container.",
+    outside_base = "That container is outside the base now.",
+    use_item_storage = "That container holds water or corpses and cannot be assigned.",
+    main_supplies_retired = "Main Supplies is retired; use a typed storage category.",
+}
+
+local function layoutReasonText(reason)
+    return LAYOUT_REASONS[tostring(reason or "")]
+        or "No layout was suggested for this building."
+end
 
 local function hasEntries(value)
     if type(value) ~= "table" then return false end
     for _ in pairs(value) do return true end
     return false
 end
-
-local function contextOrdersEnabled()
-    if KnoxSettings == nil or KnoxSettings.showLegacyContextCommands == nil then return false end
-    local ok, enabled = pcall(KnoxSettings.showLegacyContextCommands)
-    return ok and enabled == true
-end
-
 
 local function firstSquare(worldobjects)
     for _, object in ipairs(worldobjects or {}) do
@@ -404,66 +451,208 @@ function BaseContextMenu.removeZone(_, baseId, zoneId)
     end
 end
 
+function BaseContextMenu.applyLayout(player, base, entries)
+    if player == nil or base == nil then
+        KnoxActivityFeed.event("Could not apply layout: missing base or player.")
+        return
+    end
+    local playerId = KnoxPersistence.ensurePlayerId(player)
+    local result, reason = KnoxBaseManager.applyLayout(base.id, entries, playerId, player)
+    if result == nil then
+        KnoxActivityFeed.event("Could not apply layout: " .. layoutReasonText(reason))
+        return
+    end
+    local changes = {}
+    if result.added > 0 then
+        changes[#changes + 1] = tostring(result.added) .. " work area"
+            .. (result.added == 1 and "" or "s") .. " added"
+    end
+    if result.assigned > 0 then
+        changes[#changes + 1] = tostring(result.assigned) .. " storage assignment"
+            .. (result.assigned == 1 and "" or "s") .. " added"
+    end
+    local text = #changes > 0
+        and ("Layout applied: " .. table.concat(changes, ", ") .. ".")
+        or "Layout applied: nothing changed."
+    local kept = #(result.skipped or {}) + #(result.storageSkipped or {})
+    if kept > 0 then
+        text = text .. " " .. tostring(kept) .. " kept or refused."
+    end
+    KnoxActivityFeed.event(text)
+    if (result.added > 0 or result.assigned > 0) and KnoxBaseHighlights ~= nil
+        and KnoxBaseHighlights.refresh ~= nil then
+        pcall(function() KnoxBaseHighlights.refresh(player:getPlayerNum()) end)
+    end
+end
+
+function BaseContextMenu.dismissLayout(_, base)
+    KnoxActivityFeed.event("Layout proposal dismissed; no work areas or storage assignments changed.")
+end
+
 function BaseContextMenu.openSetup(_, playerNum)
     if KnoxSurvivorNotebook and KnoxSurvivorNotebook.show then
         KnoxSurvivorNotebook.show(playerNum)
     end
 end
 
-function BaseContextMenu.dispatchScout(player, base, square)
-    local success, result = KnoxSurvivorAutonomy.dispatchBaseScout(player, base.id, square)
-    KnoxActivityFeed.event(success and ("Scout departed: " .. tostring(result) .. ".")
-        or ("Could not send scout: " .. tostring(result) .. "."))
+local SCOUT_FAILURES = {
+    dispatch_unavailable = "no loaded base or destination was available",
+    need_loaded_base_resident = "no resident of this base is loaded nearby",
+    invalid_mission = "that order is not a supported mission",
+    checkpoint_base = "a checkpoint holds its road instead of sending people away",
+    need_visible_destination = "that place is out of sight for a supply run",
+    need_settled_resident = "a free resident who can be seen is needed for a supply run",
+    live_arrival_failed = "the mission could not start in the loaded world",
+    team_create_failed = "the mission record could not be created",
+    missing_active_member = "that resident is no longer loaded nearby",
+}
+
+local function scoutFailureText(result)
+    local message = SCOUT_FAILURES[tostring(result)]
+    if message ~= nil then return message end
+    return (tostring(result or "unknown reason"):gsub("_", " "))
 end
 
-function BaseContextMenu.toggleDoorLock(player, base, door)
-    if player == nil or base == nil or door == nil then
-        KnoxActivityFeed.event("Could not lock door: missing target.")
+function BaseContextMenu.dispatchScout(player, base, square, partySize, missionType,
+    radius, label, members)
+    local success, result = KnoxSurvivorAutonomy.dispatchBaseScout(
+        player, base.id, square, partySize, missionType, radius, label, members
+    )
+    if not success then
+        KnoxActivityFeed.event("Could not issue that order: "
+            .. scoutFailureText(result) .. ".")
         return
     end
-    local locked = false
-    pcall(function()
-        if door.isLockedByKey ~= nil then locked = door:isLockedByKey() == true end
-        if not locked and door.isLocked ~= nil then locked = door:isLocked() == true end
-    end)
-    local ok = pcall(function()
-        if door.setLockedByKey == nil and door.setLocked == nil then error("lock_api_unavailable") end
-        if door.setLockedByKey ~= nil then
-            door:setLockedByKey(not locked)
-        end
-        if door.setLocked ~= nil then
-            door:setLocked(not locked)
-        end
-        -- A base ID is not an engine key ID. Preserve the real lock/key identity.
-        if door.transmitCompleteItemToServer ~= nil then
-            door:transmitCompleteItemToServer()
-        elseif door.transmitModData ~= nil then
-            door:transmitModData()
-        end
-    end)
-    local confirmed = false
+    -- Report the persisted team, not an optimistic departure: the dispatch
+    -- can still have rolled back a partially removed body. Names come from the
+    -- durable identity so the message matches the Mission tab later.
+    local team = KnoxPersistence.getAwayTeam(result)
+    local executor = rawget(_G, "KnoxAwayTeamExecutor")
+    local who = team ~= nil and executor ~= nil and executor.memberLabel ~= nil
+        and executor.memberLabel(team) or "The scout"
+    local place = team ~= nil and team.destination ~= nil
+        and tostring(team.destination.label or "the destination") or "the destination"
+    local going = type(team) == "table" and type(team.memberIds) == "table"
+        and #team.memberIds > 1 and "are" or "is"
+    local label = team ~= nil and team.missionType ~= "scout" and executor ~= nil
+        and executor.missionLabel ~= nil and executor.missionLabel(team) or "Scout"
+    KnoxActivityFeed.event(tostring(label) .. " departed: " .. tostring(who)
+        .. " " .. going .. " heading to " .. place .. ".")
+end
+
+function BaseContextMenu.toggleKeepOpen(player, object)
+    local barricades = rawget(_G, "KnoxBaseBarricades")
+    if player == nil or object == nil or barricades == nil
+        or barricades.setKeepOpen == nil or barricades.isKeepOpen == nil then
+        KnoxActivityFeed.event("Could not mark that opening.")
+        return
+    end
+    local keep = barricades.isKeepOpen(object)
+    if not barricades.setKeepOpen(object, not keep) then
+        KnoxActivityFeed.event("Could not mark that opening.")
+        return
+    end
+    KnoxActivityFeed.event(not keep and "This opening will stay clear."
+        or "This opening can be boarded again.")
+end
+
+-- A building beside the base is part of that base, not a new one. The claim
+-- goes through KnoxBaseCompound so the distance and overlap rules stay in one
+-- place, and the refusal is spoken on the feed instead of hidden.
+function BaseContextMenu.renameRoomHere(player, name)
+    local roomApi = rawget(_G, "KnoxBaseCompound")
+    local square = player ~= nil and player:getCurrentSquare() or nil
+    if roomApi == nil or square == nil then return end
+    local playerId = KnoxPersistence.ensurePlayerId(player)
+    local base = KnoxPersistence.getBaseForOwner("player", playerId)
+    if base == nil then
+        KnoxActivityFeed.event("Establish a base before naming its rooms.")
+        return
+    end
+    local ok, reason = roomApi.renameRoomAt(base,
+        square:getX(), square:getY(), square:getZ(), name)
     if ok then
-        local read, actual = pcall(function()
-            local byKey = door.isLockedByKey ~= nil and door:isLockedByKey() == true
-            local plain = door.isLocked ~= nil and door:isLocked() == true
-            return byKey or plain
-        end)
-        confirmed = read and actual == not locked
-    end
-    if confirmed then
-        -- Persist locked doors so they survive reloads.
-        if KnoxPersistence.setBaseDoorLock ~= nil then
-            local sq = door.getSquare ~= nil and door:getSquare() or nil
-            if sq ~= nil then
-                KnoxPersistence.setBaseDoorLock(base.id,
-                    sq:getX(), sq:getY(), sq:getZ(), not locked)
-            end
-        end
-        KnoxActivityFeed.event(not locked and "Door locked at base."
-            or "Door unlocked at base.")
+        KnoxActivityFeed.event("Room renamed to " .. tostring(name) .. ".")
     else
-        KnoxActivityFeed.event("Could not lock door.")
+        KnoxActivityFeed.event("Could not rename this room: " .. tostring(reason) .. ".")
     end
+end
+
+function BaseContextMenu.openDepotFilters(player, zone)
+    local playerId = player ~= nil and KnoxPersistence.ensurePlayerId(player) or nil
+    local base = playerId ~= nil and KnoxPersistence.getBaseForOwner ~= nil
+        and KnoxPersistence.getBaseForOwner("player", playerId) or nil
+    if player == nil or base == nil or zone == nil then
+        KnoxActivityFeed.event("Could not open depot filters: that area is not yours.")
+        return
+    end
+    KnoxBaseStorageFilterUI.openZone(base.id, zone.id, player:getPlayerNum())
+end
+
+function BaseContextMenu.claimBuilding(player, square)
+    local compound = rawget(_G, "KnoxBaseCompound")
+    if player == nil or square == nil or compound == nil then return end
+    local playerId = KnoxPersistence.ensurePlayerId(player)
+    local base = KnoxPersistence.getBaseForOwner("player", playerId)
+    if base == nil then
+        KnoxActivityFeed.event("Establish a base before adding a second building to it.")
+        return
+    end
+    local building = square.getBuilding ~= nil and square:getBuilding() or nil
+    local hours = getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
+    local establishment, reason, gap = compound.claim(base, building, square, hours)
+    if establishment == nil then
+        KnoxActivityFeed.event("Could not add that building: "
+            .. compound.refusalText(reason, gap) .. ".")
+        return
+    end
+    local roomCount = #(establishment.rooms or {})
+    KnoxActivityFeed.event(tostring(base.name or "Base") .. " now includes "
+        .. tostring(establishment.name) .. " (" .. tostring(roomCount)
+        .. (roomCount == 1 and " room" or " rooms") .. ").")
+end
+
+function BaseContextMenu.setBaseIntent(player, base, intent)
+    if player == nil or base == nil or KnoxPersistence.setBaseIntent == nil then
+        KnoxActivityFeed.event("Could not set base intent.")
+        return
+    end
+    local hours = getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
+    local ok, reason = KnoxPersistence.setBaseIntent(
+        base.id, KnoxPersistence.ensurePlayerId(player), intent, hours)
+    if not ok then
+        KnoxActivityFeed.event("Could not set base intent: " .. tostring(reason) .. ".")
+        return
+    end
+    KnoxActivityFeed.event("Base intent: "
+        .. tostring(BASE_INTENT_LABELS[intent] or intent) .. ".")
+end
+
+-- Refusals are named because each one is a different fact: a second base
+-- cannot become the home, and the home cannot stop being the home.
+local BASE_KIND_REFUSALS = {
+    main_is_first_base = "Your first base is the main base; a later one cannot take that place.",
+    main_base_fixed = "The main base stays the main base. Establish another base for an outpost, storehouse or checkpoint.",
+    unknown_kind = "That is not a kind of base.",
+    not_your_base = "That is not your base.",
+    missing_base = "That base no longer exists.",
+}
+
+function BaseContextMenu.setBaseKind(player, base, kind)
+    if player == nil or base == nil or KnoxPersistence.setBaseKind == nil then
+        KnoxActivityFeed.event("Could not set the base kind.")
+        return
+    end
+    local hours = getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
+    local ok, reason = KnoxPersistence.setBaseKind(
+        base.id, KnoxPersistence.ensurePlayerId(player), kind, hours)
+    if not ok then
+        KnoxActivityFeed.event(BASE_KIND_REFUSALS[tostring(reason)]
+            or ("Could not set the base kind: " .. tostring(reason) .. "."))
+        return
+    end
+    KnoxActivityFeed.event("Base kind: "
+        .. tostring(BASE_KIND_LABELS[kind] or kind) .. ".")
 end
 
 -- Direct base orders for specific windows/build sites. Queues the concrete
@@ -505,6 +694,31 @@ local function assignTaskToBestResident(player, base, task)
     return nil
 end
 
+-- BARRICADE REFUSAL COPY (pure)
+-- The finder answers with a reason code. Every code it can return gets its own
+-- sentence, because a player told "Nothing here needs barricading" after the
+-- building could not even be read is being told the opposite of what happened.
+-- Only `no_unbarricaded_window` and an unknown code fall back to that sentence.
+local BARRICADE_REFUSAL_COPY = {
+    only_usable_exit = "That would seal the only way out.",
+    no_way_out = "That room has no usable exit of its own.",
+    keep_open = "Every usable opening there is marked to stay clear.",
+    barricade_room_busy = "Barricade work is already queued for that room.",
+    entrance_unverified = "I can't verify a safe exit there.",
+    room_audit_too_large = "That room has too many openings to audit safely.",
+    missing_building = "I can't tell which building this is.",
+    building_unavailable = "I can't read this building.",
+    base_or_cell_unavailable = "I can't read this base's surroundings.",
+    target_unloaded = "That window is not loaded any more.",
+    target_no_longer_valid = "That window no longer needs boarding.",
+}
+local function barricadeRefusalText(reason)
+    local text = reason ~= nil and BARRICADE_REFUSAL_COPY[tostring(reason)] or nil
+    return text or "Nothing here needs barricading."
+end
+BaseContextMenu.barricadeRefusalText = barricadeRefusalText
+-- END BARRICADE REFUSAL COPY
+
 function BaseContextMenu.orderBarricadeHere(player, base, square)
     if player == nil or base == nil or square == nil then
         KnoxActivityFeed.event("Could not order barricade: missing target.")
@@ -518,21 +732,26 @@ function BaseContextMenu.orderBarricadeHere(player, base, square)
     end
     -- Board the windows of the clicked building, skipping doors so residents
     -- can still use them. Falls back to the single clicked square outside.
-    local targets = {}
+    local targets, reason = {}, nil
     if barricades.findTargetsInBuilding ~= nil then
-        targets = barricades.findTargetsInBuilding(base, square, nil, 24) or {}
+        targets, reason = barricades.findTargetsInBuilding(base, square, player, 24)
+        targets = targets or {}
     end
     if #targets == 0 then
         local tx, ty, tz = square:getX(), square:getY(), square:getZ()
-        local single = barricades.findTarget ~= nil and barricades.findTarget(base, nil,
-            function(candidate)
-                return tonumber(candidate.x) == tx and tonumber(candidate.y) == ty
-                    and tonumber(candidate.z) == tz
-            end) or nil
+        local single, singleReason = nil, nil
+        if barricades.findTarget ~= nil then
+            single, singleReason = barricades.findTarget(base, player,
+                function(candidate)
+                    return tonumber(candidate.x) == tx and tonumber(candidate.y) == ty
+                        and tonumber(candidate.z) == tz
+                end)
+        end
+        reason = reason or singleReason
         if single ~= nil then targets = { single } end
     end
     if #targets == 0 then
-        KnoxActivityFeed.event("Nothing here needs barricading.")
+        KnoxActivityFeed.event(barricadeRefusalText(reason))
         return
     end
     local hammer = barricades.findHammer ~= nil and barricades.findHammer(nil, base) or nil
@@ -664,6 +883,10 @@ local function buildingId(square)
     return definition ~= nil and tostring(definition:getID()) or nil
 end
 
+-- Declared ahead of the menu body: the definition sits below it, and a local
+-- declared there would leave this name resolving to a nil global at the call.
+local addRadioMenu
+
 function BaseContextMenu.onFill(playerNum, context, worldobjects, test)
     if not KnoxSettings.enabled() then
         return
@@ -684,6 +907,14 @@ function BaseContextMenu.onFill(playerNum, context, worldobjects, test)
     end
     local playerId = KnoxPersistence.ensurePlayerId(player)
     local base = KnoxBaseManager.getForOwner("player", playerId)
+    local layoutBase = base
+    if KnoxPersistence.getBaseAtSquare ~= nil then
+        local ok, found = pcall(function()
+            return KnoxPersistence.getBaseAtSquare(
+                square:getX(), square:getY(), square:getZ(), "player")
+        end)
+        if ok and found ~= nil then layoutBase = found end
+    end
     local ownedBases = KnoxPersistence.getBasesForOwner ~= nil
         and KnoxPersistence.getBasesForOwner("player", playerId) or (base ~= nil and { base } or {})
     local containers = #ownedBases > 0 and containerObjects(worldobjects, ownedBases) or {}
@@ -722,34 +953,154 @@ function BaseContextMenu.onFill(playerNum, context, worldobjects, test)
         end
         if not insideOwn then
             menu:addOption("Establish Outpost Here", player, BaseContextMenu.establishOutpost, square)
+            -- Closer than a walk, same base: the option is offered only when the
+            -- compound rules accept this building, and says why when they do not.
+            local compound = rawget(_G, "KnoxBaseCompound")
+            local owned = playerId ~= nil and KnoxPersistence.getBaseForOwner ~= nil
+                and KnoxPersistence.getBaseForOwner("player", playerId) or nil
+            local candidate = compound ~= nil and compound.candidateFor(square) or nil
+            if compound ~= nil and owned ~= nil and candidate ~= nil then
+                local refusal, gap = compound.claimRefusal(compound.ensure(owned), candidate)
+                if refusal == nil then
+                    menu:addOption("Add This Building to " .. tostring(owned.name or "Base"),
+                        player, BaseContextMenu.claimBuilding, square)
+                elseif refusal ~= "already_in_base" then
+                    local line = menu:addOption(compound.refusalText(refusal, gap), nil, nil)
+                    line.notAvailable = true
+                end
+            end
         end
     end
     if base ~= nil then
         menu:addOption("Open Base Management", BaseContextMenu, BaseContextMenu.openSetup, playerNum)
-        if contextOrdersEnabled() then
-            local ordersOption = menu:addOption("Resident Orders", nil, nil)
-            local ordersMenu = ISContextMenu:getNew(menu)
-            menu:addSubMenu(ordersOption, ordersMenu)
-            ordersMenu:addOption("Scout Here", player,
-                BaseContextMenu.dispatchScout, base, square)
-            ordersMenu:addOption("Barricade Building Windows", player,
-                BaseContextMenu.orderBarricadeHere, base, square)
+        -- A depot is edited where it is painted: stand in the yard and open the
+        -- same filter window a container uses.
+        local depotZone = KnoxBaseStorage.depotZoneAt ~= nil
+            and KnoxBaseStorage.depotZoneAt(base, square:getX(), square:getY(), square:getZ()) or nil
+        if depotZone ~= nil then
+            menu:addOption("Depot Filters — " .. tostring(depotZone.label or "Depot"),
+                player, BaseContextMenu.openDepotFilters, depotZone)
         end
-        -- Door locks at base/safehouse.
-        for _, object in ipairs(worldobjects or {}) do
-            local isDoor = false
-            if instanceof ~= nil and object ~= nil then
-                local ok, result = pcall(function() return instanceof(object, "IsoDoor") end)
-                isDoor = ok and result == true
+        local currentIntent = KnoxPersistence.getBaseIntent ~= nil
+            and KnoxPersistence.getBaseIntent(base.id) or nil
+        local intentOption = menu:addOption("Base Intent: "
+            .. tostring(BASE_INTENT_LABELS[currentIntent] or "Not set"), nil, nil)
+        local intentMenu = ISContextMenu:getNew(menu)
+        menu:addSubMenu(intentOption, intentMenu)
+        for _, entry in ipairs(BASE_INTENTS) do
+            if entry.key ~= currentIntent then
+                intentMenu:addOption(entry.label, player,
+                    BaseContextMenu.setBaseIntent, base, entry.key)
             end
-            if isDoor and KnoxBaseManager.containsSquare(base, square) then
-                local locked = false
-                pcall(function()
-                    if object.isLockedByKey ~= nil then locked = object:isLockedByKey() == true end
-                end)
-                menu:addOption(locked and "Unlock Door at Base" or "Lock Door at Base", player,
-                    BaseContextMenu.toggleDoorLock, base, object)
-                break
+        end
+        -- Kind and Intent were two menus for one question. Kind is now derived
+        -- from the record (first base = main, a later one = outpost) and the
+        -- weekly preference is the single Intent menu above. Legacy `base.kind`
+        -- values still read through KnoxPersistence.baseKindFor; nothing is
+        -- written to that field by the player any more.
+        -- A room is renamed where it is: the menu offers the short list the
+        -- compound owner defines, so no text box is needed for a two-word name.
+        local roomApi = rawget(_G, "KnoxBaseCompound")
+        if roomApi ~= nil and roomApi.roomNameAt ~= nil then
+            local roomName, roomEntry = roomApi.roomNameAt(
+                base, square:getX(), square:getY(), square:getZ())
+            if roomEntry ~= nil then
+                local roomOption = menu:addOption("Room: " .. tostring(roomName or "unnamed"), nil, nil)
+                local roomMenu = ISContextMenu:getNew(menu)
+                menu:addSubMenu(roomOption, roomMenu)
+                for _, preset in ipairs(roomApi.ROOM_PRESETS or {}) do
+                    if preset ~= roomName then
+                        roomMenu:addOption(preset, player, BaseContextMenu.renameRoomHere, preset)
+                    end
+                end
+            end
+        end
+        -- A proposal is read-only until the player applies it. It never edits
+        -- an existing zone or assigns a storage policy.
+        local layoutBuilding = nil
+        if layoutBase ~= nil then
+            local ok, found = pcall(function() return square:getBuilding() end)
+            if ok then layoutBuilding = found end
+        end
+        if layoutBase ~= nil and layoutBuilding ~= nil then
+            local entries, layoutReason = KnoxBaseManager.proposeLayout(
+                layoutBase.id, layoutBuilding, square:getZ(), player)
+            entries = type(entries) == "table" and entries or {}
+            local storageEntries = type(entries.storage) == "table" and entries.storage or {}
+            local proposedCount = #entries + #storageEntries
+            local layoutOption = menu:addOption("Layout Proposal"
+                .. (proposedCount > 0 and (" (" .. tostring(proposedCount) .. ")") or ""), nil, nil)
+            local layoutMenu = ISContextMenu:getNew(menu)
+            menu:addSubMenu(layoutOption, layoutMenu)
+            if proposedCount == 0 then
+                local status = layoutMenu:addOption(layoutReasonText(layoutReason), nil, nil)
+                status.notAvailable = true
+            else
+                for _, entry in ipairs(entries) do
+                    local bounds = entry.bounds or {}
+                    local width = math.abs((tonumber(bounds.x2) or 0) - (tonumber(bounds.x1) or 0)) + 1
+                    local height = math.abs((tonumber(bounds.y2) or 0) - (tonumber(bounds.y1) or 0)) + 1
+                    local line = layoutMenu:addOption(
+                        tostring(entry.label or entry.zoneType) .. " — "
+                            .. tostring(entry.zoneType) .. " ("
+                            .. tostring(width) .. "x" .. tostring(height) .. ")",
+                        nil, nil)
+                    line.notAvailable = true
+                end
+                for _, entry in ipairs(storageEntries) do
+                    local line = layoutMenu:addOption(
+                        "Storage: " .. tostring(entry.label or entry.category)
+                            .. " (" .. tostring(entry.category) .. ") — "
+                            .. tostring(entry.roomLabel or "container"),
+                        nil, nil)
+                    line.notAvailable = true
+                end
+                layoutMenu:addOption("Apply Layout", player,
+                    BaseContextMenu.applyLayout, layoutBase, entries)
+                layoutMenu:addOption("Edit Work Areas…", BaseContextMenu,
+                    BaseContextMenu.openSetup, playerNum)
+                layoutMenu:addOption("Dismiss", player,
+                    BaseContextMenu.dismissLayout, layoutBase)
+            end
+        end
+        -- Base-scoped, location-bound orders exist only in this world menu; the
+        -- emote radial deliberately has no position-bound commands. Hiding them
+        -- behind the legacy right-click option left scouting and barricading
+        -- unreachable with default settings, so they stay available here.
+        local ordersOption = menu:addOption("Base Orders", nil, nil)
+        local ordersMenu = ISContextMenu:getNew(menu)
+        menu:addSubMenu(ordersOption, ordersMenu)
+        -- Party size is a property of the same order, so it is a nested choice
+        -- rather than peer entries. Fewer available residents than asked for is
+        -- not an error: the departure line names who actually went.
+        local PARTY_LABELS = { "One resident", "Two residents", "Three residents" }
+        local function addMissionOrder(parentMenu, label, missionType)
+            local option = parentMenu:addOption(label, nil, nil)
+            local partyMenu = ISContextMenu:getNew(parentMenu)
+            parentMenu:addSubMenu(option, partyMenu)
+            for size = 1, #PARTY_LABELS do
+                partyMenu:addOption(PARTY_LABELS[size], player,
+                    BaseContextMenu.dispatchScout, base, square, size, missionType)
+            end
+        end
+        addMissionOrder(ordersMenu, "Send Scout Here", "scout")
+        addMissionOrder(ordersMenu, "Send Food Run Here", "food")
+        addMissionOrder(ordersMenu, "Send Medical Run Here", "medicine")
+        addMissionOrder(ordersMenu, "Send Tool Run Here", "tools")
+        addMissionOrder(ordersMenu, "Send Weapon Run Here", "weapons")
+        addMissionOrder(ordersMenu, "Send Material Run Here", "building")
+        ordersMenu:addOption("Barricade Building Windows", player,
+            BaseContextMenu.orderBarricadeHere, base, square)
+        local barricades = rawget(_G, "KnoxBaseBarricades")
+        if barricades ~= nil and barricades.canKeepOpen ~= nil
+            and KnoxBaseManager.containsSquare(base, square) then
+            for _, object in ipairs(worldobjects or {}) do
+                if barricades.canKeepOpen(object) then
+                    local keep = barricades.isKeepOpen(object)
+                    menu:addOption(keep and "Allow Boarding This Opening"
+                        or "Keep This Opening Clear", player,
+                        BaseContextMenu.toggleKeepOpen, object)
+                end
             end
         end
     end
@@ -759,6 +1110,211 @@ function BaseContextMenu.onFill(playerNum, context, worldobjects, test)
         addStorageMenu(context, entry.base, entry.object, playerNum)
     end
     addBedMenu(menu, base, player, playerId, worldobjects)
+    addRadioMenu(menu, base, player, worldobjects)
+end
+
+-- RADIO STATUS (pure)
+-- One line about the set the player is pointing at. Power is named from the
+-- source that actually feeds it (object grid, generator, device battery), in
+-- that order, and a reader that does not answer is reported as no power rather
+-- than assumed. The transmit figure is the script's own number, never a
+-- survivor-scale radius.
+function BaseContextMenu.radioStatusText(parts)
+    local source = type(parts) == "table" and parts or {}
+    local power
+    if source.grid == true then power = "grid"
+    elseif source.generator == true then power = "generator"
+    elseif source.battery == true then power = "battery"
+    else power = "no power" end
+    local line = "Radio: " .. (source.on == true and "switched on" or "switched off")
+        .. " · " .. power
+    local range = tonumber(source.range)
+    if range ~= nil and range > 0 then
+        line = line .. " · transmit " .. tostring(math.floor(range))
+    end
+    return line
+end
+-- END RADIO STATUS
+
+-- The tower's first slice, and only its first: a real wave-signal device inside
+-- the player's own territory is read through the audited object/device surface,
+-- and the one write is the same setIsTurnedOn the television owner already uses.
+-- There is no broadcast, no arrival and no record here.
+local function baseRadioObject(worldobjects, base)
+    if base == nil or type(worldobjects) ~= "table" then return nil end
+    for _, object in ipairs(worldobjects) do
+        local ok, isRadio = pcall(function()
+            return instanceof(object, "IsoWaveSignal")
+        end)
+        if ok and isRadio == true then
+            local square = nil
+            pcall(function() square = object:getSquare() end)
+            if square ~= nil and (KnoxBaseManager.containsSquare == nil
+                or KnoxBaseManager.containsSquare(base, square)) then
+                return object
+            end
+        end
+    end
+    return nil
+end
+
+function BaseContextMenu.toggleRadio(radio, player, on)
+    if radio == nil then return end
+    local device = nil
+    pcall(function() device = radio:getDeviceData() end)
+    if device == nil then return end
+    local ok, nowOn = pcall(function()
+        device:setIsTurnedOn(on == true)
+        return device:getIsTurnedOn()
+    end)
+    local feed = rawget(_G, "KnoxActivityFeed")
+    if feed == nil or feed.event == nil then return end
+    if ok and nowOn == on then
+        feed.event(on == true and "Radio switched on." or "Radio switched off.")
+    else
+        feed.event("The radio will not switch on here.")
+    end
+end
+
+-- RADIO MODE (pure)
+-- The three modes, and the rule that anything else is the off mode. An unknown
+-- value must never read as broadcasting: a save from a later build, a typo in a
+-- debug call or a nil record would then put words in the county's mouth.
+function BaseContextMenu.radioModeLabel(mode)
+    if mode == "listen" then return "Listening" end
+    if mode == "broadcast" then return "Calling on the radio" end
+    return "Off"
+end
+
+function BaseContextMenu.radioModeIsCurrent(mode, current)
+    local function normalize(value)
+        if value == "listen" then return "listen" end
+        if value == "broadcast" then return "broadcast" end
+        return "off"
+    end
+    return normalize(mode) == normalize(current)
+end
+-- END RADIO MODE
+
+-- The operator is the living resident with the best real Electrical skill, read
+-- from the perk the game already tracks. No assignment is stored: it is answered
+-- when the radio is used, so a dead or departed operator cannot leave a stale id.
+local function radioOperatorLevel(base)
+    local persistence = rawget(_G, "KnoxPersistence")
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    if base == nil or persistence == nil or runtime == nil
+        or persistence.getBaseResidentIds == nil then
+        return nil
+    end
+    local levels = {}
+    for _, id in ipairs(persistence.getBaseResidentIds(base.id) or {}) do
+        local character = runtime.getCharacter ~= nil and runtime.getCharacter(id) or nil
+        if character ~= nil and character:isDead() ~= true then
+            local ok, level = pcall(function() return character:getPerkLevel(Perks.Electricity) end)
+            if ok then levels[#levels + 1] = tonumber(level) end
+        end
+    end
+    -- One authority for "the strongest resident answers": the base manager's
+    -- pure rule, shared with the arrival roll so the menu and the tower cannot
+    -- disagree about who operates the set.
+    local baseManager = rawget(_G, "KnoxBaseManager")
+    if baseManager == nil or baseManager.radioOperatorLevel == nil then return nil end
+    return baseManager.radioOperatorLevel(levels)
+end
+
+-- Setting a mode writes the one record and moves the real device with it: on to
+-- listen or call, off to off. A call also puts one line through the audited
+-- device text so the set visibly transmits, and says plainly that no answer has
+-- come back — the arrival roll is a later pass, not an invented reply here.
+function BaseContextMenu.setRadioMode(radio, base, playerId, mode, worldAgeHours)
+    if radio == nil or base == nil then return end
+    local persistence = rawget(_G, "KnoxPersistence")
+    local feed = rawget(_G, "KnoxActivityFeed")
+    if persistence == nil or persistence.setBaseRadioMode == nil then return end
+    local ok, detail = persistence.setBaseRadioMode(base.id, playerId, mode, worldAgeHours)
+    if ok ~= true then
+        if feed ~= nil and feed.event ~= nil then
+            feed.event("Only the owner can set this radio.")
+        end
+        return
+    end
+    local device = nil
+    pcall(function() device = radio:getDeviceData() end)
+    if device ~= nil then
+        pcall(function() device:setIsTurnedOn(mode ~= "off") end)
+    end
+    if mode == "broadcast" then
+        local square = nil
+        pcall(function() square = radio:getSquare() end)
+        local level = radioOperatorLevel(base)
+        local line = "Is anyone out there? This is " .. tostring(base.name or "the house") .. "."
+        if square ~= nil then
+            pcall(function()
+                radio:AddDeviceText(line, square:getX(), square:getY(), square:getZ(),
+                    "radio", "broadcast", 0)
+            end)
+        end
+        if feed ~= nil and feed.event ~= nil then
+            feed.event(level ~= nil and level > 0
+                and "Calling on the radio. Nobody has answered yet."
+                or "Calling on the radio, though nobody here knows how to run it well. Nobody has answered yet.")
+        end
+        return
+    end
+    if feed ~= nil and feed.event ~= nil then
+        feed.event(mode == "listen" and "Listening on the radio." or "Radio off.")
+    end
+end
+
+addRadioMenu = function(menu, base, player, worldobjects)
+    local radio = baseRadioObject(worldobjects, base)
+    if radio == nil then return end
+    local device = nil
+    pcall(function() device = radio:getDeviceData() end)
+    local on = false
+    if device ~= nil then
+        local ok, value = pcall(function() return device:getIsTurnedOn() end)
+        on = ok and value == true
+    end
+    local grid, generator, battery, range = false, false, false, nil
+    pcall(function() grid = radio:hasGridPower() == true end)
+    pcall(function() generator = radio:couldBePoweredByGenerator() == true end)
+    if device ~= nil then
+        pcall(function() battery = device:getHasBattery() == true end)
+        local ok, value = pcall(function() return device:getTransmitRange() end)
+        if ok then range = tonumber(value) end
+    end
+    local status = menu:addOption(BaseContextMenu.radioStatusText({
+        on = on, grid = grid, generator = generator, battery = battery, range = range,
+    }), nil, nil)
+    status.notAvailable = true
+    menu:addOption(on and "Switch Radio Off" or "Switch Radio On", player,
+        BaseContextMenu.toggleRadio, radio, not on)
+    local persistence = rawget(_G, "KnoxPersistence")
+    local playerId = persistence ~= nil and persistence.ensurePlayerId ~= nil
+        and persistence.ensurePlayerId(player) or nil
+    local mode = persistence ~= nil and persistence.getBaseRadioMode ~= nil
+        and persistence.getBaseRadioMode(base.id) or "off"
+    local worldAgeHours = 0
+    pcall(function() worldAgeHours = getGameTime():getWorldAgeHours() end)
+    local modeOption = menu:addOption("Mode: " .. BaseContextMenu.radioModeLabel(mode), nil, nil)
+    local modeMenu = ISContextMenu:getNew(menu)
+    menu:addSubMenu(modeOption, modeMenu)
+    for _, entry in ipairs({ { "off", "Off" }, { "listen", "Listen" },
+        { "broadcast", "Call on the radio" } }) do
+        if not BaseContextMenu.radioModeIsCurrent(entry[1], mode) then
+            modeMenu:addOption(entry[2], player, BaseContextMenu.setRadioMode,
+                radio, base, playerId, entry[1], worldAgeHours)
+        end
+    end
+    -- The cost of being heard is stated before the switch, in the menu the
+    -- switch lives in. It is a sentence from the base manager's pure rule, so
+    -- the wording and the odds cannot drift apart.
+    local baseManager = rawget(_G, "KnoxBaseManager")
+    if baseManager ~= nil and baseManager.radioRiskText ~= nil and mode ~= "broadcast" then
+        local line = modeMenu:addOption(baseManager.radioRiskText(radioOperatorLevel(base)), nil, nil)
+        line.notAvailable = true
+    end
 end
 
 Events.OnFillWorldObjectContextMenu.Add(BaseContextMenu.onFill)

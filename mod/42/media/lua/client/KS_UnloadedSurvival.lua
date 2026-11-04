@@ -114,9 +114,17 @@ local function consumeStoredSupply(id, kind, amount, communalBase, reserve)
     if record == nil then
         return false, "record_unavailable"
     end
-    local mutator = communalBase ~= nil and bridge.consumeNpcRecordBaseSupply or bridge.consumeNpcRecordSupply
-    if mutator == nil then return false, "communal_mutator_unavailable" end
-    local ok, result = pcall(mutator, bridge, record, kind, amount, communalBase, reserve)
+    local ok, result
+    if communalBase ~= nil then
+        if bridge.consumeNpcRecordBaseSupply == nil then return false, "communal_mutator_unavailable" end
+        ok, result = pcall(bridge.consumeNpcRecordBaseSupply,
+            bridge, record, kind, amount, communalBase, tonumber(reserve) or 1)
+    else
+        if bridge.consumeNpcRecordSupply == nil then return false, "record_mutator_unavailable" end
+        -- The ordinary Java mutator takes exactly three arguments. Passing
+        -- unused communal fields raises on every unloaded hunger/thirst step.
+        ok, result = pcall(bridge.consumeNpcRecordSupply, bridge, record, kind, amount)
+    end
     if not ok or result == nil then
         return false, "item_not_present"
     end
@@ -304,11 +312,25 @@ local function advanceWorldActivity(id, state, elapsed, hours)
     end
     if duty.mode == "away" then
         -- Away-team simulation owns travel, risk, ETA, and mission results.
-        -- Keep the last known destination in the durable ledger so a member
-        -- can materialize there after the team resolves instead of snapping
-        -- back to the stale departure square.
+        -- While the team is still at its destination the member stays pinned
+        -- there, so materialization never snaps back to a stale departure
+        -- square. On the way home the ledger's elapsed walk is authoritative,
+        -- so the map shows the same road the return clock is covering.
         local team = persistence.getAwayTeamForSurvivor ~= nil
             and persistence.getAwayTeamForSurvivor(id) or nil
+        local homeward = nil
+        if team ~= nil and team.state == "returning"
+            and persistence.awayTeamReturnProgress ~= nil then
+            homeward = persistence.awayTeamReturnProgress(team.id, hours)
+        end
+        if type(homeward) == "table" then
+            state.virtualX = math.floor(homeward.x)
+            state.virtualY = math.floor(homeward.y)
+            state.virtualZ = math.floor(homeward.z or 0)
+            state.virtualAtHours = hours
+            setActivity(state, "returning_to_base", hours)
+            return 0
+        end
         local destination = team ~= nil and team.destination or nil
         if destination ~= nil and tonumber(destination.x) ~= nil
             and tonumber(destination.y) ~= nil then
@@ -750,8 +772,13 @@ function Simulation.advanceHibernated(id, hours)
     end
     persistence.setUnloadedSurvivalState(id, state)
     if state.status == "dead" then
+        -- The hibernated state is the only witness here, so the cause is read
+        -- from the facts it actually carried: real bleeding, or a body at zero.
+        local cause = (tonumber(state.bleedingParts) or 0) > 0 and "bled_out"
+            or ((tonumber(state.health) or 1) <= 0 and "wounds" or nil)
         persistence.markSurvivorDead(id, targetHours, "unloaded_survival", {
             locationSource = "logical", corpseState = "logical_only",
+            cause = cause,
         })
         return true, "died"
     end
@@ -1105,10 +1132,14 @@ function Simulation.advanceAll(activeIds, hours)
         unused, originGroupCandidates = persistence.getTravelGroupsFor(ids)
     end
     for _, id in ipairs(ids) do
+        if not active[id] then
         local record = persistence.getRecord(id)
-        local duty = persistence.getSurvivorDuty ~= nil
+        -- Origin-only people have no stored body or base job to advance.
+        -- Avoid reading their duty/physiology on every population pass.
+        local stored = record ~= nil and not handled[id]
+        local duty = stored and persistence.getSurvivorDuty ~= nil
             and persistence.getSurvivorDuty(id) or nil
-        local state = persistence.getUnloadedSurvivalState ~= nil
+        local state = stored and persistence.getUnloadedSurvivalState ~= nil
             and persistence.getUnloadedSurvivalState(id) or nil
         local task = nil
         if type(duty) == "table" and duty.mode == "base"
@@ -1195,6 +1226,7 @@ function Simulation.advanceAll(activeIds, hours)
             if state ~= nil and persistence.setUnloadedSurvivalState ~= nil then
                 persistence.setUnloadedSurvivalState(id, state)
             end
+        end
         end
     end
     return advanced, notable

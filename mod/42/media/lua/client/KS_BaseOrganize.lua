@@ -14,7 +14,13 @@ local Organize = {}
 KnoxBaseOrganize = Organize
 
 local SCAN_RADIUS = 16
-local MAX_INSPECT = 40
+-- A full shelf used to exhaust one shared inspection budget, so the misfiled
+-- item behind it was never examined: the “re-files automatically” behaviour
+-- existed on paper only for any real base. Cheap passes (is this item in a
+-- shelf that rejects it?) now get a much larger bound, while the expensive
+-- “is there a better tier for an accepted item?” comparison keeps a small one.
+local MAX_SCANNED_ITEMS = 400
+local MAX_DEMOTED_CHECKS = 12
 local STEP_TIMEOUT_TICKS = 1800
 
 local function call(value, name, fallback, ...)
@@ -88,7 +94,7 @@ function Organize.find(base, character, available, reserved, destinationReserved
     local origin = call(character, "getCurrentSquare", nil)
     if origin == nil then return nil, "organize_unavailable" end
     local oz = origin:getZ()
-    local inspected = 0
+    local scanned, demotedChecks = 0, 0
     for _, policy in ipairs(KnoxBaseStorage.operationalPolicies(base)) do
         local dx = (tonumber(policy.x) or math.huge) - origin:getX()
         local dy = (tonumber(policy.y) or math.huge) - origin:getY()
@@ -99,8 +105,8 @@ function Organize.find(base, character, available, reserved, destinationReserved
                 local items = call(container, "getItems", nil)
                 if items ~= nil then
                     for i = 0, items:size() - 1 do
-                        if inspected >= MAX_INSPECT then return nil, "shelves_settled" end
-                        inspected = inspected + 1
+                        if scanned >= MAX_SCANNED_ITEMS then return nil, "shelves_settled" end
+                        scanned = scanned + 1
                         local item = items:get(i)
                         local identity = itemIdentity(item)
                         local favorite = call(item, "isFavorite", false) == true
@@ -109,18 +115,30 @@ function Organize.find(base, character, available, reserved, destinationReserved
                             and (reserved == nil or not reserved(item)) then
                             local misplaced = policy.transientContainer == true
                                 or not KnoxBaseStorage.acceptsDeposit(policy, item)
-                            local best = bestPolicyFor(base, character, item, policy.key, destinationReserved)
-                            if best ~= nil then
-                                local srcRank = KnoxBaseStorage.priorityRank ~= nil
-                                    and KnoxBaseStorage.priorityRank(policy) or 2
-                                local dstRank = KnoxBaseStorage.priorityRank ~= nil
-                                    and KnoxBaseStorage.priorityRank(best) or 2
-                                -- Meaningfully better only: a strictly higher
-                                -- priority tier, or a misplaced item moving to
-                                -- any shelf that accepts it. Equal-tier
-                                -- shuffles never qualify, so settled bases
-                                -- stay settled.
-                                if dstRank < srcRank or misplaced then
+                            -- A shelf that already accepts the item is only
+                            -- interesting when a higher tier exists, which costs
+                            -- a comparison per policy. A misfiled item is the
+                            -- recovery case and is always worth the check, so
+                            -- accepted items spend the small budget instead of
+                            -- hiding everything behind them.
+                            if misplaced then
+                                local best = bestPolicyFor(base, character, item,
+                                    policy.key, destinationReserved)
+                                if best == nil and KnoxBaseStorage.depotStore ~= nil then
+                                    -- The yard is where a shelf-rejected item goes
+                                    -- when no shelf wants it: the stockpile absorbs
+                                    -- what the filters refuse, instead of the item
+                                    -- sitting misfiled forever.
+                                    local store = KnoxBaseStorage.depotStore(base, item)
+                                    if store ~= nil then
+                                        return {
+                                            item = item, itemKey = identity,
+                                            source = container, sourcePolicy = policy,
+                                            depotZoneId = store.zone.id,
+                                            baseId = base.id, phase = "prepare",
+                                        }, "found"
+                                    end
+                                end                                if best ~= nil then
                                     return {
                                         item = item,
                                         itemKey = identity,
@@ -130,6 +148,32 @@ function Organize.find(base, character, available, reserved, destinationReserved
                                         baseId = base.id,
                                         phase = "prepare",
                                     }, "found"
+                                end
+                            elseif demotedChecks < MAX_DEMOTED_CHECKS then
+                                demotedChecks = demotedChecks + 1
+                                local best = bestPolicyFor(base, character, item,
+                                    policy.key, destinationReserved)
+                                if best ~= nil then
+                                    local srcRank = KnoxBaseStorage.priorityRank ~= nil
+                                        and KnoxBaseStorage.priorityRank(policy) or 2
+                                    local dstRank = KnoxBaseStorage.priorityRank ~= nil
+                                        and KnoxBaseStorage.priorityRank(best) or 2
+                                    -- Meaningfully better only: a strictly
+                                    -- higher priority tier, or a misplaced item
+                                    -- moving to any shelf that accepts it.
+                                    -- Equal-tier shuffles never qualify, so
+                                    -- settled bases stay settled.
+                                    if dstRank < srcRank then
+                                        return {
+                                            item = item,
+                                            itemKey = identity,
+                                            source = container,
+                                            sourcePolicy = policy,
+                                            destinationPolicy = best,
+                                            baseId = base.id,
+                                            phase = "prepare",
+                                        }, "found"
+                                    end
                                 end
                             end
                         end
@@ -189,6 +233,19 @@ local function withinReach(character, square)
 end
 
 local function depositDestination(base, plan)
+if plan.depotZoneId ~= nil then
+    local zone = nil
+    for _, candidate in pairs(base.zones or {}) do
+        if candidate ~= nil and candidate.id == plan.depotZoneId then
+            zone = candidate
+            break
+        end
+    end
+    if zone == nil then return nil, "depot_area_gone" end
+    local store, refusal = KnoxBaseStorage.depotStore(base, plan.item, zone)
+    if store == nil then return nil, refusal or "depot_unavailable" end
+    return { container = store.container, square = store.square, zone = store.zone }
+end
     for _, policy in ipairs(KnoxBaseStorage.operationalPolicies(base)) do
         if policy.key == plan.destinationPolicy.key then
             if not KnoxBaseStorage.acceptsDeposit(policy, plan.item) then
@@ -230,7 +287,8 @@ function Organize.step(plan, character, base, bridge, id, ticks)
         local readable, destination, refusal = pcall(depositDestination, base, plan)
         if not readable then return "failed", "organize_destination_unreadable" end
         if destination == nil then return "failed", refusal end
-        if not KnoxBaseStorage.canReceiveItem(destination.container, character, plan.item) then
+        if plan.depotZoneId == nil
+            and not KnoxBaseStorage.canReceiveItem(destination.container, character, plan.item) then
             return "failed", "organize_destination_unavailable"
         end
         local square = sourceSquare(base, plan)
@@ -244,7 +302,8 @@ function Organize.step(plan, character, base, bridge, id, ticks)
             local current = depositDestination(base, plan)
             return current ~= nil and current.container == intendedContainer
                 and plan.source:contains(candidate)
-                and KnoxBaseStorage.canReceiveItem(current.container, character, candidate)
+                and (plan.depotZoneId ~= nil
+                    or KnoxBaseStorage.canReceiveItem(current.container, character, candidate))
         end
         -- Permission may change while native pickup is turning/waiting too.
         plan.guard = allowed
@@ -280,7 +339,8 @@ function Organize.step(plan, character, base, bridge, id, ticks)
             local current = depositDestination(base, plan)
             return current ~= nil and current.container == plan.depositDestination
                 and inventory:contains(candidate)
-                and KnoxBaseStorage.canReceiveItem(current.container, character, candidate)
+                and (plan.depotZoneId ~= nil
+                    or KnoxBaseStorage.canReceiveItem(current.container, character, candidate))
         end
         plan.guard = allowed
         local admitted, action, reason = pcall(KnoxInventoryActions.queueTransfer,

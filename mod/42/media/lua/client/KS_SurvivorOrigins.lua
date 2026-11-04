@@ -133,6 +133,17 @@ local CONTEXT_PROFESSIONS = {
     private_security = { "base:securityguard" },
 }
 
+-- A facility profession wears that facility's clothing and carries its kit.
+-- It is only legitimate at the place that produced it: every downstream reader
+-- (appearance, starting gear, job preference) keys off this one profession id,
+-- so an ordinary household survivor rolling base:policeofficer is not variety,
+-- it is a defect.
+local FACILITY_PROFESSIONS = {
+    ["base:policeofficer"] = true,
+    ["base:veteran"] = true,
+    ["base:fireofficer"] = true,
+}
+
 local JOB_PREFERENCES = {
     ["base:mechanics"] = "repair",
     ["base:chef"] = "cooking",
@@ -193,6 +204,29 @@ end
 
 function Origins.contextPriority(value)
     return CONTEXT_PRIORITY[value] or 0
+end
+
+-- The professions that may not be rolled without facility evidence.
+function Origins.facilityProfessions()
+    local listed = {}
+    for professionId in pairs(FACILITY_PROFESSIONS) do
+        listed[#listed + 1] = professionId
+    end
+    table.sort(listed)
+    return listed
+end
+
+-- True when the profession may exist at that context. Only facility
+-- professions are place-bound: a farmer or a mechanic is ordinary anywhere, and
+-- gating every profession that carries a context would have made a farming
+-- household unable to hold a farmer.
+function Origins.professionAllowedAtContext(professionId, context)
+    local normalized = Origins.normalizeProfessionId(professionId)
+    if normalized == nil or FACILITY_PROFESSIONS[normalized] ~= true then
+        return true
+    end
+    local expected = PROFESSION_CONTEXT[normalized]
+    return expected ~= nil and expected == tostring(context or "generic")
 end
 
 function Origins.classifyRooms(roomNames)

@@ -254,7 +254,207 @@ function Needs.snapshot(character)
         bleedingParts = bodyDamage:getNumPartsBleeding(),
         health = bodyDamage:getHealth(),
         pain = pain,
+        -- The card's Needs line and the party strip already read this field to
+        -- name a bite, but nothing produced it. The engine's own reading is the
+        -- only source; an unreadable body stays nil rather than reading clean.
+        bitten = Needs.infectionReading(character),
     }
+end
+
+-- PAIN BANDS AND HEAVY WORK
+-- Native pain is a body value, and every surface that needs to know how much
+-- something hurts asks this one table instead of inventing a threshold. An
+-- unreadable value is nil, never "clear": a body we cannot read is not a body
+-- without pain, and the caller decides which way to fail.
+Needs.painBands = { hurting = 25, bad = 45, severe = 65 }
+
+function Needs.painBand(snapshot)
+    local pain = snapshot ~= nil and tonumber(snapshot.pain) or nil
+    if pain == nil or pain ~= pain then return nil end
+    if pain >= Needs.painBands.severe then return "severe" end
+    if pain >= Needs.painBands.bad then return "bad" end
+    if pain >= Needs.painBands.hurting then return "hurting" end
+    return "clear"
+end
+
+-- The work that loads the arms and the back. Cooking, sorting a shelf, tending
+-- a bed, a row of crops and keeping watch stay open to a hurt person: the point
+-- is that pain changes what someone chooses to do, not that it stops them
+-- living. Keys are the canonical base task types.
+Needs.heavyWork = {
+    chop_tree = true, saw_logs = true, barricade = true, repair = true,
+    farm_plow = true, haul_corpse = true, burn_corpse = true,
+    pile_corpses = true,
+}
+
+-- One reason a hurting person can give when heavy work comes up, or nil when
+-- they can take it. Unreadable pain refuses nothing: work is not sleep, and an
+-- unknown body state must never idle a settlement.
+function Needs.heavyWorkRefusal(character, taskType)
+    if character == nil or taskType == nil then return nil end
+    if not Needs.heavyWork[tostring(taskType)] then return nil end
+    -- A bitten person knows what it means. The reason is separate from pain so
+    -- the surface that speaks it can say which body fact refused the work.
+    if Needs.infectionBand(character) == "bitten" then return "infected" end
+    local ok, snapshot = pcall(Needs.snapshot, character)
+    if not ok or snapshot == nil then return nil end
+    local band = Needs.painBand(snapshot)
+    if band == "bad" or band == "severe" then return "in_pain" end
+    return nil
+end
+
+-- Is heavy work actually waiting? Speaking a refusal only makes sense when the
+-- thing being refused is on the board; an idle camp owes the player no excuse.
+function Needs.heavyWorkWaiting(queued)
+    if type(queued) ~= "table" then return false end
+    for _, task in ipairs(queued) do
+        if type(task) == "table" and Needs.heavyWork[tostring(task.type or "")] then
+            return true
+        end
+    end
+    return false
+end
+
+-- WEATHER AND WARMTH
+-- Rain is the one climate fact the game states plainly, and core temperature is
+-- the one the body states plainly. Both are read defensively: an older build, a
+-- stub or a half-restored shell yields nil, and an unknown sky is never a reason
+-- to move somebody.
+Needs.rainShelter = 0.15
+Needs.coldCore = 35.5
+-- Clothing wetness is 0..100 on the native body. Soaked is a product bound, not
+-- a measured comfort threshold: wet enough that standing about in it is work.
+Needs.soakedWetness = 45
+
+function Needs.rainIntensity()
+    local climate = rawget(_G, "getClimateManager")
+    if climate == nil then return nil end
+    local ok, value = pcall(function() return climate():getRainIntensity() end)
+    if not ok or tonumber(value) == nil then return nil end
+    return tonumber(value)
+end
+
+-- Clothing, not the sky: the engine tracks how wet what a person wears is, and
+-- a body we cannot read is unknown rather than dry.
+function Needs.clothingWetness(character)
+    if character == nil then return nil end
+    local ok, value = pcall(function() return character:getClothingWetness() end)
+    if not ok or tonumber(value) == nil then return nil end
+    return tonumber(value)
+end
+
+function Needs.coreTemperature(character)
+    if character == nil or character.getBodyDamage == nil then return nil end
+    local ok, value = pcall(function()
+        local body = character:getBodyDamage()
+        local thermo = body ~= nil and body.getThermoregulator ~= nil
+            and body:getThermoregulator() or nil
+        if thermo == nil or thermo.getCoreTemperature == nil then return nil end
+        return thermo:getCoreTemperature()
+    end)
+    if not ok or tonumber(value) == nil then return nil end
+    return tonumber(value)
+end
+
+-- The reason a person steps out of the weather, or nil when there is none. Rain
+-- is answered first because it is the thing a person can see; a cold core is
+-- answered next. Anything unreadable is silence, not a guess.
+function Needs.shelterReason(character)
+    local rain = Needs.rainIntensity()
+    if rain ~= nil and rain >= Needs.rainShelter then return "rain" end
+    local core = Needs.coreTemperature(character)
+    if core ~= nil and core <= Needs.coldCore then return "cold" end
+    -- Rain soaks a person and the soaking outlasts the rain. A body still wet
+    -- through keeps them inside after the sky clears, until it dries.
+    local wet = Needs.clothingWetness(character)
+    if wet ~= nil and wet >= Needs.soakedWetness then return "wet" end
+    return nil
+end
+
+-- The reason decides which words are spoken, in one place: a new reason cannot
+-- silently borrow another bank's line, and an unknown reason says nothing.
+Needs.shelterBanks = { rain = "weather_rain", cold = "weather_cold",
+    wet = "weather_wet" }
+
+function Needs.shelterBank(reason)
+    if reason == nil then return nil end
+    return Needs.shelterBanks[tostring(reason)]
+end
+
+-- A change of weather is worth one remark, not a running commentary: the reason
+-- is reported only when it is new. The caller keeps the last value it announced.
+function Needs.shelterAnnouncement(previous, current)
+    if current == nil then return nil end
+    if previous == current then return nil end
+    return current
+end
+
+-- ILLNESS AND INFECTION
+-- The engine already models infection on the BodyDamage blob this mod persists
+-- whole, so this is a reader plus a decision, not a second simulation. An
+-- unreadable body is nil, never "healthy": a settlement must not act on a
+-- diagnosis nobody made.
+function Needs.infectionReading(character)
+    if character == nil or character.getBodyDamage == nil then return nil end
+    local ok, infected = pcall(function()
+        local body = character:getBodyDamage()
+        if body == nil then return nil end
+        -- Current bodies state the flag. Older or stubbed bodies may only state
+        -- the apparent level, which is still the engine's own answer.
+        local check = body.IsInfected or body.isInfected
+        if check ~= nil then
+            local value = check(body)
+            if type(value) == "boolean" then return value end
+        end
+        local apparent = body.getApparentInfectionLevel
+        if apparent == nil then return nil end
+        local level = tonumber(apparent(body))
+        if level == nil then return nil end
+        return level >= 1
+    end)
+    if not ok or type(infected) ~= "boolean" then return nil end
+    return infected
+end
+
+-- One word for what the body says, or nil when it says nothing readable.
+function Needs.infectionBand(character)
+    local reading = Needs.infectionReading(character)
+    if reading == nil then return nil end
+    return reading and "bitten" or "clear"
+end
+
+-- What killed them, read from the body while it is still readable. Only the
+-- causes the facts support are returned: an infection the engine states, real
+-- bleeding, a body at zero, or a named attacker. Nothing here names a killer -
+-- the death line already has the attribution - so this answers why a person
+-- died when nobody was standing there to say.
+function Needs.deathCause(character, attributionKind)
+    if character ~= nil and Needs.infectionBand(character) == "bitten" then
+        return "infection"
+    end
+    local ok, snapshot = pcall(Needs.snapshot, character)
+    if ok and snapshot ~= nil then
+        if (tonumber(snapshot.bleedingParts) or 0) >= 1 then return "bled_out" end
+        local health = tonumber(snapshot.health)
+        if health ~= nil and health <= 0 then return "wounds" end
+    end
+    local kind = tostring(attributionKind or "")
+    if kind == "zombie" or kind == "survivor" or kind == "player" then
+        return "killed"
+    end
+    return nil
+end
+
+-- How the cause is written where there is no room for a sentence. An unknown
+-- cause returns nil rather than a vague word: a card that says nothing is
+-- honest, a row spent on "unknown" is not.
+Needs.deathCauseLabels = {
+    infection = "fever", bled_out = "bled out", wounds = "wounds", killed = "killed",
+}
+
+function Needs.deathCauseLabel(cause)
+    if cause == nil then return nil end
+    return Needs.deathCauseLabels[tostring(cause)]
 end
 
 -- Dialogue and durable intents must use the same native stat boundary as the

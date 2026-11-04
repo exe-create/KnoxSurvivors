@@ -22,6 +22,13 @@ _G.KnoxOffscreenStories = Stories
 local HISTORY_CAP = 12
 local MEET_RADIUS_TILES = 60
 local CANDIDATE_SCAN_CAP = 48
+-- A conversation can pass on a concrete event from the other person's own
+-- ledger. Only those kinds travel: a meeting is already shared knowledge, and
+-- another person's hearsay never becomes a fact. Three is enough for a rumour
+-- to feel remembered without turning every survivor into a newspaper.
+local HEARSAY_CAP = 3
+local HEARSAY_KINDS = { meet = true, scar = true, close_call = true, cache = true, ride = true }
+local HEARSAY_OUTCOMES = { friendly = true, joined = true, parted = true, declined = true }
 
 local function stableHash(text)
     local result = 5381
@@ -48,6 +55,113 @@ local function pushHistory(state, entry)
     while #state.history > HISTORY_CAP do
         table.remove(state.history, 1)
     end
+end
+
+local function boundedText(value, maximum)
+    if value == nil then return nil end
+    local valueText = tostring(value):gsub("[%c]", " "):match("^%s*(.-)%s*$")
+    if valueText == "" then return nil end
+    maximum = math.max(1, tonumber(maximum) or 120)
+    return #valueText > maximum and valueText:sub(1, maximum) or valueText
+end
+
+-- A fact crosses ledgers only at a finalized conversation, and only as an
+-- attributed copy of an older entry. The listener's own record says who told
+-- them and when; it never becomes a first-hand sighting, and hearsay does not
+-- chain into more hearsay.
+local function recordHearsay(state, listenerId, otherId, outcome, atHours)
+    if HEARSAY_OUTCOMES[outcome] ~= true or type(state.history) ~= "table" then
+        return false
+    end
+    local heard = 0
+    for _, entry in ipairs(state.history) do
+        if type(entry) == "table" and entry.kind == "heard" then heard = heard + 1 end
+    end
+    if heard >= HEARSAY_CAP then return false end
+    local ok, history = pcall(Stories.historyFor, otherId)
+    if not ok or type(history) ~= "table" then return false end
+    for index = #history, 1, -1 do
+        local entry = history[index]
+        -- A meeting is news only when it was with somebody the listener was
+        -- not part of; otherwise the source would be telling them their own
+        -- encounter back to them, or repeating the same pair.
+        local shareable = type(entry) == "table" and HEARSAY_KINDS[entry.kind] == true
+            and tonumber(entry.t) ~= nil and tonumber(entry.t) < atHours
+        if shareable and entry.kind == "meet" then
+            shareable = entry.with ~= nil and entry.with ~= listenerId
+                and entry.with ~= otherId
+        end
+        if shareable then
+            local duplicate = false
+            for _, seen in ipairs(state.history) do
+                if type(seen) == "table" and seen.kind == "heard"
+                    and seen.from == otherId
+                    and tonumber(seen.heardAtHours) == tonumber(entry.t)
+                    and seen.heardKind == entry.kind
+                    and (entry.kind ~= "meet" or seen.heardWith == entry.with) then
+                    duplicate = true
+                    break
+                end
+            end
+            if not duplicate then
+                pushHistory(state, {
+                    kind = "heard",
+                    from = otherId,
+                    heardKind = entry.kind,
+                    heardOutcome = boundedText(entry.outcome, 48),
+                    heardWith = entry.kind == "meet" and boundedText(entry.with, 96) or nil,
+                    heardAtHours = tonumber(entry.t),
+                    t = atHours,
+                })
+                return true
+            end
+        end
+    end
+    return false
+end
+
+--- Record a real wound measured by the loaded controller between two health
+-- samples. This is not a storylet: without a measured loss the ledger stays
+-- untouched. A two-hour throttle keeps one mauling from filling the history,
+-- and a later, larger wound still records once the window has passed.
+function Stories.recordSurvivorInjury(id, loss, hours)
+    local amount = tonumber(loss)
+    local atHours = tonumber(hours)
+    if type(id) ~= "string" or id == "" or amount == nil or amount ~= amount
+        or amount < 3 or atHours == nil or atHours ~= atHours then
+        return false, "invalid_injury"
+    end
+    local persist = persistence()
+    if persist == nil or persist.getUnloadedSurvivalState == nil
+        or persist.setUnloadedSurvivalState == nil then
+        return false, "history_unavailable"
+    end
+    local ok, state = pcall(persist.getUnloadedSurvivalState, id)
+    if not ok or type(state) ~= "table" then
+        return false, "canonical_history_missing"
+    end
+    if type(state.history) == "table" then
+        for index = #state.history, 1, -1 do
+            local entry = state.history[index]
+            if type(entry) == "table" and entry.kind == "close_call"
+                and tonumber(entry.t) ~= nil then
+                if atHours - tonumber(entry.t) < 2 then
+                    return false, "throttled"
+                end
+                break
+            end
+        end
+    end
+    local outcome = amount >= 20 and "severe" or "hurt"
+    pushHistory(state, {
+        kind = "close_call",
+        outcome = outcome,
+        detail = "a real wound from combat",
+        t = atHours,
+    })
+    local okWrite, saved = pcall(persist.setUnloadedSurvivalState, id, state)
+    if not okWrite or saved ~= true then return false, "history_write_failed" end
+    return true, "recorded", outcome
 end
 
 local function feed(text)
@@ -351,17 +465,13 @@ function Stories.recordLoadedEncounter(id, otherId, outcome, hours)
         detail = "a loaded survivor encounter",
         t = atHours,
     })
+    -- The meeting above is the evidence that a conversation happened. Only a
+    -- friendly outcome carries news; a hostile one leaves both ledgers with
+    -- the fact of the encounter and nothing they could not have heard.
+    recordHearsay(state, id, otherId, outcome, atHours)
     local okWrite, saved = pcall(persist.setUnloadedSurvivalState, id, state)
     if not okWrite or saved ~= true then return false, "history_write_failed" end
     return true, "recorded"
-end
-
-local function boundedText(value, maximum)
-    if value == nil then return nil end
-    local valueText = tostring(value):gsub("[%c]", " "):match("^%s*(.-)%s*$")
-    if valueText == "" then return nil end
-    maximum = math.max(1, tonumber(maximum) or 120)
-    return #valueText > maximum and valueText:sub(1, maximum) or valueText
 end
 
 local function normalizeHistoryEntry(entry)
@@ -373,6 +483,11 @@ local function normalizeHistoryEntry(entry)
         outcome = boundedText(entry.outcome, 48),
         detail = boundedText(entry.detail, 160),
         with = boundedText(entry.with, 96),
+        -- A read-only consumer can tell a second-hand entry from a sighting
+        -- without parsing the raw ledger or inventing a source.
+        source = boundedText(entry.from, 96),
+        heardKind = boundedText(entry.heardKind, 32),
+        heardWith = boundedText(entry.heardWith, 96),
         atHours = tonumber(entry.t),
     }
 end

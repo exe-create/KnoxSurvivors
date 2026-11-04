@@ -25,6 +25,10 @@ local cursor = 0
 local nextDispatchCheck = {}
 local READY_STATES = { IDLE = true, BASE_IDLE = true, BASE_PATROL = true, BASE_RETURN = true }
 local ENTRY_OFFSETS = { { 0, 0 }, { 2, 0 }, { -2, 0 }, { 0, 2 }, { 0, -2 }, { 2, 2 } }
+-- A warning needs someone at the home to notice the signs; a player across the
+-- county is not told about a column they cannot see. The World tab still shows
+-- the live event wherever the player is.
+local RAID_WARNING_RADIUS = 60
 
 local function finished(event)
     return event == nil or event.phase == "completed" or event.phase == "failed"
@@ -113,6 +117,76 @@ local function currentPlayers()
         if player ~= nil and player:getCurrentSquare() ~= nil then players[#players + 1] = player end
     end
     return players
+end
+
+local function playerNearArea(area, radius)
+    if type(area) ~= "table" then return false end
+    local minX, minY = tonumber(area.minX), tonumber(area.minY)
+    local width, height = tonumber(area.width), tonumber(area.height)
+    if minX == nil or minY == nil or width == nil or height == nil then return false end
+    local reach = (tonumber(radius) or 0) * (tonumber(radius) or 0)
+    for _, player in ipairs(currentPlayers()) do
+        local square = player:getCurrentSquare()
+        if square ~= nil then
+            local x = math.max(minX, math.min(minX + width - 1, square:getX()))
+            local y = math.max(minY, math.min(minY + height - 1, square:getY()))
+            local dx, dy = square:getX() - x, square:getY() - y
+            if dx * dx + dy * dy <= reach then return true end
+        end
+    end
+    return false
+end
+
+-- The warning is written once on the event, then said once on the existing
+-- notice rail. A reload is silent because the stamp is durable, and a player
+-- who arrives later still gets the fact from the World tab and the home line.
+local function announceRaidWarning(event, hours)
+    if type(event) ~= "table" or event.kind ~= "faction_raid" then return end
+    if event.phase ~= "scheduled" and event.phase ~= "spawning"
+        and event.phase ~= "approaching" then return end
+    if type(event.warning) == "table" then return end
+    local base = KnoxPersistence.getBase(event.targetBaseId)
+    local area = base ~= nil and (base.territory or base.home) or nil
+    if area == nil or not playerNearArea(area, RAID_WARNING_RADIUS) then return end
+    local warning = KnoxEvents.warnRaid(event.id, event.revision, hours)
+    if warning == nil then return end
+    local feed = rawget(_G, "KnoxActivityFeed")
+    local text = KnoxEvents.raidWarningText(warning)
+    if feed ~= nil and feed.note ~= nil and text ~= nil then
+        pcall(function()
+            feed.note(text, { priority = "danger", group = "Raids", key = "raid:" .. event.id })
+        end)
+    end
+    diagEvent(tostring(event.id), "raid_warning", {
+        cause = tostring(warning.cause), direction = tostring(warning.direction),
+        strength = tostring(warning.strength), etaHours = warning.etaHours,
+    })
+end
+
+-- A raid that got inside and worked the objective leaves a report, said once at
+-- the home. A column that broke at the gate never had an objective, so it has
+-- nothing to report and gets no line; the World tab still records the event.
+local function announceRaidAftermath(event, hours)
+    if type(event) ~= "table" or event.kind ~= "faction_raid" then return end
+    if event.phase ~= "withdrawing" or type(event.objective) ~= "table" then return end
+    if type(event.aftermath) == "table" then return end
+    local base = KnoxPersistence.getBase(event.targetBaseId)
+    local area = base ~= nil and (base.territory or base.home) or nil
+    if area == nil or not playerNearArea(area, RAID_WARNING_RADIUS) then return end
+    local stamp = KnoxEvents.markRaidAftermath ~= nil
+        and KnoxEvents.markRaidAftermath(event.id, event.revision, hours) or nil
+    if stamp == nil then return end
+    local text = KnoxEvents.raidAftermathText ~= nil
+        and KnoxEvents.raidAftermathText(event, hours) or nil
+    local feed = rawget(_G, "KnoxActivityFeed")
+    if feed ~= nil and feed.note ~= nil and text ~= nil then
+        pcall(function()
+            feed.note(text, { priority = "danger", group = "Raids", key = "raid-after:" .. event.id })
+        end)
+    end
+    diagEvent(tostring(event.id), "raid_aftermath", {
+        items = stamp.items, outcome = tostring(stamp.outcome or "unknown"),
+    })
 end
 
 function Runtime.memberReady(controller, base)
@@ -221,6 +295,34 @@ local function returnedHome(id, character, home)
     })
 end
 
+-- A raid that ends is written to the durable log once. The log was defined,
+-- capped and read by the faction card, but nothing ever wrote it, so the
+-- retaliation cause could never fire. Names come from the records that own
+-- them; anything unresolvable stays empty instead of being invented, and the
+-- writer's own eventId guard turns the several withdraw reasons a raid can pass
+-- through into one row.
+local function archiveRaidEnd(event, hours, reason)
+    if type(event) ~= "table" or event.kind ~= "faction_raid" then return end
+    if KnoxPersistence == nil or KnoxPersistence.recordRaidHistory == nil then return end
+    local sourceId = tostring(event.sourceFactionId or event.factionId or "")
+    local faction = sourceId ~= "" and KnoxPersistence.getFaction ~= nil
+        and KnoxPersistence.getFaction(sourceId) or nil
+    local base = event.targetBaseId ~= nil and KnoxPersistence.getBase ~= nil
+        and KnoxPersistence.getBase(event.targetBaseId) or nil
+    local outcome = type(event.objective) == "table"
+        and tostring(event.objective.outcome or "") or ""
+    if outcome == "" then outcome = tostring(reason or "unknown") end
+    pcall(KnoxPersistence.recordRaidHistory, {
+        eventId = tostring(event.id or ""),
+        atHours = hours,
+        sourceFactionId = sourceId,
+        sourceName = faction ~= nil and tostring(faction.name or "") or "",
+        targetBaseId = tostring(event.targetBaseId or ""),
+        targetName = base ~= nil and tostring(base.name or "") or "",
+        outcome = outcome,
+    })
+end
+
 local function change(event, phase, hours, reason)
     local result, status = KnoxEvents.transition(event.id, event.revision, phase, hours, reason)
     if result ~= nil and status == "changed" then
@@ -229,6 +331,7 @@ local function change(event, phase, hours, reason)
             kind = event.kind, reason = tostring(reason),
             members = event.memberIds ~= nil and #event.memberIds or nil,
         })
+        if phase == "withdrawing" then archiveRaidEnd(result, hours, reason) end
     end
     return result
 end
@@ -462,6 +565,66 @@ function Runtime.beginObjectiveWork(controller, ticks)
     return true
 end
 
+-- Paid raids: the one observation point for a player handing supplies over.
+-- The raider-side capture refuses anything whose source is inside a character's
+-- inventory, which is exactly what a handover is, so this answers the other
+-- direction and nothing else. A transfer gets at most one of the two contexts,
+-- and recordLoot refuses a repeated item id, so the two observers cannot both
+-- write the same receipt.
+function Runtime.captureHandoverContext(character, source, destination)
+    if character == nil or source == nil or destination == nil then return nil end
+    local inventory = character.getInventory ~= nil and character:getInventory() or nil
+    if inventory == nil or source ~= inventory or destination == inventory then return nil end
+    local owner = destination.getParent ~= nil and destination:getParent() or nil
+    if owner == nil or owner == character then return nil end
+    local memberId = KnoxSurvivorRuntime.idForCharacter(owner)
+    if memberId == nil or KnoxPersistence.isSurvivorAlive(memberId) ~= true then return nil end
+    local duty = KnoxPersistence.getSurvivorDuty(memberId)
+    local event = duty ~= nil and duty.eventId ~= nil
+        and KnoxEvents.get(duty.eventId) or nil
+    if event == nil or event.kind ~= "faction_raid" then return nil end
+    local square = character.getCurrentSquare ~= nil and character:getCurrentSquare() or nil
+    local theirs = owner.getCurrentSquare ~= nil and owner:getCurrentSquare() or nil
+    if square == nil or theirs == nil or square:getZ() ~= theirs:getZ() then return nil end
+    local dx, dy = square:getX() - theirs:getX(), square:getY() - theirs:getY()
+    if dx * dx + dy * dy > 4 then return nil end
+    local state = KnoxEvents.raidDemandState(event, getGameTime():getWorldAgeHours())
+    if state == nil or state.demandable ~= true then return nil end
+    return {
+        eventId = event.id, memberId = memberId,
+        x = square:getX(), y = square:getY(), z = square:getZ(),
+    }
+end
+
+function Runtime.handoverAllowed(context, character, source, destination)
+    if context == nil then return true end
+    if character == nil or source == nil or destination == nil then return false end
+    local inventory = character.getInventory ~= nil and character:getInventory() or nil
+    if inventory == nil or source ~= inventory then return false end
+    local owner = destination.getParent ~= nil and destination:getParent() or nil
+    if owner == nil or KnoxSurvivorRuntime.idForCharacter(owner) ~= context.memberId then
+        return false
+    end
+    local event = KnoxEvents.get(context.eventId)
+    local state = event ~= nil
+        and KnoxEvents.raidDemandState(event, getGameTime():getWorldAgeHours()) or nil
+    return state ~= nil and state.demandable == true
+end
+
+function Runtime.observeHandoverTransfer(context, character, source, destination,
+    original, transferred, wasPresent)
+    if context == nil or not wasPresent or transferred == nil then return false end
+    if not Runtime.handoverAllowed(context, character, source, destination) then return false end
+    if source:contains(original) or not destination:contains(transferred)
+        or transferred:getContainer() ~= destination then return false end
+    local id, fullType = transferred:getID(), transferred:getFullType()
+    if id == nil or type(fullType) ~= "string" then return false end
+    return KnoxEvents.recordLoot(context.eventId, context.memberId,
+        { itemId = tostring(id), fullType = fullType,
+            x = context.x, y = context.y, z = context.z },
+        getGameTime():getWorldAgeHours()) == true
+end
+
 function Runtime.captureLootContext(character, source, destination)
     if character == nil or source == nil or destination == nil then return nil end
     local id = KnoxSurvivorRuntime.idForCharacter(character)
@@ -507,9 +670,21 @@ function Runtime.observeLootTransfer(context, character, source, destination, or
         or transferred:getContainer() ~= destination then return false end
     local id, fullType = transferred:getID(), transferred:getFullType()
     if id == nil or type(fullType) ~= "string" then return false end
-    return KnoxEvents.recordLoot(context.eventId, context.memberId,
+    local recorded = KnoxEvents.recordLoot(context.eventId, context.memberId,
         { itemId = tostring(id), fullType = fullType, x = context.x, y = context.y, z = context.z },
         getGameTime():getWorldAgeHours())
+    -- A raid that takes something from a container inside the home got in. That
+    -- container's own square is the breach, so the player who returns finds
+    -- broken glass where it happened instead of nothing. The trace writer
+    -- collapses repeats from the same room, so looting five crates is one site.
+    local event = context ~= nil and KnoxEvents.get ~= nil
+        and KnoxEvents.get(context.eventId) or nil
+    if recorded and type(event) == "table" and event.kind == "faction_raid"
+        and KnoxPersistence ~= nil and KnoxPersistence.recordTraceSite ~= nil then
+        pcall(KnoxPersistence.recordTraceSite, "breach",
+            context.x, context.y, context.z, getGameTime():getWorldAgeHours())
+    end
+    return recorded
 end
 
 function Runtime.update(controllers, hours)
@@ -524,6 +699,8 @@ function Runtime.update(controllers, hours)
             if not valid and event.phase ~= "scheduled" and event.phase ~= "withdrawing" then
                 event = change(event, "withdrawing", hours, reason) or event
             end
+            announceRaidWarning(event, hours)
+            announceRaidAftermath(event, hours)
             if event.phase == "scheduled" or event.phase == "spawning" then
                 if hours >= (nextDispatchCheck[event.id] or 0) then
                     nextDispatchCheck[event.id] = hours + 0.05

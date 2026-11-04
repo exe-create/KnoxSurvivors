@@ -44,6 +44,10 @@ function Needs.priorityBonus(task, summary, residentCount)
     return bonus
 end
 
+local function clampPriority(value)
+    return math.max(0, math.min(100, tonumber(value) or 0))
+end
+
 function Needs.apply(tasks, summary, residentCount)
     -- Test doubles and older callers may not provide a storage snapshot.  In
     -- that case leave persisted priorities untouched rather than guessing.
@@ -54,12 +58,23 @@ function Needs.apply(tasks, summary, residentCount)
         and (tonumber(summary.loadedPolicies) or 0) > 0
     for _, task in ipairs(tasks or {}) do
         if task ~= nil then
+            local current = clampPriority(task.priority)
+            local applied = tonumber(task.appliedPriority)
             if task.basePriority == nil then
-                task.basePriority = tonumber(task.priority) or 0
+                task.basePriority = current
+            elseif applied ~= nil and current ~= clampPriority(applied) then
+                -- The board, a work-area edit or the player changed this job's
+                -- priority after the last shortage pass. That edit is now the
+                -- baseline; otherwise the cached base would silently restore
+                -- the old value on the next decision.
+                task.basePriority = current
             end
+            local base = clampPriority(task.basePriority)
             local bonus = hasSnapshot and Needs.priorityBonus(task, summary, residentCount) or 0
-            task.priority = math.max(0, math.min(100,
-                (tonumber(task.basePriority) or 0) + bonus))
+            task.priority = clampPriority(base + bonus)
+            -- Remember exactly what this pass wrote so the next pass can tell
+            -- a real external edit from our own shortage adjustment.
+            task.appliedPriority = task.priority
         end
     end
     return tasks

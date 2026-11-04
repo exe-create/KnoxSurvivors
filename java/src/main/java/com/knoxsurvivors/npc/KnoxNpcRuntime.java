@@ -6,6 +6,7 @@ import com.knoxsurvivors.agent.KnoxAgent;
 final class KnoxNpcRuntime {
     private static final float ARRIVAL_DISTANCE = 0.65f;
     private static final int STUCK_WINDOW_TICKS = 45;
+    private static final int TRANSITION_STUCK_WINDOW_TICKS = 180;
     private static final float STUCK_MIN_DISPLACEMENT = 0.12f;
 
     interface MovementEngine {
@@ -98,6 +99,7 @@ final class KnoxNpcRuntime {
     private String movementControllerState = "NotStarted";
     private float lastProgressX;
     private float lastProgressY;
+    private int lastProgressZ;
     private int noProgressTicks;
     private KnoxSurvivorRecord lastRecord;
     private final KnoxCombatController combatController = new KnoxCombatController();
@@ -211,6 +213,7 @@ final class KnoxNpcRuntime {
             movementStartY = movementEngine.bodyY(npc);
             lastProgressX = movementStartX;
             lastProgressY = movementStartY;
+            lastProgressZ = movementEngine.bodyZ(npc);
             noProgressTicks = 0;
             npc.setMovementPace(pace);
             movementEngine.start(npc, square, exactAdjacentCrossing);
@@ -290,17 +293,21 @@ final class KnoxNpcRuntime {
                 )) {
                 movementControllerState = "FailedWrongFloorOrPosition";
             }
-            if (isStuckState(movementControllerState) && remainingDistance > ARRIVAL_DISTANCE) {
+            boolean pendingTransition = isPendingTransition(movementControllerState);
+            if ((isStuckState(movementControllerState) || pendingTransition) && !KnoxMovementGeometry.arrived(
+                currentX,currentY,currentZ,movementRequest.targetX(),movementRequest.targetY(),movementRequest.targetZ(),ARRIVAL_DISTANCE)) {
+                if (pendingTransition != isPendingTransition(previousState)) noProgressTicks = 0;
                 float progress = distance(currentX, currentY, lastProgressX, lastProgressY);
-                if (progress >= STUCK_MIN_DISPLACEMENT) {
+                if (progress >= STUCK_MIN_DISPLACEMENT || currentZ != lastProgressZ) {
                     lastProgressX = currentX;
                     lastProgressY = currentY;
+                    lastProgressZ = currentZ;
                     noProgressTicks = 0;
                 } else {
                     noProgressTicks++;
                 }
-                if (noProgressTicks >= STUCK_WINDOW_TICKS) {
-                    String result = "FailedStuck displacement="
+                if (noProgressTicks >= (pendingTransition ? TRANSITION_STUCK_WINDOW_TICKS : STUCK_WINDOW_TICKS)) {
+                    String result = (pendingTransition ? "FailedTransitionStalled" : "FailedStuck") + " displacement="
                         + distance(currentX, currentY, movementStartX, movementStartY)
                         + " targetDistance=" + remainingDistance
                         + " state=" + movementControllerState;
@@ -314,6 +321,7 @@ final class KnoxNpcRuntime {
                 noProgressTicks = 0;
                 lastProgressX = currentX;
                 lastProgressY = currentY;
+                lastProgressZ = currentZ;
             }
             if (!movementControllerState.equals(previousState)
                 && !"ManualRoute".equals(movementControllerState)
@@ -398,6 +406,7 @@ final class KnoxNpcRuntime {
         movementControllerState = "NotStarted";
         lastProgressX = 0.0f;
         lastProgressY = 0.0f;
+        lastProgressZ = 0;
         noProgressTicks = 0;
         npc.setMovementPace("normal");
     }
@@ -415,6 +424,14 @@ final class KnoxNpcRuntime {
         } catch (Throwable throwable) {
             return failure(failurePrefix, throwable);
         }
+    }
+
+    private static boolean isPendingTransition(String state) {
+        // These describe requested input, not a graph which actually owns the
+        // body. Real CLIMBING/OPENING_WINDOW/SMASHING_WINDOW remain untouched.
+        return state.startsWith("Transition:TURNING_")
+            || state.startsWith("Transition:STARTED_")
+            || state.equals("Transition:ManualRoute");
     }
 
     private static boolean isStuckState(String state) {

@@ -3,6 +3,7 @@ require "KS_SurvivorInventoryActions"
 require "KS_SurvivorNeeds"
 require "TimedActions/ISToggleStoveAction"
 require "TimedActions/ISTimedActionQueue"
+require "TimedActions/ISAddItemInRecipe"
 require "Util/AdjacentFreeTileFinder"
 
 local Cooking = {}
@@ -35,11 +36,13 @@ function Cooking.canCook(item)
         or call(item,"getPoisonPower",1) > 0 or call(item,"isFavorite",false)
         or call(item,"getHungerChange",0) >= -0.01
         or call(item,"getMetalValue",1) > 0 then return false end
-    -- Recipe callbacks/replacements can change item identity and produce metal
-    -- cookware. This executor handles direct native heating only.
+    -- Direct heating cannot safely handle callbacks or replacement items.
     local replacements = call(item,"getReplaceOnCooked",nil)
     if replacements ~= nil and replacements:size() > 0 then return false end
     if call(item,"getOnCooked","") ~= "" then return false end
+    -- Keep safe raw ingredients (such as eggplant) for the recipe path or
+    -- eating. Direct heating is for food unsafe to eat uncooked.
+    if not call(item,"isbDangerousUncooked",false) then return false end
     local cook, burn = call(item,"getMinutesToCook",0),call(item,"getMinutesToBurn",0)
     return cook > 0 and burn-cook >= 6 and call(item,"getCookingTime",0) < burn-4
 end
@@ -67,7 +70,13 @@ function Cooking.hasReadyMeal(base,itemAvailable)
     for _,policy in ipairs(KnoxBaseStorage.policies(base)) do
         local store=KnoxBaseStorage.resolvePolicy(policy)
         if store~=nil and foodIn(store.container,function(item)
-            return KnoxSurvivorNeeds.isSafeFood(item) and policyAllowsItem(policy,item,itemAvailable)
+            -- An edible raw ingredient is emergency food, but it is not the
+            -- cooked meal this check promises. Otherwise eggplant/tomato in
+            -- storage prevent a hungry resident from preparing their recipe.
+            return KnoxSurvivorNeeds.isSafeFood(item)
+                and not call(item,"isFavorite",false)
+                and (not call(item,"isCookable",false) or call(item,"isCooked",false))
+                and policyAllowsItem(policy,item,itemAvailable)
         end,0)~=nil then return true end
     end
     return false
@@ -92,6 +101,139 @@ local function foodSource(base,character,itemAvailable)
             end
         end
     end
+end
+
+-- The vanilla evolved-recipe action owns ingredient consumption and the new
+-- food instance. Only a small set of actual cooked meals belongs in this
+-- kitchen path; raw ingredients alone are never counted as a finished meal.
+local PREPARED_MEALS = { ["Stir fry"] = true, Soup = true, Stew = true }
+local RECIPE_BASE_ITEMS = {
+    ["Base.Pan"] = true, ["Base.PanFriedVegetables"] = true,
+    ["Base.Pot"] = true, ["Base.PotOfSoupRecipe"] = true,
+    ["Base.PotOfStew"] = true,
+}
+local function recipeFood(item)
+    return call(item,"IsFood",false) and not call(item,"isRotten",true)
+        and not call(item,"isPoison",true) and call(item,"getPoisonPower",1)<=0
+        and not call(item,"isFavorite",false)
+        and call(item,"getHungerChange",0)<-0.01
+end
+
+local function preparedCount(item)
+    local extras=call(item,"getExtraItems",nil)
+    return extras~=nil and extras:size() or 0
+end
+
+local function recipeContainers(base,character,itemAvailable)
+    if ArrayList==nil or RecipeManager==nil then return nil,nil,nil end
+    local root=character:getInventory()
+    local containers=ArrayList.new()
+    local entries,byItem={},{}
+    local seen={}
+    local function add(container,square,policy)
+        if container==nil or seen[container] then return end
+        seen[container]=true
+        containers:add(container)
+        local items=container:getItems()
+        for i=0,items:size()-1 do
+            local item=items:get(i)
+            if item~=nil and owners[item]==nil
+                and (itemAvailable==nil or itemAvailable(item)==true)
+                and (policy==nil or policyAllowsItem(policy,item,itemAvailable)) then
+                local entry={item=item,container=container,square=square,
+                    policy=policy~=nil and policy.key or nil}
+                entries[#entries+1]=entry
+                byItem[item]=entry
+            end
+        end
+    end
+    add(root,nil,nil)
+    local origin=character:getCurrentSquare()
+    if origin==nil then return nil,nil,nil end
+    for _,policy in ipairs(KnoxBaseStorage.policies(base)) do
+        if math.abs((tonumber(policy.z) or 0)-origin:getZ())<=2
+            and ((tonumber(policy.x) or math.huge)-origin:getX())^2
+                + ((tonumber(policy.y) or math.huge)-origin:getY())^2<=32*32 then
+            local store=KnoxBaseStorage.resolvePolicy(policy)
+            if store~=nil then add(store.container,store.square,policy) end
+        end
+    end
+    return containers,entries,byItem
+end
+
+local function recipeSource(base,character,itemAvailable)
+    local containers,entries,byItem=recipeContainers(base,character,itemAvailable)
+    if containers==nil then return nil end
+    for _,baseEntry in ipairs(entries) do
+        local baseItem=baseEntry.item
+        if RECIPE_BASE_ITEMS[call(baseItem,"getFullType","")]
+            and baseItem~=call(character,"getPrimaryHandItem",nil)
+            and baseItem~=call(character,"getSecondaryHandItem",nil)
+            and not call(baseItem,"isFavorite",false)
+            and not call(baseItem,"isRotten",false)
+            and not call(baseItem,"isPoison",false) then
+            local ok,recipes=pcall(RecipeManager.getEvolvedRecipe,
+                baseItem,character,containers,true)
+            if ok and recipes~=nil then
+                for r=0,recipes:size()-1 do
+                    local recipe=recipes:get(r)
+                    if PREPARED_MEALS[call(recipe,"getUntranslatedName","")]
+                        and call(recipe,"isCookable",false) then
+                        local existing=preparedCount(baseItem)
+                        local needed=math.max(0,2-existing)
+                        if needed>0 and needed<=2 then
+                            local compatible=call(recipe,"getItemsCanBeUse",nil,
+                                character,baseItem,containers)
+                            local selected,types={},{}
+                            local previous=call(baseItem,"getExtraItems",nil)
+                            if previous~=nil then
+                                for i=0,previous:size()-1 do
+                                    local ingredient=previous:get(i)
+                                    local kind=type(ingredient)=="string" and ingredient
+                                        or call(ingredient,"getFullType","")
+                                    types[kind]=true
+                                end
+                            end
+                            if compatible~=nil then
+                                for i=0,compatible:size()-1 do
+                                    local item=compatible:get(i)
+                                    local entry=byItem[item]
+                                    local itemType=call(item,"getFullType","")
+                                    if entry~=nil and item~=baseItem and recipeFood(item)
+                                        and not types[itemType] then
+                                        selected[#selected+1]=entry
+                                        types[itemType]=true
+                                        if #selected==needed then break end
+                                    end
+                                end
+                            end
+                            if #selected==needed then
+                                local sources={baseEntry}
+                                for _,entry in ipairs(selected) do sources[#sources+1]=entry end
+                                return {recipe=recipe,sources=sources,
+                                    initialIngredients=existing}
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+function Cooking.findRecipeMeal(base,character,itemAvailable)
+    return recipeSource(base,character,itemAvailable)
+end
+
+local function canHeat(plan)
+    if plan.kind~="recipe" then return Cooking.canCook(plan.item) end
+    local item=plan.item
+    return recipeFood(item) and preparedCount(item)>=2
+        and call(item,"isCookable",false) and not call(item,"isCooked",false)
+        and not call(item,"isBurnt",false)
+        and call(item,"getMinutesToCook",0)>0
+        and call(item,"getMinutesToBurn",0)-call(item,"getMinutesToCook",0)>=6
+        and call(item,"getCookingTime",0)<call(item,"getMinutesToBurn",0)-4
 end
 
 local function usable(object)
@@ -161,7 +303,8 @@ function Cooking.findTask(base,character,itemAvailable)
     if origin==nil then return nil,"cooking_unavailable" end
     local now=getTimestampMs~=nil and tonumber(getTimestampMs()) or nil
     if now~=nil and nextScan[base]~=nil and now<nextScan[base] then return nil,"kitchen_scan_cooldown" end
-    local source=foodSource(base,character,itemAvailable)
+    local recipe=recipeSource(base,character,itemAvailable)
+    local source=recipe==nil and foodSource(base,character,itemAvailable) or nil
     local regions={}
     local hasCookingArea=false
     for _,zone in pairs(base.zones or {}) do
@@ -201,11 +344,13 @@ function Cooking.findTask(base,character,itemAvailable)
                             mark=nil
                         end
                         if (recovered~=nil and (itemAvailable==nil or itemAvailable(recovered)==true)
-                            and (Cooking.canCook(recovered) or KnoxSurvivorNeeds.isSafeFood(recovered)))
-                            or (source~=nil and empty and not object:Activated() and mark==nil) then
+                            and (Cooking.canCook(recovered) or KnoxSurvivorNeeds.isSafeFood(recovered)
+                                or canHeat({kind="recipe",item=recovered})))
+                            or ((recipe~=nil or source~=nil) and empty
+                                and not object:Activated() and mark==nil) then
                             return {id="cook:"..tostring(base.id),action="cook",x=x,y=y,z=square:getZ(),
                                 objectIndex=object:getObjectIndex(),spriteName=call(call(object,"getSprite",nil),"getName",""),
-                                zoneId=region.id},"found"
+                                zoneId=region.id,mode=recipe~=nil and "recipe" or "direct"},"found"
                         end
                     end
                 end
@@ -213,7 +358,8 @@ function Cooking.findTask(base,character,itemAvailable)
         end end
     end
     if now~=nil then nextScan[base]=now+10000 end
-    return nil, source==nil and "no_microwave_safe_ingredients" or "no_available_powered_microwave"
+    return nil, source==nil and recipe==nil and "no_suitable_meal_ingredients"
+        or "no_available_powered_appliance"
 end
 
 local function resolve(base,target)
@@ -240,14 +386,39 @@ function Cooking.begin(base,target,character,id,itemAvailable)
     if recovered~=nil and itemAvailable~=nil and itemAvailable(recovered)~=true then
         return nil,"cooking_ingredient_reserved"
     end
+    local recipe=nil
+    if recovered==nil and target.mode=="recipe" then
+        recipe=recipeSource(base,character,itemAvailable)
+    end
     local source=recovered~=nil and {item=recovered,container=object:getContainer()}
-        or foodSource(base,character,itemAvailable)
+        or (recipe~=nil and recipe.sources[1]) or foodSource(base,character,itemAvailable)
     if source==nil or owners[source.item]~=nil then return nil,"cooking_ingredient_unavailable" end
     if recovered==nil and (object:Activated() or not object:getContainer():getItems():isEmpty()
         or object:getModData().KnoxCooking~=nil) then return nil,"cooking_appliance_in_use" end
+    local kind=recipe~=nil and "recipe" or "direct"
+    if recovered~=nil and not Cooking.canCook(recovered) then kind="recipe" end
+    -- Older saves may contain a marked safe raw ingredient from the previous
+    -- direct-heating policy. It cannot become a meal in the stove by itself;
+    -- return that exact item to the resident so the appliance can be reused.
+    local recoverRaw=recovered~=nil and KnoxSurvivorNeeds.isSafeFood(recovered)
+        and not call(recovered,"isCooked",false)
+        and not Cooking.canCook(recovered)
+        and not canHeat({kind="recipe",item=recovered})
     local plan={object=object,item=source.item,source=source,baseId=base.id,target=target,id=id,
-        phase=recovered~=nil and "heat" or "collect",recovered=recovered~=nil}
-    owners[object],owners[plan.item]=plan,plan
+        phase=recovered~=nil and (recoverRaw and "recover_raw" or "heat")
+            or (recipe~=nil and "collect_recipe" or "collect"),
+        recovered=recovered~=nil,kind=kind,recipe=recipe~=nil and recipe.recipe or nil,
+        recipeSources=recipe~=nil and recipe.sources or nil,
+        ingredientIndex=1,sourceIndex=1,claimedItems={source.item}}
+    if recipe~=nil then
+        for index=2,#recipe.sources do
+            local ingredient=recipe.sources[index].item
+            if owners[ingredient]~=nil then return nil,"cooking_ingredient_reserved" end
+            plan.claimedItems[#plan.claimedItems+1]=ingredient
+        end
+    end
+    owners[object]=plan
+    for _,item in ipairs(plan.claimedItems) do owners[item]=plan end
     return plan,"ready"
 end
 
@@ -256,7 +427,7 @@ function HeatAction:isValid()
     local p=self.plan
     return enabled() and owners[self.object]==p and usable(self.object) and near(self.character,self.object:getSquare())
         and not self.object:Activated() and self.object:getContainer():getItems():size()==1
-        and self.object:getContainer():contains(p.item) and Cooking.canCook(p.item)
+        and self.object:getContainer():contains(p.item) and canHeat(p)
 end
 function HeatAction:complete()
     if not self:isValid() then return false end
@@ -306,7 +477,9 @@ function Cooking.cancel(plan,character)
     if mark~=nil and mark.baseId==plan.baseId and mark.itemId==tostring(plan.item:getID())
         and not plan.object:getContainer():contains(plan.item) then plan.object:getModData().KnoxCooking=nil end
     if owners[plan.object]==plan then owners[plan.object]=nil end
-    if owners[plan.item]==plan then owners[plan.item]=nil end
+    for _,item in ipairs(plan.claimedItems or {plan.item}) do
+        if owners[item]==plan then owners[item]=nil end
+    end
 end
 
 local function move(plan,square,character,bridge,ticks,phase)
@@ -318,10 +491,12 @@ local function move(plan,square,character,bridge,ticks,phase)
     return "working"
 end
 
-local function transfer(plan,character,source,destination,nextPhase)
-    local action,reason=KnoxInventoryActions.queueTransfer(character,plan.item,source,destination,nil)
+local function transfer(plan,character,source,destination,nextPhase,item)
+    item=item or plan.item
+    local action,reason=KnoxInventoryActions.queueTransfer(character,item,source,destination,nil)
     if action==nil then return "failed",reason end
     plan.action,plan.phase,plan.destination,plan.afterTransfer=action,"transfer",destination,nextPhase
+    plan.transferItem=item
     return "working"
 end
 
@@ -342,8 +517,101 @@ function Cooking.step(plan,character,base,bridge,ticks)
         or (type(queue.queue)=="table" and #queue.queue>0)
         or (plan.action~=nil and queue:indexOf(plan.action)~=-1) then return "working" end
     if plan.phase=="transfer" then
-        if not plan.destination:contains(plan.item) then return "failed","cooking_transfer_not_completed" end
+        if not plan.destination:contains(plan.transferItem or plan.item) then
+            return "failed","cooking_transfer_not_completed"
+        end
+        if plan.afterTransfer=="collect_recipe" then
+            plan.sourceIndex=(plan.sourceIndex or 1)+1
+        end
         plan.phase,plan.action=plan.afterTransfer,nil
+        plan.transferItem=nil
+    end
+    if plan.phase=="recover_raw" then
+        if not near(character,object:getSquare()) then
+            return move(plan,object:getSquare(),character,bridge,ticks,"recover_raw")
+        end
+        if markedItem(object,base)~=plan.item then return "failed","cooking_contents_changed" end
+        stopHeat(plan,character)
+        return transfer(plan,character,container,inventory,"return_raw")
+    end
+    if plan.phase=="return_raw" then
+        if not inventory:contains(plan.item) then return "failed","raw_ingredient_transfer_failed" end
+        return "done","raw_ingredient_recovered_to_inventory"
+    end
+    if plan.phase=="collect_recipe" then
+        local entry=plan.recipeSources~=nil and plan.recipeSources[plan.sourceIndex or 1] or nil
+        if entry==nil then
+            plan.phase="assemble_recipe"
+        else
+            local item=entry.item
+            if entry.container==inventory then
+                if not inventory:contains(item) then return "failed","recipe_item_missing" end
+                plan.sourceIndex=plan.sourceIndex+1
+                return "working"
+            end
+            local valid=false
+            if entry.policy~=nil then
+                for _,policy in ipairs(KnoxBaseStorage.policies(base)) do
+                    if policy.key==entry.policy then
+                        local store=KnoxBaseStorage.resolvePolicy(policy)
+                        valid=store~=nil and store.container==entry.container
+                            and policyAllowsItem(policy,item,nil)
+                        break
+                    end
+                end
+            end
+            if not valid or not entry.container:contains(item) then
+                return "failed","recipe_source_changed"
+            end
+            if entry.square~=nil and not near(character,entry.square) then
+                return move(plan,entry.square,character,bridge,ticks,"collect_recipe")
+            end
+            return transfer(plan,character,entry.container,inventory,"collect_recipe",item)
+        end
+    end
+    if plan.phase=="assemble_recipe" then
+        local entry=plan.recipeSources[plan.ingredientIndex+1]
+        if entry==nil then
+            if preparedCount(plan.item)<2 then return "failed","recipe_not_a_meal" end
+            plan.phase="load"
+        else
+            local used=entry.item
+            if not inventory:contains(plan.item) or not inventory:contains(used) then
+                return "failed","recipe_item_missing"
+            end
+            local compatible=call(plan.recipe,"getItemsCanBeUse",nil,
+                character,plan.item,nil)
+            if compatible==nil or not compatible:contains(used) then
+                return "failed","recipe_ingredient_no_longer_usable"
+            end
+            local action=ISAddItemInRecipe:new(character,plan.recipe,plan.item,used)
+            if action==nil then return "failed","recipe_action_unavailable" end
+            -- Queue admission may complete synchronously; capture the old
+            -- ingredient count before the game's action can mutate the pan.
+            plan.recipeBeforeCount=preparedCount(plan.item)
+            local admitted=ISTimedActionQueue.add(action)
+            if admitted==nil or ISTimedActionQueue.queues==nil
+                or admitted~=ISTimedActionQueue.queues[character] then
+                return "failed","recipe_action_not_queued"
+            end
+            plan.action,plan.phase=action,"recipe_action"
+            return "working"
+        end
+    end
+    if plan.phase=="recipe_action" then
+        local result=plan.action~=nil and plan.action.baseItem or nil
+        if result==nil or not inventory:contains(result)
+            or preparedCount(result)<=plan.recipeBeforeCount
+            or not call(plan.recipe,"isResultItem",false,result) then
+            return "failed","recipe_action_no_result"
+        end
+        plan.item=result
+        owners[result]=plan
+        plan.claimedItems[#plan.claimedItems+1]=result
+        plan.ingredientIndex=plan.ingredientIndex+1
+        plan.action=nil
+        plan.phase="assemble_recipe"
+        return "working"
     end
     if plan.phase=="collect" then
         local actualSource
@@ -375,7 +643,7 @@ function Cooking.step(plan,character,base,bridge,ticks)
         if not inventory:contains(plan.item) then return "failed","cooking_ingredient_missing" end
         if not near(character,object:getSquare()) then return move(plan,object:getSquare(),character,bridge,ticks,"load") end
         if object:Activated() or not container:getItems():isEmpty() then return "failed","cooking_appliance_in_use" end
-        if not Cooking.canCook(plan.item) then return "failed","cooking_ingredient_changed" end
+        if not canHeat(plan) then return "failed","cooking_ingredient_changed" end
         local status,reason=transfer(plan,character,inventory,container,"heat")
         if status=="working" then
             object:getModData().KnoxCooking={baseId=base.id,itemId=tostring(plan.item:getID())}
@@ -389,7 +657,7 @@ function Cooking.step(plan,character,base,bridge,ticks)
             stopHeat(plan,character)
             return transfer(plan,character,container,inventory,"deposit")
         end
-        if not Cooking.canCook(plan.item) then return "failed","cooking_food_no_longer_suitable" end
+        if not canHeat(plan) then return "failed","cooking_food_no_longer_suitable" end
         character:faceThisObject(object)
         if not object:Activated() then
             local now=getGameTime():getWorldAgeHours()

@@ -218,7 +218,7 @@ local function relationContext(player, id)
     if npc == nil or npc == player or read(npc, "isDead", true) then return nil, "not_loaded" end
     local p, n = read(player, "getCurrentSquare", nil), read(npc, "getCurrentSquare", nil)
     if p == nil or n == nil or player:getZ() ~= npc:getZ()
-        or (player:getX() - npc:getX()) ^ 2 + (player:getY() - npc:getY()) ^ 2 > 9 then return nil, "too_far" end
+        or (player:getX() - npc:getX()) ^ 2 + (player:getY() - npc:getY()) ^ 2 > 16 then return nil, "too_far" end
     local affiliation = persistence.getSurvivorAffiliation(id) or {}
     if affiliation.kind == "player" then return nil, "player_owned" end
     if persistence.isSurvivorHostileToPlayer(id, playerId) then return nil, "hostile" end

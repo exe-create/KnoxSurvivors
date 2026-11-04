@@ -451,6 +451,14 @@ function Farming.traceAction(character, target, action, context)
     action.KnoxFarmingTraceAttached = true
     context = context or {}
     local lastPoll, observedPoll = {}, {}
+    -- The Java class object is not a Kahlua table, so `getClass():getName()`
+    -- threw "attempted index: getName of non-table" on every traced farm phase;
+    -- catching it still wrote a stack trace to console.txt each time. The traced
+    -- object's own text names the actor, so the class is never asked for.
+    local function actorClassName()
+        if character == nil then return nil end
+        return tostring(character)
+    end
     local function emit(phase, result)
         if not traceEnabled() then return end
         -- Diagnostics cannot change native admission, returns or errors.
@@ -469,7 +477,7 @@ function Farming.traceAction(character, target, action, context)
             KnoxDebugLog.log("jobs", id, "farm_native_" .. phase, {
                 task = context.taskId, base = context.baseId, kind = target.action,
                 action = value(action.Type), actionToken = tostring(action), result = value(result),
-                actorClass = value(safeCall(safeCall(character, "getClass"), "getName")),
+                actorClass = value(actorClassName()),
                 charX = value(safeCall(square, "getX")), charY = value(safeCall(square, "getY")),
                 charZ = value(safeCall(square, "getZ")),
                 tx = value(safeCall(target.square, "getX")), ty = value(safeCall(target.square, "getY")),

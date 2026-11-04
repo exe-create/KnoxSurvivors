@@ -282,6 +282,276 @@ local function targetNeedsBarricade(object, character)
     return barricade == nil or barricade:canAddPlank()
 end
 
+-- The entrance invariant reads native room identity from loaded squares. It
+-- does not build a room graph: a room's own squares and the wall objects next
+-- to them answer which openings serve that room. An unreadable room fails
+-- closed so a missing native reader cannot become permission to seal an exit.
+local KEEP_OPEN_KEY = "KnoxBarricadeKeepOpen"
+local MAX_ROOM_OPENINGS = 128
+
+function Barricades.isKeepOpen(object)
+    if object == nil or object.getModData == nil then return false end
+    local ok, data = pcall(function() return object:getModData() end)
+    return ok and type(data) == "table" and data[KEEP_OPEN_KEY] == true
+end
+
+function Barricades.setKeepOpen(object, keep)
+    if object == nil or object.getModData == nil then return false end
+    local ok, data = pcall(function() return object:getModData() end)
+    if not ok or type(data) ~= "table" then return false end
+    data[KEEP_OPEN_KEY] = keep == true or nil
+    return true
+end
+
+function Barricades.canKeepOpen(object)
+    return object ~= nil and (isDoor(object) or isBarricadeAble(object))
+end
+
+local function barricadePlanksOf(object, character)
+    if object == nil or object.getBarricadeForCharacter == nil then return nil end
+    local read, barricade = pcall(function()
+        return object:getBarricadeForCharacter(character)
+    end)
+    if not read then return nil end
+    if barricade == nil then return 0 end
+    if barricade.getNumPlanks == nil then return nil end
+    local counted, planks = pcall(function() return barricade:getNumPlanks() end)
+    if not counted then return nil end
+    return tonumber(planks) or 0
+end
+
+local function openingUsable(object, character)
+    if object == nil then return false end
+    if isOpen(object) then return true end
+    -- A plain door with no barricade API is still a usable door. A window
+    -- whose barricade state cannot be read is not proven usable.
+    if object.getBarricadeForCharacter == nil then return true end
+    return barricadePlanksOf(object, character) == 0
+end
+
+local OUTSIDE_STEPS = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } }
+
+-- A wall opening faces the street when a *loaded* neighbour of its own square
+-- has no room. An unloaded neighbour proves nothing, so it is never read as
+-- outside: the flag stays false and the finder keeps its scan order. This is
+-- the only place the side of an opening is decided.
+local function openingFacesOutside(square)
+    if square == nil or square.getX == nil or square.getY == nil
+        or square.getZ == nil then return false end
+    local cell = getCell ~= nil and getCell() or nil
+    if cell == nil or cell.getGridSquare == nil then return false end
+    local x, y, z = square:getX(), square:getY(), square:getZ()
+    for _, step in ipairs(OUTSIDE_STEPS) do
+        local ok, neighbour = pcall(function()
+            return cell:getGridSquare(x + step[1], y + step[2], z)
+        end)
+        if ok and neighbour ~= nil and neighbour.getRoom ~= nil then
+            local read, room = pcall(function() return neighbour:getRoom() end)
+            if read and room == nil then return true end
+        end
+    end
+    return false
+end
+
+Barricades.openingFacesOutside = openingFacesOutside
+
+-- Exterior links first: the face a raider reaches is boarded before an
+-- interior-to-interior opening. Pure ordering of the same work list, so the
+-- entrance invariant's budget and reservations are untouched.
+function Barricades.orderTargets(found, limit)
+    if type(found) ~= "table" then return found end
+    for index, target in ipairs(found) do
+        target.scanOrder = index
+    end
+    table.sort(found, function(first, second)
+        local firstOutside = first.exterior == true
+        local secondOutside = second.exterior == true
+        if firstOutside ~= secondOutside then return firstOutside end
+        return (first.scanOrder or 0) < (second.scanOrder or 0)
+    end)
+    local keep = tonumber(limit) or #found
+    while #found > keep do table.remove(found) end
+    for _, target in ipairs(found) do target.scanOrder = nil end
+    return found
+end
+
+local function roomKeyOf(room)
+    if room == nil then return nil end
+    if room.getRoomDef ~= nil then
+        local read, definition = pcall(function() return room:getRoomDef() end)
+        if read and definition ~= nil and definition.getID ~= nil then
+            local identified, id = pcall(function() return definition:getID() end)
+            if identified and id ~= nil then return "room:" .. tostring(id) end
+        end
+    end
+    return room
+end
+
+local function roomsServedBy(square)
+    local rooms, keys = {}, {}
+    if square == nil then return rooms, keys end
+    local cell = getCell ~= nil and getCell() or nil
+    local function add(candidate)
+        if candidate == nil or candidate.getRoom == nil then return end
+        local read, room = pcall(function() return candidate:getRoom() end)
+        if not read or room == nil then return end
+        local key = roomKeyOf(room)
+        if key ~= nil and keys[key] == nil then
+            keys[key] = true
+            rooms[#rooms + 1] = room
+        end
+    end
+    add(square)
+    if cell ~= nil and square.getX ~= nil and square.getY ~= nil
+        and square.getZ ~= nil then
+        local read, x, y, z = pcall(function()
+            return square:getX(), square:getY(), square:getZ()
+        end)
+        if read then
+            for _, offset in ipairs({ { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } }) do
+                local found, neighbor = pcall(function()
+                    return cell:getGridSquare(x + offset[1], y + offset[2], z)
+                end)
+                if found then add(neighbor) end
+            end
+        end
+    end
+    return rooms, keys
+end
+
+local function roomAudit(room, character, cache)
+    local key = roomKeyOf(room)
+    if cache ~= nil and key ~= nil and cache[key] ~= nil then
+        return cache[key], nil
+    end
+    if room == nil or room.getSquares == nil then
+        return nil, "entrance_unverified"
+    end
+    local listed, squares = pcall(function() return room:getSquares() end)
+    if not listed or squares == nil or squares.size == nil or squares.get == nil then
+        return nil, "entrance_unverified"
+    end
+    local counted, size = pcall(function() return squares:size() end)
+    if not counted or tonumber(size) == nil then return nil, "entrance_unverified" end
+    local result = { usableCount = 0, usable = {}, openings = {},
+        noWayOut = false, overflow = false }
+    local seen = {}
+    local cell = getCell ~= nil and getCell() or nil
+    local function consider(openingSquare)
+        if openingSquare == nil or openingSquare.getObjects == nil then return end
+        local objects = openingSquare:getObjects()
+        if objects == nil or objects.size == nil or objects.get == nil then return end
+        local sized, count = pcall(function() return objects:size() end)
+        if not sized or tonumber(count) == nil then return end
+        for index = 0, count - 1 do
+            local object = objects:get(index)
+            if object ~= nil and seen[object] == nil
+                and (isDoor(object) or isBarricadeAble(object)) then
+                seen[object] = true
+                if #result.openings >= MAX_ROOM_OPENINGS then
+                    result.overflow = true
+                    return
+                end
+                result.openings[#result.openings + 1] = object
+                if openingUsable(object, character) then
+                    result.usableCount = result.usableCount + 1
+                    result.usable[object] = true
+                end
+            end
+        end
+    end
+    for index = 0, size - 1 do
+        local roomSquare = squares:get(index)
+        if roomSquare ~= nil then
+            consider(roomSquare)
+            if cell ~= nil and roomSquare.getX ~= nil and roomSquare.getY ~= nil
+                and roomSquare.getZ ~= nil then
+                local read, x, y, z = pcall(function()
+                    return roomSquare:getX(), roomSquare:getY(), roomSquare:getZ()
+                end)
+                if read then
+                    for _, offset in ipairs({ { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } }) do
+                        local found, neighbor = pcall(function()
+                            return cell:getGridSquare(x + offset[1], y + offset[2], z)
+                        end)
+                        if found then consider(neighbor) end
+                    end
+                end
+            end
+        end
+    end
+    if result.overflow then return nil, "room_audit_too_large" end
+    result.noWayOut = result.usableCount == 0
+    if cache ~= nil and key ~= nil then cache[key] = result end
+    return result, nil
+end
+
+-- A candidate opening is reserved when it is the only usable opening of any
+-- native room it serves, when that room already has no usable opening, or when
+-- the player marked it to stay clear. Upper-floor windows are exempt from the
+-- ground-floor audit, matching the design's stair/balcony rule.
+function Barricades.entranceReserved(base, object, square, character, cache)
+    if object == nil or square == nil then return false, "entrance_unverified", nil, false end
+    if Barricades.isKeepOpen(object) then return true, "keep_open", nil, true end
+    local groundZ = tonumber(base ~= nil and base.home ~= nil and base.home.z or 0) or 0
+    local squareZ = nil
+    if square.getZ ~= nil then
+        local read, value = pcall(function() return square:getZ() end)
+        if read then squareZ = tonumber(value) end
+    end
+    if squareZ ~= nil and squareZ ~= groundZ then return false, nil, nil, false end
+    local rooms = roomsServedBy(square)
+    if #rooms == 0 then return false, "entrance_unverified", nil, false end
+    local budget, candidateUsable = nil, false
+    for _, room in ipairs(rooms) do
+        local audit, reason = roomAudit(room, character, cache)
+        if audit == nil then return false, reason or "entrance_unverified", nil, false end
+        if budget == nil or audit.usableCount < budget then budget = audit.usableCount end
+        if audit.usable[object] == true then candidateUsable = true end
+        if audit.noWayOut then return true, "no_way_out", 0, false end
+        if audit.usable[object] == true and audit.usableCount <= 1 then
+            return true, "only_usable_exit", audit.usableCount, true
+        end
+    end
+    return false, nil, budget, candidateUsable
+end
+
+function Barricades.pendingWorkRooms(base)
+    local pending = {}
+    if base == nil or type(base.tasks) ~= "table" then return pending end
+    local cell = getCell ~= nil and getCell() or nil
+    if cell == nil then return pending end
+    for _, task in pairs(base.tasks) do
+        if task ~= nil and task.type == "barricade"
+            and (task.state == "queued" or task.state == "claimed") then
+            local target = task.target
+            if target ~= nil then
+                local targetSquare = cell:getGridSquare(
+                    tonumber(target.x) or 0, tonumber(target.y) or 0,
+                    tonumber(target.z) or 0)
+                if targetSquare ~= nil then
+                    local _, keys = roomsServedBy(targetSquare)
+                    for key in pairs(keys) do pending[key] = true end
+                end
+            end
+        end
+    end
+    return pending
+end
+
+-- A window with planks already on it is the work in progress, so it is
+-- finished before an untouched one is started. Reading the barricade is the
+-- same native query the completion check uses.
+local function planksOn(object, character)
+    if object == nil or object.getBarricadeForCharacter == nil then return 0 end
+    local ok, barricade = pcall(function()
+        return object:getBarricadeForCharacter(character)
+    end)
+    if not ok or barricade == nil or barricade.getNumPlanks == nil then return 0 end
+    local counted, planks = pcall(function() return barricade:getNumPlanks() end)
+    return counted and tonumber(planks) or 0
+end
+
 function Barricades.findTarget(base, character, eligible)
     local territory = base ~= nil and (base.territory or base.home) or nil
     local cell = getCell ~= nil and getCell() or nil
@@ -299,6 +569,10 @@ function Barricades.findTarget(base, character, eligible)
     maxX = math.min(maxX, minX + 96)
     maxY = math.min(maxY, minY + 96)
     local startZ = tonumber((base.home or {}).z) or 0
+    local pendingRooms = Barricades.pendingWorkRooms(base)
+    local auditCache = {}
+    local lastReason = nil
+    local pending = nil
     for z = startZ, startZ + 3 do
         for x = minX, maxX do
             for y = minY, maxY do
@@ -311,15 +585,41 @@ function Barricades.findTarget(base, character, eligible)
                         -- free preserves a stable route for residents, supply
                         -- runs, corpse carriers, and the player.
                         if not isDoor(object) and targetNeedsBarricade(object, character) then
-                            local target = targetFromObject(base, object, square)
-                            if eligible == nil or eligible(target) then return target, "found" end
+                            local _, roomKeys = roomsServedBy(square)
+                            local busy = false
+                            for key in pairs(roomKeys) do
+                                if pendingRooms[key] then busy = true; break end
+                            end
+                            if busy then
+                                lastReason = "barricade_room_busy"
+                            else
+                                local reserved, why = Barricades.entranceReserved(
+                                    base, object, square, character, auditCache)
+                                if reserved then
+                                    lastReason = why or "only_usable_exit"
+                                elseif why ~= nil then
+                                    lastReason = why
+                                else
+                                    local target = targetFromObject(base, object, square)
+                                    if eligible == nil or eligible(target) then
+                                        -- Finish a started window before opening
+                                        -- another: one board on each of six
+                                        -- windows is worse than two finished.
+                                        if planksOn(object, character) > 0 then
+                                            return target, "found"
+                                        end
+                                        if pending == nil then pending = target end
+                                    end
+                                end
+                            end
                         end
                     end
                 end
             end
         end
     end
-    return nil, "no_unbarricaded_window"
+    if pending ~= nil then return pending, "found" end
+    return nil, lastReason or "no_unbarricaded_window"
 end
 
 local function buildingKeyOf(square)
@@ -370,6 +670,9 @@ function Barricades.findTargetsInBuilding(base, building, character, limit)
     maxY = math.min(maxY, minY + 96)
     local startZ = tonumber((base.home or {}).z) or 0
     local maxTargets = math.max(1, tonumber(limit) or 24)
+    local pendingRooms = Barricades.pendingWorkRooms(base)
+    local plannedCounts, auditCache = {}, {}
+    local blockedReason = nil
     for z = startZ, startZ + 3 do
         for x = minX, maxX do
             for y = minY, maxY do
@@ -381,9 +684,40 @@ function Barricades.findTargetsInBuilding(base, building, character, limit)
                         local object = objects:get(index)
                         if targetNeedsBarricade(object, character)
                             and not isDoor(object) then
-                            found[#found + 1] = targetFromObject(base, object, square)
-                            if #found >= maxTargets then
-                                return found, "found"
+                            local _, roomKeys = roomsServedBy(square)
+                            local busy = false
+                            for key in pairs(roomKeys) do
+                                if pendingRooms[key] then
+                                    busy = true; blockedReason = "barricade_room_busy"; break
+                                end
+                            end
+                            if not busy then
+                                local reserved, why, budget, candidateUsable = Barricades.entranceReserved(
+                                    base, object, square, character, auditCache)
+                                if reserved then
+                                    blockedReason = why or "only_usable_exit"
+                                elseif why ~= nil then
+                                    blockedReason = why
+                                else
+                                    local allowed = true
+                                    if candidateUsable and budget ~= nil then
+                                        for key in pairs(roomKeys) do
+                                            if (plannedCounts[key] or 0) >= budget - 1 then
+                                                allowed = false
+                                                blockedReason = "barricade_room_busy"
+                                                break
+                                            end
+                                        end
+                                    end
+                                    if allowed then
+                                        local target = targetFromObject(base, object, square)
+                                        target.exterior = openingFacesOutside(square)
+                                        found[#found + 1] = target
+                                        for key in pairs(roomKeys) do
+                                            plannedCounts[key] = (plannedCounts[key] or 0) + 1
+                                        end
+                                    end
+                                end
                             end
                         end
                     end
@@ -391,7 +725,8 @@ function Barricades.findTargetsInBuilding(base, building, character, limit)
             end
         end
     end
-    return found, #found > 0 and "found" or "no_unbarricaded_window"
+    Barricades.orderTargets(found, maxTargets)
+    return found, #found > 0 and "found" or (blockedReason or "no_unbarricaded_window")
 end
 
 local function spriteNameOf(object)
@@ -448,7 +783,13 @@ function Barricades.resolveTarget(base, target, character)
         return nil, "target_unloaded"
     end
     local object = resolvedObject(square, target, character, true)
-    if object ~= nil then return { object = object, square = square }, "resolved" end
+    if object ~= nil then
+        local reserved, why = Barricades.entranceReserved(
+            base, object, square, character, nil)
+        if reserved then return nil, why or "only_usable_exit" end
+        if why ~= nil then return nil, why end
+        return { object = object, square = square }, "resolved"
+    end
     return nil, "target_no_longer_valid"
 end
 
@@ -530,6 +871,23 @@ function Barricades.queueAction(character, target, base)
     if character == nil or target == nil or target.object == nil then
         diag("missing_target", nil)
         return nil, "missing_barricade_target"
+    end
+    local square = nil
+    if target.object.getSquare ~= nil then
+        local read, value = pcall(function() return target.object:getSquare() end)
+        if read then square = value end
+    end
+    if square == nil and getCell ~= nil and getCell() ~= nil then
+        square = getCell():getGridSquare(tonumber(target.x) or 0,
+            tonumber(target.y) or 0, tonumber(target.z) or 0)
+    end
+    if square ~= nil then
+        local reserved, why = Barricades.entranceReserved(
+            base, target.object, square, character, nil)
+        if reserved or why ~= nil then
+            diag("entrance_reserved", { reason = why or "only_usable_exit" })
+            return nil, why or "only_usable_exit"
+        end
     end
     if not Barricades.canPrepare(character, base) then
         diag("missing_materials", nil)

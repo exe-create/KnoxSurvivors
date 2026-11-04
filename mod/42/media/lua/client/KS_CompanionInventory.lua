@@ -11,6 +11,7 @@ require "TimedActions/ISClothingExtraAction"
 require "TimedActions/ISWearClothing"
 require "KS_SurvivorRuntime"
 require "KS_Persistence"
+local UILayout = require "KS_SurvivorUILayout"
 
 local CompanionInventory = rawget(_G, "KnoxCompanionInventory") or {}
 _G.KnoxCompanionInventory = CompanionInventory
@@ -24,6 +25,17 @@ local MAX_DISTANCE_SQUARED = 16
 -- dirtyUI / direction change because it is not a world container.
 local active = CompanionInventory._active or {}
 CompanionInventory._active = active
+local attention = CompanionInventory._attention or {}
+CompanionInventory._attention = attention
+
+local function releaseAttention(playerNum)
+    local held = attention[playerNum]
+    attention[playerNum] = nil
+    if held ~= nil and KnoxSurvivorRuntime.getController(held.id) == held.owner
+        and held.owner.playerConversation == held.lease then
+        KnoxSurvivorRuntime.endPlayerConversation(held.id, held.player)
+    end
+end
 
 local function nearby(player, character)
     if player == nil or character == nil or player:getCurrentSquare() == nil
@@ -63,7 +75,40 @@ function CompanionInventory.canManage(playerNum, survivorId, expectedBody)
         return false, "not_your_survivor"
     end
     if not nearby(player, character) then return false, "too_far_away" end
+    local held = attention[playerNum]
+    if expectedBody ~= nil and held ~= nil and (held.id ~= survivorId
+        or KnoxSurvivorRuntime.getController(survivorId) ~= held.owner
+        or held.owner.playerConversation ~= held.lease
+        or held.owner.state ~= "PLAYER_CONVERSATION") then return false, "interaction_ended" end
     return true, nil, character
+end
+
+-- Why managing a survivor's pack was refused, in the player's words. The
+-- shared order vocabulary owns the sentences, so the context menu, the Viewpoint
+-- action, the interaction panel and the Crew tab cannot describe one refusal
+-- three different ways.
+function CompanionInventory.refusalText(reason)
+    local code = tostring(reason or "")
+    local catalog = rawget(_G, "KnoxOrderCatalog")
+    if catalog ~= nil and catalog.failureText ~= nil then
+        return catalog.failureText(code)
+    end
+    return "That pack cannot be opened: "
+        .. (code ~= "" and code:gsub("_", " ") or "unknown reason") .. "."
+end
+
+-- One request path for every surface that can open a pack. A refusal is
+-- reported with the shared sentence instead of being a silent false return, and
+-- the caller still gets the real reason so it can keep its own attention and
+-- window state correct.
+function CompanionInventory.request(playerNum, survivorId)
+    local accepted, reason = CompanionInventory.show(playerNum, survivorId)
+    if accepted then return true, "vanilla_loot_window" end
+    local feed = rawget(_G, "KnoxActivityFeed")
+    if feed ~= nil and feed.event ~= nil then
+        feed.event(CompanionInventory.refusalText(reason))
+    end
+    return false, reason
 end
 
 -- Resolve through native container ownership and the existing runtime identity
@@ -223,6 +268,46 @@ local function isSurvivorContainer(playerNum, container)
     return false, nil, nil
 end
 
+-- The equipped dot is drawn by vanilla in ISInventoryPane:renderdetails from
+-- `player:isEquipped(item)`, where player is getSpecificPlayer(self.player).
+-- The refresh masquerade below only covers refreshContainer, so a survivor pane
+-- rendered with the real player produced no dot at all. Redirect the same three
+-- globals for the duration of the detail pass, and only for a survivor pane.
+if ISInventoryPane ~= nil and ISInventoryPane.renderdetails ~= nil then
+    if CompanionInventory._origRenderDetails == nil then
+        CompanionInventory._origRenderDetails = ISInventoryPane.renderdetails
+    end
+    local origRenderDetails = CompanionInventory._origRenderDetails
+    ISInventoryPane.renderdetails = function(self, doDragged)
+        local playerNum = self.player
+        local survivorId = active[playerNum]
+        if type(survivorId) ~= "string" or survivorId == "" or self.inventory == nil then
+            return origRenderDetails(self, doDragged)
+        end
+        local character = self.knoxSurvivorCharacter
+        if character == nil or self.knoxSurvivorContainer ~= self.inventory then
+            return origRenderDetails(self, doDragged)
+        end
+        local savedGetSpecificPlayer = rawget(_G, "getSpecificPlayer")
+        local savedGetPlayerHotbar = rawget(_G, "getPlayerHotbar")
+        _G.getSpecificPlayer = function(p)
+            if p == playerNum then return character end
+            if savedGetSpecificPlayer ~= nil then return savedGetSpecificPlayer(p) end
+            return nil
+        end
+        _G.getPlayerHotbar = function(p)
+            if p == playerNum then return nil end
+            if savedGetPlayerHotbar ~= nil then return savedGetPlayerHotbar(p) end
+            return nil
+        end
+        local ok, result = pcall(origRenderDetails, self, doDragged)
+        _G.getSpecificPlayer = savedGetSpecificPlayer
+        _G.getPlayerHotbar = savedGetPlayerHotbar
+        if ok then return result end
+        error(result, 0)
+    end
+end
+
 -- Render the survivor's inventory with the same equipped/worn line + red dot
 -- that vanilla player inventory uses. Loot panes are normally onCharacter=false
 -- and never set isEquipped, so the divider and icons are skipped. Temporarily
@@ -256,6 +341,16 @@ if ISInventoryPane ~= nil and ISInventoryPane.refreshContainer ~= nil then
             local ok, flag = pcall(function() return isSurvivorContainer(playerNum, self.inventory) end)
             if ok and flag then isSurvivorPane = true end
         end
+        -- Stamp the decision once per refresh. The render pass runs every frame
+        -- and used to re-walk every item (with a pcall each) just to conclude
+        -- that this pane is not a survivor's. The stamp costs one comparison.
+        if isSurvivorPane then
+            self.knoxSurvivorCharacter = character
+            self.knoxSurvivorContainer = self.inventory
+        else
+            self.knoxSurvivorCharacter = nil
+            self.knoxSurvivorContainer = nil
+        end
         if isSurvivorPane and self.parent ~= nil then
             local savedOnCharacter = self.parent.onCharacter
             local savedGetSpecificPlayer = rawget(_G, "getSpecificPlayer")
@@ -287,6 +382,12 @@ end
 -- getPlayerInventory(survivor:getPlayerNum()).inventoryPane on a non-local
 -- player (-1). Wrap it once so any createMenu (including our survivor-
 -- redirected one) falls back to the survivor's own ItemContainer.
+-- pcall with a function reference instead of a fresh closure per item: building
+-- the bag list walks every carried item on each menu open, and a closure per item
+-- is allocation with no extra safety. Failures stay isolated per item.
+local function knoxItemCategory(item) return item:getCategory() end
+local function knoxItemEquipped(character, item) return character:isEquipped(item) end
+
 if ISInventoryPaneContextMenu ~= nil and ISInventoryPaneContextMenu.getContainers ~= nil then
     if CompanionInventory._origGetContainers == nil then
         CompanionInventory._origGetContainers = ISInventoryPaneContextMenu.getContainers
@@ -315,9 +416,9 @@ if ISInventoryPaneContextMenu ~= nil and ISInventoryPaneContextMenu.getContainer
                     local item = items:get(i)
                     local bInv = item ~= nil and item.getInventory ~= nil and item:getInventory() or nil
                     if bInv ~= nil then
-                        local ok4, cat = pcall(function() return item:getCategory() end)
+                        local ok4, cat = pcall(knoxItemCategory, item)
                         local show = false
-                        local ok5, eq = pcall(function() return character:isEquipped(item) end)
+                        local ok5, eq = pcall(knoxItemEquipped, character, item)
                         if ok5 and eq then show = true end
                         if not show and ok4 and cat == "Container" then show = true end
                         if show then fallback:add(bInv) end
@@ -788,6 +889,28 @@ function CompanionInventory.show(playerNum, survivorId)
         return false, "inventory_ui_unavailable"
     end
 
+    local held = attention[playerNum]
+    if active[playerNum] == survivorId and exposedBodies[playerNum] == character
+        and held ~= nil and KnoxSurvivorRuntime.getController(survivorId) == held.owner
+        and held.owner.playerConversation == held.lease then
+        setVisiblePage(playerInv, true)
+        setVisiblePage(loot, true)
+        return true, "vanilla_loot_window"
+    end
+    if active[playerNum] ~= nil then CompanionInventory.finish(playerNum)
+    else releaseAttention(playerNum) end
+    local previousOwner = KnoxSurvivorRuntime.getController(survivorId)
+    if previousOwner ~= nil and previousOwner.playerConversation ~= nil
+        and previousOwner.playerConversation.player == localPlayerFor(playerNum) then
+        KnoxSurvivorRuntime.endPlayerConversation(survivorId, localPlayerFor(playerNum))
+    end
+    local paused, pauseReason = KnoxSurvivorRuntime.beginPlayerConversation(survivorId, localPlayerFor(playerNum))
+    if not paused then return false, pauseReason end
+    local owner = KnoxSurvivorRuntime.getController(survivorId)
+    if owner == nil or owner.playerConversation == nil then return false, "survivor_unavailable" end
+    attention[playerNum] = { id=survivorId, player=localPlayerFor(playerNum),
+        owner=owner, lease=owner.playerConversation }
+
     active[playerNum] = survivorId
     exposedBodies[playerNum] = character
     knownBodies[character] = survivorId
@@ -813,11 +936,13 @@ function CompanionInventory.show(playerNum, survivorId)
 end
 
 function CompanionInventory.clear(playerNum)
+    releaseAttention(playerNum)
     if active ~= nil then active[playerNum] = nil end
     exposedBodies[playerNum] = nil
 end
 
 function CompanionInventory.finish(playerNum)
+    releaseAttention(playerNum)
     local sid = active[playerNum]
     if active ~= nil then active[playerNum] = nil end
     exposedBodies[playerNum] = nil
@@ -834,5 +959,39 @@ function CompanionInventory.finish(playerNum)
     end
     inventoryLog("finish", sid or tostring(playerNum), { getFullType = function() return "finish" end }, playerNum)
 end
+
+local nextAttentionCheck = 0
+function CompanionInventory.updateAttention()
+    local now = getTimestampMs()
+    if now < nextAttentionCheck then return end
+    nextAttentionCheck = now + 500
+    for playerNum, held in pairs(attention) do
+        local loot = getPlayerLoot(playerNum)
+        local pane = loot ~= nil and loot.inventoryPane or nil
+        local showing = loot ~= nil and loot:isVisible() and pane ~= nil
+            and isSurvivorContainer(playerNum, pane.inventory)
+        local keep, reason = false, nil
+        if showing then
+            -- The pack shares the person-surface close rule: a replaced body,
+            -- death, hostility, lost sight or walking away ends it. Ownership,
+            -- reach and the held conversation lease stay canManage's question.
+            keep, reason = UILayout.personSurfaceState(held.player, held.id, {
+                body = exposedBodies[playerNum], controller = held.owner, lease = held.lease,
+                state = held, maximumDistanceSquared = MAX_DISTANCE_SQUARED,
+            })
+            if keep and not CompanionInventory.canManage(playerNum, held.id, exposedBodies[playerNum]) then
+                keep, reason = false, "survivor_unavailable"
+            end
+            if keep and not KnoxSurvivorRuntime.beginPlayerConversation(held.id, held.player) then
+                keep, reason = false, "survivor_unavailable"
+            end
+        end
+        if not keep then
+            if reason ~= nil then UILayout.noticePersonSurfaceClose(reason) end
+            CompanionInventory.finish(playerNum)
+        end
+    end
+end
+if Events ~= nil and Events.OnTick ~= nil then Events.OnTick.Add(CompanionInventory.updateAttention) end
 
 return CompanionInventory

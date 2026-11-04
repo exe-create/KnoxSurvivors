@@ -151,6 +151,24 @@ local function assessBuilding(origin, building, inspectedSquare)
     }
 end
 
+-- A household settles the building its people were born in, a police roster
+-- its station, a military roster its facility. Those are the same building the
+-- leader's own origin records, so the preference needs no new storage and
+-- grants no claim: the building still has to be loaded, unclaimed, suitable and
+-- reachable before it can become a home.
+local function outranks(candidate, best)
+    if best == nil then return true end
+    if candidate.homePreferred ~= best.homePreferred then
+        return candidate.homePreferred == true
+    end
+    if candidate.facilityPreferred ~= best.facilityPreferred then
+        return candidate.facilityPreferred == true
+    end
+    if candidate.score ~= best.score then return candidate.score > best.score end
+    if candidate.distance ~= best.distance then return candidate.distance < best.distance end
+    return candidate.buildingId < best.buildingId
+end
+
 function BaseScouting.findBestCandidate(character, factionId, worldAgeHours)
     local origin = character ~= nil and character:getCurrentSquare() or nil
     local cell = origin ~= nil and getCell() or nil
@@ -165,6 +183,15 @@ function BaseScouting.findBestCandidate(character, factionId, worldAgeHours)
     local background = faction ~= nil and faction.background or nil
     local preferredContext = (background == "law_enforcement" or background == "fire_service"
         or background == "military") and background or nil
+    local birthBuildingId = nil
+    if faction ~= nil and faction.leaderId ~= nil
+        and KnoxPersistence.getSurvivorOrigin ~= nil then
+        local leaderOrigin = KnoxPersistence.getSurvivorOrigin(faction.leaderId)
+        if type(leaderOrigin) == "table"
+            and type(leaderOrigin.buildingId) == "string" then
+            birthBuildingId = leaderOrigin.buildingId
+        end
+    end
     local seen = {}
     for _, radius in ipairs(SCAN_RADII) do
         for dx = -radius, radius do
@@ -186,6 +213,8 @@ function BaseScouting.findBestCandidate(character, factionId, worldAgeHours)
                         local candidate = assessBuilding(origin, building, square)
                         if candidate ~= nil then
                             candidate.facilityPreferred = false
+                            candidate.homePreferred = birthBuildingId ~= nil
+                                and candidate.buildingId == birthBuildingId
                             if preferredContext ~= nil then
                                 local ok, context = pcall(function()
                                     local names, rooms = {}, building:getDef():getRooms()
@@ -201,14 +230,7 @@ function BaseScouting.findBestCandidate(character, factionId, worldAgeHours)
                                 candidate.buildingId,
                                 worldAgeHours
                             )
-                            and (best == nil
-                                or (candidate.facilityPreferred and not best.facilityPreferred)
-                                or (candidate.facilityPreferred == best.facilityPreferred
-                                    and (candidate.score > best.score
-                                or (candidate.score == best.score
-                                    and (candidate.distance < best.distance
-                                        or (candidate.distance == best.distance
-                                            and candidate.buildingId < best.buildingId)))))) then
+                            and outranks(candidate, best) then
                             best = candidate
                         end
                     end

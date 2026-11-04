@@ -258,9 +258,13 @@ local function decideEncounterOutcome(firstId, secondId, record)
         return "hostile"
     end
     local socialRoll = roll - (KnoxSettings.allowHostileEncounters() and hostileChance or 0)
+    -- Deception is what a person is willing to pretend. One deceptive member is
+    -- enough to turn a meeting into an ambush, so the pair's chance comes from
+    -- the stored trait rather than from a personality name, and a service
+    -- contact never rolls for it at all.
     local lureChance = not serviceContact
-        and (firstPersonality == "opportunist" or secondPersonality == "opportunist")
-        and 10 or 0
+        and KnoxPersistence.deceptionLureChance ~= nil
+        and KnoxPersistence.deceptionLureChance(firstId, secondId) or 0
     if lureChance > 0 and socialRoll < lureChance then
         return "lure"
     end
@@ -839,6 +843,12 @@ local function assignGroupLeaders(controllers, orderedIds, ticks, forceReadOnly)
                 controller:setGroupObjective(objective, forceReadOnly)
                 if controller.setGroupLeaderOrder ~= nil then
                     controller:setGroupLeaderOrder(leaderOrder)
+                end
+                -- The leader answers for the group. After real losses it says
+                -- so through the same order record the members already read;
+                -- no movement or combat decision is made here.
+                if not forceReadOnly and controller.considerGroupWithdrawal ~= nil then
+                    pcall(controller.considerGroupWithdrawal, controller)
                 end
             else
                 controller:clearGroupLeader()

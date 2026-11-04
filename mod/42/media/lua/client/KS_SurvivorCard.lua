@@ -29,14 +29,22 @@ local WINDOW_HEIGHT = 540
 local PADDING = 10
 local SECTION_GAP = 8
 
-local COL_BG      = { 0.06, 0.06, 0.06 }
-local COL_BORDER  = { 0.28, 0.28, 0.28 }
-local COL_SEC_BG  = { 0.10, 0.10, 0.10 }
-local COL_SEC_HDR = { 0.70, 0.70, 0.68 }
-local COL_LABEL   = { 0.62, 0.62, 0.60 }
-local COL_VALUE   = { 0.88, 0.88, 0.85 }
-local COL_DIM     = { 0.52, 0.52, 0.50 }
-local COL_ACCENT  = { 0.48, 0.56, 0.38 }
+-- One material: the card reads the same charcoal/bone palette as the party
+-- strip, notice rail and crosshair prompt instead of carrying a second grey
+-- system of its own. Meaning-bearing colour (hostility, trust) still comes
+-- from the reputation view; these are the neutrals around it.
+if type(UILayout) ~= "table" then
+    UILayout = rawget(_G, "KnoxSurvivorUILayout") or {}
+end
+local THEME = type(UILayout.theme) == "table" and UILayout.theme or {}
+local COL_BG      = THEME.charcoal
+local COL_BORDER  = THEME.border
+local COL_SEC_BG  = { COL_BG[1] + 0.024, COL_BG[2] + 0.023, COL_BG[3] + 0.021 }
+local COL_SEC_HDR = THEME.muted
+local COL_LABEL   = THEME.label
+local COL_VALUE   = THEME.bone
+local COL_DIM     = THEME.dim
+local COL_ACCENT  = THEME.green
 
 -- Vanilla ISScrollBar is 17 wide. Custom-drawn scrollers always reserve it
 -- so right-aligned values never slide under the bar when it appears, and
@@ -57,17 +65,19 @@ local function clamp(value, minimum, maximum)
     return math.max(minimum, math.min(maximum, value))
 end
 
+-- Meaning-bearing colour only: red is hostile, amber is uneasy, bone is
+-- neutral, and the one Knox accent marks earned trust. The value comes from
+-- KS_ReputationView, so the band and the colour cannot disagree.
+local function standingTone(tone)
+    if tone == "hostile" then return { 0.86, 0.34, 0.30 } end
+    if tone == "friendly" then return COL_ACCENT end
+    if tone == "cautious" then return { 0.84, 0.76, 0.52 } end
+    if tone == "wary" or tone == "neutral" then return { 0.70, 0.68, 0.62 } end
+    return COL_VALUE
+end
+
 local function trimText(font, text, maximumWidth)
-    local value = tostring(text or "")
-    if getTextManager():MeasureStringX(font, value) <= maximumWidth then
-        return value
-    end
-    local suffix = "..."
-    while #value > 1
-        and getTextManager():MeasureStringX(font, value .. suffix) > maximumWidth do
-        value = string.sub(value, 1, #value - 1)
-    end
-    return value .. suffix
+    return UILayout.fitText(font, text, maximumWidth)
 end
 
 local function dayLabel(value)
@@ -227,6 +237,14 @@ function KnoxPanel:prerender()
     end
     if self.medicalButton ~= nil then
         self.medicalButton:setEnable(survivorLoaded)
+        -- The button keeps its one native handler; only its name follows the
+        -- condition the card already shows, so a bleed is not a hidden second
+        -- click target or a promised treatment.
+        local label = snapshot.medicalActionLabel or "Medical Check"
+        if self.medicalButton.knoxLabel ~= label then
+            self.medicalButton.knoxLabel = label
+            self.medicalButton:setTitle(label)
+        end
         local tooltip = not survivorLoaded
             and "A medical check is available when this survivor is nearby." or nil
         if self.medicalButton.tooltip ~= tooltip then self.medicalButton:setTooltip(tooltip) end
@@ -293,7 +311,26 @@ function KnoxPanel:prerender()
     end
     keyValue("Purpose", snapshot.lifeIntent ~= nil and snapshot.lifeIntent.label or nil)
     keyValue("Location", snapshot.locationLabel)
-    keyValue("Order", snapshot.orderLabel)
+    -- Only a dead survivor carries this, and only when the body or the ledger
+    -- named a cause. A living card spends no row on it: `keyValue` renders a
+    -- nil as "Unknown", so the guard is what keeps the row absent.
+    if snapshot.deathCauseLabel ~= nil then
+        keyValue("Died", snapshot.deathCauseLabel)
+    end
+    keyValue("Order", snapshot.orderDisplayLabel or snapshot.orderLabel)
+    -- The card is often the only place a held weapon is named; a broken one
+    -- says so here instead of waiting for the inventory to be opened. An
+    -- unloaded body spends no row on "Equipment unavailable".
+    if snapshot.loaded == true and snapshot.weaponName ~= nil
+        and snapshot.weaponName ~= "" then
+        keyValue("Weapon", snapshot.weaponName)
+        -- Rounds are only known for a live body's ranged weapon. The engine's
+        -- own count names the magazine; a chambered round is one more shot.
+        if snapshot.ammoName ~= nil and snapshot.ammoName ~= "" then
+            local empty = snapshot.ammoName == "Empty"
+            keyValue("Ammo", snapshot.ammoName, empty and { 0.86, 0.34, 0.30 } or nil)
+        end
+    end
     local status = snapshot.activity or "Idle"
     if snapshot.distanceTiles ~= nil then
         status = status .. " (" .. tostring(math.floor(snapshot.distanceTiles + 0.5)) .. " tiles)"
@@ -308,6 +345,17 @@ function KnoxPanel:prerender()
     sectionHeader("Condition")
     if snapshot.knowledge ~= nil and snapshot.knowledge.reportAtHours ~= nil then
         keyValue("Values", "Last self-report; current condition unknown")
+    end
+    -- A bite is the condition that changes the whole plan, so it gets its own
+    -- row above the bleed. The word comes from the same engine flag the Needs
+    -- line reads; a clean or unreadable body spends no row.
+    if snapshot.infectionLabel ~= nil then
+        keyValue("Infection", snapshot.infectionLabel, { 0.86, 0.34, 0.30 })
+    end
+    -- A bleed is a count, not a bar. The word comes from the view model's own
+    -- projection, so the card and the Needs line cannot disagree about it.
+    if snapshot.bleedingLabel ~= nil then
+        keyValue("Bleeding", snapshot.bleedingLabel, { 0.86, 0.34, 0.30 })
     end
     do
         local vitals = snapshot.vitals or {}
@@ -341,14 +389,102 @@ function KnoxPanel:prerender()
         needBar("Water", needs.water, false)
         needBar("Sleep", needs.sleep ~= nil and needs.sleep or needs.rest, false)
         needBar("Endurance", needs.endurance, false)
+        -- Pain is the one bar where more is worse; the needs above are reserves.
+        needBar("Pain", vitals.pain, true)
     end
     y = y + 4
     sectionHeader("Relationship")
-    keyValue("Faction", snapshot.factionName or "None")
-    local trustLabel = snapshot.trustLabel or "Unknown"
-    local trustCol = trustLabel == "Trusting" and COL_ACCENT
-        or (trustLabel == "Cautious" and COL_VALUE or COL_DIM)
-    keyValue("Trust", trustLabel, trustCol)
+    local function standingRow(title, value, tone)
+        local col = standingTone(tone)
+        self:drawText(tostring(title), PADDING, y,
+            COL_LABEL[1], COL_LABEL[2], COL_LABEL[3], 1, UIFont.Small)
+        self:drawTextRight(trimText(UIFont.Small, tostring(value or "Unknown"),
+            math.max(20, w - 100)), PADDING + w, y,
+            col[1], col[2], col[3], 1, UIFont.Small)
+        y = y + smallH + 2
+        return col
+    end
+    local function standingBar(fill, col, signedBar)
+        local barW = math.max(20, w - 4)
+        local fraction = clamp(tonumber(fill) or 0, 0, 1)
+        self:drawRect(PADDING, y, barW, 7, 0.45, 0.02, 0.02, 0.02)
+        if signedBar then
+            -- A signed faction bar needs a zero tick, or a half-full bar reads
+            -- as "good" when it is really a neutral no-contact score.
+            local zeroX = PADDING + barW * 0.5
+            self:drawRect(zeroX, y - 1, 1, 9, 0.55, 0.75, 0.75, 0.70)
+            self:drawRect(PADDING, y, math.max(1, barW * fraction), 7, 0.9,
+                col[1], col[2], col[3])
+        else
+            self:drawRect(PADDING, y, math.max(1, barW * fraction), 7, 0.9,
+                col[1], col[2], col[3])
+        end
+        y = y + 9
+    end
+    local function standingDetail(text)
+        if text == nil or text == "" then return end
+        self:drawText(trimText(UIFont.Small, tostring(text), w), PADDING, y,
+            COL_DIM[1], COL_DIM[2], COL_DIM[3], 1, UIFont.Small)
+        y = y + smallH + 1
+    end
+    -- The faction's own colour, derived from its name, so a card reads as the
+    -- same group the nameplate above the person does.
+    local factionColour = snapshot.factionName ~= nil
+        and KnoxPersistence.factionAccent ~= nil
+        and KnoxPersistence.factionAccent(snapshot.factionName) or nil
+    keyValue("Faction", snapshot.factionName or "None", factionColour)
+    -- The card spells out the same recognition the nameplate shows in the
+    -- world, from the same resolver: a household is a household in both places.
+    local names = rawget(_G, "KnoxSurvivorNames")
+    local persistence = rawget(_G, "KnoxPersistence")
+    local facts = persistence ~= nil and persistence.survivorCompany ~= nil
+        and persistence.survivorCompany(snapshot.id) or nil
+    local companyName = names ~= nil and names.companyName ~= nil
+        and names.companyName(facts) or nil
+    local companyPlace = names ~= nil and names.companyPlace ~= nil
+        and names.companyPlace(facts) or nil
+    local companySize = facts ~= nil and math.floor(tonumber(facts.memberCount) or 0) or 0
+    if facts ~= nil and facts.isLeader == true and companySize >= 2 then
+        keyValue("Household", companyPlace ~= nil
+            and (companySize .. " people · " .. companyPlace) or (companySize .. " people"))
+    elseif companyName ~= nil then
+        keyValue("With", companyPlace ~= nil
+            and (companyName .. " · " .. companyPlace) or companyName)
+    end
+    -- Personal standing and faction standing are always two rows. The person's
+    -- trust is never presented as the faction's reputation, and an unknown
+    -- faction row says so instead of showing a fabricated neutral.
+    local standing = snapshot.standing
+    if standing ~= nil and standing.known == true then
+        local col = standingRow("Personal", standing.label, standing.tone)
+        standingBar(standing.fill, col, false)
+        if standing.hostile == true then
+            -- Behaviour, not the personal band: a trusting person in a hostile
+            -- faction is dangerous without their own history being rewritten.
+            self:drawText(trimText(UIFont.Small,
+                standing.hostileText or "Hostile right now", w), PADDING, y,
+                0.86, 0.34, 0.30, 1, UIFont.Small)
+            y = y + smallH + 1
+        end
+        standingDetail(standing.deltaText)
+        standingDetail(standing.nextText)
+        y = y + 2
+    else
+        keyValue("Trust", snapshot.trustLabel or "Unknown")
+    end
+    local factionStanding = snapshot.factionStanding
+    if factionStanding ~= nil then
+        if factionStanding.known == true then
+            local col = standingRow("Faction standing", factionStanding.label,
+                factionStanding.tone)
+            standingBar(factionStanding.fill, col, true)
+            standingDetail(factionStanding.deltaText)
+            y = y + 2
+        else
+            keyValue("Faction standing", factionStanding.label or "No contact recorded",
+                COL_DIM)
+        end
+    end
     keyValue("Meetings", snapshot.relationshipMeetings ~= nil
         and tostring(math.max(0, math.floor(snapshot.relationshipMeetings))) or nil)
     if snapshot.isSpouse then keyValue("Relationship", "Spouse", COL_ACCENT) end
@@ -376,8 +512,12 @@ end
 
 function KnoxPanel:onInventoryButton()
     if self.window == nil or self.window.snapshot == nil then return end
-    if CompanionInventory == nil or CompanionInventory.show == nil then return end
-    CompanionInventory.show(self.window.playerNum, self.window.survivorId)
+    -- request() explains a refusal in the shared vocabulary; the card's own
+    -- button used to fail silently.
+    local open = CompanionInventory ~= nil and (CompanionInventory.request
+        or CompanionInventory.show) or nil
+    if open == nil then return end
+    open(self.window.playerNum, self.window.survivorId)
 end
 
 function KnoxPanel:onMedicalButton()
@@ -396,11 +536,11 @@ function KnoxPanel:createChildren()
     local buttonH = getTextManager():getFontHeight(UIFont.Small) + 10
     self.inventoryButton = ISButton:new(PADDING, self.height - buttonH - PADDING, 122, buttonH,
         "Inventory", self, KnoxPanel.onInventoryButton)
-    self.inventoryButton:initialise()
+    self.inventoryButton:initialise(); UILayout.tintPrimary(self.inventoryButton)
     self:addChild(self.inventoryButton)
     self.medicalButton = ISButton:new(PADDING + 130, self.height - buttonH - PADDING, 122, buttonH,
         "Medical Check", self, KnoxPanel.onMedicalButton)
-    self.medicalButton:initialise()
+    self.medicalButton:initialise(); UILayout.tintButton(self.medicalButton)
     self:addChild(self.medicalButton)
 end
 
@@ -528,7 +668,11 @@ local function ensureViews(window)
             kv("Time Alive", dayLabel(snap.daysSurvived))
             kv("Known", dayLabel(snap.daysKnown))
             kv("Faction", snap.factionName or "None")
-            kv("Trust", snap.trustLabel or "Unknown")
+            kv("Trust", snap.standing ~= nil and snap.standing.label or snap.trustLabel or "Unknown")
+            if snap.factionStanding ~= nil then
+                kv("Faction standing", snap.factionStanding.known == true
+                    and snap.factionStanding.label or "No contact")
+            end
             kv("Meetings", snap.relationshipMeetings ~= nil
                 and tostring(math.max(0, math.floor(snap.relationshipMeetings))) or "Unknown")
             kv("Purpose", snap.lifeIntent and snap.lifeIntent.label or "Unknown")
@@ -539,6 +683,22 @@ local function ensureViews(window)
                 job = KnoxOrderCatalog.normalizeBasePreference(job)
             end
             if job ~= nil and job ~= "" and job ~= "auto" then kv("Base Job", job:sub(1,1):upper()..job:sub(2)) end
+            -- The settings a follower or resident is actually running under:
+            -- read through the same owner the wheel and Party Orders use, so
+            -- this row cannot report a stance the orders do not have.
+            local service = rawget(_G, "KnoxCompanionService")
+            local tactics = service ~= nil and service.survivorTactics ~= nil
+                and snap.id ~= nil and service.survivorTactics(snap.id) or nil
+            if tactics ~= nil then
+                if tactics.mode == "companion" then
+                    local stance = tostring(tactics.stance)
+                    kv("Stance", stance:sub(1,1):upper() .. stance:sub(2))
+                    local shape = tactics.formation == "single_file" and "Single File" or "Paired"
+                    kv("Formation", shape .. " " .. tostring(tactics.spacing))
+                elseif tactics.mode == "base" then
+                    kv("Supply Runs", tactics.lootRuns and "Joins" or "Stays home")
+                end
+            end
             kv("Base / Activity", trimText(UIFont.Small, snap.locationLabel .. " — " .. (snap.orderLabel or ""), w - 70))
             local act = snap.activity or "Idle"
             if snap.distanceTiles ~= nil then act = act .. " (" .. tostring(math.floor(snap.distanceTiles+0.5)) .. " tiles)" end
@@ -828,6 +988,10 @@ function Window:destroy(restoreFocus)
     if windows[self.playerNum] == self then
         windows[self.playerNum] = nil
     end
+    local layoutApi = rawget(_G, "KnoxSurvivorUILayout")
+    if layoutApi ~= nil and layoutApi.releaseSurface ~= nil then
+        pcall(layoutApi.releaseSurface, self.playerNum, "card")
+    end
     if restoreFocus then
         restoreJoypadFocus(self)
     end
@@ -844,19 +1008,24 @@ function Window:new(playerNum)
     local width = math.min(math.floor(WINDOW_WIDTH * scale), math.max(1, screenWidth - 20))
     local height = math.min(math.floor(WINDOW_HEIGHT * scale), math.max(1, screenHeight - 20))
     local window = ISCollapsableWindowJoypad:new(0, 0, width, height)
+    -- One scale rule, one clamp: the card is the largest Knox window and the
+    -- first thing a small display loses.
+    UILayout.trackWindow(window)
     setmetatable(window, self)
     self.__index = self
     window.playerNum = playerNum
     window.survivorId = nil
     window.snapshot = nil
     window.previousJoypadFocus = nil
-    UILayout.bindInteractionWindow(window)
+    -- The card is a read, so it keeps its distance and sight: a resident on a
+    -- far job is still worth reading about. It closes on the person's death or
+    -- hostility, and on the player aiming, driving or dying.
+    UILayout.bindPersonSurface(window, { checkDistance = false, requireSight = false })
     window.resizable = true
     window.minimumWidth = math.min(360, width)
     window.minimumHeight = math.min(260, height)
     window.pin = true
-    window.backgroundColor = { r = COL_BG[1], g = COL_BG[2], b = COL_BG[3], a = 0.94 }
-    window.borderColor = { r = COL_BORDER[1], g = COL_BORDER[2], b = COL_BORDER[3], a = 0.95 }
+    UILayout.tintWindow(window)
     window:setTitle("Survivor")
     return window
 end
@@ -891,6 +1060,13 @@ function SurvivorCard.show(playerNum, survivorId)
     if snapshot == nil then
         print("[KnoxSurvivors][Card] no snapshot for survivor=" .. tostring(survivorId))
         return nil
+    end
+
+    -- One Knox surface per player: the card replaces a notebook or trade
+    -- window that was open. A failed lookup above closes nothing.
+    local layoutApi = rawget(_G, "KnoxSurvivorUILayout")
+    if layoutApi ~= nil and layoutApi.claimSurface ~= nil then
+        pcall(layoutApi.claimSurface, playerNum, "card", SurvivorCard)
     end
 
     local window = windows[playerNum]

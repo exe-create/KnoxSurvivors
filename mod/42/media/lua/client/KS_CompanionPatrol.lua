@@ -105,6 +105,55 @@ function Patrol.recordDirectiveArrival(directive)
     return recordArrival(directive, directive)
 end
 
+-- PATROL SIGHTING (pure)
+-- A patrol's report is a reading of what its own arrival can see, not a second
+-- threat model. The controller supplies the real nearby count from its existing
+-- pressure scan; this module only owns the words and the retelling gap.
+function Patrol.sightingWord(pressure, direction, contact)
+    local count = tonumber(pressure) or 0
+    if contact ~= nil then
+        local where = direction ~= nil and (" to the " .. tostring(direction)) or " nearby"
+        return "I see " .. tostring(contact) .. where .. "."
+    end
+    if count <= 0 then return nil end
+    local where = direction ~= nil and (" to the " .. tostring(direction))
+        or " near the patrol route"
+    if count >= 5 then return "A crowd" .. where .. "." end
+    if count >= 2 then return "A few" .. where .. "." end
+    return "Movement" .. where .. "."
+end
+
+-- A patrol names only somebody it does not already own. A player-owned person
+-- is not a sighting; a faction member is named by the faction's existing name,
+-- and everybody else is a stranger. This is a word choice, not a relationship
+-- change or a second faction read.
+function Patrol.contactWord(affiliation, factionName, knownName)
+    if type(affiliation) ~= "table" then return "a stranger" end
+    if affiliation.kind == "player" then return nil end
+    if type(knownName) == "string" and knownName ~= "" then return knownName end
+    if affiliation.kind == "faction" and type(factionName) == "string"
+        and factionName ~= "" then
+        return "a member of " .. factionName
+    end
+    return "a stranger"
+end
+
+function Patrol.feedLine(line)
+    if type(line) ~= "string" or line == "" then return nil end
+    return "Patrol: " .. line
+end
+
+function Patrol.sightingDue(last, now, cooldown)
+    -- An unset stamp is a patrol's first stop, not a stop that must wait for the
+    -- cooldown to expire from tick zero.
+    if last == nil then return true end
+    local stamp = tonumber(last)
+    if stamp == nil then return true end
+    local wait = tonumber(cooldown) or 1800
+    return (tonumber(now) or 0) >= stamp + wait
+end
+-- END PATROL SIGHTING
+
 -- Resolve a real standing tile around the next stop, never outside the selected
 -- area or on another floor. A blocked corner is not the end of a patrol order.
 function Patrol.resolveWaypoint(area, survivorId, step, cell, current, excluded, ticks, guard)

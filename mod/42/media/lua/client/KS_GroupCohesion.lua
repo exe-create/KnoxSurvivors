@@ -58,10 +58,7 @@ function Cohesion.record(group,before,members,hours,groupCandidates)
     if KnoxSettings~=nil and KnoxSettings.allowNPCFactions~=nil and not KnoxSettings.allowNPCFactions() then return nil end
     local minimum=KnoxSettings~=nil and KnoxSettings.npcFactionMinimumMembers~=nil
         and KnoxSettings.npcFactionMinimumMembers() or 4
-    local faction,reason=KnoxPersistence.evaluateTravelGroupFaction(group.id,hours,minimum)
-    if faction~=nil and reason=="created" then
-        print("[KnoxSurvivors][Relationships] faction-formed="..faction.id.." source=shared_unloaded_survival")
-    end
-    return faction,reason
+    -- Formation is announced by the promotion owner, once, for every route.
+    return KnoxPersistence.evaluateTravelGroupFaction(group.id,hours,minimum)
 end
 return Cohesion

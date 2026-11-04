@@ -6,6 +6,12 @@ local function square(x,y,z)
         canStand=function() return true end,isBlockedTo=function() return false end,
         isHoppableTo=function() return false end,getRoom=function() end,getBuilding=function() end}
 end
+assert(not C.shouldWakeSettledFollower(square(0,0,0),square(2,0,0),2,0,0),
+    "a stationary anchor keeps the settled follower calm")
+assert(C.shouldWakeSettledFollower(square(0,0,0),square(2.5,0,0),1.5,0,0),
+    "a moving anchor wakes a two-tile follower before the old three-tile gap")
+assert(C.shouldWakeSettledFollower(square(0,0,0),square(4,0,0),nil,nil,nil),
+    "a follower without a saved anchor still wakes for a clear gap")
 local list={size=function() return 0 end,get=function() end}
 getCell=function() return {getGridSquare=function(_,x,y,z) return square(x,y,z) end,
     getZombieList=function() return list end} end

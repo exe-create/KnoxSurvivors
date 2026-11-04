@@ -117,6 +117,249 @@ local function locationKey(base)
         home.z or 0, base.relocatedAtHours or 0 }, ":")
 end
 
+-- RAID INTENT (pure)
+-- The player-facing beat of a raid needs three honest answers: why the faction
+-- is coming, from where, and how many. Each answer here is derived only from
+-- facts the caller already recorded; nothing in this section reads a save, a
+-- world or a clock, so the wording is exercisable without a game session.
+local RAID_CAUSE_ORDER = { "retaliation", "need", "grievance" }
+local RAID_CAUSE_PHRASE = {
+    retaliation = "they want it back",
+    need = "they are short of supplies",
+    grievance = "they hold a grudge",
+}
+-- Rough bands, never a headcount. The player learns what kind of trouble this
+-- is, not the enemy roster.
+local RAID_STRENGTH_BANDS = {
+    { upTo = 1, text = "one of them" },
+    { upTo = 3, text = "a few armed" },
+    { upTo = 6, text = "several armed" },
+    { upTo = math.huge, text = "a strong party" },
+}
+local RAID_DIRECTION_NS = { [true] = "south", [false] = "north" }
+local RAID_DIRECTION_EW = { [true] = "east", [false] = "west" }
+
+local function raidFinite(value)
+    return type(value) == "number" and value == value and math.abs(value) < math.huge
+end
+
+-- Precedence is deliberate: a repayment outranks hunger, and hunger outranks a
+-- standing grudge, because the more specific real cause is the more useful
+-- warning. No evidence means no cause; the caller must not invent one.
+function KnoxEvents.raidCause(evidence)
+    if type(evidence) ~= "table" then return nil, "no_evidence" end
+    for _, cause in ipairs(RAID_CAUSE_ORDER) do
+        if evidence[cause] == true then return cause end
+    end
+    return nil, "no_cause"
+end
+
+function KnoxEvents.raidCausePhrase(cause)
+    if type(cause) ~= "string" then return nil end
+    return RAID_CAUSE_PHRASE[cause]
+end
+
+function KnoxEvents.raidStrength(partySize)
+    local count = tonumber(partySize)
+    if not raidFinite(count) or count < 1 then return nil end
+    for _, band in ipairs(RAID_STRENGTH_BANDS) do
+        if count <= band.upTo then return band.text end
+    end
+    return nil
+end
+
+-- Compass word of the attacker's home relative to the defended home. Zomboid's
+-- y axis grows south, so a larger y is a southern origin. A diagonal needs to
+-- be within a third of the way from square, not merely off-centre, or every
+-- approach would read as a corner.
+function KnoxEvents.raidDirection(fromPoint, toPoint)
+    if type(fromPoint) ~= "table" or type(toPoint) ~= "table" then return nil, "no_points" end
+    local fromX, fromY = tonumber(fromPoint.x), tonumber(fromPoint.y)
+    local toX, toY = tonumber(toPoint.x), tonumber(toPoint.y)
+    if not raidFinite(fromX) or not raidFinite(fromY)
+        or not raidFinite(toX) or not raidFinite(toY) then return nil, "no_points" end
+    local dx, dy = fromX - toX, fromY - toY
+    local ax, ay = math.abs(dx), math.abs(dy)
+    if ax == 0 and ay == 0 then return nil, "same_place" end
+    if math.min(ax, ay) * 2 >= math.max(ax, ay) then
+        return RAID_DIRECTION_NS[dy > 0] .. "-" .. RAID_DIRECTION_EW[dx > 0]
+    end
+    if ax >= ay then return RAID_DIRECTION_EW[dx > 0] end
+    return RAID_DIRECTION_NS[dy > 0]
+end
+
+function KnoxEvents.raidEtaText(remainingHours)
+    local remaining = tonumber(remainingHours)
+    if not raidFinite(remaining) then return nil end
+    if remaining <= 0 then return "arriving now" end
+    if remaining < 1 then return "under an hour out" end
+    if remaining < 1.5 then return "about an hour out" end
+    return "about " .. tostring(math.floor(remaining + 0.5)) .. " h out"
+end
+
+-- One sentence for the notice rail: who, from where, how many, and why. It is
+-- a warning of intent, not a sighting, so it never claims a body at the fence.
+function KnoxEvents.raidWarningText(warning)
+    if type(warning) ~= "table" then return nil end
+    local name = type(warning.factionName) == "string" and warning.factionName ~= ""
+        and warning.factionName or nil
+    local strength = type(warning.strength) == "string" and warning.strength ~= ""
+        and warning.strength or nil
+    if name == nil or strength == nil then return nil end
+    local where = type(warning.direction) == "string"
+        and (" from the " .. warning.direction) or ""
+    local phrase = KnoxEvents.raidCausePhrase(warning.cause)
+    local tail = phrase ~= nil and (", and " .. phrase) or ""
+    return name .. " is coming" .. where .. ": " .. strength .. tail .. "."
+end
+
+-- One line for the World tab's existing faction row, so a live raid reads as a
+-- threat with a cause and an ETA instead of the raw event phase.
+function KnoxEvents.raidThreatText(warning, hours)
+    if type(warning) ~= "table" then return nil end
+    local parts = {}
+    if type(warning.direction) == "string" then parts[#parts + 1] = "from the " .. warning.direction end
+    if type(warning.strength) == "string" then parts[#parts + 1] = warning.strength end
+    local phrase = KnoxEvents.raidCausePhrase(warning.cause)
+    if phrase ~= nil then parts[#parts + 1] = phrase end
+    local eta = nil
+    if raidFinite(warning.etaHours) and raidFinite(hours) then
+        eta = KnoxEvents.raidEtaText(warning.etaHours - hours)
+    end
+    if #parts == 0 and eta == nil then return nil end
+    local body = table.concat(parts, ", ")
+    if eta ~= nil then body = body .. (body ~= "" and "; " or "") .. eta end
+    return "Raid on your home — " .. body
+end
+
+-- How the home's own watch lines up with an inbound raid. The counts come from
+-- the base's real guard and patrol areas and the duty records that staff them;
+-- this owner only puts them into words, so no caller invents its own version.
+function KnoxEvents.raidWatchClause(watch)
+    if type(watch) ~= "table" then return nil end
+    local posts, staffed = tonumber(watch.posts), tonumber(watch.staffed)
+    if posts == nil or posts ~= posts or math.abs(posts) == math.huge or posts < 1 then return nil end
+    posts = math.floor(posts)
+    staffed = staffed ~= nil and staffed == staffed and math.abs(staffed) ~= math.huge
+        and math.max(0, math.floor(staffed)) or 0
+    if staffed >= posts then return "Every post is staffed." end
+    if staffed <= 0 then
+        return posts == 1 and "The post is unmanned." or (tostring(posts) .. " posts are unmanned.")
+    end
+    return tostring(staffed) .. " of " .. tostring(posts) .. " posts staffed."
+end
+
+-- Who is deliberately out of the way. `holding` is the count the base
+-- projection measured from the residents' own decisions; this only puts it
+-- into words, and says nothing at all when nobody is holding, so a quiet home
+-- never reads as if somebody were hiding.
+function KnoxEvents.raidFallbackClause(watch)
+    if type(watch) ~= "table" then return nil end
+    local holding = tonumber(watch.holding)
+    if holding == nil or holding ~= holding or math.abs(holding) == math.huge
+        or holding < 1 then return nil end
+    holding = math.floor(holding)
+    if holding == 1 then return "1 resident is out of the way." end
+    return tostring(holding) .. " residents are out of the way."
+end
+
+-- The base attention item keeps its copy in this one owner, so the in-world
+-- line, the notebook pill and the Work-tab band cannot describe a raid
+-- differently. The optional watch facts add the home's own readiness and who
+-- is out of the way; they never change the alarm itself.
+function KnoxEvents.raidAttention(warning, watch)
+    if type(warning) ~= "table" then return nil end
+    local title = type(warning.direction) == "string"
+        and ("A raid is coming from the " .. warning.direction) or "A raid is coming"
+    local strength = type(warning.strength) == "string" and warning.strength or nil
+    local phrase = KnoxEvents.raidCausePhrase(warning.cause)
+    local detail = strength
+    if detail ~= nil then detail = detail:sub(1, 1):upper() .. detail:sub(2) end
+    if phrase ~= nil then
+        detail = detail ~= nil and (detail .. "; " .. phrase .. ".")
+            or (phrase:sub(1, 1):upper() .. phrase:sub(2) .. ".")
+    elseif detail ~= nil then
+        detail = detail .. "."
+    end
+    local readiness = KnoxEvents.raidWatchClause(watch)
+    if readiness ~= nil then
+        detail = detail ~= nil and (detail .. " " .. readiness) or readiness
+    end
+    local fallback = KnoxEvents.raidFallbackClause(watch)
+    if fallback ~= nil then
+        detail = detail ~= nil and (detail .. " " .. fallback) or fallback
+    end
+    return { title = title, detail = detail, action = "review_world", actionLabel = "Review threat" }
+end
+
+-- A raid that has ended must stop reading as an imminent threat. The phase and
+-- the receipts the save already carries say what happened, so this only puts it
+-- into words; a raid still on the road has no aftermath and gets none.
+function KnoxEvents.raidAftermathText(event, hours)
+    if type(event) ~= "table" or event.kind ~= "faction_raid" then return nil end
+    local phase = event.phase
+    if phase ~= "withdrawing" and phase ~= "completed" and phase ~= "failed" then return nil end
+    if phase == "failed" then return "The raid broke before it reached your gate." end
+    local count = type(KnoxEvents.objectiveCount) == "function" and KnoxEvents.objectiveCount(event) or 0
+    local taken = nil
+    if count == 1 then taken = "1 item" elseif count > 1 then taken = tostring(count) .. " items" end
+    if phase == "withdrawing" then
+        return taken ~= nil and ("They are pulling out with " .. taken .. ".")
+            or "They are pulling out empty-handed."
+    end
+    return taken ~= nil and ("The raid is over: they carried off " .. taken .. ".")
+        or "The raid is over: they left empty-handed."
+end
+
+-- A raid names its members, and a member of a live raid at this home is an
+-- intruder whatever the diplomacy row between two survivors happens to read.
+-- This answers only the record's own facts; distance, line of sight and the
+-- resident's role leash still decide whether the intruder can be reached.
+local RAID_DEFENCE_PHASES = {
+    approaching = true, active = true, objective = true, withdrawing = true,
+}
+
+function KnoxEvents.raidDefenceApplies(event, baseId, survivorId, hours)
+    if type(event) ~= "table" or event.kind ~= "faction_raid" then return false end
+    if type(baseId) ~= "string" or baseId == "" or event.targetBaseId ~= baseId then return false end
+    if type(survivorId) ~= "string" or survivorId == "" then return false end
+    if RAID_DEFENCE_PHASES[event.phase] ~= true then return false end
+    local deadline, now = tonumber(event.deadlineHours), tonumber(hours)
+    if deadline ~= nil and now ~= nil and now > deadline then return false end
+    for _, member in ipairs(type(event.memberIds) == "table" and event.memberIds or {}) do
+        if member == survivorId then return true end
+    end
+    return false
+end
+
+-- The home's own eyes. `intruders` is the set `raidIntrudersForBase` answers;
+-- `occupant` is a body somebody can actually see right now
+-- ({ survivorId = "a", x = 12, y = 8, z = 0 }); `bounds` is the base's own
+-- rectangle as the base owner stores it (minX/minY/maxX/maxY, or minX/minY
+-- with width/height, optionally z and allFloors). A raider counts only when
+-- the record already names him and the body is inside those walls on that
+-- floor. No geometry is invented here and no radius is assumed.
+function KnoxEvents.raidIntruderInside(intruders, occupant, bounds)
+    if type(intruders) ~= "table" or type(occupant) ~= "table" then return false end
+    if type(bounds) ~= "table" then return false end
+    local survivorId = occupant.survivorId
+    if type(survivorId) ~= "string" or survivorId == "" then return false end
+    if intruders[survivorId] ~= true then return false end
+    local x, y = tonumber(occupant.x), tonumber(occupant.y)
+    local minX, minY = tonumber(bounds.minX), tonumber(bounds.minY)
+    if x == nil or y == nil or minX == nil or minY == nil then return false end
+    local maxX = tonumber(bounds.maxX) or (minX + (tonumber(bounds.width) or 0) - 1)
+    local maxY = tonumber(bounds.maxY) or (minY + (tonumber(bounds.height) or 0) - 1)
+    if maxX < minX or maxY < minY then return false end
+    if x < minX or x > maxX or y < minY or y > maxY then return false end
+    if bounds.allFloors ~= true then
+        local bz, oz = tonumber(bounds.z), tonumber(occupant.z)
+        if bz ~= nil and oz ~= nil and bz ~= oz then return false end
+    end
+    return true
+end
+-- END RAID INTENT
+
 local function raidOwners(factionId, baseId)
     local faction = KnoxPersistence.getFaction(factionId)
     local target = KnoxPersistence.getBase(baseId)
@@ -159,6 +402,181 @@ local function availableMember(id, home)
     return type(snapshot) == "string" and snapshot ~= ""
 end
 
+-- RAID WARNING (owner: this event service)
+-- A warning is written once, on the existing event record, at the earliest
+-- honest moment: the faction has decided and its real members are named. The
+-- stamp makes a reload silent instead of repeating the alarm, and it survives
+-- because it is part of the event the save already carries.
+local function raidBaseCenter(base)
+    local home = type(base) == "table" and base.home or nil
+    if type(home) ~= "table" or not finite(home.minX) or not finite(home.minY)
+        or not finite(home.width) or not finite(home.height) then return nil end
+    return home.minX + (home.width - 1) / 2, home.minY + (home.height - 1) / 2
+end
+
+-- Every flag is a recorded fact, never a guess: the diplomacy row that made the
+-- raid legal, a completed raid our side already ran against them, and their own
+-- home's measured reserves. A faction with none of the three gets no cause and
+-- therefore no invented sentence.
+local function raidEvidence(event, faction, sourceBase, hours)
+    local evidence = {}
+    if type(event.targetFactionId) == "string"
+        and KnoxPersistence.getFactionRelationship ~= nil then
+        local relationship = KnoxPersistence.getFactionRelationship(faction.id, event.targetFactionId)
+        if type(relationship) == "table" and relationship.disposition == "hostile" then
+            evidence.grievance = true
+        end
+    end
+    if KnoxPersistence.getRaidHistory ~= nil
+        and type(event.targetFactionId) == "string" then
+        for _, raid in ipairs(KnoxPersistence.getRaidHistory() or {}) do
+            if tostring(raid.sourceFactionId or "") == tostring(event.targetFactionId) then
+                local raided = KnoxPersistence.getBase ~= nil
+                    and KnoxPersistence.getBase(raid.targetBaseId) or nil
+                if type(raided) == "table" and raided.ownerKind == "faction"
+                    and tostring(raided.ownerId or "") == tostring(faction.id) then
+                    evidence.retaliation = true
+                    break
+                end
+            end
+        end
+    end
+    local jobs = rawget(_G, "KnoxBaseJobs")
+    if jobs ~= nil and jobs.settlementSummary ~= nil and sourceBase ~= nil
+        and finite(hours) then
+        local ok, summary = pcall(function() return jobs.settlementSummary(sourceBase, hours) end)
+        if ok and type(summary) == "table" then
+            for _, reserve in ipairs(summary.reserves or {}) do
+                if (tonumber(reserve.missing) or 0) > 0 then
+                    evidence.need = true
+                    break
+                end
+            end
+        end
+    end
+    return evidence
+end
+
+-- Read-only: builds the warning a surface may show without stamping the event.
+-- Only warnRaid below writes, so the notice rail cannot be silenced by a
+-- projection having read the same facts first.
+local function raidWarningFor(event, hours)
+    if type(event) ~= "table" or event.kind ~= "faction_raid" or not finite(hours) then return nil end
+    local faction = KnoxPersistence.getFaction(event.sourceFactionId)
+    local target = KnoxPersistence.getBase(event.targetBaseId)
+    local name = type(faction) == "table" and faction.name or nil
+    if type(name) ~= "string" or name == "" then return nil end
+    local sourceBase = KnoxPersistence.getBase(event.sourceBaseId)
+    local sourceX, sourceY = raidBaseCenter(sourceBase)
+    local targetX, targetY = raidBaseCenter(target)
+    local direction = sourceX ~= nil and targetX ~= nil
+        and KnoxEvents.raidDirection({ x = sourceX, y = sourceY },
+            { x = targetX, y = targetY }) or nil
+    local travel = nil
+    if sourceX ~= nil and targetX ~= nil and KnoxPersistence.awayTravelHours ~= nil then
+        travel = KnoxPersistence.awayTravelHours({ x = sourceX, y = sourceY },
+            { x = targetX, y = targetY })
+    end
+    local members = type(event.memberIds) == "table" and #event.memberIds or 0
+    return {
+        factionName = name,
+        atHours = hours,
+        cause = KnoxEvents.raidCause(raidEvidence(event, faction, sourceBase, hours)),
+        direction = direction,
+        strength = KnoxEvents.raidStrength(members),
+        partySize = members,
+        etaHours = travel ~= nil and hours + travel or nil,
+        sourceBaseId = event.sourceBaseId,
+        targetBaseId = event.targetBaseId,
+    }
+end
+
+function KnoxEvents.warnRaid(id, revision, hours)
+    local event = records()[id]
+    if type(event) ~= "table" or event.kind ~= "faction_raid" then return nil, "not_a_raid" end
+    if type(event.warning) == "table" then return nil, "already_warned" end
+    if event.phase ~= "scheduled" and event.phase ~= "spawning" and event.phase ~= "approaching" then
+        return nil, "not_inbound"
+    end
+    if not serial(event.revision) or event.revision ~= revision then return nil, "stale_revision" end
+    local warning = raidWarningFor(event, hours)
+    if warning == nil then return nil, "warning_facts_unavailable" end
+    event.warning = warning
+    return copy(warning), "warned"
+end
+
+-- The base HUD, the notebook pill and the Work-tab band read one inbound raid
+-- through this. It reports only the warning phases; an assault under way is a
+-- fight the world already shows.
+-- The aftermath is written once, like the warning: the record carries what the
+-- raid cost, so a reload neither repeats the report nor loses it. A raid that
+-- never got inside has no objective and therefore nothing to record.
+function KnoxEvents.markRaidAftermath(id, revision, hours)
+    local event = records()[id]
+    if type(event) ~= "table" or event.kind ~= "faction_raid" then return nil, "not_a_raid" end
+    if event.revision ~= revision then return nil, "stale_revision" end
+    if event.phase ~= "withdrawing" and event.phase ~= "completed" and event.phase ~= "failed" then
+        return nil, "not_finished"
+    end
+    if type(event.aftermath) == "table" then return nil, "already_recorded" end
+    if type(event.objective) ~= "table" then return nil, "no_objective" end
+    local items = type(KnoxEvents.objectiveCount) == "function"
+        and KnoxEvents.objectiveCount(event) or 0
+    event.aftermath = {
+        saidAtHours = hours,
+        items = items,
+        outcome = type(event.objective.outcome) == "string" and event.objective.outcome or nil,
+    }
+    return copy(event.aftermath), "recorded"
+end
+
+-- The whole set a resident's threat scan needs, answered from the same records
+-- the raid itself runs on. Returns an empty set, never nil, so a caller can ask
+-- it on every scan without inventing a reason to skip the home.
+function KnoxEvents.raidIntrudersForBase(baseId, hours)
+    local set = {}
+    if type(baseId) ~= "string" or baseId == "" then return set end
+    for _, event in pairs(records()) do
+        if type(event) == "table" and event.kind == "faction_raid"
+            and event.targetBaseId == baseId and not terminal(event)
+            and type(event.memberIds) == "table" then
+            for _, member in ipairs(event.memberIds) do
+                if KnoxEvents.raidDefenceApplies(event, baseId, member, hours) then
+                    set[tostring(member)] = true
+                end
+            end
+        end
+    end
+    return set
+end
+
+function KnoxEvents.inboundRaidForBase(baseId, hours, watch)
+    if type(baseId) ~= "string" then return nil end
+    local best = nil
+    for id, event in pairs(records()) do
+        if type(event) == "table" and event.kind == "faction_raid"
+            and event.targetBaseId == baseId and not terminal(event)
+            and (event.phase == "scheduled" or event.phase == "spawning"
+                or event.phase == "approaching") then
+            local warning = type(event.warning) == "table" and event.warning
+                or raidWarningFor(event, hours)
+            local item = warning ~= nil and KnoxEvents.raidAttention(warning, watch) or nil
+            if item ~= nil then
+                item.eventId = id
+                item.phase = event.phase
+                item.etaHours = warning.etaHours
+                item.threatText = KnoxEvents.raidThreatText(warning, hours)
+                local eta = tonumber(item.etaHours)
+                local bestEta = best ~= nil and tonumber(best.etaHours) or nil
+                if best == nil or (eta or math.huge) < (bestEta or math.huge) then
+                    best = item
+                end
+            end
+        end
+    end
+    return best ~= nil and copy(best) or nil
+end
+
 function KnoxEvents.get(id)
     local event = type(id) == "string" and records()[id] or nil
     return type(event) == "table" and copy(event) or nil
@@ -182,6 +600,41 @@ function KnoxEvents.saveUnloadedTravel(id, revision, travel)
     event.unloadedTravel = copy(travel)
     return true
 end
+
+-- RAID DEMAND (pure)
+-- A raid that reached the house and started searching can be paid instead of
+-- searched past. The price is already the objective's own required count, so
+-- paying is the same take_supplies objective reached from the other side, with
+-- the same receipts and the same withdrawal. This answers only whether an offer
+-- can be accepted right now and how much is left; it writes nothing.
+function KnoxEvents.raidDemandState(event, hours)
+    if type(event) ~= "table" or event.kind ~= "faction_raid" then
+        return { demandable = false, remaining = 0, reason = "not_a_raid" }
+    end
+    if event.phase ~= "objective" then
+        return { demandable = false, remaining = 0, reason = "not_searching" }
+    end
+    local objective = type(event.objective) == "table" and event.objective or nil
+    local required = tonumber(objective ~= nil and objective.requiredItems)
+    local deadline = tonumber(objective ~= nil and objective.deadlineHours)
+    local now = tonumber(hours)
+    if required == nil or deadline == nil or now == nil then
+        return { demandable = false, remaining = 0, reason = "invalid_objective" }
+    end
+    local taken = 0
+    for _ in pairs(type(objective.receipts) == "table" and objective.receipts or {}) do
+        taken = taken + 1
+    end
+    local remaining = math.max(0, math.floor(required) - taken)
+    if remaining <= 0 then
+        return { demandable = false, remaining = 0, reason = "already_paid" }
+    end
+    if now >= deadline then
+        return { demandable = false, remaining = remaining, reason = "too_late" }
+    end
+    return { demandable = true, remaining = remaining, reason = "demanding" }
+end
+-- END RAID DEMAND
 
 function KnoxEvents.beginRaidObjective(id, revision, hours)
     local event = records()[id]
@@ -366,6 +819,29 @@ function KnoxEvents.proposeRaid(factionId, baseId, hours)
         sourceBaseId = owners.home.id, targetFactionId = owners.targetFactionId,
         sourceLocation = locationKey(owners.home), targetLocation = locationKey(owners.target),
         memberIds = members, livingAtProposal = #living, defendersAtProposal = #available - count }
+end
+
+-- D7.4: a loud tower can bring the wrong people, and the choice of who heard
+-- it belongs to the raid owner rather than to the radio. This asks each
+-- faction's own proposal check in a stable order and returns the first that
+-- accepts the base; it writes nothing, and scheduleRaid stays the only writer
+-- of a raid event. A faction that refuses is not a failure, it is a faction
+-- that had no reason or no reach.
+function KnoxEvents.radioRaider(baseId, hours)
+    if type(baseId) ~= "string" or baseId == "" or not finite(hours) then
+        return nil, "invalid_call"
+    end
+    local factions = KnoxPersistence.getFactions ~= nil
+        and KnoxPersistence.getFactions() or nil
+    if type(factions) ~= "table" then return nil, "no_factions" end
+    local ids = {}
+    for id in pairs(factions) do ids[#ids + 1] = tostring(id) end
+    table.sort(ids)
+    for _, factionId in ipairs(ids) do
+        local proposal = KnoxEvents.proposeRaid(factionId, baseId, hours)
+        if proposal ~= nil then return factionId, "candidate" end
+    end
+    return nil, "no_candidate"
 end
 
 function KnoxEvents.scheduleRaid(factionId, baseId, hours, delayHours)

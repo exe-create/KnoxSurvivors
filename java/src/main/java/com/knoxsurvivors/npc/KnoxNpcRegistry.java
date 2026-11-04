@@ -334,6 +334,23 @@ public final class KnoxNpcRegistry {
         if (runtime == null) {
             return "COMBAT_FAILED NONE_ACTIVE";
         }
+        return beginLockedDoorCombat(runtime, runtime.npc().getTraversalInteractionTarget());
+    }
+
+    /**
+     * Forced entry names the exact door the survivor is standing beside. The
+     * traversal target is cleared as soon as a route advances, so a window
+     * detour used to reach this boundary with no door at all.
+     */
+    public synchronized String beginLockedDoorCombatAt(String id, Object door) {
+        KnoxNpcRuntime runtime = activeNpcs.get(id);
+        if (runtime == null) {
+            return "COMBAT_FAILED NONE_ACTIVE";
+        }
+        return beginLockedDoorCombat(runtime, door);
+    }
+
+    private String beginLockedDoorCombat(KnoxNpcRuntime runtime, Object door) {
         try {
             if (KnoxNpcFactory.hasNativeTraversalOwner(runtime.npc())) {
                 KnoxNpcFactory.observeNativeAction(runtime.npc());
@@ -342,10 +359,7 @@ public final class KnoxNpcRegistry {
             if (KnoxCombatController.hasNativeRecoveryOwner(runtime.npc())) {
                 return "COMBAT_DEFERRED NATIVE_RECOVERY";
             }
-            return runtime.combat().beginLockedDoor(
-                runtime.npc(),
-                runtime.npc().getTraversalInteractionTarget()
-            );
+            return runtime.combat().beginLockedDoor(runtime.npc(), door);
         } catch (Throwable throwable) {
             return failure("COMBAT_FAILED", throwable);
         }

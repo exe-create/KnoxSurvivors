@@ -15,6 +15,8 @@ public final class KnoxCombatControllerVerifier {
 
     public static void main(String[] arguments) throws Exception {
         verifyNativeAttackOwnership();
+        verifyIdleAttackLatchRecovery();
+        verifyAdmittedRangedInput();
         verifyTraversalOwnsCombat();
         verifyTargetRetirementWaitsForNativeAttack();
         verifyNativeHitReactionStateOwnsBody();
@@ -96,6 +98,8 @@ public final class KnoxCombatControllerVerifier {
             "melee policy keeps a safe margin inside native adjusted reach");
         require(attackEntry < reapproach,
             "attack entry is closer than reapproach hysteresis");
+        require(reapproach >= meleeRange + 0.24f && reapproach < 1.25f - 0.10f,
+            "melee holds position through small target drift but reacquires inside native reach");
         require(attackEntry < 1.25f,
             "attack entry remains inside native melee reach");
         npc.setMovementRoute(List.of(new float[] {meleeRange, 0, 0}));
@@ -231,6 +235,56 @@ public final class KnoxCombatControllerVerifier {
                 require(body.pressedAttackCount==1,"actual native release resumes the same combat owner");
             }
         }
+    }
+
+    private static void verifyAdmittedRangedInput() throws Exception {
+        for (boolean admitted : List.of(true, false)) {
+            FakeBody body = new FakeBody();
+            body.state = "IdleState"; body.action = "idle";
+            body.attackStarted = admitted; body.attackType = admitted ? "shoot" : "";
+            body.initiateAttack = admitted;
+            KnoxCombatController combat = new KnoxCombatController();
+            combatField("npc").set(combat, new KnoxNpc("ranged-admission", body, 10, 20, 0));
+            combatField("target").set(combat, new FakeTarget());
+            combatField("phase").set(combat, "ATTACKING");
+            combatField("liveCombat").setBoolean(combat, true);
+            combatField("rangedWeapon").setBoolean(combat, true);
+            combatField("lastRangedRepositionTick").setInt(combat, 1000);
+            combatField("desiredAttackRange").setFloat(combat, 1);
+            combatField("attackRequests").setInt(combat, 1);
+            combatField("damageObserved").setBoolean(combat, true);
+            combat.tick();
+            require(body.controlVars.initiateAttack == admitted,
+                "only native-admitted ranged input survives until animation starts");
+            require(body.pressedAttackCount == 0, "AI input sync must not press another attack");
+        }
+        System.out.println("Ranged admission PASS accepted_input_preserved=true no_fabricated_request=true prior_hit=true");
+    }
+
+    private static void verifyIdleAttackLatchRecovery() throws Exception {
+        Method recover = KnoxCombatController.class.getDeclaredMethod("recoverIdleAttackLatch", Object.class);
+        recover.setAccessible(true);
+        for (String owner : List.of("idle", "recent", "animation", "swipe", "reload", "injury")) {
+            FakeBody body = new FakeBody();
+            body.state = owner.equals("swipe") ? "SwipeStatePlayer"
+                : owner.equals("injury") ? "PlayerHitReactionState" : "IdleState";
+            body.action = owner.equals("reload") ? "reload" : "idle";
+            body.attackAnimation = owner.equals("animation");
+            KnoxCombatController combat = new KnoxCombatController();
+            combatField("ticks").setInt(combat, owner.equals("recent") ? 100 : 300);
+            combatField("attackRequests").setInt(combat, 1);
+            combatField("attackAnimationObserved").setBoolean(combat, true);
+            combatField("damageObserved").setBoolean(combat, true);
+            boolean recovered = (Boolean) recover.invoke(combat, body);
+            require(recovered == owner.equals("idle"), "only an expired idle attack latch recovers: " + owner);
+            if (recovered) {
+                require(!body.attackStarted && body.attackType.isEmpty() && !body.initiateAttack,
+                    "old successful shot cannot block subsequent attack admission");
+                require(combatField("lastAttackTick").getInt(combat) == 300,
+                    "recovery yields a real cooldown before another request");
+            }
+        }
+        System.out.println("Combat stale latch PASS prior hit/animation recovers; live native owners preserved");
     }
 
     private static void verifyNativeAttackOwnership() throws Exception {

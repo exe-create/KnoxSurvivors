@@ -21,7 +21,42 @@ local EMOTES = {follow="followme",hold="stop",relax="signalok",guard="stop",
     enable_auto_equipment="signalok",disable_auto_equipment="signalok",
     signalok="signalok",
     talk="wavehi",joke="clap",compliment="thumbsup",funny_face="shrug",
-    insult="insult",slap="thumbsdown"}
+    insult="insult",slap="thumbsdown",
+    mock="insult",blame="thumbsdown",threaten="stop"}
+-- A vanilla emote has no duration: playEmote keeps the pose until something
+-- else replaces it, so telling a joke left the survivor clapping forever. Every
+-- emote started here gets an end time, and the pose is cleared on the tick that
+-- reaches it. Another emote, a death or a vehicle simply replaces the record.
+local EMOTE_HOLD_MS = 3500
+local pendingStops = {}
+-- Build 42's Kahlua has no global next(), so "is the table empty" was calling
+-- nil once per frame and threw 1934 exceptions in one session. A count costs
+-- less than a scan and cannot fail.
+local pendingCount = 0
+local stopTickerInstalled = false
+
+local function installStopTicker()
+    if stopTickerInstalled or Events == nil or Events.OnTick == nil then return end
+    stopTickerInstalled = true
+    Events.OnTick.Add(function()
+        if pendingCount <= 0 then return end
+        local now = getTimestampMs ~= nil and tonumber(getTimestampMs()) or nil
+        for actor, record in pairs(pendingStops) do
+            if record == nil or now == nil or now >= (record.untilMs or 0) then
+                pendingStops[actor] = nil
+                pendingCount = pendingCount - 1
+                if pendingCount < 0 then pendingCount = 0 end
+                local cleared = pcall(function()
+                    if actor.stopEmote ~= nil then actor:stopEmote() end
+                end)
+                if not cleared then
+                    pcall(function() actor:playEmote(nil) end)
+                end
+            end
+        end
+    end)
+end
+
 local function call(actor, method)
     local ok,value=pcall(function() return actor[method](actor) end)
     return ok and value or nil
@@ -43,7 +78,12 @@ function Signals.play(actor, emote)
     local previous=cooldowns[actor]
     if previous~=nil and now>=previous and now-previous<3000 then return false end
     local success=pcall(function() actor:playEmote(emote) end)
-    if success then cooldowns[actor]=now end
+    if success then
+        cooldowns[actor]=now
+        installStopTicker()
+        if pendingStops[actor] == nil then pendingCount = pendingCount + 1 end
+        pendingStops[actor] = { untilMs = (now or 0) + EMOTE_HOLD_MS }
+    end
     return success
 end
 function Signals.send(player, kind)

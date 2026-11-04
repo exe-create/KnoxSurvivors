@@ -13,6 +13,57 @@ Parties.PAIR_MIN_MEMBERS = 3
 Parties.PAIR_LEASE_HOURS = 2
 Parties.COORDINATE_INTERVAL_TICKS = 3600
 
+-- The pair is still the existing two-person scavenge lease. Roles only choose
+-- which two eligible residents lead and escort; they do not add a squad or a
+-- second movement owner. Scavenger is the best leader, Guard the best escort.
+local LEADER_ROLE_SCORE = {
+    scavenger = 100, guard = 80, runner = 70, quartermaster = 60,
+    auto = 55, farmer = 50, builder = 50, mechanic = 45, cook = 35, medic = 30,
+}
+local FOLLOWER_ROLE_SCORE = {
+    guard = 100, runner = 80, scavenger = 70, quartermaster = 65,
+    auto = 50, builder = 55, farmer = 50, mechanic = 50, cook = 45, medic = 40,
+}
+
+local function roleForDuty(duty)
+    local catalog = rawget(_G, "KnoxOrderCatalog")
+    if catalog == nil or catalog.roleForPreference == nil then return "auto" end
+    local ok, role = pcall(catalog.roleForPreference,
+        duty ~= nil and duty.jobPreference or nil)
+    return ok and role ~= nil and role or "auto"
+end
+
+-- Pure selection helper: the caller supplies eligible { id, role } entries.
+-- The first pass picks the best leader, the second the best remaining escort.
+-- Ties resolve by id so the same eligible group produces the same pair.
+function Parties.choosePair(candidates)
+    local leader, leaderScore, leaderIndex = nil, nil, nil
+    for index, candidate in ipairs(candidates or {}) do
+        local score = LEADER_ROLE_SCORE[candidate.role or "auto"]
+            or LEADER_ROLE_SCORE.auto
+        if leader == nil or score > leaderScore
+            or (score == leaderScore
+                and tostring(candidate.id) < tostring(leader.id)) then
+            leader, leaderScore, leaderIndex = candidate, score, index
+        end
+    end
+    if leader == nil then return nil end
+    local follower, followerScore, followerIndex = nil, nil, nil
+    for index, candidate in ipairs(candidates or {}) do
+        if index ~= leaderIndex then
+            local score = FOLLOWER_ROLE_SCORE[candidate.role or "auto"]
+                or FOLLOWER_ROLE_SCORE.auto
+            if follower == nil or score > followerScore
+                or (score == followerScore
+                    and tostring(candidate.id) < tostring(follower.id)) then
+                follower, followerScore, followerIndex = candidate, score, index
+            end
+        end
+    end
+    if follower == nil then return nil end
+    return leader, follower, leaderIndex, followerIndex
+end
+
 local leasesBySettlement = {}
 local nextRun = 0
 
@@ -79,7 +130,8 @@ local function settlementSupplyNeeds(controller, residentCount)
     local ok, summary = pcall(storage.summarize, base)
     if not ok or type(summary) ~= "table" then return nil end
     local needs = { baseId = controller.baseId, categories = {}, types = {}, typeRules = {} }
-    for _, status in ipairs(planner.reserveStatus(summary.totals or {}, residentCount)) do
+    for _, status in ipairs(planner.reserveStatus(summary.totals or {}, residentCount,
+        base ~= nil and base.reserveTargets or nil)) do
         if (tonumber(status.missing) or 0) > 0 then
             needs.categories[tostring(status.category)] = tonumber(status.missing)
         end
@@ -191,8 +243,13 @@ local function availableDuty(controller, id, persistence)
         and persistence.getSurvivorDuty(id) or {}
     if duty.eventId ~= nil then return false end
     if controller.baseId ~= nil then
+        local preference = duty.jobPreference
+        local catalog = rawget(_G, "KnoxOrderCatalog")
+        if catalog ~= nil and catalog.normalizeBasePreference ~= nil then
+            preference = catalog.normalizeBasePreference(preference)
+        end
+        if preference == "rest" then return false end
         return duty.mode == "base" and (duty.baseId == nil or duty.baseId == controller.baseId)
-            and (duty.jobPreference == nil or duty.jobPreference == "auto")
             and duty.baseSupplyOrder == nil and duty.activeSupplyRun == nil
             and (controller.base ~= nil and controller.base.ownerKind == "faction"
                 and duty.allowLootRuns ~= false or duty.allowLootRuns == true)
@@ -527,13 +584,20 @@ function Parties.coordinate(controllers, activeIds, ticks)
             local candidates = {}
             for _, id in ipairs(memberIds) do
                 if not Parties.ownsSurvivor(id) and eligible(controllers, id, persistence) then
-                    candidates[#candidates + 1] = id
+                    local duty = persistence ~= nil and persistence.getSurvivorDuty ~= nil
+                        and persistence.getSurvivorDuty(id) or nil
+                    candidates[#candidates + 1] = {
+                        id = id, role = roleForDuty(duty),
+                    }
                 end
             end
-            local candidateIndex = 1
-            while existingCount < pairLimit and #candidates - candidateIndex + 1 >= Parties.PAIR_SIZE do
-                local leaderId, followerId = candidates[candidateIndex], candidates[candidateIndex + 1]
-                candidateIndex = candidateIndex + Parties.PAIR_SIZE
+            while existingCount < pairLimit and #candidates >= Parties.PAIR_SIZE do
+                local leaderEntry, followerEntry, leaderIndex, followerIndex =
+                    Parties.choosePair(candidates)
+                if leaderEntry == nil then break end
+                table.remove(candidates, math.max(leaderIndex, followerIndex))
+                table.remove(candidates, math.min(leaderIndex, followerIndex))
+                local leaderId, followerId = leaderEntry.id, followerEntry.id
                 local leader = controllers[leaderId]
                 local follower = controllers[followerId]
                 local leaderChar = leader.character

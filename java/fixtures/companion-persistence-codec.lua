@@ -13,9 +13,17 @@ assert(p.rememberObserverKnowledge("codec-owner","codec-person","report",{
     state={health=65,hunger=.8,thirst=.3,fatigue=.2,endurance=.8,bleedingParts=0},
     line="I am hurt and need food."},11))
 assert(p.recordPlayerSocialAct("codec-owner","codec-person","slap",-20,2,10))
+assert(p.getPlayerRelationshipSnapshot("codec-owner","codec-person").lastTrustDelta==-20)
+assert(p.getPlayerRelationshipSnapshot("codec-owner","codec-person").lastTrustCause=="slap")
 assert(p.recordPlayerSocialAct("codec-owner","codec-person","insult",-12,1,10))
+-- The insult asked for -12 but only -10 could be applied before the floor. The
+-- view must show what happened, not what was requested.
+assert(p.getPlayerRelationshipSnapshot("codec-owner","codec-person").lastTrustDelta==-10)
+assert(p.getPlayerRelationshipSnapshot("codec-owner","codec-person").lastTrustCause=="insult")
 local relation,cooldown=p.recordPlayerSocialAct("codec-owner","codec-person","insult",-12,1,10)
 assert(relation.trust==0 and cooldown=="cooldown")
+assert(p.getPlayerRelationshipSnapshot("codec-owner","codec-person").lastTrustDelta==-10,
+    "a cooldown retry must not overwrite the last real change")
 assert(p.setUnloadedSurvivalState("codec-person",{hunger=.6,thirst=.3,fatigue=.2,endurance=.8,health=91,
     lastHours=12,status="hibernated",virtualX=105,virtualY=205,virtualZ=0}))
 -- Per-pass lookup candidates are runtime references, never durable ownership.
@@ -41,7 +49,10 @@ function verifyPersistedCompanion()
     assert(current.getSurvivorPlayerContact("codec-person","codec-other")==nil)
     assert(current.getObserverKnowledge("codec-owner","codec-person").seen.value.position.x==102)
     assert(current.getObserverKnowledge("codec-other","codec-person").seen.value.position.x==50)
-    assert(current.getPlayerRelationshipSnapshot("codec-owner","codec-person").trust==0)
+    local ownerRelation=current.getPlayerRelationshipSnapshot("codec-owner","codec-person")
+    assert(ownerRelation.trust==0)
+    assert(ownerRelation.lastTrustDelta==-10 and ownerRelation.lastTrustCause=="insult")
+    assert(ownerRelation.lastTrustChangedAtHours==10)
     assert(current.getPlayerRelationshipSnapshot("codec-other","codec-person")==nil)
     assert(current.getObserverKnowledge("codec-owner","codec-person").report.value.state.health==65)
     assert(current.getObserverKnowledge("codec-owner","codec-person").report.atHours==11)

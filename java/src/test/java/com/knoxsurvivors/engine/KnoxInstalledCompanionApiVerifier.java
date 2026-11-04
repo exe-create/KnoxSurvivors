@@ -10,6 +10,10 @@ public final class KnoxInstalledCompanionApiVerifier {
         ClassLoader loader = KnoxInstalledCompanionApiVerifier.class.getClassLoader();
         Class<?> character = Class.forName("zombie.characters.IsoGameCharacter", false, loader);
         Class<?> player = Class.forName("zombie.characters.IsoPlayer", false, loader);
+        method(character, "setPerformingAttackAnimation", void.class, boolean.class);
+        method(character, "setPerformingShoveAnimation", void.class, boolean.class);
+        method(character, "setPerformingStompAnimation", void.class, boolean.class);
+        method(player, "clearHandToHandAttack", void.class);
         Class<?> object = Class.forName("zombie.iso.IsoObject", false, loader);
         Class<?> trait = Class.forName("zombie.scripting.objects.CharacterTrait", false, loader);
         Class<?> utility = Class.forName("zombie.chat.ChatUtility", false, loader);
@@ -27,6 +31,9 @@ public final class KnoxInstalledCompanionApiVerifier {
             if (!origin.equals(gameJar)) throw new AssertionError("Mock/stale engine class: " + type.getName());
         }
         method(character, "getCurrentStateName", String.class);
+        Class<?> food = Class.forName("zombie.inventory.types.Food", false, loader);
+        method(food, "canAge", boolean.class);
+        method(food, "getOffAgeMax", int.class);
         method(character, "getCurrentActionContextStateName", String.class);
         method(character, "isClimbing", boolean.class);
         method(player, "isPerformingAttackAnimation", boolean.class);

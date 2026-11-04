@@ -241,9 +241,12 @@ function TaskBoard.canClaimSpecific(baseId, taskId, survivorId, playerId)
             return false, "already_claimed_task"
         end
     end
-    if KnoxBaseManager.canPerformTask ~= nil
-        and not KnoxBaseManager.canPerformTask(survivorId, baseId, task) then
-        return false, "not_eligible"
+    if KnoxBaseManager.canPerformTask ~= nil then
+        -- Keep the gate's own reason. "Not eligible" told the player nothing
+        -- about a resident who is hurt, out of materials or short of a skill,
+        -- and the caller can only explain what it is given.
+        local eligible, reason = KnoxBaseManager.canPerformTask(survivorId, baseId, task)
+        if not eligible then return false, reason or "not_eligible" end
     end
     return true, "eligible"
 end
@@ -289,7 +292,8 @@ function TaskBoard.finish(baseId, taskId, survivorId, succeeded, reason)
     if finished == nil then
         return nil, result
     end
-    return finished, succeeded and "complete" or "blocked"
+    return finished, succeeded and "complete"
+        or (result == "gave_up" and "cancelled" or "blocked")
 end
 
 return TaskBoard

@@ -50,6 +50,9 @@ local function clearCommunalAllocation(item, seen, depth)
         local ok, data = pcall(function() return item:getModData() end)
         if ok and data ~= nil then data.KnoxBaseProvision = nil end
     end
+    -- Most transferred items are not containers. Kahlua can surface a missing
+    -- Java method through pcall itself, so check the method before calling it.
+    if item.getInventory == nil then return end
     local ok, inventory = pcall(function() return item:getInventory() end)
     if not ok or inventory == nil then return end
     local items = inventory:getItems()

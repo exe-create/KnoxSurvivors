@@ -4,16 +4,16 @@ _G.KnoxSettings = Settings
 local DEFAULTS = {
     Enabled = true,
     DisableSurvivorCaps = false,
-    WorldPopulation = 2048,
-    InitialGroupChance = 65,
+    WorldPopulation = 420,
+    InitialGroupChance = 45,
     InitialGroupMaxSize = 4,
-    InitialGroupCount = 128,
-    InitialFactionCount = 12,
-    MaxActiveSurvivors = 32,
+    InitialGroupCount = 48,
+    InitialFactionCount = 6,
+    MaxActiveSurvivors = 24,
     ActivationsPerUpdate = 2,
-    PopulationRefillDays = 5,
+    PopulationRefillDays = 7,
     MinimumSpawnDistance = 40,
-    SurvivorEncounterDistance = 280,
+    SurvivorEncounterDistance = 220,
     CompanionLimit = 4,
     FollowerFormation = 1,
     FollowerSpacing = 1,
@@ -22,13 +22,17 @@ local DEFAULTS = {
     EnableExperimentalEngineWork = false,
     NpcDrivingSpeed = 20,
     SurvivorAimingAssist = 1,
+    EFZFirearmCompatibility = false,
     SpawnWithSpouse = false,
     ContinueSurvivorsAfterPlayerDeath = true,
     AllowNPCFactions = true,
-    EnableKnoxEvents = false,
+    -- Mirrors sandbox-options.txt: the county's events and raids are part of the
+    -- intended world, and a save with no stored sandbox table must not fall back
+    -- to a quieter county than a new game starts with.
+    EnableKnoxEvents = true,
     AutomaticFactionEntries = true,
-    FactionEntryMinimumDays = 3,
-    FactionEntryIntervalDays = 7,
+    FactionEntryMinimumDays = 7,
+    FactionEntryIntervalDays = 10,
     PoliceNeighborhoodPatrols = true,
     PolicePatrolMargin = 16,
     MilitaryFacilityClearing = true,
@@ -36,10 +40,10 @@ local DEFAULTS = {
     NPCFactionMinimumMembers = 4,
     NPCFactionMaxMembers = 8,
     AllowHostileEncounters = true,
-    AllowAutonomousRetreat = true,
-    AllowFactionRaids = false,
-    FactionRaidMinimumDays = 14,
-    FactionRaidIntervalDays = 7,
+    AllowAutonomousRetreat = false,
+    AllowFactionRaids = true,
+    FactionRaidMinimumDays = 21,
+    FactionRaidIntervalDays = 10,
     ShowCompanionHUD = true,
     ShowActivityFeed = true,
     ShowSurvivorSpeech = true,
@@ -206,7 +210,11 @@ function Settings.allowSurvivorDoorWindowOpening()
 end
 
 function Settings.survivorAimingAssist()
-    return integer("SurvivorAimingAssist", 1, 3)
+    return integer("SurvivorAimingAssist", 3, 5)
+end
+
+function Settings.efzFirearmCompatibility()
+    return value("EFZFirearmCompatibility") == true
 end
 
 function Settings.spawnWithSpouse()

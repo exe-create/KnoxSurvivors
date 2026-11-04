@@ -12,6 +12,7 @@ local Window = ISCollapsableWindowJoypad:derive("KnoxTradeWindow")
 local PAD = 10
 
 local MESSAGES = {
+    work_step_finishing = "Finishing the current step...",
     both_sides_required = "Choose items on both sides.", fair_offer = "That looks fair.",
     gift_item_required = "Choose an item to give.", gift_ready = "Ready to give this item.",
     offer_too_low = "They want more for those items.", offer_no_longer_fair = "The offer has changed. Review the items.",
@@ -27,7 +28,7 @@ local MESSAGES = {
     inventory_unreadable_or_too_large = "That inventory cannot be safely inspected. Trading stopped.",
     shared_inventory = "The two inventories are not separate. Trading stopped.",
     player_busy = "Finish your current action first.", survivor_busy_or_threatened = "They are busy or dealing with a threat.",
-    survivor_busy = "They need to finish what they are doing.", out_of_reach = "Stand beside them with nothing blocking the way.",
+    survivor_busy = "They need to finish what they are doing.", out_of_reach = "Move beside them to hand over items; you can browse from nearby.",
     too_far = "Move closer to trade.", hostile = "They will not trade with you.",
     player_owned = "Use Manage Inventory for your own survivors.",
     danger = "Trading stopped because of danger.", relationship_changed = "Your relationship changed. Trading stopped.",
@@ -118,7 +119,7 @@ function Window:createChildren()
     self.playerList, self.survivorList = makeList(PAD, "giving"), makeList(PAD * 2 + column, "taking")
     local function button(x, y, width, title, callback)
         local value = ISButton:new(x, y, width, self.buttonHeight, title, self, callback)
-        value:initialise()
+        value:initialise(); UILayout.tintButton(value)
         self:addChild(value)
         return value
     end
@@ -133,7 +134,7 @@ function Window:createChildren()
     end)
     self.statusY = toggleY + self.buttonHeight + PAD
     local footerY, footerWidth = self.height - PAD - self.buttonHeight, (self.width - PAD * 4) / 3
-    self.tradeButton = button(PAD, footerY, footerWidth, "Trade", Window.exchange)
+    self.tradeButton = button(PAD, footerY, footerWidth, "Trade", Window.exchange); UILayout.tintPrimary(self.tradeButton)
     self.clearButton = button(PAD * 2 + footerWidth, footerY, footerWidth, "Clear Offer", function(window)
         if window.action ~= nil then return end
         window.giving, window.taking = {}, {}
@@ -243,6 +244,31 @@ end
 function Window:update()
     ISCollapsableWindowJoypad.update(self)
     if self.closed or self.playerList == nil then return end
+    if self.pendingBrowseUntil ~= nil then
+        local now = getTimestampMs()
+        if self.pendingBrowseBody ~= nil and (KnoxSurvivorRuntime.getCharacter(self.survivorId) ~= self.pendingBrowseBody
+            or KnoxSurvivorRuntime.getController(self.survivorId) ~= self.pendingBrowseOwner) then
+            self.pendingBrowseUntil = nil
+            self:stopBrowsing("survivor_unavailable")
+        elseif now >= self.pendingBrowseUntil then
+            self.pendingBrowseUntil = nil
+            self:stopBrowsing("survivor_busy_or_threatened")
+        elseif now >= (self.nextBrowseRetryAt or 0) then
+            self.nextBrowseRetryAt = now + 250
+            local session, reason = KnoxTradeActions.beginBrowse(self.player, self.survivorId)
+            if session ~= nil then
+                self.session, self.pendingBrowseUntil, self.browsingStopped = session, nil, false
+                self.giveButton:setEnable(true)
+                self.takeButton:setEnable(true)
+                self.clearButton:setEnable(true)
+                self:refreshStock()
+            elseif reason ~= "work_step_finishing" then
+                self.pendingBrowseUntil = nil
+                self:stopBrowsing(reason)
+            end
+        end
+        return
+    end
     if self.action ~= nil then
         if self.action.finished then
             self.status = UI.message(self.action.result)
@@ -309,6 +335,9 @@ function Window:close()
     self:setVisible(false)
     self:removeFromUIManager()
     if windows[self.playerNum] == self then windows[self.playerNum] = nil end
+    if UILayout ~= nil and UILayout.releaseSurface ~= nil then
+        pcall(UILayout.releaseSurface, self.playerNum, "trade")
+    end
     if JoypadState ~= nil and JoypadState.players[self.playerNum + 1] ~= nil then
         local focus = JoypadState.players[self.playerNum + 1].focus
         if focus == self or focus == self.playerList or focus == self.survivorList then
@@ -320,6 +349,11 @@ end
 function UI.show(playerNum, survivorId, giftMode)
     local player = getSpecificPlayer(playerNum)
     if player == nil then return nil end
+    -- One Knox surface per player: trade replaces a card or notebook that was
+    -- open. The person-surface rule still owns when trade itself closes.
+    if UILayout ~= nil and UILayout.claimSurface ~= nil then
+        pcall(UILayout.claimSurface, playerNum, "trade", UI)
+    end
     if windows[playerNum] ~= nil then windows[playerNum]:close() end
     local session, reason = KnoxTradeActions.beginBrowse(player, survivorId)
     local scale = math.max(1, getTextManager():getFontHeight(UIFont.Small) / 14)
@@ -336,15 +370,27 @@ function UI.show(playerNum, survivorId, giftMode)
     window.survivorName = name ~= "" and name or "Survivor"
     window.tickTexture = getTexture("media/ui/inventoryPanes/Tickbox_Tick.png")
     window.resizable, window.pin, window.nextRefreshAt = false, true, 0
-    window.backgroundColor = { r = .06, g = .06, b = .06, a = .94 }
-    window.borderColor = { r = .28, g = .28, b = .28, a = 1 }
+    -- Same charcoal sheet and hairline as every other Knox window; Trade used
+    -- to paint its own near-black and read as a different program.
+    UILayout.tintWindow(window)
     window:setTitle(trim((window.giftMode and "Give Item - " or "Trade - ") .. window.survivorName, width - 80))
-    UILayout.bindInteractionWindow(window)
+    -- The person-surface close rule: trade ends when this body is replaced,
+    -- dies, turns hostile, leaves sight or walks beyond talking distance. The
+    -- session keeps its own exchange validation; this only owns the window.
+    window.knoxPersonBody = KnoxSurvivorRuntime.getCharacter(survivorId)
+    UILayout.bindPersonSurface(window)
     window:initialise()
     window:setRenderThisPlayerOnly(playerNum)
     window:addToUIManager()
     windows[playerNum] = window
-    if session == nil then window:stopBrowsing(reason) else window:refreshStock() end
+    if session == nil then
+        window:stopBrowsing(reason)
+        if reason == "work_step_finishing" then
+            window.pendingBrowseUntil = getTimestampMs() + 15000
+            window.pendingBrowseBody = KnoxSurvivorRuntime.getCharacter(survivorId)
+            window.pendingBrowseOwner = KnoxSurvivorRuntime.getController(survivorId)
+        end
+    else window:refreshStock() end
     if JoypadState ~= nil and JoypadState.players[playerNum + 1] ~= nil then
         window.previousJoypadFocus = JoypadState.players[playerNum + 1].focus
         setJoypadFocus(playerNum, window.playerList)
@@ -356,8 +402,15 @@ function UI.showGift(playerNum, survivorId)
     return UI.show(playerNum, survivorId, true)
 end
 
+function UI.close(playerNum)
+    local window = windows[tonumber(playerNum) or 0]
+    if window ~= nil then window:close() end
+end
+
 function UI.closeAll()
-    for _, window in pairs(windows) do window:close() end
+    local playerNums = {}
+    for playerNum in pairs(windows) do playerNums[#playerNums + 1] = playerNum end
+    for _, playerNum in ipairs(playerNums) do UI.close(playerNum) end
 end
 
 Events.OnGameStart.Add(UI.closeAll)

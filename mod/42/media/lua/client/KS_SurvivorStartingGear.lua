@@ -152,4 +152,44 @@ function StartingGear.initialize(id, character, bridge, loadoutTheme)
             .. " equipment=" .. equipped
 end
 
+-- A created survivor's chosen weapon is carried, not equipped: the existing
+-- equip action still decides the hand slot, and a refusal to add the item is a
+-- real failure rather than a silent empty-handed body.
+function StartingGear.applyChosenWeapon(id, character, fullType)
+    if character == nil or character:getInventory() == nil then
+        return false, "inventory_unavailable"
+    end
+    if type(fullType) ~= "string" or fullType == "" then return true, "none" end
+    if not fullType:match("^[A-Za-z][A-Za-z0-9_]*%.[A-Za-z][A-Za-z0-9_]*$") then
+        return false, "invalid_item"
+    end
+    local added = {}
+    if not add(character:getInventory(), fullType, added) then
+        return false, "add_failed:" .. fullType
+    end
+    return true, "added=" .. fullType
+end
+
+-- The creator's chosen pack. Each item is added to the same real inventory the
+-- kit used, and the first refusal is reported rather than hidden: a person who
+-- was promised bandages and got none is a defect the player can see.
+function StartingGear.applyItems(character, items)
+    if character == nil or character:getInventory() == nil then
+        return false, "inventory_unavailable"
+    end
+    if type(items) ~= "table" or #items == 0 then return true, "none" end
+    local inventory = character:getInventory()
+    local added = {}
+    for _, fullType in ipairs(items) do
+        if type(fullType) ~= "string"
+            or not fullType:match("^[A-Za-z][A-Za-z0-9_]*%.[A-Za-z][A-Za-z0-9_]*$") then
+            return false, "invalid_item"
+        end
+        if not add(inventory, fullType, added) then
+            return false, "add_failed:" .. fullType
+        end
+    end
+    return true, "added=" .. tostring(#added)
+end
+
 return StartingGear

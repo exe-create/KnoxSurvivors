@@ -106,11 +106,21 @@ function Planner.requirementTypes(requirements)
     return result
 end
 
+-- A saved per-base target wins only for its own category. The defaults below
+-- remain the fallback; the existing categories keep their prior thresholds,
+-- while fuel now has a two-can default and a real search kind.
+local function targetOverride(targets, category)
+    if type(targets) ~= "table" then return nil end
+    local value = tonumber(targets[category])
+    if value == nil then return nil end
+    return math.max(0, math.min(50, math.floor(value)))
+end
+
 -- One shared reserve definition for both automatic supply decisions and the
 -- player-facing settlement status. Keeping the thresholds here prevents the
 -- Notebook from describing a base as healthy while the resident controller is
 -- simultaneously sending somebody out for supplies.
-function Planner.reserveStatus(totals, residentCount)
+function Planner.reserveStatus(totals, residentCount, targets, waterSource)
     totals = type(totals) == "table" and totals or {}
     local residents = math.max(1, math.floor(tonumber(residentCount) or 1))
     local definitions = {
@@ -123,43 +133,89 @@ function Planner.reserveStatus(totals, residentCount)
         { kind = "find_materials", category = "building", target = 4 },
         { kind = "find_clothing", category = "clothing", target = residents },
         { kind = "find_ammo", category = "ammunition", target = 2 },
+        { kind = "find_fuel", category = "fuel", target = 2 },
     }
     local result = {}
     for _, definition in ipairs(definitions) do
         local current = math.max(0, tonumber(totals[definition.category]) or 0)
+        local override = targetOverride(targets, definition.category)
+        local target = override ~= nil and override or definition.target
+        -- Once the taps are dry, stored water is the whole supply. Raise only
+        -- the unreserved default; a player's saved target still wins.
+        if definition.category == "water" and override == nil
+            and waterSource == "dry" then
+            target = math.max(target, residents * 4)
+        end
         result[#result + 1] = {
             kind = definition.kind,
             category = definition.category,
             current = current,
-            target = definition.target,
-            missing = math.max(0, definition.target - current),
+            target = target,
+            missing = math.max(0, target - current),
         }
     end
     return result
+end
+
+-- The sandbox's own shutoff day is the only water-source state this mod
+-- reads. A non-positive modifier means the shutoff is disabled; an absent
+-- clock or modifier stays unknown instead of claiming the taps are running.
+function Planner.waterSourceState(worldAgeDays, waterShutModifier)
+    local days = tonumber(worldAgeDays)
+    local modifier = tonumber(waterShutModifier)
+    if days == nil or modifier == nil or days ~= days or modifier ~= modifier
+        or days == math.huge or modifier == math.huge then return "unknown" end
+    if modifier <= 0 then return "running" end
+    return days >= modifier and "dry" or "running"
 end
 
 -- Pick the first meaningful settlement shortage using the same conservative
 -- per-resident reserve targets used by the loaded autonomy controller. This is
 -- a pure decision helper; claims, movement, and item transfers remain owned by
 -- their existing systems.
-function Planner.shortages(totals, residentCount)
+function Planner.shortages(totals, residentCount, targets, waterSource)
     local result = {}
-    for _, status in ipairs(Planner.reserveStatus(totals, residentCount)) do
+    for _, status in ipairs(Planner.reserveStatus(totals, residentCount, targets, waterSource)) do
         if status.missing > 0 then result[#result + 1] = status.kind end
     end
     return result
 end
 
-function Planner.chooseShortage(totals, residentCount)
-    return Planner.shortages(totals, residentCount)[1]
+function Planner.chooseShortage(totals, residentCount, targets, waterSource)
+    return Planner.shortages(totals, residentCount, targets, waterSource)[1]
+end
+
+-- Assigned shelves and a floor pile are both stock a resident can pick up, so
+-- a shortage must count both before it sends anyone out. This is the one place
+-- they are added together; the summary keeps them apart so a missing shelf is
+-- still visible as a missing shelf.
+function Planner.stockTotals(summary)
+    local totals = {}
+    for category, quantity in pairs(type(summary) == "table"
+        and type(summary.totals) == "table" and summary.totals or {}) do
+        totals[category] = math.max(0, tonumber(quantity) or 0)
+    end
+    for category, quantity in pairs(type(summary) == "table"
+        and type(summary.floorTotals) == "table" and summary.floorTotals or {}) do
+        totals[category] = (totals[category] or 0) + math.max(0, tonumber(quantity) or 0)
+    end
+    return totals
+end
+
+-- A streamed-out or unassigned storage set is unknown stock, not an empty
+-- pantry. Supply trips also require a real destination on return, so do not
+-- elect a worker until at least one assigned container was inspected.
+function Planner.hasKnownStorageSnapshot(summary)
+    return type(summary) == "table"
+        and (tonumber(summary.loadedPolicies) or 0) > 0
 end
 
 -- Claims are maintained by the base controller. Select the first shortage
 -- that is either unowned or already owned by this resident, allowing food and
 -- water runs to coexist without ever assigning two workers to the same kind.
-function Planner.chooseAvailableShortage(totals, residentCount, claims, survivorId)
+function Planner.chooseAvailableShortage(totals, residentCount, claims, survivorId, targets, waterSource)
     claims = type(claims) == "table" and claims or {}
-    local current = Planner.shortages(totals, residentCount)
+    local current = Planner.shortages(totals, residentCount, targets, waterSource)
     -- Reconstruction may evaluate the worker after another, higher-priority
     -- lease expires. Finish the worker's existing kind instead of letting one
     -- resident accumulate two simultaneous leases.

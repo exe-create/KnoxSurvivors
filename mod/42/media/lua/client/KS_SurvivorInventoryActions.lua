@@ -84,6 +84,8 @@ function KnoxNpcInventoryTransferAction:isValid()
     local events = rawget(_G, "KnoxEventRuntime")
     if self.knoxEventContext ~= nil and (events == nil or not events.lootTransferAllowed(
         self.knoxEventContext, self.character, self.srcContainer, self.destContainer)) then return false end
+    if self.knoxHandoverContext ~= nil and (events == nil or not events.handoverAllowed(
+        self.knoxHandoverContext, self.character, self.srcContainer, self.destContainer)) then return false end
     -- Native validity decides everything including real container capacity:
     -- assigned storage fills like ordinary Project Zomboid containers, and
     -- full shelves simply reject so deposits overflow elsewhere.
@@ -95,6 +97,8 @@ function KnoxNpcInventoryTransferAction:canMergeAction(action)
     -- A plan's transient permission applies to one exact item/destination.
     -- Native batching must not absorb an action with a different permission.
     if self.knoxTransferGuard ~= nil or action.knoxTransferGuard ~= nil then return false end
+    -- A handover is one item to one named body; batching it would lose the id.
+    if self.knoxHandoverContext ~= nil or action.knoxHandoverContext ~= nil then return false end
     local first, other = self.knoxEventContext, action.knoxEventContext
     if (first == nil) ~= (other == nil) then return false end
     if first ~= nil and (first.eventId ~= other.eventId or first.memberId ~= other.memberId
@@ -111,12 +115,20 @@ function KnoxNpcInventoryTransferAction:transferItem(item)
     if context ~= nil and (events == nil or not events.lootTransferAllowed(
         context, self.character, self.srcContainer, self.destContainer)) then return end
     local wasPresent = context ~= nil and self.srcContainer:contains(item)
+    local handover = self.knoxHandoverContext
+    local handoverPresent = handover ~= nil and self.srcContainer:contains(item)
     -- Exact 42.20.3 SP perform() calls this once per actual batched item. Native
     -- transfer can replace self.item or put it on the floor when capacity changes.
     ISInventoryTransferAction.transferItem(self, item)
     if context ~= nil then
         events.observeLootTransfer(context, self.character, self.srcContainer, self.destContainer,
             item, self.item, wasPresent)
+    end
+    -- The receipt for a paid raid is written here, after the item is really in
+    -- their hands, not when the player clicks the menu.
+    if handover ~= nil and events ~= nil then
+        events.observeHandoverTransfer(handover, self.character, self.srcContainer,
+            self.destContainer, item, self.item, handoverPresent)
     end
 end
 
@@ -157,7 +169,12 @@ function InventoryActions.queueTransfer(character, item, source, destination, du
     -- Install before admission: vanilla can start/complete synchronously.
     action.knoxTransferGuard = guard
     local events = rawget(_G, "KnoxEventRuntime")
-    if events ~= nil then action.knoxEventContext = events.captureLootContext(character, source, destination) end
+    if events ~= nil then
+        action.knoxEventContext = events.captureLootContext(character, source, destination)
+        if action.knoxEventContext == nil and events.captureHandoverContext ~= nil then
+            action.knoxHandoverContext = events.captureHandoverContext(character, source, destination)
+        end
+    end
     return admitAction(character, action, "transfer", "queued")
 end
 

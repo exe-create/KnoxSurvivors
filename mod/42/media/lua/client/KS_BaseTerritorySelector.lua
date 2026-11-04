@@ -15,7 +15,7 @@ Selection.__index = Selection
 local activeSelection = nil
 local tickHooked = false
 
-local BOUNDARY_COLOR = { r = 0.30, g = 0.62, b = 0.30, a = 0.32 }
+local BOUNDARY_COLOR = KnoxBaseHighlights.BOUNDARY_COLOUR
 
 local function newSelectionCursor(selection)
     local cursor = ISSelectCursor:new(selection.player, selection, selection.onSquareSelected)
@@ -85,8 +85,10 @@ local function draftTick()
                     local ix1 = math.max(minX, zx1); local ix2 = math.min(maxX, zx2)
                     local iy1 = math.max(minY, zy1); local iy2 = math.min(maxY, zy2)
                     if ix1 <= ix2 and iy1 <= iy2 then
+                        local edge = KnoxBaseHighlights.OVERLAP_COLOUR
                         if addAreaHighlightForPlayer ~= nil then
-                            addAreaHighlightForPlayer(pn, ix1, iy1, ix2 + 1, iy2 + 1, z, 0.92, 0.92, 0.88, 0.16)
+                            addAreaHighlightForPlayer(pn, ix1, iy1, ix2 + 1, iy2 + 1, z,
+                                edge.r, edge.g, edge.b, edge.a)
                         end
                     end
                 end

@@ -411,6 +411,10 @@ public final class KnoxBridge {
         return npcRegistry.beginLockedDoorCombat(id);
     }
 
+    public String beginNpcLockedDoorCombatAt(String id, Object door) {
+        return npcRegistry.beginLockedDoorCombatAt(id, door);
+    }
+
     public String tickNpcCombat(String id) {
         return npcRegistry.tickCombat(id);
     }

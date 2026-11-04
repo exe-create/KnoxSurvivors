@@ -354,6 +354,13 @@ tasks.withType<Test>().configureEach {
     systemProperty("knox.logDirectory", layout.buildDirectory.dir("verification-logs/$name").get().asFile.absolutePath)
 }
 
+val verifyPlaceVocabulary by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Fails when a spoken place line exists in KS_FactionCamps but not in the design vocabulary table."
+    workingDir(rootProject.projectDir)
+    commandLine("bash", "scripts/knox-vocabulary.sh", rootProject.projectDir.absolutePath)
+}
+
 tasks.check {
     dependsOn(
         verifyCombatTransformer,
@@ -368,6 +375,7 @@ tasks.check {
         verifyMeleeCombatLifecycle,
         verifyInventorySnapshot,
         verifyPersistenceCodec,
+        verifyPlaceVocabulary,
         verifyEquipmentOwnership,
         verifyGameLuaCompilation,
         verifyInstalledCompanionApi,

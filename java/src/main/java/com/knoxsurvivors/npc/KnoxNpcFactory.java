@@ -615,6 +615,12 @@ final class KnoxNpcFactory {
             npc.clearMovementRoute();
             return false;
         }
+        // Native paths can start at the centre of the tile already occupied
+        // by the moving follower. Do not turn back to that start marker before
+        // proceeding forward. Keep final in-tile goals and floor transitions.
+        if (nodes.size() > 1 && KnoxMovementGeometry.startNodeBehind(x,y,z,nodes.get(0),nodes.get(1))) {
+            nodes = nodes.subList(1,nodes.size());
+        }
         npc.setMovementRoute(nodes);
         return true;
     }
@@ -653,12 +659,17 @@ final class KnoxNpcFactory {
             int currentZ = (int) Math.floor(
                 ((Number) invoke(body, "getZ")).floatValue()
             );
+            int[] failedEdge = {(int) Math.floor(node[0]), (int) Math.floor(node[1])};
+            if ((int) Math.floor(node[2]) == currentZ
+                && (Math.abs(failedEdge[0] - currentX) > 1 || Math.abs(failedEdge[1] - currentY) > 1)) {
+                failedEdge = KnoxMovementGeometry.nextRouteTile(x, y, node[0], node[1]);
+            }
             npc.rememberTraversalFailure(
                 currentX,
                 currentY,
                 currentZ,
-                (int) Math.floor(node[0]),
-                (int) Math.floor(node[1]),
+                failedEdge[0],
+                failedEdge[1],
                 (int) Math.floor(node[2]),
                 traversal
             );
@@ -708,7 +719,12 @@ final class KnoxNpcFactory {
                 : "FAILED_INVALID_Z_CHANGE";
         }
         if (Math.abs(deltaX) > 1 || Math.abs(deltaY) > 1) {
-            return "CLEAR";
+            int[] edge = KnoxMovementGeometry.nextRouteTile(
+                ((Number) invoke(body, "getX")).floatValue(),
+                ((Number) invoke(body, "getY")).floatValue(), node[0], node[1]
+            );
+            nextX = edge[0]; nextY = edge[1];
+            deltaX = nextX - currentX; deltaY = nextY - currentY;
         }
 
         Object nextSquare = invoke(
@@ -787,6 +803,7 @@ final class KnoxNpcFactory {
             if (characterState.contains("SmashWindowState")) {
                 return "SMASHING_WINDOW";
             }
+            if ("CLIMB_ATTEMPTED".equals(npc.getTraversalInteractionStage())) return "ManualRoute";
 
             boolean open = (Boolean) invoke(window, "IsOpen");
             boolean smashed = (Boolean) invoke(window, "isSmashed");
@@ -828,12 +845,14 @@ final class KnoxNpcFactory {
                 npc.setTraversalInteractionStage("OPEN_ATTEMPTED");
                 return "STARTED_WINDOW_OPEN";
             }
+            if (!windowLandingClear(body, nextSquare)) return "FAILED_OCCUPIED_WINDOW_LANDING";
             invoke(
                 body,
                 "climbThroughWindow",
                 classFor(body, "zombie.iso.objects.IsoWindow"),
                 window
             );
+            npc.setTraversalInteractionStage("CLIMB_ATTEMPTED");
             return "STARTED_WINDOW_CLIMB";
         }
 
@@ -845,6 +864,7 @@ final class KnoxNpcFactory {
         );
         if (windowThumpable != null) {
             npc.useTraversalInteractionTarget(windowThumpable);
+            if ("CLIMB_ATTEMPTED".equals(npc.getTraversalInteractionStage())) return "ManualRoute";
             if (!npc.isClimbingAllowed()) {
                 return "FAILED_CLIMBING_DISABLED";
             }
@@ -855,12 +875,14 @@ final class KnoxNpcFactory {
             if ((Boolean) invoke(body, "shouldBeTurning")) {
                 return "TURNING_TO_WINDOW";
             }
+            if (!windowLandingClear(body, nextSquare)) return "FAILED_OCCUPIED_WINDOW_LANDING";
             invoke(
                 body,
                 "climbThroughWindow",
                 classFor(body, "zombie.iso.objects.IsoThumpable"),
                 windowThumpable
             );
+            npc.setTraversalInteractionStage("CLIMB_ATTEMPTED");
             return "STARTED_WINDOW_CLIMB";
         }
 
@@ -872,15 +894,18 @@ final class KnoxNpcFactory {
         );
         if (windowFrame != null) {
             npc.useTraversalInteractionTarget(windowFrame);
+            if ("CLIMB_ATTEMPTED".equals(npc.getTraversalInteractionStage())) return "ManualRoute";
             if (!npc.isClimbingAllowed()) {
                 return "FAILED_CLIMBING_DISABLED";
             }
+            if (!windowLandingClear(body, nextSquare)) return "FAILED_OCCUPIED_WINDOW_LANDING";
             invoke(
                 body,
                 "climbThroughWindowFrame",
                 classFor(body, "zombie.iso.objects.IsoWindowFrame"),
                 windowFrame
             );
+            npc.setTraversalInteractionStage("CLIMB_ATTEMPTED");
             return "STARTED_WINDOW_FRAME_CLIMB";
         }
 
@@ -1001,6 +1026,16 @@ final class KnoxNpcFactory {
             nextSquare
         );
         return blocked ? "FAILED_STATIC_BLOCKAGE" : "CLEAR";
+    }
+
+    static boolean windowLandingClear(Object body, Object square) throws ReflectiveOperationException {
+        if (square == null) return false;
+        Class<?> character = classFor(body, "zombie.characters.IsoGameCharacter");
+        for (Object occupant : (List<?>) invoke(square, "getMovingObjects")) {
+            if (occupant != body && character.isInstance(occupant)
+                && !(Boolean) invoke(occupant, "isDead")) return false;
+        }
+        return true;
     }
 
     private static void faceObject(Object body, Object object)

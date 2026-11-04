@@ -223,10 +223,32 @@ local function profileForProfession(id, profession, allTraits)
     }
 end
 
-function Capabilities.generate(id, preferredProfessionId)
+-- The two halves of the ordinary-roll rule, exposed so a fixture can hold the
+-- rule itself: building the set is one decision and asking it is another, and
+-- neither needs vanilla profession definitions to answer.
+function Capabilities.denySet(list)
+    if type(list) ~= "table" then return nil end
+    local set = nil
+    for _, entry in ipairs(list) do
+        set = set or {}
+        set[tostring(entry)] = true
+    end
+    return set
+end
+
+function Capabilities.professionDenied(professionId, denied)
+    return type(denied) == "table" and denied[tostring(professionId)] == true
+end
+
+function Capabilities.generate(id, preferredProfessionId, denyProfessions)
     if type(id) ~= "string" or id == "" then
         return nil, "invalid_survivor_id"
     end
+    -- Denied professions are skipped by the ordinary roll only. A preferred
+    -- profession comes from authored event data or a saved origin context and
+    -- stays strict, so a missing definition still fails loudly instead of
+    -- silently becoming someone else.
+    local denied = Capabilities.denySet(denyProfessions)
     local professions = orderedDefinitions(
         CharacterProfessionDefinition.getProfessions(),
         professionId
@@ -248,11 +270,13 @@ function Capabilities.generate(id, preferredProfessionId)
             .. tostring(preferredProfessionId) .. " points=" .. tostring(remaining)
     end
     for _, profession in ipairs(professions) do
-        local profile, remaining = profileForProfession(id, profession, allTraits)
-        if profile ~= nil then
-            return profile, "generated"
+        if not Capabilities.professionDenied(professionId(profession), denied) then
+            local profile, remaining = profileForProfession(id, profession, allTraits)
+            if profile ~= nil then
+                return profile, "generated"
+            end
+            lastPoints = remaining
         end
-        lastPoints = remaining
     end
     return nil, "unable_to_balance_vanilla_points=" .. tostring(lastPoints)
 end
@@ -324,11 +348,17 @@ local function restoreSkills(character, skills)
     end
 end
 
-function Capabilities.ensure(id, character, initializeNew, preferredProfessionId)
+function Capabilities.ensure(
+    id,
+    character,
+    initializeNew,
+    preferredProfessionId,
+    denyProfessions
+)
     local profile = KnoxPersistence.getSurvivorCapabilities(id)
     local result = "existing"
     if profile == nil then
-        profile, result = Capabilities.generate(id, preferredProfessionId)
+        profile, result = Capabilities.generate(id, preferredProfessionId, denyProfessions)
         if profile == nil or not KnoxPersistence.setSurvivorCapabilities(id, profile) then
             return nil, result
         end
@@ -378,13 +408,68 @@ function Capabilities.ensureForOrigin(
         if profile ~= nil then return profile, "contextual:" .. tostring(reason) end
         lastReason = reason
     end
-    local profile, reason = Capabilities.ensure(id, character, initializeNew)
+    -- No usable facility evidence means an ordinary person. Facility
+    -- professions are denied rather than rolled here, so a household survivor
+    -- cannot become a police officer (with the uniform and the kit that
+    -- follow the profession) just because the identity hash landed there.
+    local profile, reason = Capabilities.ensure(
+        id,
+        character,
+        initializeNew,
+        nil,
+        KnoxSurvivorOrigins.facilityProfessions()
+    )
     if profile ~= nil then
         return profile, #candidates > 0 and "context_fallback:" .. tostring(reason)
             or reason
     end
     return nil, reason or lastReason
 end
+
+-- LEVEL UPS (pure)
+-- One rule turns two skill snapshots into the line the player reads. A perk the
+-- previous snapshot did not hold is a baseline, not a gain: a survivor's first
+-- capture carries the whole starting sheet, which the feed announced as
+-- "reached Doctor 7, Fitness 5, Strength 5 (+5 more)". A real gain is a level
+-- that went up on a perk that was already recorded, and every one of them is
+-- named, because a "+N more" tells the player nothing they can act on.
+function Capabilities.levelUps(previous, current)
+    local gains = {}
+    if type(previous) ~= "table" or type(current) ~= "table" then
+        return gains
+    end
+    for perkId, after in pairs(current) do
+        if type(after) == "table" then
+            local before = previous[perkId]
+            if type(before) == "table" then
+                local wanted = tonumber(after.level) or 0
+                local had = tonumber(before.level) or 0
+                if wanted > had then
+                    gains[#gains + 1] = { perk = tostring(perkId), level = wanted }
+                end
+            end
+        end
+    end
+    table.sort(gains, function(first, second)
+        if first.level ~= second.level then return first.level > second.level end
+        return first.perk < second.perk
+    end)
+    return gains
+end
+
+function Capabilities.levelUpText(name, gains)
+    local parts = {}
+    for _, gain in ipairs(gains or {}) do
+        if type(gain) == "table" and gain.perk ~= nil then
+            parts[#parts + 1] = tostring(gain.perk) .. " " .. tostring(gain.level or 0)
+        end
+    end
+    if #parts == 0 then
+        return nil
+    end
+    return tostring(name or "A survivor") .. " reached " .. table.concat(parts, ", ")
+end
+-- END LEVEL UPS
 
 function Capabilities.capture(id, character)
     local profile = KnoxPersistence.getSurvivorCapabilities(id)
@@ -416,37 +501,34 @@ function Capabilities.capture(id, character)
     -- only missing piece was visibility, so announce level-ups here where
     -- the before/after evidence is in hand.
     if saved and type(previous) == "table" then
-        local ups = {}
-        for perkId, savedSkill in pairs(skills) do
-            if type(savedSkill) == "table" then
-                local before = previous[perkId]
-                local beforeLevel = type(before) == "table"
-                    and (tonumber(before.level) or 0) or 0
-                local afterLevel = tonumber(savedSkill.level) or 0
-                if afterLevel > beforeLevel then
-                    ups[#ups + 1] = tostring(perkId) .. " " .. tostring(afterLevel)
-                end
-            end
-        end
+        local ups = Capabilities.levelUps(previous, skills)
         if #ups > 0 then
-            table.sort(ups)
-            local name = tostring(id)
+            -- A skill gain is spoken by a person, never by a runtime id. This
+            -- path fell back to the raw id, so the feed said "ks-world-238
+            -- reached Butchering 2". The name owner resolves the same identity
+            -- the nameplate shows; an unreadable identity becomes a plain noun
+            -- rather than an internal handle.
+            local name = "A survivor"
             pcall(function()
                 local persistence = rawget(_G, "KnoxPersistence")
                 local identity = persistence ~= nil
                     and persistence.getSurvivorIdentity ~= nil
                     and persistence.getSurvivorIdentity(id) or nil
-                if type(identity) == "table" and identity.name ~= nil then
-                    name = tostring(identity.name)
-                elseif type(identity) == "table" and identity.firstName ~= nil then
-                    name = tostring(identity.firstName)
+                local runtime = rawget(_G, "KnoxSurvivorRuntime")
+                local character = runtime ~= nil and runtime.getCharacter ~= nil
+                    and runtime.getCharacter(id) or nil
+                local names = rawget(_G, "KnoxSurvivorNames")
+                if names ~= nil and names.resolve ~= nil then
+                    local _, _, resolved = names.resolve(id, identity, character)
+                    if type(resolved) == "string" and resolved ~= "" then name = resolved end
+                elseif type(identity) == "table" and identity.forename ~= nil then
+                    name = tostring(identity.forename)
                 end
             end)
-            local shown = {}
-            for index = 1, math.min(3, #ups) do shown[#shown + 1] = ups[index] end
-            local text = name .. " reached " .. table.concat(shown, ", ")
-            if #ups > 3 then
-                text = text .. " (+" .. tostring(#ups - 3) .. " more)"
+            local text = Capabilities.levelUpText(name, ups)
+            local gainsText = {}
+            for index, gain in ipairs(ups) do
+                gainsText[index] = gain.perk .. " " .. tostring(gain.level)
             end
             pcall(function()
                 local feed = rawget(_G, "KnoxActivityFeed")
@@ -457,7 +539,7 @@ function Capabilities.capture(id, character)
             pcall(function()
                 local log = rawget(_G, "KnoxDebugLog")
                 if log ~= nil and log.log ~= nil then
-                    log.log("skills", id, "level_up", { gains = table.concat(ups, ",") })
+                    log.log("skills", id, "level_up", { gains = table.concat(gainsText, ",") })
                 end
             end)
         end
