@@ -109,4 +109,78 @@ function NightShelter.isUnclaimedTemporaryShelter(square)
     return true
 end
 
+local function nowHours()
+    return getGameTime():getWorldAgeHours()
+end
+
+function NightShelter.canShelter(survivorId, square)
+    if square==nil then return false end
+    local base=KnoxPersistence.getBaseAtSquare(square:getX(),square:getY(),square:getZ())
+    if base==nil then return true end
+    local duty=KnoxPersistence.getSurvivorDuty(survivorId)
+    if duty~=nil and duty.mode=="base" and duty.baseId==base.id then return true end
+    local guest=base.overnightGuests~=nil and base.overnightGuests[survivorId] or nil
+    return guest~=nil and guest.status=="accepted" and (tonumber(guest.untilHours) or 0)>nowHours()
+end
+
+function NightShelter.pendingVisit(player, survivorId)
+    local playerId=KnoxCompanionService.getPlayerId(player)
+    for _,base in pairs(KnoxPersistence.getBases()) do
+        local guest=base.overnightGuests~=nil and base.overnightGuests[survivorId] or nil
+        if base.ownerKind=="player" and base.ownerId==playerId and guest~=nil
+            and guest.status=="pending" and (tonumber(guest.untilHours) or 0)>nowHours() then return base end
+    end
+    return nil
+end
+
+function NightShelter.respond(player, survivorId, accepted)
+    local base=NightShelter.pendingVisit(player,survivorId)
+    local character=KnoxSurvivorRuntime.getCharacter(survivorId)
+    if base==nil or character==nil or player:isDead() or character:isDead()
+        or player:getZ()~=character:getZ()
+        or (player:getX()-character:getX())^2+(player:getY()-character:getY())^2>16
+        or not player:CanSee(character) then return false,"visitor_unavailable" end
+    local hour=NightShelter.currentHour()
+    local remaining=(NightShelter.NIGHT_END_HOUR-hour)%24
+    local ok,message=KnoxPersistence.answerOvernightStay(base.id,
+        KnoxCompanionService.getPlayerId(player),survivorId,accepted,nowHours(),nowHours()+remaining)
+    if not ok then return false,"overnight_request_expired" end
+    if ok then
+        local hostile=KnoxPersistence.isSurvivorHostileToPlayer(survivorId,KnoxCompanionService.getPlayerId(player))
+        local line=accepted and KnoxOrderCatalog.text("IGUI_Knox_GuestThanks","Thank you. I'll leave in the morning.")
+            or hostile and KnoxOrderCatalog.text("IGUI_Knox_GuestAngry","Get out of my way.")
+            or KnoxOrderCatalog.text("IGUI_Knox_GuestLeaves","All right. I'll find somewhere else.")
+        KnoxActivityFeed.speak(character,line)
+        message=accepted and KnoxOrderCatalog.text("IGUI_Knox_GuestAccepted","The visitor can stay until morning.")
+            or KnoxOrderCatalog.text("IGUI_Knox_GuestRefused","The overnight request was refused.")
+    end
+    return ok,message
+end
+
+function NightShelter.requestVisit(controller, ticks)
+    if ticks<(controller.nextOvernightAskCheck or 0) then return end
+    controller.nextOvernightAskCheck=ticks+600
+    if controller.groupLeaderId~=nil or #(controller.groupMembers or {})>1 then return end
+    local character=controller.character
+    for playerNum=0,(getNumActivePlayers()-1) do
+        local player=getSpecificPlayer(playerNum)
+        if player~=nil and not player:isDead() and player:getZ()==character:getZ()
+            and (player:getX()-character:getX())^2+(player:getY()-character:getY())^2<=64
+            and player:CanSee(character) then
+            local playerId=KnoxCompanionService.getPlayerId(player)
+            local hostSquare=player:getCurrentSquare()
+            local base=hostSquare~=nil and KnoxPersistence.getBaseAtSquare(
+                hostSquare:getX(),hostSquare:getY(),hostSquare:getZ(),"player") or nil
+            if base~=nil and base.ownerId==playerId
+                and not KnoxPersistence.isSurvivorHostileToPlayer(controller.id,playerId) then
+                local request=KnoxPersistence.requestOvernightStay(base.id,controller.id,nowHours())
+                if request~=nil then
+                    KnoxActivityFeed.speak(character,KnoxOrderCatalog.text("IGUI_Knox_GuestRequest","Could I spend the night here?"))
+                end
+                return
+            end
+        end
+    end
+end
+
 return NightShelter

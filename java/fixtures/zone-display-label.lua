@@ -5,14 +5,18 @@ local P = assert(rawget(_G, "KnoxPersistence"), "the persistence module is loade
 assert(type(P.zoneDisplayLabel) == "function", "the zone record owner names a zone")
 
 -- A label that is already the current name, or the player's own, is shown as written.
-assert(P.zoneDisplayLabel({ type = "log_processing", label = "Log Yard" }, "x") == "Log Yard",
+-- Superseded 2026-11-06: the yard's current name is "Drop Point"; "Log Yard" is
+-- now a legacy name translated below, like "Log Processing".
+assert(P.zoneDisplayLabel({ type = "log_processing", label = "Drop Point" }, "x") == "Drop Point",
     "the current name reads unchanged")
 assert(P.zoneDisplayLabel({ type = "log_processing", label = "Back Yard" }, "x") == "Back Yard",
     "a name the player chose is never translated")
 
--- The legacy default is the only string that changes.
-assert(P.zoneDisplayLabel({ type = "log_processing", label = "Log Processing" }, "x") == "Log Yard",
+-- The old names are the only strings that change.
+assert(P.zoneDisplayLabel({ type = "log_processing", label = "Log Processing" }, "x") == "Drop Point",
     "the pre-rename default reads as the current name")
+assert(P.zoneDisplayLabel({ type = "log_processing", label = "Log Yard" }, "x") == "Drop Point",
+    "the earlier yard name reads as the current name")
 
 -- Another kind of area keeps its words even when they match.
 assert(P.zoneDisplayLabel({ type = "woodcutting", label = "Log Processing" }, "x") == "Log Processing",

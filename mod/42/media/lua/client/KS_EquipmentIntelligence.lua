@@ -219,14 +219,14 @@ local function bagScore(item)
         + safe(function() return item:getWeightReduction() end, 0) * 0.15
 end
 
-local function clothingScore(item)
+local function clothingScore(item, overheating)
     if not isClothing(item) then return nil end
     local conditionMax = safe(function() return item:getConditionMax() end, 0)
     local condition = conditionMax > 0
         and safe(function() return item:getCondition() end, 0) / conditionMax or 0
     return safe(function() return item:getBiteDefense() end, 0) * 0.08
         + safe(function() return item:getScratchDefense() end, 0) * 0.04
-        + safe(function() return item:getInsulation() end, 0) * 2
+        + safe(function() return item:getInsulation() end, 0) * (overheating and -2 or 2)
         + condition * 3
 end
 
@@ -327,6 +327,16 @@ end
 function Equipment.choose(character, available)
     if character == nil then return nil end
     local candidates = rootItems(character)
+    local needs = rawget(_G, "KnoxSurvivorNeeds")
+    local heat = needs and needs.thermalMoodle and needs.thermalMoodle(character, "heat") or nil
+    local cold = needs and needs.thermalMoodle and needs.thermalMoodle(character, "cold") or nil
+    local comfort = states[character] or {nextAt=0}
+    states[character] = comfort
+    -- Returning to normal is not a reason to put the overheating coat straight
+    -- back on. Retain the comfort choice until native cold asks for warmth.
+    if heat ~= nil and heat > 0 then comfort.preferCooler = true
+    elseif cold ~= nil and cold > 0 then comfort.preferCooler = false end
+    local function wearScore(item) return clothingScore(item, comfort.preferCooler == true) end
     local primary = safe(function() return character:getPrimaryHandItem() end, nil)
     local primaryIsUsableGun = isUsableGun(primary)
     local bestMelee, bestMeleeScore = nil, -math.huge
@@ -347,8 +357,8 @@ function Equipment.choose(character, available)
                         safe(function() return replacedWearScore(character, location, bagScore) end, math.huge),
                         BAG_SWITCH_MARGIN
                 elseif isClothing(item) then
-                    candidate, current, margin = clothingScore(item),
-                        safe(function() return replacedWearScore(character, location, clothingScore) end, math.huge),
+                    candidate, current, margin = wearScore(item),
+                        safe(function() return replacedWearScore(character, location, wearScore) end, math.huge),
                         CLOTHING_SWITCH_MARGIN
                 end
                 local gain = candidate ~= nil and candidate - (current or -1) or nil
@@ -371,6 +381,75 @@ function Equipment.choose(character, available)
     return nil
 end
 
+-- Enlistment offers actual spare garments matching the donor's worn uniform.
+-- No starter kit is regenerated and the donor is never stripped to dress a recruit.
+function Equipment.offerFactionUniform(donor, recruit, faction, ticks)
+    if donor==nil or recruit==nil or faction==nil or faction.background~="military" then return false end
+    local source=donor.character:getInventory()
+    local destination=recruit.character:getInventory()
+    local worn=donor.character:getWornItems()
+    local uniformTypes={}
+    for index=0,worn:size()-1 do
+        local item=worn:getItemByIndex(index)
+        if item~=nil then uniformTypes[item:getFullType()]=true end
+    end
+    local state=states[recruit.character] or {nextAt=0}
+    states[recruit.character]=state
+    if state.uniformReceipts~=nil then return false end
+    local receipts={}
+    local items=source:getItems()
+    for index=0,items:size()-1 do
+        local item=items:get(index)
+        local personal=safe(function() return item:isFavorite() end,true)
+        local location=wearableLocation(item)
+        local wornItem=location~=nil and donor.character:getWornItem(location) or nil
+        local claims=donor.reservations~=nil and donor.reservations.items or nil
+        if location~=nil and uniformTypes[fullType(item)] and item~=wornItem and not personal
+            and (claims==nil or claims[item]==nil)
+            and item~=donor.character:getPrimaryHandItem() and item~=donor.character:getSecondaryHandItem() then
+            local function allowed()
+                local first=KnoxPersistence.getFactionForSurvivor(donor.id)
+                local second=KnoxPersistence.getFactionForSurvivor(recruit.id)
+                return first~=nil and second~=nil and first.id==faction.id and second.id==faction.id
+                    and not donor.character:isDead() and not recruit.character:isDead()
+                    and item:getContainer()==source
+                    and donor.character:getWornItem(location)~=item
+                    and not safe(function() return item:isFavorite() end,true)
+                    and item~=donor.character:getPrimaryHandItem() and item~=donor.character:getSecondaryHandItem()
+                    and (donor.reservations==nil or donor.reservations.items==nil
+                        or donor.reservations.items[item]==nil)
+            end
+            local action=KnoxInventoryActions.queueTransfer(donor.character,item,source,destination,nil,allowed)
+            if action~=nil then receipts[#receipts+1]={item=item,location=location,expires=(ticks or 0)+600} end
+            if #receipts>=3 then break end
+        end
+    end
+    if #receipts>0 then state.uniformReceipts=receipts; return true end
+    return false
+end
+
+function Equipment.receiveUniform(id, character, bridge, state, ticks)
+    local receipts=state.uniformReceipts
+    if receipts==nil then return false end
+    for index=#receipts,1,-1 do
+        local receipt=receipts[index]
+        if ticks>=receipt.expires then table.remove(receipts,index)
+        elseif receipt.item:getContainer()==character:getInventory() then
+            local faction=KnoxPersistence.getFactionForSurvivor(id)
+            if faction~=nil and faction.background=="military" then
+                local result=tostring(bridge:wearNpcOwnedItemById(id,receipt.item:getFullType(),receipt.item:getID()))
+                if result:find("WORN_OWNED",1,true)==1
+                    and character:getWornItem(receipt.location)==receipt.item then
+                    table.remove(receipts,index)
+                    return true
+                end
+            else table.remove(receipts,index) end
+        end
+    end
+    if #receipts==0 then state.uniformReceipts=nil end
+    return false
+end
+
 function Equipment.reconsider(id, character, bridge, ticks, force, available)
     if character == nil or bridge == nil then return false, "equipment_unavailable" end
     local state = states[character] or { nextAt = 0 }
@@ -384,6 +463,9 @@ function Equipment.reconsider(id, character, bridge, ticks, force, available)
         return false, "equipment_action_active"
     end
     state.nextAt = (ticks or 0) + EVALUATION_TICKS
+    if Equipment.receiveUniform(id,character,bridge,state,ticks or 0) then
+        return true,"faction_uniform_received"
+    end
     -- A broken primary is a real event. Say it once per item through the
     -- dialogue owner's voice selection; the chooser still owns whether to
     -- swap. A skipped line (cooldown, speech off) is retried next evaluation.

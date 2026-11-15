@@ -79,9 +79,9 @@ assert(I.raidWarningText({ factionName = "Northside Crew" }) == nil,
 
 -- The World row: cause and ETA, in one line.
 local threat = I.raidThreatText(warning, 12)
-assert(threat == "Raid on your home — from the south-east, a few armed, they want it back; under an hour out",
+assert(threat == "Raid on your home - from the south-east, a few armed, they want it back; under an hour out",
     "the threat line carries direction, band, cause and ETA: " .. tostring(threat))
-assert(I.raidThreatText({ direction = "north" }, 12) == "Raid on your home — from the north",
+assert(I.raidThreatText({ direction = "north" }, 12) == "Raid on your home - from the north",
     "a bare warning still names the direction it has")
 
 -- The attention item: one title, one detail, one existing action.

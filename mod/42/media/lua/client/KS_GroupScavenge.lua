@@ -126,32 +126,42 @@ local function settlementSupplyNeeds(controller, residentCount)
     local storage = rawget(_G, "KnoxBaseStorage")
     local planner = rawget(_G, "KnoxBaseSupplyPlanner")
     if storage == nil or storage.summarize == nil or planner == nil
-        or planner.reserveStatus == nil then return nil end
+        or planner.reserveStatus == nil or planner.stockTotals == nil then return nil end
     local ok, summary = pcall(storage.summarize, base)
-    if not ok or type(summary) ~= "table" then return nil end
+    if not ok or type(summary) ~= "table"
+        or planner.hasKnownStorageSnapshot == nil
+        or not planner.hasKnownStorageSnapshot(summary) then return nil end
+    local jobs = rawget(_G, "KnoxBaseJobs")
+    local waterSource = jobs ~= nil and jobs.waterSourceState ~= nil
+        and jobs.waterSourceState() or "unknown"
     local needs = { baseId = controller.baseId, categories = {}, types = {}, typeRules = {} }
-    for _, status in ipairs(planner.reserveStatus(summary.totals or {}, residentCount,
-        base ~= nil and base.reserveTargets or nil)) do
+    for _, status in ipairs(planner.reserveStatus(planner.stockTotals(summary), residentCount,
+        base.reserveTargets, waterSource)) do
         if (tonumber(status.missing) or 0) > 0 then
             needs.categories[tostring(status.category)] = tonumber(status.missing)
         end
     end
-    for _, task in pairs(base.tasks or {}) do
-        if task.state == "queued" or task.state == "claimed" then
-            local requirements = task.requirements
-            for itemType, required in pairs(requirements ~= nil and requirements.items or {}) do
-                itemType = tostring(itemType)
-                local count = math.max(0, math.floor(tonumber(required) or 0))
-                local exact = { items = { [itemType] = count },
-                    itemRules = requirements.itemRules }
-                local assigned = storage.countAssignedItem ~= nil
-                    and storage.countAssignedItem(base, itemType, exact) or 0
-                needs.types[itemType] = math.max(
-                    tonumber(needs.types[itemType]) or 0,
-                    count - math.max(0, math.floor(tonumber(assigned) or 0))
-                )
-                needs.typeRules[itemType] = needs.typeRules[itemType] or {}
-                needs.typeRules[itemType][#needs.typeRules[itemType] + 1] = exact
+    -- Individual runners and pairs consume the same queued-job demand:
+    -- consumables add across jobs, while one usable tool can serve several.
+    for _, goal in ipairs(jobs ~= nil and jobs.materialGoals ~= nil
+        and jobs.materialGoals(base) or {}) do
+        needs.types[goal.fullType] = goal.missing
+        needs.typeRules[goal.fullType] = { goal.requirements }
+    end
+    -- A named item minimum is the same demand a job requirement makes: an exact
+    -- type with a count. It joins the same needs table the container planner
+    -- already filters on, so the pair that leaves for a shortage searches for
+    -- the item the player named rather than for its whole category.
+    if planner.itemGoalStatus ~= nil and storage.goalItemCount ~= nil then
+        for _, goal in ipairs(planner.itemGoalStatus(base.reserveTargets, function(fullType)
+            return storage.goalItemCount(base, fullType)
+        end)) do
+            if goal.missing > 0 then
+                needs.types[goal.fullType] = math.max(
+                    tonumber(needs.types[goal.fullType]) or 0, goal.missing)
+                needs.typeRules[goal.fullType] = needs.typeRules[goal.fullType] or {}
+                table.insert(needs.typeRules[goal.fullType], 1,
+                    { items = { [goal.fullType] = 1 } })
             end
         end
     end
@@ -172,6 +182,15 @@ end
 
 local function belongsToSettlement(controller, id, persistence)
     local base = controller ~= nil and controller.base or nil
+    if controller ~= nil and controller.baseId ~= nil and persistence ~= nil and persistence.getBase ~= nil then
+        local current=persistence.getBase(controller.baseId)
+        if current ~= nil and current.ownerKind=="group" then base=current end
+    end
+    if base ~= nil and base.ownerKind == "group" then
+        local current=persistence ~= nil and persistence.getBase ~= nil and persistence.getBase(controller.baseId) or nil
+        return current ~= nil and current.ownerKind=="group" and current.ownerId==base.ownerId
+            and persistence.isGroupBaseMember ~= nil and persistence.isGroupBaseMember(current,id,true)
+    end
     if base == nil or base.ownerKind ~= "faction" then return true end
     if persistence ~= nil and persistence.getBase ~= nil then
         local ok, current = pcall(persistence.getBase, controller.baseId)
@@ -192,7 +211,19 @@ local function idleState(controller)
 end
 
 local function leaseAuthorized(lease)
-    if lease.factionOwnerId == nil then return true end
+    if lease.groupOwnerId ~= nil then
+        local persistence=rawget(_G,"KnoxPersistence")
+        local base=persistence ~= nil and persistence.getBase ~= nil and persistence.getBase(lease.baseId) or nil
+        if base==nil or base.ownerKind~="group" or base.ownerId~=lease.groupOwnerId
+            or persistence.isGroupBaseMember==nil then return false end
+        return persistence.isGroupBaseMember(base,lease.leaderId,true)
+            and persistence.isGroupBaseMember(base,lease.followerId,true)
+    end
+    if lease.factionOwnerId == nil then
+        local persistence=rawget(_G,"KnoxPersistence")
+        local base=persistence ~= nil and persistence.getBase ~= nil and persistence.getBase(lease.baseId) or nil
+        return base==nil or base.ownerKind~="group"
+    end
     local persistence = rawget(_G, "KnoxPersistence")
     if persistence == nil or persistence.getSurvivorAffiliation == nil then return false end
     if persistence.getBase ~= nil then
@@ -257,6 +288,12 @@ local function availableDuty(controller, id, persistence)
     return duty.mode == nil or duty.mode == "autonomous"
 end
 
+local function scheduledRest(controller, id)
+    local jobs = rawget(_G, "KnoxBaseJobs")
+    return controller.baseId ~= nil and jobs ~= nil and jobs.isRestWindow ~= nil
+        and jobs.isRestWindow(id) == true
+end
+
 local function eligible(controllers, id, persistence)
     local controller = controllers[id]
     if controller == nil or controller.character == nil or controller.pendingBaseSupplyDeposit ~= nil then
@@ -279,7 +316,7 @@ local function eligible(controllers, id, persistence)
     if not alive(persistence, id) then
         return false
     end
-    if not readyForSortie(controller) then
+    if scheduledRest(controller, id) or not readyForSortie(controller) then
         return false
     end
     if hasClaim(persistence, id, controller.baseId) then
@@ -566,18 +603,26 @@ function Parties.coordinate(controllers, activeIds, ticks)
         local pairLimit = supplyParty and math.max(1, math.floor(residentCount / 4)) or 1
         if supplyParty then
             local manager = rawget(_G, "KnoxBaseManager")
-            local homeCount = 0
+            local homeCount, onDutyHome = 0, 0
             for _, id in ipairs(memberIds) do
                 local member = controllers[id]
                 local square = member.character ~= nil and member.character:getCurrentSquare() or nil
                 if not Parties.ownsSurvivor(id) and square ~= nil and manager ~= nil
                     and manager.containsSquare ~= nil and manager.containsSquare(member.base, square) then
                     homeCount = homeCount + 1
+                    if not scheduledRest(member, id) then
+                        onDutyHome = onDutyHome + 1
+                    end
                 end
             end
             local minimumHome = residentCount == 3 and 1 or math.ceil(residentCount / 2)
             pairLimit = math.min(pairLimit, existingCount
                 + math.max(0, math.floor((homeCount - minimumHome) / Parties.PAIR_SIZE)))
+            -- Sleeping/recreation residents still count toward the population
+            -- reserve, but cannot be the only scheduled cover left at home.
+            -- This caps new departures; a live lease keeps its return owner.
+            pairLimit = math.min(pairLimit, existingCount
+                + math.max(0, math.floor((onDutyHome - 1) / Parties.PAIR_SIZE)))
         end
         if existingCount < pairLimit and #memberIds >= Parties.PAIR_MIN_MEMBERS
             and (not isSupplyPartySettlement(first) or supplyParty) then
@@ -615,6 +660,8 @@ function Parties.coordinate(controllers, activeIds, ticks)
                     purpose = supplyParty and "base_supply" or "routine_scavenge",
                     supplyNeeds = supplyNeeds,
                     baseId = leader.baseId,
+                    groupOwnerId = leader.base ~= nil and leader.base.ownerKind == "group"
+                        and leader.base.ownerId or nil,
                     factionOwnerId = leader.base ~= nil and leader.base.ownerKind == "faction"
                         and tostring(leader.base.ownerId) or nil,
                 }

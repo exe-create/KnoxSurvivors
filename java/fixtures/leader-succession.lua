@@ -62,6 +62,10 @@ local b = assert(p.allocateWorldSurvivor({ x = 12, y = 11, z = 0, key = "ls-b", 
 local c = assert(p.allocateWorldSurvivor({ x = 13, y = 11, z = 0, key = "ls-c", region = "LS" }, 10))
 local group = assert(p.createTravelGroup({ a, b, c }, 10))
 assert(group.leaderId == a, "the first member founds the group")
+group.memberJoinedAtHours[b] = 11
+group.memberJoinedAtHours[c] = 10
+assert(p.issueTravelGroupLeaderOrder(group.id, a, "withdraw", 11, 13))
+assert(p.setTravelGroupObjective(group.id, a, { kind = "travel_area", phase = "traveling" }, 11))
 local promoted = p.markSurvivorDead(a, 12, "test_death")
 assert(promoted == true, "the death is recorded")
 
@@ -69,7 +73,33 @@ local _, candidates = p.getTravelGroupsFor({ b, c })
 local after = p.getTravelGroupFor(b, candidates)
 assert(after ~= nil, "the group survives its leader")
 assert(after.leaderId ~= a, "a dead member is never left in charge of a real group")
-assert(after.leaderId == b or after.leaderId == c, "the successor is a real surviving member")
+assert(after.leaderId == c, "the real death path selects tenure before roster order")
 assert(p.isSurvivorAlive(after.leaderId) == true, "the successor is alive")
+assert(after.leaderOrder == nil and after.objective == nil,
+    "the deceased leader's directives do not survive succession")
+
+local d = assert(p.allocateWorldSurvivor({ x = 21, y = 11, z = 0, key = "ls-d", region = "LS" }, 20))
+local e = assert(p.allocateWorldSurvivor({ x = 22, y = 11, z = 0, key = "ls-e", region = "LS" }, 20))
+local f = assert(p.allocateWorldSurvivor({ x = 23, y = 11, z = 0, key = "ls-f", region = "LS" }, 20))
+local factionGroup = assert(p.createTravelGroup({ d, e, f }, 20))
+local faction = assert(p.promoteTravelGroupToFaction(factionGroup.id, 22, 3))
+faction.memberJoinedAtHours[e] = 21
+faction.memberJoinedAtHours[f] = 20
+factionGroup.memberJoinedAtHours[e] = 21
+factionGroup.memberJoinedAtHours[f] = 20
+assert(p.markSurvivorDead(d, 23, "test_death"))
+assert(p.getFaction(faction.id).leaderId == f,
+    "faction death succession uses tenure instead of the first roster ID")
+assert(p.getTravelGroupFor(f).leaderId == f,
+    "the faction's travel group follows the same succession rule")
+assert(#p.getFaction(faction.id).memberIds == 2,
+    "the deceased member is still removed from the faction")
+assert(p.markSurvivorDead(e, 24, "test_death"))
+assert(p.getFaction(faction.id).leaderId == f,
+    "a non-leader death preserves the living leader")
+assert(p.markSurvivorDead(f, 25, "test_death"))
+assert(p.getFaction(faction.id) == nil,
+    "the last member's death collapses the empty faction through existing cleanup")
+assert(p.markSurvivorDead(d, 26, "duplicate_death"), "death handling remains idempotent")
 
 print("Leader succession PASS tenure=true deterministic=true dead_excluded=true handover=true leaderless=true real_group=true")

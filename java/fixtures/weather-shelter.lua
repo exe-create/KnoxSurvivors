@@ -86,3 +86,12 @@ assert(N.shelterReason(body(36.8)) == nil, "a missing sky moves nobody")
 
 getClimateManager = previousClimate
 print("Weather shelter PASS rain=true cold=true wet=true threshold=true unknown=true")
+
+local oldMoodle=MoodleType
+MoodleType={HYPERTHERMIA="heat",HYPOTHERMIA="cold"}
+local thermal=body(36.8)
+thermal.getMoodles=function() return {getMoodleLevel=function(_,kind) return kind=="heat" and 2 or 0 end} end
+rain=0
+assert(N.shelterReason(thermal)=="heat", "native overheating finds shade without inventing a core-temperature threshold")
+assert(N.shelterBank("heat")=="weather_heat", "heat uses its own truthful speech bank")
+MoodleType=oldMoodle

@@ -1,9 +1,12 @@
 local p=KnoxPersistence
+p.getPopulationState().creatorRoster = {["user_example:Saved person"]="codec-person"}
 for _,id in ipairs({"codec-owner","codec-other"}) do
     assert(p.ensurePlayerId({getModData=function() return {KnoxSurvivors={playerId=id}} end})==id)
 end
 assert(p.setRecord("codec-person",expectedRecord))
+assert(p.setSurvivorCreatorRecord("codec-person",{name="Custom Survivor",faction="user_custom",profile="custom",attitude="neutral"}))
 assert(p.setPlayerCompanion("codec-person","codec-owner","follow",10))
+assert(p.setSurvivorAutoMedical("codec-person","codec-owner",false,10))
 assert(p.rememberSurvivorPlayerContact("codec-person","codec-owner",{x=102,y=203,z=0,atHours=11,source="voice"}))
 assert(p.rememberObserverKnowledge("codec-owner","codec-person","seen",{position={x=102,y=203,z=0},alive=true},11))
 assert(p.rememberObserverKnowledge("codec-other","codec-person","seen",{position={x=50,y=60,z=0},alive=true},8))
@@ -34,6 +37,10 @@ local unused,oldCandidates=p.getTravelGroupsFor({originA,originB})
 assert(p.getTravelGroupFor(originA,oldCandidates)==savedGroup)
 function verifyReloadedGroupIndex()
     local current=KnoxPersistence
+    assert(current.getSurvivorCreatorRecord("codec-person").profile=="custom",
+        "custom purpose survives the installed B42 table codec")
+    assert(current.getPopulationState().creatorRoster["user_example:Saved person"]=="codec-person",
+        "per-world creator allocation receipt survives the real B42 table codec")
     assert(current.getTravelGroupFor(originA,oldCandidates)==nil,"old-world object cannot own a loaded group")
     local selected,freshCandidates=current.getTravelGroupsFor({originA,originB})
     local group=current.getTravelGroupFor(originA,freshCandidates)
@@ -41,6 +48,7 @@ function verifyReloadedGroupIndex()
     assert(current.getUnloadedSurvivalState(originB).pendingMaterialization==true)
 end
 function verifyPersistedCompanion()
+    assert(p.getSurvivorPolicies("codec-person").autoMedical==false,"medical off survives actual table codec")
     local current=KnoxPersistence
     assert(current.getRecord("codec-person")==expectedRecord)
     local duty=current.getSurvivorDuty("codec-person")

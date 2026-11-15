@@ -476,6 +476,44 @@ function DeveloperTools.calmTestScene(playerNum)
     print("[KnoxSurvivors][DeveloperTools] calm-scene removed=" .. tostring(removed))
 end
 
+-- Spawn one authored creator person where the player clicked. The record is the
+-- same hand-over the world start uses, so the body arrives with its creator
+-- look, kit and name instead of an anonymous test body.
+function DeveloperTools.spawnCreatorPerson(playerNum, rosterIndex, worldObjects)
+    local player = getSpecificPlayer(playerNum)
+    local object = worldObjects ~= nil and worldObjects[1] or nil
+    local square = object ~= nil and object:getSquare() or nil
+    local Creator = rawget(_G, "KnoxCreator")
+    if Creator == nil then pcall(function() Creator = require "KS_Creator" end) end
+    if Creator == nil or Creator.load == nil then
+        KnoxActivityFeed.event("Creator spawn failed: creator unavailable.")
+        return
+    end
+    local roster, group = Creator.load()
+    local person = type(roster) == "table" and roster[tonumber(rosterIndex) or 0] or nil
+    if person == nil then
+        KnoxActivityFeed.event("Creator spawn failed: nobody at that roster row.")
+        return
+    end
+    local record = Creator.recordFor(person, group)
+    if record == nil then
+        KnoxActivityFeed.event("Creator spawn failed: invalid person.")
+        return
+    end
+    spawnSequence = spawnSequence + 1
+    local token = "manual-spawn-" .. tostring(getTimestampMs ~= nil and getTimestampMs() or 0) .. "-" .. spawnSequence
+    local owner = { runId = token, ownerToken = token, scenarioId = "creator" }
+    local success, result, id = KnoxSurvivorAutonomy.spawnCreatorSurvivor(player, record, square, owner)
+    if success and id ~= nil then spawnBatches[#spawnBatches + 1] = { ids = { id }, owner = owner } end
+    if success then
+        KnoxActivityFeed.event("Creator spawn: " .. tostring(person.name or record.name) .. " arrived.")
+    else
+        KnoxActivityFeed.event("Creator spawn failed: " .. tostring(result) .. ".")
+    end
+    print("[KnoxSurvivors][DeveloperTools] creator-spawn=" .. tostring(person.name)
+        .. " success=" .. tostring(success) .. " result=" .. tostring(result))
+end
+
 local function onFill(playerNum, context, worldObjects, test)
     if not KnoxSettings.developerToolsEnabled() then
         return
@@ -509,6 +547,28 @@ local function onFill(playerNum, context, worldObjects, test)
         end
     end
     populationMenu:addOption("Remove Last Spawn (Test Survivors Only)",nil,DeveloperTools.cleanupLastSpawn)
+    pcall(function()
+        local Creator = rawget(_G, "KnoxCreator")
+        if Creator == nil then Creator = require "KS_Creator" end
+        if Creator == nil or Creator.load == nil then return end
+        local roster, group = Creator.load()
+        local entries = Creator.devSpawnEntries ~= nil and Creator.devSpawnEntries(roster, group) or {}
+        if #entries == 0 then return end
+        local creatorOption = populationMenu:addOption("Spawn Creator Person Here", nil, nil)
+        local creatorMenu = ISContextMenu:getNew(populationMenu)
+        populationMenu:addSubMenu(creatorOption, creatorMenu)
+        local shown = 0
+        for _, entry in ipairs(entries) do
+            shown = shown + 1
+            if shown > 40 then break end
+            creatorMenu:addOption(tostring(entry.label) .. " (" .. tostring(entry.detail or "") .. ")",
+                playerNum, DeveloperTools.spawnCreatorPerson, entry.index, worldObjects)
+        end
+        if #entries > 40 then
+            local note = creatorMenu:addOption("... " .. tostring(#entries - 40) .. " more in the creator file", nil, nil)
+            note.notAvailable = true
+        end
+    end)
 
     local jobsOption = menu:addOption("Base & Job Tests", nil, nil)
     local jobsMenu = ISContextMenu:getNew(menu)

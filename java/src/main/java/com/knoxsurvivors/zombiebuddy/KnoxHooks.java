@@ -26,6 +26,12 @@ public final class KnoxHooks {
         return KnoxHumanCombatGate.overridePVP(attacker, victim);
     }
 
+    public static float survivorStrength(Object victim, Object weapon, Object attacker, float damage) {
+        if (!KnoxAgent.usesZombieBuddyPatches()
+            || !callerIs("zombie.characters.IsoGameCharacter", Set.of("Hit"))) return damage;
+        return KnoxCombatGate.scaleSurvivorDamage(victim, weapon, attacker, damage);
+    }
+
     private static boolean callerIs(String owner, Set<String> methods) {
         // Advice is inlined into the predicate. Only its immediate caller qualifies;
         // an outer callback cannot grant local-player status inside nested combat code.

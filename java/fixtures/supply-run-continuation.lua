@@ -4,31 +4,24 @@ local e = KnoxAwayTeamExecutor
 assert(e ~= nil, "away executor must be loaded")
 assert(type(e.runContinues) == "function", "runContinues must exist")
 assert(type(e.packFull) == "function", "packFull must exist")
-assert(e.RUN_SEARCH_LIMIT == 3, "the bounded chain limit is three searches")
-
--- The decision that used to be missing: a run does not stop after one crate.
-local continues, why = e.runContinues({ searches = 1, maxSearches = 3, packFull = false })
-assert(continues == true and why == "continue", "a second container is still allowed")
-continues, why = e.runContinues({ searches = 2, maxSearches = 3, packFull = false })
-assert(continues == true and why == "continue", "the third container is still allowed")
-continues, why = e.runContinues({ searches = 3, maxSearches = 3, packFull = false })
-assert(continues == false and why == "search_budget", "the budget is a real stop")
-continues, why = e.runContinues({ searches = 1, maxSearches = 3, packFull = true })
-assert(continues == false and why == "pack_full", "a full pack is a real stop")
-continues, why = e.runContinues({ searches = 1, packFull = false })
-assert(continues == true, "a missing limit falls back to the shipped one")
-continues, why = e.runContinues({ searches = nil, maxSearches = 1, packFull = false })
-assert(continues == false and why == "search_budget", "an unknown count is not a free search")
-continues, why = e.runContinues(nil)
-assert(continues == false and why == "no_state", "no state never authorises a search")
+-- Resource trips have no container-count deadline. Scouting is separate.
+for _,searches in ipairs({1,3,30,300}) do
+    local continues,why=e.runContinues({searches=searches,packFull=false,missionType="food"})
+    assert(continues and why=="continue","resource runs stay out until actually full")
+end
+local continues,why=e.runContinues({searches=300,packFull=true,missionType="food"})
+assert(not continues and why=="pack_full","a real carrying limit ends the search")
+assert(e.runContinues({searches=3,missionType="scout"})==false,"scouting remains bounded")
+assert(e.runContinues(nil)==false,"missing state refuses work")
 
 -- Real weight against real capacity, and an unreadable body is not "full".
 local function withInventory(weight, capacity)
     return {
         getInventory = function()
             return {
-                getWeight = function() return weight end,
-                getCapacityWeight = function() return capacity end,
+                getCapacityWeight = function() return weight end,
+                getMaxWeight = function() return capacity end,
+                getItems = function() return {size=function() return 0 end} end,
             }
         end,
     }
@@ -100,5 +93,40 @@ assert(p.beginAwayTeamCollection(legacy.id, 19))
 local oneShot = p.recordAwayTeamCollection(legacy.id, "run-legacy", { "Base.Hammer" }, 19)
 assert(oneShot ~= nil and p.awayTeamCollectionReady(legacy.id) == true,
     "an omitted final argument keeps the old one-container contract")
+
+-- Restore the actual controller count from the durable member ledger, then
+-- exercise its normal completion handoff into the real continuation decision.
+local controller = setmetatable({id="resume-scout", awaySearches=99,
+    releaseSupply=function() end, markAwayCargoDelivery=function() end},
+    assert(KnoxAutonomyController))
+local savedGet, savedRecord, savedReady = p.getAwayTeam, e.recordCollection, e.collectionReady
+local teams = {
+    resume={missionType="scout",searchProgress={["resume-scout"]={step=7}},
+        collection={byMember={["resume-scout"]={searches=2,collected=false}}}},
+    complete={missionType="scout",collection={byMember={["resume-scout"]={searches=3,collected=true}}}},
+    empty={missionType="scout"},
+    invalid={missionType="scout",collection={byMember={["resume-scout"]={searches=-4}}}},
+}
+p.getAwayTeam=function(id) return teams[id] end
+controller:setAwayTeam("resume")
+assert(controller.awaySearches==2 and controller.awaySearchStep==7 and not controller.awayCollected,
+    "reactivation restores the member's two completed searches and existing phase")
+local finalReceipt
+e.recordCollection=function(_, _, _, _, _, final) finalReceipt=final; return {} end
+e.collectionReady=function() return false end
+assert(controller:finishAwayCollection(100) and finalReceipt==true and controller.awayCollected,
+    "the next real completion reaches the scout limit using the restored count")
+controller:setAwayTeam("complete")
+assert(controller.awaySearches==3 and controller.awayCollected,
+    "a completed scout restores all three searches and its completion flag")
+controller.awaySearches=99
+controller:setAwayTeam("empty")
+assert(controller.awaySearches==0, "a new team without a member ledger clears stale searches")
+controller:setAwayTeam("invalid")
+assert(controller.awaySearches==0, "negative persisted searches normalize to zero")
+controller.awaySearches=99
+controller:setAwayTeam(nil)
+assert(controller.awaySearches==0, "clearing the mission resets stale searches")
+p.getAwayTeam, e.recordCollection, e.collectionReady = savedGet, savedRecord, savedReady
 
 print("Supply run continuation PASS continues=true pack_full=true budget=true accumulate=true final_only=true legacy_one_shot=true")

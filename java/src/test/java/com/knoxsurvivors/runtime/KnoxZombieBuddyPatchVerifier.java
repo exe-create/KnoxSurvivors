@@ -24,7 +24,7 @@ public final class KnoxZombieBuddyPatchVerifier {
         Files.createDirectories(workspace);
         Map<String, byte[]> adviceBytes = new HashMap<>();
         Map<String, String[]> targets = new LinkedHashMap<>();
-        for (String leaf : List.of("CallbackEligibility", "HumanEligibility", "TargetVisibility")) {
+        for (String leaf : List.of("CallbackEligibility", "HumanEligibility", "TargetVisibility", "SurvivorStrength")) {
             Class<?> advice = Class.forName(PKG + leaf);
             Patch patch = advice.getAnnotation(Patch.class);
             require(patch != null && patch.isAdvice() && !patch.IKnowWhatIAmDoing(), "ordinary supported advice");
@@ -55,8 +55,8 @@ public final class KnoxZombieBuddyPatchVerifier {
                 require(countCalls(gameLocator, "zombie.CombatManager", method,
                     "zombie/CombatManager", "checkPVP") == 1, "one scoped human gate: " + method);
             require(countCalls(gameLocator, "zombie.CombatManager", "attackCollisionCheck",
-                "zombie/characters/IsoPlayer", "isLocalPlayer") == 5,
-                "five impact-method local checks demonstrate why broad advice is unsafe");
+                "zombie/characters/IsoPlayer", "isLocalPlayer") == 4,
+                "four impact-method local checks demonstrate why broad advice is unsafe");
         }
         Path fixtures = Files.createTempDirectory(workspace, "fixtures-");
         Map<String, String> sources = new LinkedHashMap<>();
@@ -64,6 +64,7 @@ public final class KnoxZombieBuddyPatchVerifier {
         sources.put("zombie.network.GameClient", "public class GameClient {public static boolean client;}");
         sources.put("zombie.network.GameServer", "public class GameServer {public static boolean server;}");
         sources.put("zombie.Lua.LuaManager", "public class LuaManager {public static Object env = new Object();}");
+        sources.put("zombie.characters.IsoGameCharacter", "public class IsoGameCharacter extends zombie.iso.IsoMovingObject {public float processHitDamage(Object weapon,Object attacker,float d,boolean flag,float dot){return d;}} ");
         sources.put("zombie.characters.IsoPlayer", "public class IsoPlayer extends zombie.iso.IsoMovingObject { public boolean god,dead; public Object square=new Object(); public boolean isLocalPlayer(){return false;} public static boolean isLocalPlayer(Object p){return false;} public static boolean isLocalPlayer(IsoPlayer p){return false;} public boolean isGodMod(){return god;} public boolean isDead(){return dead;} public Object getCurrentSquare(){return square;} }");
         sources.put("com.knoxsurvivors.engine.KnoxIsoPlayerShell", "public class KnoxIsoPlayerShell extends zombie.characters.IsoPlayer {}");
         sources.put("zombie.ai.states.SwipeStatePlayer", "public class SwipeStatePlayer {public static boolean OnAnimEvent_AttackCollisionCheck(Object p){return zombie.characters.IsoPlayer.isLocalPlayer(p);} public static boolean OnAnimEvent_PlaySwingSound(Object p){return zombie.characters.IsoPlayer.isLocalPlayer(p);} public static boolean OnAnimEvent_PlaySwingSoundAlways(Object p){return zombie.characters.IsoPlayer.isLocalPlayer(p);} public static boolean other(Object p){return zombie.characters.IsoPlayer.isLocalPlayer(p);} public static boolean nested(Object p){return zombie.CombatManager.nestedLocal(p);} }");
@@ -131,6 +132,13 @@ public final class KnoxZombieBuddyPatchVerifier {
             require(first==bootstrap.getMethod("getBridge").invoke(null), "single shared registry owner");
             require(first==loader.loadClass("com.knoxsurvivors.zombiebuddy.LuaApi").getMethod("getBridge").invoke(null), "Lua accessor reuses shared instance");
         }
+        KnoxStrengthFixtureVerifier.verify(Path.of(args[4]), artifact, framework, true,
+            (classes, original) -> {
+                try (var fixtureLocator = new ClassFileLocator.ForFolder(classes.toFile())) {
+                    var locator = new ClassFileLocator.Compound(fixtureLocator, adviceLocator);
+                    return weave(PKG + "SurvivorStrength", targets.get(PKG + "SurvivorStrength"), locator, adviceLocator);
+                }
+            });
         System.out.println("ZombieBuddy Patch verifier PASS checks="+checks+" official_binary=2.3.4 real_engine_binding=true fixture_semantics=true native_gameplay=NOT_VERIFIED");
     }
 

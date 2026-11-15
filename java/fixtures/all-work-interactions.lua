@@ -93,6 +93,25 @@ conversation:updatePlayerConversation(100)
 assert(conversation.state=="IDLE","available urgent self-care still preempts attention")
 KnoxSurvivorNeeds.decide=priorDecide
 
+-- A pack is a loot pane, not a conversation: needs must not close it and cancel
+-- the transfer the player is in the middle of. Default talk keeps the rule above.
+local packing=worker("repair","BASE_TASK_ACTION")
+assert(packing:beginPlayerConversation(player,{managePack=true}),
+    "pack management takes the same attention lease")
+assert(packing.playerConversation.managePack==true,"the lease records gear management")
+packing.tradeNeedsSelfCare=function() return true end
+KnoxSurvivorNeeds.decide=function() return {kind="eat"} end
+packing:updatePlayerConversation(300)
+assert(packing.state=="PLAYER_CONVERSATION",
+    "an open pack outlives the self-care decision that ends Talk")
+packing:updatePlayerConversation(3000)
+assert(packing.state=="IDLE","the pack lease still expires on its own clock")
+KnoxSurvivorNeeds.decide=priorDecide
+assert(packing:beginPlayerConversation(player),
+    "closing the pack returns the survivor to a normal conversation")
+assert(packing.playerConversation.managePack==nil,"normal attention clears gear management")
+assert(packing:endPlayerConversation(player))
+
 body.visible=oldVisible
 p.getSurvivorDuty,p.getSurvivorCapabilities=priorDuty,priorCapabilities
 getSpecificPlayer,KnoxBaseCorpseHandling,ISTimedActionQueue,KnoxBaseJobs=oldPlayer,oldCorpse,oldQueues,oldJobs

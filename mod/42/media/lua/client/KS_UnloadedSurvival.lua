@@ -11,6 +11,10 @@ require "KS_OrderCatalog"
 -- inventory before the relief is recorded.
 local MAX_STEP_HOURS = 6
 local PHYSICAL_TASK_OFFSCREEN_WAIT_HOURS = 12
+-- First-materialization travel is location-only. Amortize that county work;
+-- stored bodies still advance physiology together through their existing owner.
+local ORIGIN_TRAVEL_BUDGET = 64
+local originTravelCursor = 0
 -- Meal triggers match the loaded need thresholds (0.45) so hibernated
 -- survivors eat/drink on the same schedule they would while loaded.
 local FOOD_TRIGGER = 0.45
@@ -37,13 +41,6 @@ local WAKE_FATIGUE = 0.35
 -- relief; weak foods and small water containers still provide only native value.
 local BASE_HIBERNATION_FOOD_ITEMS = 4
 local BASE_HIBERNATION_WATER_ITEMS = 3
-
-local function canonicalTaskType(taskType)
-    if KnoxOrderCatalog ~= nil and KnoxOrderCatalog.normalizeTaskType ~= nil then
-        return KnoxOrderCatalog.normalizeTaskType(taskType) or taskType
-    end
-    return taskType
-end
 
 local function finite(value)
     value = tonumber(value)
@@ -334,9 +331,22 @@ local function advanceWorldActivity(id, state, elapsed, hours)
         local destination = team ~= nil and team.destination or nil
         if destination ~= nil and tonumber(destination.x) ~= nil
             and tonumber(destination.y) ~= nil then
-            state.virtualX = math.floor(tonumber(destination.x))
-            state.virtualY = math.floor(tonumber(destination.y))
-            state.virtualZ = math.floor(tonumber(destination.z) or 0)
+            local journey=state.awayJourney
+            if type(journey)~="table" or journey.teamId~=team.id then
+                local x,y,z=recordLocation(id)
+                journey={teamId=team.id,x=tonumber(state.virtualX) or x,
+                    y=tonumber(state.virtualY) or y,z=tonumber(state.virtualZ) or z}
+                state.awayJourney=journey
+            end
+            local departed=tonumber(team.departedAtHours) or hours
+            local duration=math.max(0.001,(tonumber(team.etaHours) or hours)-departed)
+            local fraction=team.state=="outbound" and math.max(0,math.min(1,(hours-departed)/duration)) or 1
+            state.virtualX = math.floor((tonumber(journey.x) or destination.x)
+                + (destination.x-(tonumber(journey.x) or destination.x))*fraction)
+            state.virtualY = math.floor((tonumber(journey.y) or destination.y)
+                + (destination.y-(tonumber(journey.y) or destination.y))*fraction)
+            state.virtualZ = fraction>=1 and math.floor(tonumber(destination.z) or 0)
+                or math.floor(tonumber(journey.z) or 0)
             state.virtualAtHours = hours
         end
         setActivity(state, "away_mission", hours)
@@ -345,6 +355,20 @@ local function advanceWorldActivity(id, state, elapsed, hours)
     local x, y, z = tonumber(state.virtualX), tonumber(state.virtualY), tonumber(state.virtualZ)
     if x == nil or y == nil or z == nil then
         x, y, z = recordLocation(id)
+    end
+    if duty.mode == "autonomous" or duty.mode == "base" then
+        local population = rawget(_G,"KnoxWorldPopulation")
+        if population and population.advanceIntentTravel then
+            state.virtualX,state.virtualY,state.virtualZ = x,y,z
+            local handled,_,moving,kind = population.advanceIntentTravel(id,state,hours-elapsed,hours)
+            if handled then
+                local supplies = type(kind)=="string" and (kind:find("find_",1,true)==1 or kind=="scavenge")
+                setActivity(state,kind=="base_supply_deposit" and "returning_to_base"
+                    or (tonumber(moving) or 0)>0 and (supplies and "seeking_supplies" or "exploring")
+                    or "sheltering",hours)
+                return tonumber(moving) or 0
+            end
+        end
     end
     if x == nil or y == nil or z == nil then return 0 end
     local residentBase = duty.mode == "base" and duty.baseId ~= nil
@@ -419,27 +443,47 @@ local function advanceWorldActivity(id, state, elapsed, hours)
         state.virtualAtHours = hours
         return math.min(elapsed, distance / RETURN_TILES_PER_HOUR)
     end
+    local ambientMoving = 0
     if duty.mode == "base" and duty.baseId ~= nil then
         local area, task = residentArea, residentTask
         if area ~= nil and not security then
             -- A stored resident should not return to the exact old tile every
             -- time, or make a whole settlement reappear in one stack.  This is
-            -- low-cost ambient base life rather than simulated pathfinding: each
-            -- six-hour phase gives each identity one deterministic place inside
-            -- its own saved territory.  Materialization still validates the
-            -- real square before committing it to the persistent Java record.
+            -- coarse base life rather than native pathfinding. Walk toward the
+            -- deterministic place for this phase instead of teleporting there.
+            -- Materialization still validates the actual loaded square.
             local minX = math.floor(tonumber(area.minX) or x)
             local minY = math.floor(tonumber(area.minY) or y)
             local width, height = areaDimensions(area)
             local phase = math.floor(hours / MAX_STEP_HOURS)
             local seed = stableHash(tostring(id) .. ":base:" .. tostring(phase))
-            x = minX + (seed % width)
-            y = minY + (math.floor(seed / width) % height)
-            z = area.allFloors == true and z or (tonumber(area.z) or z)
+            local tx = minX + (seed % width)
+            local ty = minY + (math.floor(seed / width) % height)
+            local tz = area.allFloors == true and z or (tonumber(area.z) or z)
+            if tz == z then
+                local dx,dy = tx-x,ty-y
+                local distance = math.sqrt(dx*dx+dy*dy)
+                local travel = math.min(distance,math.max(0,elapsed)*RETURN_TILES_PER_HOUR)
+                if distance > 0 then x,y = x+dx/distance*travel,y+dy/distance*travel end
+                ambientMoving = travel/RETURN_TILES_PER_HOUR
+            end
         end
         local workingOffscreen = false
         if task ~= nil and KnoxBaseDutySimulation ~= nil then
             KnoxBaseDutySimulation.advance(task, elapsed)
+            -- Stored-material labour: its own predicate, never a widening of
+            -- canAdvanceOffscreen: that result gates the return walk above.
+            -- Only a claimed job whose every item the base already holds may
+            -- accumulate hours; nothing is created or consumed, and completion
+            -- still belongs to the loaded action.
+            if not security and KnoxBaseDutySimulation.advanceLabor ~= nil then
+                local storage = rawget(_G, "KnoxBaseStorage")
+                local countAssigned = storage ~= nil and storage.countAssignedItem ~= nil
+                    and function(fullType, requirements)
+                        return storage.countAssignedItem(residentBase, fullType, requirements)
+                    end or nil
+                KnoxBaseDutySimulation.advanceLabor(residentBase, task, elapsed, countAssigned)
+            end
             workingOffscreen = true
             -- A completed watch shift is elapsed time, not a completed Guard or
             -- Patrol order. Preserve the task owner and last physical location.
@@ -482,7 +526,7 @@ local function advanceWorldActivity(id, state, elapsed, hours)
     state.virtualY = y
     state.virtualZ = z
     state.virtualAtHours = hours
-    return 0
+    return ambientMoving
 end
 
 local function advanceRestAndTravel(id, state, elapsed, hours, cohort)
@@ -1124,13 +1168,7 @@ function Simulation.advanceAll(activeIds, hours)
             end
         end
     end
-    -- Stored/event steps may remove people or change canonical group membership.
-    -- Build a fresh candidate set for this synchronous origin-travel phase only.
-    local originGroupCandidates
-    if persistence.getTravelGroupsFor ~= nil then
-        local unused
-        unused, originGroupCandidates = persistence.getTravelGroupsFor(ids)
-    end
+    local originIds = {}
     for _, id in ipairs(ids) do
         if not active[id] then
         local record = persistence.getRecord(id)
@@ -1156,11 +1194,7 @@ function Simulation.advanceAll(activeIds, hours)
             end
         end
         if not active[id] and record == nil then
-            local population = rawget(_G, "KnoxWorldPopulation")
-            if population ~= nil and population.advanceOriginTravel ~= nil then
-                local ok = population.advanceOriginTravel(id, targetHours, originGroupCandidates)
-                if ok then advanced = advanced + 1 end
-            end
+            originIds[#originIds+1] = id
         elseif not active[id] and not handled[id] and record ~= nil then
             -- A claimed base job does not suspend physiology.  The ordinary
             -- stored-survivor path also advances the only jobs that are safe
@@ -1227,6 +1261,25 @@ function Simulation.advanceAll(activeIds, hours)
                 persistence.setUnloadedSurvivalState(id, state)
             end
         end
+        end
+    end
+    -- Stored/event steps can change membership. Rebuild only the selected
+    -- origin candidates after those mutations, with no cross-tick group cache.
+    local selected = {}
+    for offset=1,math.min(ORIGIN_TRAVEL_BUDGET,#originIds) do
+        selected[#selected+1] = originIds[(originTravelCursor+offset-1)%#originIds+1]
+    end
+    originTravelCursor = #originIds > 0 and (originTravelCursor+#selected)%#originIds or 0
+    local population = rawget(_G,"KnoxWorldPopulation")
+    if #selected > 0 and population and population.advanceOriginTravel then
+        local originGroupCandidates
+        if persistence.getTravelGroupsFor then
+            local unused
+            unused,originGroupCandidates = persistence.getTravelGroupsFor(selected)
+        end
+        for _,id in ipairs(selected) do
+            local ok = population.advanceOriginTravel(id,targetHours,originGroupCandidates)
+            if ok then advanced=advanced+1 end
         end
     end
     return advanced, notable

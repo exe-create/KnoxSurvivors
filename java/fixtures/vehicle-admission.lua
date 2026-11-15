@@ -43,9 +43,11 @@ assert(Travel.assessReadiness(vehicle{ignition=true},nil)==true,
 ok,reason=Travel.assessReadiness(vehicle{engine=false},nil)
 assert(ok==false and reason=="no_keys",
     "a keyless parked car reports no keys before a misleading engine-off verdict")
+ok,reason=Travel.assessReadiness(vehicle{ignition=true,engine=false},owner)
+assert(ok==true, "a keyed parked car can be admitted for a native start attempt")
 ok,reason=Travel.assessReadiness(vehicle{ignition=true,engine=false},nil)
-assert(ok==false and reason=="vehicle_engine_off",
-    "a keyed but stopped engine keeps its own reason")
+assert(ok==false and reason=="vehicle_state_unknown",
+    "the native start action requires a readable driver inventory")
 ok,reason=Travel.assessReadiness(vehicle{ignition=true,locked=true},nil)
 assert(ok==false and reason=="vehicle_doors_locked",
     "a locked keyed car keeps the existing lock refusal")
@@ -57,3 +59,6 @@ assert(ok==false and reason=="driver_seat_occupied",
     "an occupied driver seat remains the first refusal")
 assert(Travel.assessReadiness(vehicle{ignition=true},owner)==true,
     "the same ready car is admitted for a character with the key")
+
+assert(Travel.assessReadiness(vehicle{ignition=true,driver=owner},owner)==true,
+    "the same driver may request a route while already seated")

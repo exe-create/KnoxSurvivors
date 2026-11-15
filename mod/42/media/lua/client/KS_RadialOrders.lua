@@ -652,6 +652,11 @@ function Radial.orderParty(radialSelf, kind)
     local playerNum = radialSelf ~= nil and radialSelf.playerNum or 0
     local player = playerFor(playerNum)
     if player == nil then return end
+    if (kind == "let_companion_drive" or kind == "take_wheel")
+        and not Radial.drivingOrdersEnabled() then
+        orderFeedback("Order", function() return false, "npc_driving_disabled" end)
+        return
+    end
     if kind == "more" then
         Radial.fillKnox(radialSelf, "knox_party_more")
         return
@@ -873,6 +878,47 @@ function Radial.orderPartyWeapon(radialSelf, preference)
     Radial.fillKnox(radialSelf, "pm:weapons")
 end
 
+-- The wheel and the right-click menu read the same setting. Only the wheel
+-- rows that need a driver are gated; boarding and leaving stay available.
+function Radial.drivingOrdersEnabled()
+    local settings = rawget(_G, "KnoxSettings")
+    return settings ~= nil and settings.enableExperimentalNpcDriving ~= nil
+        and settings.enableExperimentalNpcDriving() == true
+end
+
+function Radial.partyVehicleOrders()
+    if Radial.drivingOrdersEnabled() then return PARTY_VEHICLES end
+    local rows = {}
+    for _, entry in ipairs(PARTY_VEHICLES) do
+        if entry.kind == "enter_vehicle" or entry.kind == "exit_vehicle" then
+            rows[#rows + 1] = entry
+        end
+    end
+    return rows
+end
+
+function Radial.addFollowerVehicleSlices(menu, radialSelf, survivorId)
+    if menu == nil or survivorId == nil then return false end
+    local playerNum = radialSelf ~= nil and radialSelf.playerNum or 0
+    local player = playerFor(playerNum)
+    local character = liveCharacter(survivorId)
+    if character ~= nil and character.getVehicle ~= nil and character:getVehicle() ~= nil then
+        menu:addSlice("Exit Vehicle", iconForOrder("exit_vehicle", "back"), Radial.orderOne,
+            radialSelf, survivorId, "exit_vehicle")
+    elseif player ~= nil and player.getVehicle ~= nil and player:getVehicle() ~= nil then
+        menu:addSlice("Take Passenger Seat", iconForOrder("enter_vehicle", "group"), Radial.orderOne,
+            radialSelf, survivorId, "enter_vehicle")
+        if Radial.drivingOrdersEnabled() then
+            menu:addSlice("Take Driver Seat & Drive", iconForOrder("drive_ahead", "moveout"), Radial.orderOne,
+                radialSelf, survivorId, "drive_ahead")
+        end
+    elseif Radial.drivingOrdersEnabled() then
+        menu:addSlice("Drive Nearest Vehicle", iconForOrder("drive_nearest_vehicle", "moveout"), Radial.orderOne,
+            radialSelf, survivorId, "drive_nearest_vehicle")
+    end
+    return true
+end
+
 -- Follower order slice callback: invoked as callback(radialSelf, id, kind).
 function Radial.orderOne(radialSelf, survivorId, kind)
     local service = rawget(_G, "KnoxCompanionService")
@@ -880,6 +926,11 @@ function Radial.orderOne(radialSelf, survivorId, kind)
     local playerNum = radialSelf ~= nil and radialSelf.playerNum or 0
     local player = playerFor(playerNum)
     if player == nil then return end
+    if (kind == "drive_ahead" or kind == "drive_nearest_vehicle")
+        and not Radial.drivingOrdersEnabled() then
+        orderFeedback("Order", function() return false, "npc_driving_disabled" end)
+        return
+    end
     if kind == "movement" then
         Radial.fillKnox(radialSelf, "fm:" .. tostring(survivorId)); return
     elseif kind == "vehicles" then
@@ -1241,7 +1292,7 @@ local function fillPartyPage(radialSelf, key, playerNum, menu)
             addBack(menu, radialSelf, "pm:survival")
             return true
         elseif key == "pm:vehicles" then
-            for _, entry in ipairs(PARTY_VEHICLES) do
+            for _, entry in ipairs(Radial.partyVehicleOrders()) do
                 menu:addSlice(entry.label, iconForOrder(entry.kind, entry.fallbackIcon), Radial.orderParty,
                     radialSelf, entry.kind)
             end
@@ -1347,20 +1398,7 @@ local function fillFollowerPage(radialSelf, key, playerNum, menu)
             if not memberIn(followerMembers(playerNum), id) then
                 Radial.fillKnox(radialSelf, "knox_followers"); return true
             end
-            local player = playerFor(playerNum)
-            local character = liveCharacter(id)
-            if character ~= nil and character.getVehicle ~= nil and character:getVehicle() ~= nil then
-                menu:addSlice("Exit Vehicle", iconForOrder("exit_vehicle", "back"), Radial.orderOne,
-                    radialSelf, id, "exit_vehicle")
-            elseif player ~= nil and player.getVehicle ~= nil and player:getVehicle() ~= nil then
-                menu:addSlice("Take Passenger Seat", iconForOrder("enter_vehicle", "group"), Radial.orderOne,
-                    radialSelf, id, "enter_vehicle")
-                menu:addSlice("Take Driver Seat & Drive", iconForOrder("drive_ahead", "moveout"), Radial.orderOne,
-                    radialSelf, id, "drive_ahead")
-            else
-                menu:addSlice("Drive Nearest Vehicle", iconForOrder("drive_nearest_vehicle", "moveout"), Radial.orderOne,
-                    radialSelf, id, "drive_nearest_vehicle")
-            end
+            Radial.addFollowerVehicleSlices(menu, radialSelf, id)
             addBack(menu, radialSelf, "f:" .. id)
             return true
         elseif type(key) == "string" and string.sub(key, 1, 6) == "fmore:" then

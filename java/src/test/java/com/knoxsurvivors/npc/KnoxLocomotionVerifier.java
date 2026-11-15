@@ -13,6 +13,7 @@ public final class KnoxLocomotionVerifier {
         System.out.println(
             "KnoxLocomotionVerifier PASS walk=true run=true sprint=true"
                 + " downgrade=true condition=true stealth=true perception=true throttle=true"
+                + " stamina_failclosed=true"
         );
     }
 
@@ -54,6 +55,29 @@ public final class KnoxLocomotionVerifier {
         );
         require(engineDenied.running() && !engineDenied.sprinting(),
             "native canSprint remains authoritative");
+        // A failed stamina read used to arrive as endurance 1.0 / fatigue 0.0,
+        // which the policy read as a fully rested body and granted sprint.
+        KnoxLocomotionPolicy.Decision unreadable = KnoxLocomotionPolicy.decide(
+            "sprint", 15.0f, Float.NaN, Float.NaN, 100.0f, true
+        );
+        require(!unreadable.running() && !unreadable.sprinting(),
+            "unreadable stamina denies run and sprint instead of assuming rest");
+        require(!KnoxLocomotionPolicy.decide(
+            "run", 15.0f, Float.NaN, 0.10f, 100.0f, true
+        ).running(), "a half-read stamina pair is still unknown, not rested");
+        require(!KnoxLocomotionPolicy.decide(
+            "catchup", 20.0f, 0.80f, Float.NaN, 100.0f, true
+        ).sprinting(), "unreadable fatigue cannot unlock a sprint");
+        // The production read: a body with no stats must report unknown stamina,
+        // not the old 1.0/0.0 default that read as fully rested.
+        float[] unreadableStamina = KnoxNpcFactory.staminaFor(new Object());
+        require(!Float.isFinite(unreadableStamina[0]) && !Float.isFinite(unreadableStamina[1]),
+            "an unreadable body reports unknown stamina, never a rested one");
+        KnoxLocomotionPolicy.Decision fromUnreadableBody = KnoxLocomotionPolicy.decide(
+            "sprint", 15.0f, unreadableStamina[0], unreadableStamina[1], 100.0f, true
+        );
+        require(!fromUnreadableBody.running() && !fromUnreadableBody.sprinting(),
+            "a failed stamina read denies sprint and run");
     }
 
     public static final class NativeHealth {

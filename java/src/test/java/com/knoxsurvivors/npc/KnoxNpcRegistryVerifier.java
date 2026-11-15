@@ -24,6 +24,16 @@ public final class KnoxNpcRegistryVerifier {
             throw new IllegalStateException("ordinary corpse was incorrectly scheduled");
         }
 
+        FakeData metadata = new FakeData();
+        metadata.rawset("foreign", "preserved");
+        if (!KnoxNpcRegistry.tagCorpseSurvivorId(new DataBody(metadata), "survivor-1")
+            || !"survivor-1".equals(metadata.rawget("KnoxSurvivorsCorpseSurvivorId"))
+            || !"preserved".equals(metadata.rawget("foreign")))
+            throw new IllegalStateException("corpse identity metadata receipt failed");
+        if (KnoxNpcRegistry.tagCorpseSurvivorId(new DataBody(new RefusedData()), "survivor-1")
+            || KnoxNpcRegistry.tagCorpseSurvivorId(new DataBody(null), "survivor-1")
+            || KnoxNpcRegistry.tagCorpseSurvivorId(new DataBody(new IgnoredData()), "survivor-1"))
+            throw new IllegalStateException("unreadable corpse metadata incorrectly accepted");
         KnoxCorpseRetirement handoff = new KnoxCorpseRetirement();
         handoff.markCorpseCreated(true);
         handoff.markReanimationScheduled();
@@ -39,6 +49,23 @@ public final class KnoxNpcRegistryVerifier {
         System.out.println(
             "corpse lifecycle verified native-predicate=true native-schedule=true cleanup-retry=true"
         );
+    }
+
+    public static class FakeData {
+        private final java.util.Map<Object,Object> values = new java.util.HashMap<>();
+        public void rawset(Object key,Object value) { values.put(key,value); }
+        public Object rawget(Object key) { return values.get(key); }
+    }
+    public static final class IgnoredData extends FakeData {
+        @Override public void rawset(Object key,Object value) { }
+    }
+    public static final class RefusedData extends FakeData {
+        @Override public void rawset(Object key,Object value) { throw new IllegalStateException("fixture"); }
+    }
+    public static final class DataBody {
+        private final Object data;
+        public DataBody(Object data) { this.data=data; }
+        public Object getModData() { return data; }
     }
 
     public static final class FakeBody {

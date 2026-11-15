@@ -4,6 +4,7 @@ import com.knoxsurvivors.agent.KnoxAgent;
 import com.knoxsurvivors.agent.KnoxCombatGate;
 import com.knoxsurvivors.agent.KnoxHumanCombatGate;
 import java.util.Map;
+import java.util.List;
 
 /** Drives one controlled melee encounter through IsoPlayer's normal attack entry point. */
 final class KnoxCombatController {
@@ -13,12 +14,17 @@ final class KnoxCombatController {
     private static final int MAX_AIM_SETTLE_TICKS = 30;
     private static final int DIRECT_STATE_FALLBACK_TICKS = 3;
     private static final int ATTACK_RECOVERY_TICKS = 24;
-    private static final int MELEE_RECOVERY_TICKS = 30;
+    private static final int MELEE_RECOVERY_TICKS = 12;
     private static final float ATTACK_ENTRY_BUFFER = 0.05f;
     private static final float REAPPROACH_BUFFER = 0.25f;
     private static final int RANGED_REPOSITION_COOLDOWN_TICKS = 60;
     private static final int APPROACH_REFRESH_TICKS = 30;
     private static final int DAMAGE_LOG_INTERVAL_TICKS = 60;
+    // Build 42 resolves a shot through the character's aim-control owner; an
+    // off-slot shell has no input component, so a firearm can request attacks
+    // and never reduce the target. Bound that silence instead of firing forever.
+    private static final int RANGED_NO_DAMAGE_ATTACKS = 3;
+    private static final int RANGED_NO_DAMAGE_TICKS = 180;
 
     private KnoxNpc npc;
     private Object target;
@@ -26,6 +32,7 @@ final class KnoxCombatController {
     private int ticks;
     private int lastAttackTick = -ATTACK_RETRY_TICKS;
     private int attackRequests;
+    private int reactingTicks;
     private float initialTargetHealth;
     private float lastTargetHealth;
     private int lastDamageLogTick = -DAMAGE_LOG_INTERVAL_TICKS;
@@ -49,6 +56,9 @@ final class KnoxCombatController {
     private Object approachSquare;
     private int lastRangedRepositionTick = -RANGED_REPOSITION_COOLDOWN_TICKS;
     private int lastApproachTick;
+    private int lastDefensiveStepTick = -60;
+    private int defensiveStepEndTick;
+    private float defensiveStepAwayX, defensiveStepAwayY, defensiveStepX, defensiveStepY;
     private float approachTargetX;
     private float approachTargetY;
     private int stationaryApproachRetries;
@@ -127,7 +137,7 @@ final class KnoxCombatController {
         String result = "COMBAT_STARTED mode=locked-door targetHealth="
             + initialTargetHealth
             + " weaponCondition="
-            + initialWeaponCondition;
+            + initialWeaponCondition + " npcId=" + npc.getId();
         KnoxAgent.writeLog("NPC combat " + result);
         return result;
     }
@@ -285,7 +295,7 @@ final class KnoxCombatController {
             + " targetHealth=" + initialTargetHealth
             + " weaponCondition=" + initialWeaponCondition
             + " maxRange=" + weaponMaxRange
-            + " desiredRange=" + desiredAttackRange;
+            + " desiredRange=" + desiredAttackRange + " npcId=" + npc.getId();
         KnoxAgent.writeLog("NPC combat " + result);
         return result;
     }
@@ -302,6 +312,12 @@ final class KnoxCombatController {
         // when the combat target is already close enough to attack. Observe
         // required native receipts without turning this into a movement tick.
         if (!actorUnavailable && KnoxNpcFactory.hasNativeTraversalOwner(npc)) {
+            // Traversal pauses the encounter: it must not inherit a stale stall.
+            reactingTicks = 0;
+            if ("DEFENSIVE_STEP".equals(phase)) {
+                KnoxNpcFactory.stopCombatStep(npc);
+                phase = "ATTACKING";
+            }
             KnoxNpcFactory.observeNativeAction(npc);
             return "COMBAT_NATIVE_ACTION phase=" + phase;
         }
@@ -357,7 +373,7 @@ final class KnoxCombatController {
         float dy = targetY - bodyY;
         float targetDistance = (float) Math.sqrt(dx * dx + dy * dy);
         float attackEntryThreshold = attackEntryThreshold(desiredAttackRange);
-        float reapproachThreshold = reapproachThreshold(desiredAttackRange);
+        float reapproachThreshold = combatReapproachRange(rangedWeapon, desiredAttackRange, weaponMaxRange);
 
         String bodyAction = String.valueOf(
             body.getClass().getMethod("getCurrentActionContextStateName").invoke(body)
@@ -368,10 +384,29 @@ final class KnoxCombatController {
             // Reapplying aim/attack input here suppresses the visible reaction and can
             // leave AttackType set, which also makes a frontal zombie collision return
             // before AddRandomDamageFromZombie is called.
+            if ("DEFENSIVE_STEP".equals(phase)) {
+                KnoxNpcFactory.stopCombatStep(npc);
+                phase = "ATTACKING";
+            }
             clearNativeRecoveryInput(body);
+            reactingTicks++;
+            // The three other waits in this encounter are all bounded (idle-latch
+            // recovery, ATTACK_STALLED, ranged silence). An injury-owned body is
+            // the only unbounded one: the idle latch needs idle, the stall gate
+            // needs attackStarted, and the request block sits below this return.
+            // Chain-stunned bodies waited here until death (7 bitten seconds with
+            // zero swings, encounter never ended). Fail so Lua re-decides.
+            if (injuryStallExpired(reactingTicks)) {
+                phase = "FAILED";
+                return finish("COMBAT_FAILED INJURY_STALL action=" + bodyAction
+                    + " attacks=" + attackRequests + " targetHealth=" + currentHealth);
+            }
             return "COMBAT_REACTING action=" + bodyAction
                 + " targetHealth=" + currentHealth;
         }
+        // Any tick past the injury check proves the body is answering again:
+        // only consecutive injury-owned ticks count toward the stall.
+        reactingTicks = 0;
 
         // One native ownership snapshot governs movement and attack admission.
         // A requested attack can precede both the attacking flag and animation.
@@ -383,8 +418,41 @@ final class KnoxCombatController {
         if (recoverIdleAttackLatch(body)) {
             return "COMBAT_RECOVERING_STALE_ATTACK targetHealth=" + currentHealth;
         }
+        if ("DEFENSIVE_STEP".equals(phase)) {
+            boolean safe = !attackActive && ticks < defensiveStepEndTick && ticks < defenseWindowUntil
+                && defensiveStepStillFacesThreat(defensiveStepAwayX, defensiveStepAwayY,
+                    dx, dy, targetDistance)
+                && defensiveStepDestination(body, target, targetDistance, defensiveStepX, defensiveStepY) != null;
+            if (safe) {
+                faceTarget(body, targetX, targetY);
+                applyReadyPosture(body);
+                String movement = KnoxNpcFactory.tickMovement(npc, 0.0f, "walk");
+                if ("ManualRoute".equals(movement)) return "COMBAT_DEFENSIVE_STEP";
+            }
+            KnoxNpcFactory.stopCombatStep(npc);
+            phase = "ATTACKING";
+        }
+        if (liveCombat && !rangedWeapon && !obstacleTarget && !attackActive
+            && ticks < defenseWindowUntil && ticks - lastDefensiveStepTick >= 60) {
+            float[] destination = defensiveStepDestination(body, target, targetDistance);
+            if (destination != null && KnoxNpcFactory.beginCombatStep(npc,
+                destination[0], destination[1], destination[2])) {
+                lastDefensiveStepTick = ticks;
+                defensiveStepEndTick = ticks + 36;
+                defensiveStepX = destination[0]; defensiveStepY = destination[1];
+                defensiveStepAwayX = -dx / targetDistance;
+                defensiveStepAwayY = -dy / targetDistance;
+                phase = "DEFENSIVE_STEP";
+                faceTarget(body, targetX, targetY);
+                applyReadyPosture(body);
+                String movement = KnoxNpcFactory.tickMovement(npc, 0.0f, "walk");
+                if ("ManualRoute".equals(movement)) return "COMBAT_DEFENSIVE_STEP";
+                KnoxNpcFactory.stopCombatStep(npc);
+                phase = "ATTACKING";
+            }
+        }
         float minimumRangedDistance = minimumRangedDistance(desiredAttackRange);
-        if (shouldRepositionRanged(
+        if (!"RANGED_REPOSITIONING".equals(phase) && shouldRepositionRanged(
             rangedWeapon,
             targetDistance,
             minimumRangedDistance,
@@ -397,7 +465,7 @@ final class KnoxCombatController {
                 npc,
                 target,
                 approachSquare,
-                desiredAttackRange
+                rangedSpacingRange(minimumRangedDistance)
             );
             body.getClass().getMethod("setRunning", boolean.class).invoke(body, true);
             phase = "RANGED_REPOSITIONING";
@@ -413,6 +481,9 @@ final class KnoxCombatController {
                 + " targetHealth=" + currentHealth;
         }
 
+        // One-tick bridge: an arrival inside native reach skips both the
+        // re-route above and the immediate reapproach below that would undo it.
+        boolean justArrivedInReach = false;
         if ("RANGED_REPOSITIONING".equals(phase)) {
             // The Build 42 Lua firearm hook observes the shell's aiming/attack
             // variables independently of this controller phase. Clear them on
@@ -424,7 +495,7 @@ final class KnoxCombatController {
                 phase = "FAILED";
                 return finish("COMBAT_FIREARM_FALLBACK CLOSE_REPOSITION " + movement);
             }
-            float resumeDistance = Math.max(minimumRangedDistance, desiredAttackRange * 0.65f);
+            float resumeDistance = rangedSpacingRange(minimumRangedDistance) - 0.15f;
             if (!"Succeeded".equals(movement) && targetDistance < resumeDistance) {
                 return "COMBAT_RANGED_REPOSITIONING movement=" + movement
                     + " distance=" + targetDistance
@@ -436,17 +507,40 @@ final class KnoxCombatController {
             phase = "AIMING";
             aimTicks = 0;
         } else if ("APPROACHING".equals(phase) && !obstacleTarget) {
+            // Tick movement before judging the band: a route that just arrived
+            // inside native reach admits the swing below instead of re-routing
+            // around a target that barely drifted (log: give-ups at 1.03/1.14
+            // vs entries 0.75/0.90 with 0.9/1.25 reach, after ~100 approach
+            // steps and two swings). Ranged keeps its own spacing.
+            String movement = null;
             if (targetDistance > attackEntryThreshold) {
+                // Nearby combat keeps the weapon facing the opponent while the
+                // existing native control-space conversion supplies strafing.
+                // Route heading must not overwrite aim heading every frame.
+                if (targetDistance <= 4.0f) {
+                    faceTarget(body, targetX, targetY);
+                    applyReadyPosture(body);
+                }
                 // Keep one range-based destination under the captured-route adapter.
                 // Replacing it with pathToCharacter() every few ticks sends the shell
                 // into the target's occupied space, then repeatedly invalidates its
                 // own route as the target and animation graph move.
                 approachSteps++;
-                String movement = KnoxNpcFactory.tickMovement(npc, targetDistance, "run");
+                movement = KnoxNpcFactory.tickMovement(npc, targetDistance,
+                    approachPace(rangedWeapon, targetDistance, attackEntryThreshold));
                 if (movement.startsWith("Failed")) {
                     phase = "FAILED";
-                    return finish("COMBAT_FAILED LIVE_PURSUIT " + movement);
+                    return finish("COMBAT_FAILED APPROACH " + movement);
                 }
+            }
+            justArrivedInReach = movement != null && arrivedInMeleeReach(
+                rangedWeapon, movement, targetDistance, weaponMaxRange);
+            if (movement == null || justArrivedInReach) {
+                phase = "AIMING";
+                aimTicks = 0;
+                if (!attackActive) clearMovementIntent();
+                stationaryApproachRetries = 0;
+            } else {
                 boolean targetMoved = targetMovedSinceApproach(
                     targetX, targetY, approachTargetX, approachTargetY
                 );
@@ -470,10 +564,6 @@ final class KnoxCombatController {
                     + " desiredRange=" + desiredAttackRange
                     + " targetHealth=" + currentHealth;
             }
-            phase = "AIMING";
-            aimTicks = 0;
-            clearMovementIntent();
-            stationaryApproachRetries = 0;
         } else if ("APPROACHING".equals(phase)) {
             approachSteps++;
             String movement = KnoxNpcFactory.tickMovement(npc);
@@ -492,7 +582,7 @@ final class KnoxCombatController {
             return "COMBAT_" + phase;
         }
 
-        if (!obstacleTarget && targetDistance > reapproachThreshold) {
+        if (!obstacleTarget && targetDistance > reapproachThreshold && !justArrivedInReach) {
             if (!attackActive) {
                 clearAttackIntent();
                 beginLiveApproach();
@@ -500,7 +590,7 @@ final class KnoxCombatController {
                 aimTicks = 0;
                 KnoxAgent.writeLog(
                     "NPC combat REAPPROACH distance=" + targetDistance
-                        + " desiredRange=" + desiredAttackRange
+                        + " desiredRange=" + desiredAttackRange + " npcId=" + npc.getId()
                 );
                 return "COMBAT_REAPPROACHING distance=" + targetDistance
                     + " targetHealth=" + currentHealth;
@@ -558,7 +648,11 @@ final class KnoxCombatController {
 
         if ("AIMING".equals(phase)) {
             aimTicks++;
-            if (aimTicks < aimSettleTicks) {
+            boolean armedMeleeContact = liveCombat && !rangedWeapon && !obstacleTarget
+                && combatWeapon != null && !attackActive && Float.isFinite(targetDistance)
+                && Float.isFinite(desiredAttackRange) && desiredAttackRange > 0.0f
+                && targetDistance > .001f && targetDistance <= desiredAttackRange;
+            if (aimTicks < aimSettleTicks && !armedMeleeContact) {
                 return "COMBAT_AIMING ticks=" + aimTicks + "/" + aimSettleTicks
                     + " targetHealth=" + currentHealth;
             }
@@ -589,6 +683,18 @@ final class KnoxCombatController {
             directStateFallbackUsed = true;
             KnoxAgent.writeLog("NPC combat DIRECT_SWIPE_STATE_FALLBACK");
         }
+        // A firearm that fires without ever reducing the target still pays the
+        // noise, ammunition and condition cost while the survivor stands in the
+        // open. Its ballistics owner needs an aim-control source this shell does
+        // not have, so the engagement can request shots indefinitely and observe
+        // no damage. After a few silent requests, fail it: the Lua owner already
+        // answers COMBAT_FAILED with its bounded melee fallback.
+        if (rangedSilentExhausted(
+            rangedWeapon, damageObserved, attackRequests, firstSwingTick, ticks)) {
+            phase = "FAILED";
+            return finish("COMBAT_FAILED RANGED_NO_DAMAGE attacks=" + attackRequests
+                + " distance=" + targetDistance + " targetHealth=" + currentHealth);
+        }
         if (attackStarted
             && attackRequests > 0
             && ticks - lastAttackTick > 180
@@ -609,7 +715,7 @@ final class KnoxCombatController {
         );
         boolean attackTypeClear = attackType.isEmpty() || "NONE".equalsIgnoreCase(attackType);
         if (!attackActive && weaponReady && attackTypeClear
-            && ticks - lastAttackTick >= ATTACK_RETRY_TICKS) {
+            && ticks - lastAttackTick >= attackRetryTicks(rangedWeapon)) {
             requestAttack(body, aimAtFloor, rangedWeapon);
             attackRequests++;
             swingCount++;
@@ -619,7 +725,7 @@ final class KnoxCombatController {
                 KnoxAgent.writeLog("NPC combat FIRST_SWING tick=" + ticks
                     + " distance=" + targetDistance
                     + " desiredRange=" + desiredAttackRange
-                    + " weaponMaxRange=" + weaponMaxRange);
+                    + " weaponMaxRange=" + weaponMaxRange + " npcId=" + npc.getId());
             }
             distanceAtLastSwing = targetDistance;
             lastAttackTick = ticks;
@@ -627,6 +733,7 @@ final class KnoxCombatController {
             directStateFallbackUsed = false;
             KnoxAgent.writeLog(
                 "NPC combat ATTACK_REQUEST count=" + attackRequests + " targetHealth=" + currentHealth
+                    + " npcId=" + npc.getId()
             );
             if (rangedWeapon) {
                 return "COMBAT_FIREARM_REQUEST attacks=" + attackRequests
@@ -659,7 +766,8 @@ final class KnoxCombatController {
             if (lastDamageLogTick < 0 || ticks - lastDamageLogTick >= DAMAGE_LOG_INTERVAL_TICKS
                 || currentHealth <= 0.0f) {
                 KnoxAgent.writeLog("NPC combat DAMAGE targetHealth=" + currentHealth
-                    + " previous=" + pendingDamageStartHealth + " samples=" + pendingDamageSamples);
+                    + " previous=" + pendingDamageStartHealth + " samples=" + pendingDamageSamples
+                    + " npcId=" + (npc != null ? npc.getId() : "unavailable"));
                 lastDamageLogTick = ticks;
                 pendingDamageSamples = 0;
             }
@@ -698,6 +806,10 @@ final class KnoxCombatController {
     }
 
     void reset() {
+        if (npc != null && "DEFENSIVE_STEP".equals(phase)) {
+            try { KnoxNpcFactory.stopCombatStep(npc); }
+            catch (ReflectiveOperationException ignored) { }
+        }
         KnoxHumanCombatGate.clear(this);
         if (npc != null) {
             npc.setCombatActive(false);
@@ -726,6 +838,7 @@ final class KnoxCombatController {
         ticks = 0;
         lastAttackTick = -ATTACK_RETRY_TICKS;
         attackRequests = 0;
+        reactingTicks = 0;
         initialTargetHealth = 0.0f;
         lastTargetHealth = 0.0f;
         lastDamageLogTick = -DAMAGE_LOG_INTERVAL_TICKS;
@@ -758,6 +871,8 @@ final class KnoxCombatController {
         approachSteps = 0;
         approachRefreshes = 0;
         lastRangedRepositionTick = -RANGED_REPOSITION_COOLDOWN_TICKS;
+        lastDefensiveStepTick = -60;
+        defensiveStepEndTick = 0;
     }
 
     private void beginLiveApproach() throws ReflectiveOperationException {
@@ -798,7 +913,7 @@ final class KnoxCombatController {
     }
 
     private void clearMovementIntent() throws ReflectiveOperationException {
-        npc.clearMovementRoute();
+        KnoxNpcFactory.stopCombatStep(npc);
         Object body = npc.getBody();
         Object pathfinder = body.getClass().getMethod("getPathFindBehavior2").invoke(body);
         pathfinder.getClass().getMethod("cancel").invoke(pathfinder);
@@ -853,7 +968,8 @@ final class KnoxCombatController {
     }
 
     private String metricsSuffix() {
-        return " swing=" + swingCount
+        return " npcId=" + (npc != null ? npc.getId() : "unavailable")
+            + " swing=" + swingCount
             + " firstSwingTick=" + firstSwingTick
             + " firstSwingDistance=" + distanceAtFirstSwing
             + " lastSwingDistance=" + distanceAtLastSwing
@@ -878,6 +994,10 @@ final class KnoxCombatController {
             );
     }
 
+    static int attackRetryTicks(boolean ranged) {
+        return ranged ? ATTACK_RETRY_TICKS : MELEE_RECOVERY_TICKS;
+    }
+
     static int recoveryTicks(boolean ranged) {
         return ranged ? ATTACK_RECOVERY_TICKS : MELEE_RECOVERY_TICKS;
     }
@@ -899,8 +1019,48 @@ final class KnoxCombatController {
         return desiredRange + ATTACK_ENTRY_BUFFER;
     }
 
+    // One number for "no progress under injury": sustained hit-reaction with
+    // attacks pending is chain-stun, not recovery. Calibrated against a live
+    // death (~7 bitten seconds ran ~115 combat ticks with zero swings), while a
+    // single bite reaction clears in tens of ticks.
+    private static final int INJURY_STALL_TICKS = 90;
+
+    static boolean injuryStallExpired(int consecutiveReactingTicks) {
+        return consecutiveReactingTicks > INJURY_STALL_TICKS;
+    }
+
+    // A finished route inside native reach is a swing, not a re-route: entry
+    // is the conservative band, reach is the native truth. Log-pinned:
+    // give-ups at 1.03/1.14 vs entries 0.75/0.90 with 0.9/1.25 reach, after
+    // ~100 approach steps and two swings. Ranged keeps its own spacing.
+    static boolean arrivedInMeleeReach(boolean rangedWeapon, String movement,
+        float targetDistance, float weaponMaxRange) {
+        return !rangedWeapon && "Succeeded".equals(movement)
+            && targetDistance <= weaponMaxRange;
+    }
+
+    // Close the last stretch at combat pace. Walking the final tiles lets a
+    // moving target pace the approach forever (the observed orbit at 1-2
+    // tiles); running inside firearm steadiness range is unchanged, and the
+    // final half tile stays a walk so arrival does not overshoot the swing.
+    static String approachPace(boolean rangedWeapon, float targetDistance,
+        float attackEntryThreshold) {
+        if (!rangedWeapon && targetDistance > attackEntryThreshold + 0.5f) return "run";
+        return targetDistance <= 4.0f ? "walk" : "run";
+    }
+
+
     static float reapproachThreshold(float desiredRange) {
         return desiredRange + REAPPROACH_BUFFER;
+    }
+
+    static float combatReapproachRange(boolean ranged, float desiredRange, float maximumRange) {
+        return ranged ? Math.max(reapproachThreshold(desiredRange), maximumRange - 0.25f)
+            : reapproachThreshold(desiredRange);
+    }
+
+    static float rangedSpacingRange(float minimumDistance) {
+        return minimumDistance + 0.65f;
     }
 
     static float minimumRangedDistance(float desiredRange) {
@@ -927,6 +1087,23 @@ final class KnoxCombatController {
 
     static boolean liveTargetMode(boolean controlledGate) {
         return !controlledGate;
+    }
+
+    // A firearm engagement is only worth keeping while it can actually hurt the
+    // target. An off-slot shell supplies no aim-control owner to Build 42's
+    // ballistics, so shots can cost noise, ammunition and condition and never
+    // reduce health. Bounded, not guessed: the request count and elapsed window
+    // are both required before the encounter is declared silent.
+    static boolean rangedSilentExhausted(
+        boolean ranged,
+        boolean damageObserved,
+        int attackRequests,
+        int firstSwingTick,
+        int ticks
+    ) {
+        return ranged && !damageObserved && firstSwingTick >= 0
+            && attackRequests >= RANGED_NO_DAMAGE_ATTACKS
+            && ticks - firstSwingTick >= RANGED_NO_DAMAGE_TICKS;
     }
 
     private static void applyReadyPosture(Object body) throws ReflectiveOperationException {
@@ -1062,6 +1239,84 @@ final class KnoxCombatController {
         controlVars.getClass().getField("melee").setBoolean(controlVars, false);
         controlVars.getClass().getField("bannedAttacking").setBoolean(controlVars, false);
         controlVars.getClass().getField("initiateAttack").setBoolean(controlVars, initiate);
+    }
+
+    static boolean defensiveStepStillFacesThreat(float awayX, float awayY,
+        float targetDx, float targetDy, float distance) {
+        // A normal advancing zombie stays ahead; a substantial flank or a
+        // target behind the retreat direction ends the step.
+        return distance > .05f && awayX * targetDx + awayY * targetDy <= -.9f * distance;
+    }
+
+    // Fail closed when installed geometry or threat facts cannot be read.
+    private static float[] defensiveStepDestination(Object body, Object target, float distance) {
+        return defensiveStepDestination(body, target, distance, Float.NaN, Float.NaN);
+    }
+
+    private static float[] defensiveStepDestination(Object body, Object target, float distance,
+        float destinationX, float destinationY) {
+        if (!inherits(target, "zombie.characters.IsoZombie") || distance < .05f || distance > .75f)
+            return null;
+        try {
+            if ((Boolean) target.getClass().getMethod("isOnFloor").invoke(target)) return null;
+            float x = ((Number) body.getClass().getMethod("getX").invoke(body)).floatValue();
+            float y = ((Number) body.getClass().getMethod("getY").invoke(body)).floatValue();
+            float z = ((Number) body.getClass().getMethod("getZ").invoke(body)).floatValue();
+            float tx = ((Number) target.getClass().getMethod("getX").invoke(target)).floatValue();
+            float ty = ((Number) target.getClass().getMethod("getY").invoke(target)).floatValue();
+            Object cell = body.getClass().getMethod("getCell").invoke(body);
+            Object current = body.getClass().getMethod("getCurrentSquare").invoke(body);
+            int nearby = 0; boolean targetFound = false;
+            Class<?> square = classFor(body, "zombie.iso.IsoGridSquare");
+            var getSquare = cell.getClass().getMethod("getGridSquare", int.class, int.class, int.class);
+            var getMoving = square.getMethod("getMovingObjects");
+            // A spacing tick only needs contact threats. Query native nearby
+            // squares rather than reflecting over the entire loaded zombie list.
+            for (int gx=(int)Math.floor(x-2.5f); gx<=(int)Math.floor(x+2.5f); gx++) {
+                for (int gy=(int)Math.floor(y-2.5f); gy<=(int)Math.floor(y+2.5f); gy++) {
+                    Object localSquare = getSquare.invoke(cell,gx,gy,(int)Math.floor(z));
+                    if (localSquare == null) continue;
+                    for (Object zombie : (List<?>)getMoving.invoke(localSquare)) {
+                        if (!inherits(zombie,"zombie.characters.IsoZombie")) continue;
+                        if ((Boolean) zombie.getClass().getMethod("isDead").invoke(zombie)) continue;
+                        float zx = ((Number) zombie.getClass().getMethod("getX").invoke(zombie)).floatValue();
+                        float zy = ((Number) zombie.getClass().getMethod("getY").invoke(zombie)).floatValue();
+                        float zz = ((Number) zombie.getClass().getMethod("getZ").invoke(zombie)).floatValue();
+                        if ((int) zz == (int) z && (zx-x)*(zx-x)+(zy-y)*(zy-y) <= 6.25f) {
+                            if (++nearby > 1) return null;
+                            if (zombie == target) targetFound = true;
+                        }
+                    }
+                }
+            }
+            if (nearby != 1 || !targetFound) return null;
+            float endX = Float.isNaN(destinationX) ? x - (tx-x) / distance * .65f : destinationX;
+            float endY = Float.isNaN(destinationY) ? y - (ty-y) / distance * .65f : destinationY;
+            int sx = (int) Math.floor(x), sy = (int) Math.floor(y);
+            int ex = (int) Math.floor(endX), ey = (int) Math.floor(endY), floor = (int) Math.floor(z);
+            if (Math.abs(ex-sx)+Math.abs(ey-sy) > 1) return null;
+            Object next = cell.getClass().getMethod("getGridSquare", int.class, int.class, int.class)
+                .invoke(cell, ex, ey, floor);
+            if (current == null || next == null) return null;
+            if ((Boolean) square.getMethod("HasStairs").invoke(current)
+                || (Boolean) square.getMethod("HasStairs").invoke(next)
+                || !(Boolean) square.getMethod("TreatAsSolidFloor").invoke(next)
+                || !(Boolean) square.getMethod("isFree", boolean.class).invoke(next, false)
+                || square.getMethod("getRoom").invoke(current) != square.getMethod("getRoom").invoke(next)) return null;
+            if (current != next && (!(Boolean) square.getMethod("isFree", boolean.class).invoke(next, true)
+                || (Boolean) square.getMethod("isBlockedTo", square).invoke(current, next)
+                || (Boolean) square.getMethod("isBlockedTo", square).invoke(next, current)
+                || square.getMethod("getDoorTo", square).invoke(current, next) != null
+                || square.getMethod("getWindowTo", square).invoke(current, next) != null
+                || square.getMethod("getWindowFrameTo", square).invoke(current, next) != null
+                || square.getMethod("getWindowThumpableTo", square).invoke(current, next) != null
+                || (Boolean) square.getMethod("isHoppableTo", square).invoke(current, next)
+                || square.getMethod("getHoppableTo", square).invoke(current, next) != null
+                || square.getMethod("getWallHoppableTo", square).invoke(current, next) != null)) return null;
+            return new float[] {endX, endY, z};
+        } catch (ReflectiveOperationException | RuntimeException unavailable) {
+            return null;
+        }
     }
 
     private static void faceTarget(Object body, float targetX, float targetY)

@@ -82,7 +82,7 @@ assert(p.getSurvivorDuty("return-a").mode == "base",
     "the returned member resumes ordinary base duty")
 local notices = Executor.takePlayerNotices("return-owner", 17.1, 3)
 assert(#notices == 1 and string.find(notices[1], "Ada Marsh", 1, true) ~= nil
-    and string.find(notices[1], "brought back 1", 1, true) ~= nil,
+    and string.find(notices[1], "1 item(s) collected", 1, true) ~= nil,
     "the completed trip reports the real person and haul once")
 
 -- A body that is still loaded is walking home itself: elapsed time must not

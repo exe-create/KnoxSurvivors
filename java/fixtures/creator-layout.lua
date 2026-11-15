@@ -65,6 +65,6 @@ local headers = 0
 for _, row in ipairs(rows) do
     if row.kind == "faction" then headers = headers + 1 end
 end
-assert(headers == #Creator.FACTIONS, "one header per faction")
+assert(headers == #Creator.defaultEntries(), "one header per authoring default")
 
 print("creator_layout ok")

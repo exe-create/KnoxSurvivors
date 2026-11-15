@@ -11,10 +11,14 @@ import com.knoxsurvivors.npc.KnoxNpcRegistry;
  * milestone is verified in game.</p>
  */
 public final class KnoxBridge {
-    public static final String RUNTIME_VERSION = "0.3.0-rc1";
+    public static final String RUNTIME_VERSION = "0.3.0-rc2";
 
     private long pingCount;
     private final KnoxNpcRegistry npcRegistry = new KnoxNpcRegistry();
+
+    public boolean containsActiveBody(Object body) {
+        return npcRegistry.containsActiveBody(body);
+    }
 
     public synchronized String ping() {
         pingCount++;
@@ -32,6 +36,29 @@ public final class KnoxBridge {
 
     public boolean isRuntimeLoaded() {
         return true;
+    }
+
+    /** UI3DModel exposes no hand setters to Lua; its reflection helpers require debug mode. */
+    public boolean setCreatorPreviewHands(Object uiModel, String primaryModel, String secondaryModel) {
+        if (uiModel == null) return false;
+        try {
+            ClassLoader loader = uiModel.getClass().getClassLoader();
+            Class<?> uiType = Class.forName("zombie.ui.UI3DModel", false, loader);
+            if (uiModel.getClass() != uiType) return false;
+            Class<?> modelType = Class.forName(
+                "zombie.core.skinnedmodel.advancedanimation.AnimatedModel", false, loader);
+            java.lang.reflect.Field field = uiType.getDeclaredField("animatedModel");
+            field.setAccessible(true);
+            Object model = field.get(uiModel);
+            if (model == null || model.getClass() != modelType) return false;
+            java.lang.reflect.Method primary = modelType.getMethod("setPrimaryHandModelName", String.class);
+            java.lang.reflect.Method secondary = modelType.getMethod("setSecondaryHandModelName", String.class);
+            primary.invoke(model, primaryModel);
+            secondary.invoke(model, secondaryModel);
+            return true;
+        } catch (ReflectiveOperationException | LinkageError | RuntimeException unavailable) {
+            return false;
+        }
     }
 
     /** Native ordinary-speech intelligibility, not a Knox hearing radius or radio receipt. */
@@ -124,6 +151,10 @@ public final class KnoxBridge {
 
     public String tickNpc(String id) {
         return npcRegistry.tick(id);
+    }
+
+    public Object getNpcWindowForGlassRemoval(String id) {
+        return npcRegistry.windowForGlassRemoval(id);
     }
 
     public String observeNpcNativeAction(String id) {

@@ -1,3 +1,4 @@
+local KS_SafeCall = require "KS_SafeCall"
 require "TimedActions/ISChopTreeAction"
 require "TimedActions/ISTimedActionQueue"
 require "Entity/TimedActions/ISHandcraftAction"
@@ -8,11 +9,8 @@ local Woodcutting = rawget(_G, "KnoxBaseWoodcutting") or {}
 _G.KnoxBaseWoodcutting = Woodcutting
 
 local function safeCall(object, method, ...)
-    if object == nil or object[method] == nil then
-        return nil
-    end
-    local success, value = pcall(object[method], object, ...)
-    return success and value or nil
+    local value = KS_SafeCall.invoke(object, method, ...)
+    return value or nil
 end
 
 local function walkItems(container, visitor)

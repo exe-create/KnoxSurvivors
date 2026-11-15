@@ -4,6 +4,40 @@ require "KS_BaseManager"
 local Highlights = rawget(_G, "KnoxBaseHighlights") or {}
 _G.KnoxBaseHighlights = Highlights
 
+-- Preview and committed corners must use the same loaded grid square.
+function Highlights.pickMouseSquare(player)
+    local cell = getCell ~= nil and getCell() or nil
+    local current = player ~= nil and player.getCurrentSquare ~= nil and player:getCurrentSquare() or nil
+    if cell == nil or current == nil then return nil, nil, nil, nil end
+    local z = current:getZ()
+    local compat = rawget(_G, "KnoxViewpointCompatibility")
+    if compat ~= nil and require("KS_SurvivorUILayout").isPerspective() then
+        local square = compat.targetSquare(player)
+        if square ~= nil then return square, square:getX(), square:getY(), square:getZ() end
+        return nil, nil, nil, z
+    end
+    local mx, my = getMouseX(), getMouseY()
+    local okX, x = pcall(screenToIsoX, player:getPlayerNum(), mx, my, z)
+    local okY, y = pcall(screenToIsoY, player:getPlayerNum(), mx, my, z)
+    if not okX or not okY or type(x) ~= "number" or type(y) ~= "number" then
+        return nil, nil, nil, z
+    end
+    local square = cell:getGridSquare(math.floor(x), math.floor(y), z)
+    if square == nil then return nil, nil, nil, z end
+    return square, square:getX(), square:getY(), square:getZ()
+end
+
+-- Native area bounds are exclusive at the far edge.
+function Highlights.drawArea(playerNum, minX, minY, maxX, maxY, z, color)
+    if addAreaHighlightForPlayer ~= nil then
+        addAreaHighlightForPlayer(playerNum, minX, minY, maxX + 1, maxY + 1, z,
+            color.r, color.g, color.b, color.a)
+    elseif addAreaHighlight ~= nil then
+        addAreaHighlight(minX, minY, maxX + 1, maxY + 1, z,
+            color.r, color.g, color.b, color.a)
+    end
+end
+
 local enabled = {}
 local draftByPlayer = {}
 local highlightedFloors = {}

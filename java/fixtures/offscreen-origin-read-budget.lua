@@ -1,6 +1,6 @@
 -- Origin-only population must advance travel without reading nonexistent body state.
 local savedPersistence, savedPopulation, savedEvents = KnoxPersistence, KnoxWorldPopulation, KnoxEvents
-local ids, travel, records = {}, 0, 0
+local ids, travel, records, seen = {}, 0, 0, {}
 for i = 1, 100 do ids[i] = "budget-origin-" .. tostring(i) end
 ids[101] = "budget-active"
 KnoxPersistence = {
@@ -18,9 +18,17 @@ KnoxEvents = nil
 KnoxWorldPopulation = { advanceOriginTravel = function(id, hours)
     assert(id ~= "budget-active" and hours == 13)
     travel = travel + 1
+    seen[id] = true
     return true
 end }
-local advanced, notable = KnoxUnloadedSurvival.advanceAll({"budget-active"}, 13)
-assert(advanced == 100 and notable == 0 and travel == 100 and records == 100)
+for pass=1,2 do
+    local before=travel
+    local advanced, notable = KnoxUnloadedSurvival.advanceAll({"budget-active"}, 13)
+    assert(advanced == 64 and notable == 0 and travel-before == 64,
+        "one county pass advances at most 64 origin travel entries")
+end
+local unique=0
+for _ in pairs(seen) do unique=unique+1 end
+assert(unique==100 and records==200, "rotation reaches every independent origin without reading active body state")
 KnoxPersistence, KnoxWorldPopulation, KnoxEvents = savedPersistence, savedPopulation, savedEvents
-print("Offscreen read budget PASS 100 real origin travel advances; zero irrelevant duty/physiology reads")
+print("Offscreen read budget PASS per_pass=64 unique_origins=100 zero_irrelevant_physiology=true")

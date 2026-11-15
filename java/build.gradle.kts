@@ -123,7 +123,7 @@ val verifyZombieBuddyPatches by tasks.registering(JavaExec::class) {
         args(layout.buildDirectory.dir("zombiebuddy-patch-verification").get().asFile.absolutePath,
             file(pzHome.get()).resolve("projectzomboid.jar").absolutePath,
             tasks.jar.get().archiveFile.get().asFile.absolutePath,
-            file(pzHome.get()).resolve("ZombieBuddy.jar").absolutePath)
+            file(pzHome.get()).resolve("ZombieBuddy.jar").absolutePath, rootProject.projectDir.absolutePath)
     }
 }
 
@@ -156,12 +156,12 @@ val verifyUnifiedKnoxBridge by tasks.registering(JavaExec::class) {
 val verifyCombatTransformer by tasks.registering(JavaExec::class) {
     group = "verification"
     description = "Verifies the narrow melee callback patch against the configured game jar."
-    dependsOn(tasks.testClasses)
+    dependsOn(tasks.testClasses, tasks.jar)
     classpath = sourceSets.test.get().runtimeClasspath
     mainClass.set("com.knoxsurvivors.agent.KnoxSwipeStateTransformerVerifier")
     doFirst {
         val gameJar = file(pzHome.get()).resolve("projectzomboid.jar")
-        args(gameJar.absolutePath)
+        args(gameJar.absolutePath, rootProject.projectDir.absolutePath, tasks.jar.get().archiveFile.get().asFile.absolutePath, file(pzHome.get()).resolve("ZombieBuddy.jar").absolutePath)
     }
 }
 
@@ -239,6 +239,21 @@ val verifyInstalledCompanionApi by tasks.registering(Exec::class) {
             "-Duser.home=${evidence.resolve("home").absolutePath}", "-cp", classpath,
             "com.knoxsurvivors.engine.KnoxInstalledCompanionApiVerifier",
             gameJar.absolutePath, fixture.absolutePath)
+    }
+}
+
+val verifyCreatorPreviewApi by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Checks native creator hand-model setters with debug off, without a game or graphics context."
+    dependsOn(tasks.testClasses, "verifyGameJar")
+    doFirst {
+        val home = file(pzHome.get())
+        val classpath = listOf(home.resolve("*").absolutePath,
+            sourceSets.main.get().output.classesDirs.asPath,
+            sourceSets.test.get().output.classesDirs.asPath)
+            .joinToString(System.getProperty("path.separator"))
+        commandLine(home.resolve("jre64/bin/java.exe").absolutePath, "-cp", classpath,
+            "com.knoxsurvivors.engine.KnoxCreatorPreviewApiVerifier")
     }
 }
 
@@ -361,8 +376,30 @@ val verifyPlaceVocabulary by tasks.registering(Exec::class) {
     commandLine("bash", "scripts/knox-vocabulary.sh", rootProject.projectDir.absolutePath)
 }
 
+val uiSourceGuards = listOf(
+    Triple("verifyUiAscii", "knox-ui-ascii.sh", "Checks Lua source for characters outside printable ASCII."),
+    Triple("verifyUiHomeSource", "knox-ui-home-source.sh", "Checks that both home pages share their home resolution."),
+    Triple("verifyUiNoRawIds", "knox-ui-no-raw-ids.sh", "Checks display expressions for raw internal IDs."),
+    Triple("verifyUiPageScroller", "knox-ui-page-scroller.sh", "Checks mounted page scrollers and list sizing."),
+    Triple("verifyUiPlaceholders", "knox-ui-placeholders.sh", "Checks for question marks used as missing values."),
+).map { (taskName, script, taskDescription) ->
+    tasks.register<Exec>(taskName) {
+        group = "verification"
+        description = taskDescription
+        workingDir(rootProject.projectDir)
+        commandLine("bash", "scripts/$script")
+    }
+}
+
+val verifyUiSource by tasks.registering {
+    group = "verification"
+    description = "Runs the UI source guards."
+    dependsOn(uiSourceGuards)
+}
+
 tasks.check {
     dependsOn(
+        verifyUiSource,
         verifyCombatTransformer,
         verifyZombieVisibilityTransformer,
         verifyZombieVisibilityRuntime,
@@ -379,6 +416,7 @@ tasks.check {
         verifyEquipmentOwnership,
         verifyGameLuaCompilation,
         verifyInstalledCompanionApi,
+        verifyCreatorPreviewApi,
         verifyInstalledRuntimeApi,
         verifyRuntimeAdapters,
         verifyZombieBuddyPatches,

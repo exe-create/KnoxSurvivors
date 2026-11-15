@@ -19,6 +19,12 @@ local labels = {}
 -- global next(), so "is anything showing" is a counter, not a scan.
 local tagged = {}
 local taggedCount = 0
+-- Reused each frame instead of rebuilding the crowded-plate list (and one small
+-- record per plate) on every paint. The count resets at the start of each frame;
+-- the buffer only ever grows to the widest crowd seen, so a steady crowd stops
+-- allocating after its first frame.
+local drawnBuffer = {}
+local drawnUsed = 0
 
 local function fullName(id)
     local identity = KnoxPersistence.getSurvivorIdentity(id) or {}
@@ -49,7 +55,7 @@ local function companyLine(company)
     if type(company) ~= "table" or type(company.headline) ~= "string"
         or company.headline == "" then return nil end
     if type(company.place) == "string" and company.place ~= "" then
-        return company.headline .. " · " .. company.place
+        return company.headline .. " - " .. company.place
     end
     return company.headline
 end
@@ -102,6 +108,9 @@ function Nameplates.update(ticks)
     if not enabled and taggedCount <= 0 and #labels == 0 then return end
     local distance = KnoxSettings.survivorNameplateDistance()
     labels = {}
+    -- One survivor-to-viewer relation per pass, reused by both the colour line
+    -- and the native tag write. The old shape classified every survivor twice.
+    local relations = {}
     local viewerIds = {}
     if enabled then
         for number = 0, math.max(0, getNumActivePlayers() - 1) do
@@ -124,8 +133,12 @@ function Nameplates.update(ticks)
             if enabled then
                 name = fullName(id)
                 local colors = {}
+                local row = {}
+                relations[id] = row
                 for number, viewerId in pairs(viewerIds) do
-                    colors[number] = COLORS[Nameplates.classify(id, viewerId)] or COLORS.neutral
+                    local relation = Nameplates.classify(id, viewerId)
+                    row[number] = relation
+                    colors[number] = COLORS[relation] or COLORS.neutral
                 end
                 local company = nil
                 if KnoxPersistence.survivorCompany ~= nil then
@@ -138,9 +151,15 @@ function Nameplates.update(ticks)
                             local size = math.floor(tonumber(facts.memberCount) or 0)
                             local headline = nil
                             if facts.isLeader == true and size >= 2 then
-                                headline = "Household of " .. tostring(size)
+                                headline = type(facts.name) == "string"
+                                    and facts.name ~= "" and facts.name
+                                    or ("Household of " .. tostring(size))
                             elseif leaderName ~= nil then
-                                headline = "With " .. leaderName
+                                local withName = leaderName
+                                if withName:match("^The ") ~= nil then
+                                    withName = "the " .. withName:sub(5)
+                                end
+                                headline = "With " .. withName
                             end
                             cached = headline ~= nil and {
                                 headline = headline,
@@ -169,7 +188,15 @@ function Nameplates.update(ticks)
                 if playerId ~= nil and hours ~= nil then
                     pcall(recordProximity, playerId, id, hours)
                 end
-                local relation = Nameplates.classify(id, playerId)
+                -- Reuse the pass's relation when it was computed for this exact
+                -- viewer; the identity fallback keeps the old behaviour.
+                local viewerNumber = player:getPlayerNum()
+                local row = relations[id]
+                local relation = row ~= nil and viewerIds[viewerNumber] ~= nil
+                    and row[viewerNumber] or nil
+                if relation == nil then
+                    relation = Nameplates.classify(id, playerId)
+                end
                 local color = COLORS[relation] or COLORS.neutral
                 if tagged[character] ~= true then
                     tagged[character] = true
@@ -193,7 +220,9 @@ function Nameplates.crowdedBy(drawn, x, y, halfWidth, fontHeight)
     if tonumber(x) == nil or tonumber(y) == nil then return false end
     local width = tonumber(halfWidth) or 0
     local height = tonumber(fontHeight) or 0
-    for _, spot in ipairs(drawn) do
+    local limit = tonumber(drawn.used) or #drawn
+    for index = 1, limit do
+        local spot = drawn[index]
         if type(spot) == "table"
             and math.abs((tonumber(spot.y) or 0) - y) <= height
             and math.abs((tonumber(spot.x) or 0) - x) <= (tonumber(spot.halfWidth) or 0) + width then
@@ -233,10 +262,10 @@ local function projectHead(character, playerNum, left, top, zoom, mode)
         -- Preserve the native isometric anchor; perspective pixels already
         -- include camera projection and must never receive these offsets.
         return (IsoUtils.XToScreen(character:getX(), character:getY(), character:getZ(), 0)
-            - character:getOffsetX() - IsoCamera.getOffX(playerNum)) / zoom + left,
+ - character:getOffsetX() - IsoCamera.getOffX(playerNum)) / zoom + left,
             (IsoUtils.YToScreen(character:getX(), character:getY(), character:getZ(), 0)
-            - character:getOffsetY() - 64 * Core.getTileScale()
-            - IsoCamera.getOffY(playerNum)) / zoom + top
+ - character:getOffsetY() - 64 * Core.getTileScale()
+ - IsoCamera.getOffY(playerNum)) / zoom + top
     end
     if mode ~= "perspective" or playerNum ~= 0 or getNumActivePlayers() ~= 1 then return nil end
     local ui = rawget(_G, "ViewpointUI")
@@ -315,8 +344,8 @@ local function computeStatus(survivorId, character)
         local ok, asleep = pcall(function() return character:isAsleep() end)
         if ok and asleep == true then return "asleep" end
     end
-    -- Bitten outranks standing, pain and work. A dying person is the fact the
-    -- player can still act on; everything else about them is secondary.
+    -- An observed bite outranks standing, pain and work. This band describes
+    -- readable wounds; it does not diagnose systemic infection or prognosis.
     local illness = rawget(_G, "KnoxSurvivorNeeds")
     if illness ~= nil and illness.infectionBand ~= nil and character ~= nil then
         local ok, band = pcall(illness.infectionBand, character)
@@ -404,7 +433,10 @@ function Nameplates.render()
     local mode = cameraMode()
     if mode == nil then return end
     -- Plates already painted this pass, so a neighbour can tell it is crowded.
-    local drawn = {}
+    drawnUsed = 0
+    drawnBuffer.used = 0
+    -- The text manager is a singleton; once per frame, not once per label.
+    local text = getTextManager()
     for playerNum = 0, math.max(0, getNumActivePlayers() - 1) do
         local player = getSpecificPlayer(playerNum)
         if player ~= nil and player:getCurrentSquare() ~= nil then
@@ -420,30 +452,58 @@ function Nameplates.render()
                     if dx * dx + dy * dy <= distance * distance and player:CanSee(character) then
                         local alpha = character:getAlpha(playerNum)
                         local x, y = projectHead(character, playerNum, left, top, zoom, mode)
-                        local text = getTextManager()
-                        local halfWidth = text:MeasureStringX(UIFont.Small, label.name) / 2
+                        -- A label lives for one 15-tick pass, so its name and
+                        -- household line are fixed for every frame in between:
+                        -- measure them once instead of every paint.
+                        if label.nameHalfWidth == nil then
+                            label.nameHalfWidth = text:MeasureStringX(UIFont.Small, label.name) / 2
+                        end
+                        local halfWidth = label.nameHalfWidth
                         local fontHeight = text:getFontHeight(UIFont.Small)
-                        local companyText = companyLine(label.company)
+                        if label.companyChecked ~= true then
+                            label.companyChecked = true
+                            label.companyText = companyLine(label.company) or false
+                        end
+                        local companyText = label.companyText or nil
                         -- The second line is recognition, not a marker: activity
                         -- reads only at talking distance, like company does.
                         local statusText = dx * dx + dy * dy <= 16
                             and Nameplates.statusWord(label.id, character) or nil
                         if statusText ~= nil then
-                            local statusWidth = text:MeasureStringX(UIFont.Small, statusText) / 2
+                            -- The word changes at most every 750 ms; measuring the
+                            -- same string on every frame is pure waste.
+                            if label.statusWidthText ~= statusText then
+                                label.statusWidthText = statusText
+                                label.statusWidth = text:MeasureStringX(UIFont.Small, statusText) / 2
+                            end
+                            local statusWidth = label.statusWidth
                             if statusWidth > halfWidth then halfWidth = statusWidth end
                         end
                         if companyText ~= nil then
                             -- The wider of the two lines decides whether the
                             -- label fits on screen, so a long household name
                             -- cannot draw past the viewport edge.
-                            local companyWidth = text:MeasureStringX(UIFont.Small, companyText) / 2
+                            if label.companyWidth == nil then
+                                label.companyWidth = text:MeasureStringX(UIFont.Small, companyText) / 2
+                            end
+                            local companyWidth = label.companyWidth
                             if companyWidth > halfWidth then halfWidth = companyWidth end
                         end
                         if alpha > 0 and finite(x) and finite(y) and x - halfWidth >= left and x + halfWidth <= left + width
                             and y >= top and y + fontHeight <= top + height then
                             local color = label.colors[playerNum] or COLORS.neutral
-                            local crowded = Nameplates.crowdedBy(drawn, x, y, halfWidth, fontHeight)
-                            drawn[#drawn + 1] = { x = x, y = y, halfWidth = halfWidth }
+                            drawnBuffer.used = drawnUsed
+                            local crowded = Nameplates.crowdedBy(
+                                drawnBuffer, x, y, halfWidth, fontHeight
+                            )
+                            drawnUsed = drawnUsed + 1
+                            local spot = drawnBuffer[drawnUsed]
+                            if spot == nil then
+                                spot = {}
+                                drawnBuffer[drawnUsed] = spot
+                            end
+                            spot.x, spot.y, spot.halfWidth = x, y, halfWidth
+                            drawnBuffer.used = drawnUsed
                             text:DrawStringCentre(UIFont.Small, x + 1, y + 1, label.name, 0, 0, 0, alpha)
                             text:DrawStringCentre(UIFont.Small, x, y, label.name, color[1], color[2], color[3], alpha)
                             -- A faction introduces itself the first time one of
@@ -452,8 +512,18 @@ function Nameplates.render()
                             -- its people is seen. Afterwards it is recognised
                             -- only within conversation distance, so a known
                             -- group reads as a group without becoming a label.
-                            local faction = KnoxPersistence.getFactionForSurvivor ~= nil
-                                and KnoxPersistence.getFactionForSurvivor(label.id) or nil
+                            -- The lookup is expensive, the identity is not: read the
+                            -- cheap key every draw so joining or leaving a faction paints
+                            -- on this frame, and re-resolve only when it actually moved.
+                            local factionKey = KnoxPersistence.getSurvivorFactionId ~= nil
+                                and KnoxPersistence.getSurvivorFactionId(label.id) or nil
+                            if label.factionChecked ~= true or label.factionKey ~= factionKey then
+                                label.factionChecked = true
+                                label.factionKey = factionKey
+                                label.faction = KnoxPersistence.getFactionForSurvivor ~= nil
+                                    and KnoxPersistence.getFactionForSurvivor(label.id) or nil
+                            end
+                            local faction = label.faction
                             local tag = faction ~= nil and type(faction.name) == "string"
                                 and faction.name ~= "" and faction.name or nil
                             local known = faction ~= nil and faction.formationNoticed == true

@@ -1,12 +1,11 @@
 name=Knox Survivors
 id=KnoxSurvivors
 author=.exe
-version=0.3.0-rc1
-description=One survivor mod for Build 42.21. Activate either ZombieBuddy or KnoxBridgeRuntime, never both. Single-player test candidate; native companion acceptance pending.
+version=0.3.0-rc2
+description=One survivor mod for Build 42.22. Activate either ZombieBuddy or KnoxBridgeRuntime, never both. Single-player test candidate; native companion acceptance pending.
 poster=poster.png
 icon=icon.png
-versionMin=42.21
-versionMax=42.21
+versionMin=42.22
 javaJarFile=media/java/knox-survivors.jar
 javaPkgName=com.knoxsurvivors.zombiebuddy
 incompatible=

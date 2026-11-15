@@ -86,6 +86,57 @@ function Planner.missingRequirements(requirements, inventory)
     return missing
 end
 
+-- Live job demand is derived, never another saved stock ledger. Consumable
+-- counts add; jobs share durable tools and require only the largest tool set.
+function Planner.taskItemGoals(tasks, countFor)
+    if type(countFor) ~= "function" then return {} end
+    local demand = {}
+    for _, task in pairs(type(tasks) == "table" and tasks or {}) do
+        if type(task) == "table" and task.state == "queued" then
+            local requirements = task.requirements or {}
+            for fullType, count in pairs(requirements.items or {}) do
+                local key = Planner.itemTargetKey(fullType)
+                local required = math.max(0, math.floor(tonumber(count) or 0))
+                if key ~= nil and required > 0 then
+                    local row = demand[key]
+                    if row == nil then
+                        row = { key = key, fullType = fullType, durable = 0, consumable = 0,
+                            requirements = { items = {}, itemRules = {} } }
+                        demand[key] = row
+                    end
+                    local rule = (requirements.itemRules or {})[fullType]
+                    if type(rule) == "table" and rule.usable == true then
+                        row.durable = math.max(row.durable, required)
+                    else
+                        row.consumable = row.consumable + required
+                    end
+                    row.target = row.durable + row.consumable
+                    row.requirements.items[fullType] = row.target
+                    for name, value in pairs(type(rule) == "table" and rule or {}) do
+                        local combined = row.requirements.itemRules[fullType] or {}
+                        if type(value) == "number" then
+                            combined[name] = math.max(tonumber(combined[name]) or 0, value)
+                        elseif value == true then combined[name] = true end
+                        row.requirements.itemRules[fullType] = combined
+                    end
+                end
+            end
+        end
+    end
+    local result = {}
+    for _, row in pairs(demand) do
+        local ok, count = pcall(countFor, row.fullType, row.requirements)
+        local current = ok and tonumber(count) or nil
+        if current ~= nil and current == current and current >= 0 and current < math.huge then
+            row.current = math.floor(current)
+            row.missing = math.max(0, row.target - row.current)
+            if row.missing > 0 then result[#result + 1] = row end
+        end
+    end
+    table.sort(result, function(a, b) return a.key < b.key end)
+    return result
+end
+
 function Planner.matchesMissingRequirement(item, requirements, inventory)
     if not Planner.matchesRequirement(item, requirements) then return false end
     local fullType = safe(function() return item:getFullType() end, nil)
@@ -114,6 +165,59 @@ local function targetOverride(targets, category)
     local value = tonumber(targets[category])
     if value == nil then return nil end
     return math.max(0, math.min(50, math.floor(value)))
+end
+
+-- ITEM MINIMUMS
+-- A category target is a rule of thumb. A player who wants twenty bandages
+-- says twenty bandages, so one exact item can carry its own saved floor beside
+-- the category defaults. The key is the same shape the container filters use
+-- for one item type, so a shelf rule and a stock rule name a type the same way.
+local ITEM_TARGET_PREFIX = "item:"
+
+function Planner.itemTargetKey(fullType)
+    if type(fullType) ~= "string" or fullType == "" or #fullType > 64 then return nil end
+    if not string.match(fullType, "^[%w_%.%-]+$") then return nil end
+    return ITEM_TARGET_PREFIX .. fullType
+end
+
+function Planner.itemTargetType(key)
+    if type(key) ~= "string"
+        or string.sub(key, 1, #ITEM_TARGET_PREFIX) ~= ITEM_TARGET_PREFIX then
+        return nil
+    end
+    local fullType = string.sub(key, #ITEM_TARGET_PREFIX + 1)
+    if fullType == "" or #fullType > 64 then return nil end
+    if not string.match(fullType, "^[%w_%.%-]+$") then return nil end
+    return fullType
+end
+
+-- The player's item floors, oldest rule first only in the sense of type order:
+-- sorting by type keeps the list stable between refreshes so a stepper never
+-- moves under the pointer. countFor(fullType) is the base's own on-hand count,
+-- injected by the caller; this function reads no world and writes nothing.
+function Planner.itemGoalStatus(targets, countFor)
+    if type(targets) ~= "table" or type(countFor) ~= "function" then return {} end
+    local keys = {}
+    for key, value in pairs(targets) do
+        local fullType = Planner.itemTargetType(key)
+        if fullType ~= nil and (tonumber(value) or 0) > 0 then keys[#keys + 1] = key end
+    end
+    table.sort(keys)
+    local result = {}
+    for _, key in ipairs(keys) do
+        local fullType = Planner.itemTargetType(key)
+        local target = math.max(0, math.min(50, math.floor(tonumber(targets[key]) or 0)))
+        local ok, counted = pcall(countFor, fullType)
+        local current = ok and math.max(0, math.floor(tonumber(counted) or 0)) or 0
+        result[#result + 1] = {
+            key = key,
+            fullType = fullType,
+            current = current,
+            target = target,
+            missing = math.max(0, target - current),
+        }
+    end
+    return result
 end
 
 -- One shared reserve definition for both automatic supply decisions and the

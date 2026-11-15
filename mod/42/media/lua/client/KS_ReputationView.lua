@@ -75,7 +75,7 @@ local function deltaText(delta, causes, cause, fallback)
     local applied = number(delta)
     if applied == nil or applied == 0 then return nil end
     local words = causes ~= nil and causes[tostring(cause or "")] or nil
-    return signed(applied) .. " · " .. (words or fallback)
+    return signed(applied) .. " - " .. (words or fallback)
 end
 
 -- The band describes the personal relationship record. Faction hostility is

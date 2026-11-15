@@ -26,9 +26,11 @@ local broken = Layout.wrapLines("aa\nbb", 80, measure)
 assert(#broken == 2 and broken[1] == "aa" and broken[2] == "bb",
     "an explicit break stays a break")
 
--- A word longer than the line is left whole rather than cut.
+-- A word longer than the line is split without discarding its ending.
 local longWord = Layout.wrapLines("abcdefgh", 3, measure)
-assert(#longWord == 1 and longWord[1] == "abcdefgh", "a long word is never cut")
+assert(#longWord == 3 and table.concat(longWord, "") == "abcdefgh",
+    "an oversized word wraps without losing any characters")
+for _, line in ipairs(longWord) do assert(measure(line) <= 3, "long word stays inside its sheet") end
 
 -- Runs of spaces do not leave empty lines behind.
 local spaced = Layout.wrapLines("aa   bb", 40, measure)

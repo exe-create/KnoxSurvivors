@@ -75,22 +75,54 @@ local function selectedItems(selection)
     return result
 end
 
+local function offerCountText(giftMode, giving, taking)
+    local giveCount = #selectedItems(giving)
+    local giveLabel = tostring(giveCount) .. (giveCount == 1 and " item" or " items")
+    if giftMode then return "You give " .. giveLabel .. "." end
+    local takeCount = #selectedItems(taking)
+    local takeLabel = tostring(takeCount) .. (takeCount == 1 and " item" or " items")
+    return "You offer " .. giveLabel .. "; they offer " .. takeLabel .. "."
+end
+
+local function layoutStockRows(list)
+    local manager = getTextManager()
+    local fontH = manager:getFontHeight(UIFont.Small)
+    local measure = function(value) return manager:MeasureStringX(UIFont.Small, value) end
+    local scroll = list:getYScroll()
+    local height = 0
+    for _, row in ipairs(list.items or {}) do
+        row.knoxNameLines = UILayout.wrapLines(row.text, math.max(1, list.width - 70), measure)
+        row.height = math.max(list.itemheight, #row.knoxNameLines * fontH + 8)
+        height = height + row.height
+    end
+    list:setScrollHeight(height)
+    list:setYScroll(scroll)
+end
+
 function Window:drawStock(y, row)
     local window, item = self.parent, row.item
     local offered = window[self.offerKey][item] == true
-    if self.selected == row.index then self:drawRect(0, y, self.width, self.itemheight, .22, .7, .7, .7) end
+    local rowHeight = row.height or self.itemheight
+    if y + self:getYScroll() + rowHeight < 0 or y + self:getYScroll() >= self.height then
+        return y + rowHeight
+    end
+    if self.selected == row.index then self:drawRect(0, y, self.width, rowHeight, .22, .7, .7, .7) end
     if offered then
         local color = getCore():getGoodHighlitedColor()
         self:drawTextureScaledAspect(window.tickTexture, 5, y + 4, 16, 16, 1, color:getR(), color:getG(), color:getB())
     end
     local texture = item:getTex()
     if texture ~= nil then self:drawTextureScaledAspect(texture, 24, y + 3, 20, 20, 1, 1, 1, 1) end
-    self:drawText(trim(row.text, self.width - 70), 49, y + 4, .88, .88, .85, 1, UIFont.Small)
-    return y + self.itemheight
+    local lineHeight = getTextManager():getFontHeight(UIFont.Small)
+    for index, line in ipairs(row.knoxNameLines or { row.text }) do
+        self:drawText(line, 49, y + 4 + (index - 1) * lineHeight, .88, .88, .85, 1, UIFont.Small)
+    end
+    return y + rowHeight
 end
 
 function Window:createChildren()
     ISCollapsableWindowJoypad.createChildren(self)
+    UILayout.finishWindow(self, "Close trade")
     local line = getTextManager():getFontHeight(UIFont.Small)
     self.lineHeight, self.buttonHeight = line, line + 8
     local listY = self:titleBarHeight() + PAD + line + 4
@@ -118,20 +150,27 @@ function Window:createChildren()
     end
     self.playerList, self.survivorList = makeList(PAD, "giving"), makeList(PAD * 2 + column, "taking")
     local function button(x, y, width, title, callback)
-        local value = ISButton:new(x, y, width, self.buttonHeight, title, self, callback)
+        local fitted = UILayout.fitText(UIFont.Small, title, math.max(1, width - 12))
+        local value = ISButton:new(x, y, width, self.buttonHeight, fitted, self, callback)
         value:initialise(); UILayout.tintButton(value)
+        value.tooltip = title
+        value.knoxFullTitle = title
         self:addChild(value)
         return value
     end
     local toggleY = listY + listHeight + PAD
-    self.giveButton = button(PAD, toggleY, column, "Offer / Remove", function(window)
+    local toggleTitle = self.giftMode and "Select item" or "Toggle offer"
+    self.giveButton = button(PAD, toggleY, column, toggleTitle, function(window)
         local row = window.playerList.items[window.playerList.selected]
         if row then window:toggle("giving", row.item) end
     end)
-    self.takeButton = button(PAD * 2 + column, toggleY, column, "Offer / Remove", function(window)
+    self.takeButton = button(PAD * 2 + column, toggleY, column, "Toggle offer", function(window)
         local row = window.survivorList.items[window.survivorList.selected]
         if row then window:toggle("taking", row.item) end
     end)
+    self.giveButton.tooltip = self.giftMode and "Select or remove the item you are giving."
+        or "Add or remove the selected item from your offer."
+    self.takeButton.tooltip = "Add or remove the selected item from their offer."
     self.statusY = toggleY + self.buttonHeight + PAD
     local footerY, footerWidth = self.height - PAD - self.buttonHeight, (self.width - PAD * 4) / 3
     self.tradeButton = button(PAD, footerY, footerWidth, "Trade", Window.exchange); UILayout.tintPrimary(self.tradeButton)
@@ -145,9 +184,10 @@ function Window:createChildren()
     if self.giftMode then
         self.survivorList:setVisible(false)
         self.takeButton:setVisible(false)
-        self.tradeButton.title = "Give Item"
+        self.tradeButton.knoxFullTitle = "Give Item"
     end
     self.tradeButton:setEnable(false)
+    self:layoutTrade()
 end
 
 function Window:toggle(key, item)
@@ -184,10 +224,13 @@ function Window:refreshStock()
         local selected = old ~= nil and old.item or nil
         local scroll = list:getYScroll()
         list:clear()
+        list:setScrollHeight(0)
         for index, item in ipairs(items) do
-            list:addItem(itemName(item, self.player), item)
+            local name = tostring(itemName(item, self.player) or "")
+            list:addItem(name, item, name)
             if item == selected then list.selected = index end
         end
+        layoutStockRows(list)
         list:setYScroll(scroll)
     end
     fill(self.playerList, stock.playerItems)
@@ -295,24 +338,90 @@ function Window:update()
     end
 end
 
+function Window:layoutTrade()
+    if self.playerList == nil or self.tradeButton == nil then return end
+    local manager = getTextManager()
+    local line = manager:getFontHeight(UIFont.Small)
+    local measure = function(value) return manager:MeasureStringX(UIFont.Small, value) end
+    local available = math.max(1, self.width - PAD * 2)
+    local column = math.max(1, (self.width - PAD * 3) / 2)
+    self.lineHeight, self.buttonHeight = line, line + 8
+    local headers = { UILayout.wrapLines("Your inventory", column, measure),
+        UILayout.wrapLines(tostring(self.survivorName or ""), column, measure) }
+    local headerY = self:titleBarHeight() + PAD
+    local listY = headerY + math.max(#headers[1], #headers[2]) * line + 4
+    local counts = offerCountText(self.giftMode, self.giving, self.taking)
+    local statusLines = UILayout.wrapLines(tostring(self.status or ""), available, measure)
+    local countLines = UILayout.wrapLines(counts, available, measure)
+    local help = self.giftMode and "Double-click / A: select item. Y: give item. B: close."
+        or "Double-click / A: offer item. Y: trade. B: close."
+    local helpLines = UILayout.wrapLines(help, available, measure)
+    local hiddenLines = UILayout.wrapLines("Equipped, favorite and unsupported items are hidden.", available, measure)
+    local footerButtons = { self.tradeButton, self.clearButton, self.doneButton }
+    for _, button in ipairs(footerButtons) do
+        button.knoxPreferredWidth = 0
+        button:setTitle(button.knoxFullTitle)
+    end
+    local footer = UILayout.footerPlacements(footerButtons, available,
+        { spacing = PAD, buttonHeight = self.buttonHeight, measure = measure })
+    local footerY = self.height - PAD - footer.height
+    local statusHeight = (#statusLines + #countLines) * line
+    local minListHeight = math.max(26, line + 8)
+    local fixed = listY + PAD + self.buttonHeight + PAD + statusHeight + PAD
+    local spare = footerY - fixed - minListHeight
+    if spare < (#helpLines + #hiddenLines) * line then helpLines, hiddenLines = {}, {} end
+    local listHeight = math.max(1, footerY - fixed - (#helpLines + #hiddenLines) * line)
+    local lists = { self.playerList, self.survivorList }
+    for index, list in ipairs(lists) do
+        local changedWidth = list.width ~= column
+        list:setX(index == 1 and PAD or PAD * 2 + column)
+        list:setY(listY); list:setWidth(column); list:setHeight(listHeight)
+        if changedWidth then layoutStockRows(list) end
+    end
+    local toggleY = listY + listHeight + PAD
+    for index, button in ipairs({ self.giveButton, self.takeButton }) do
+        button:setX(index == 1 and PAD or PAD * 2 + column); button:setY(toggleY)
+        button:setWidth(column); button:setHeight(self.buttonHeight)
+        button:setTitle(UILayout.fitText(UIFont.Small, button.knoxFullTitle, math.max(1, column - 12), measure))
+    end
+    self.statusY = toggleY + self.buttonHeight + PAD
+    for _, placement in ipairs(footer.placements) do
+        local button = placement.control
+        button:setX(PAD + placement.x); button:setY(footerY + placement.y)
+        button:setWidth(placement.width); button:setHeight(placement.height)
+        button:setTitle(UILayout.fitText(UIFont.Small, button.knoxFullTitle, math.max(1, placement.width - 12), measure))
+    end
+    self.tradeLayout = { headerY = headerY, headers = headers, status = statusLines,
+        counts = countLines, help = helpLines, hidden = hiddenLines }
+    self.tradeLayoutWidth, self.tradeLayoutHeight = self.width, self.height
+    self.tradeLayoutStatus, self.tradeLayoutName = self.status, self.survivorName
+    self.tradeLayoutCounts = counts
+end
+
 function Window:prerender()
     ISCollapsableWindowJoypad.prerender(self)
     if self.isCollapsed or self.playerList == nil then return end
-    local line, y = self.lineHeight, self:titleBarHeight() + PAD
-    self:drawText("Your inventory", PAD, y, .88, .88, .85, 1, UIFont.Small)
-    self:drawText(trim(self.survivorName, self.survivorList.width), self.survivorList.x, y, .88, .88, .85, 1, UIFont.Small)
-    self:drawText(trim(self.status, self.width - PAD * 2), PAD, self.statusY, .88, .88, .85, 1, UIFont.Small)
-    local counts = self.giftMode
-        and ("You give " .. #selectedItems(self.giving) .. " item(s).")
-        or ("You offer " .. #selectedItems(self.giving) .. " item(s); they offer " .. #selectedItems(self.taking) .. ".")
-    self:drawText(trim(counts, self.width - PAD * 2), PAD, self.statusY + line, .65, .65, .65, 1, UIFont.Small)
-    if self.helpLines > 0 then
-        local help = self.giftMode and "Double-click / A: select item. Y: give item. B: close."
-            or "Double-click / A: offer item. Y: trade. B: close."
-        self:drawText(trim(help, self.width - PAD * 2), PAD,
-            self.statusY + line * 2, .65, .65, .65, 1, UIFont.Small)
-        self:drawText(trim("Equipped, favorite and unsupported items are hidden.", self.width - PAD * 2), PAD,
-            self.statusY + line * 3, .65, .65, .65, 1, UIFont.Small)
+    local counts = offerCountText(self.giftMode, self.giving, self.taking)
+    if self.tradeLayout == nil or self.tradeLayoutWidth ~= self.width or self.tradeLayoutHeight ~= self.height
+        or self.tradeLayoutStatus ~= self.status or self.tradeLayoutName ~= self.survivorName
+        or self.tradeLayoutCounts ~= counts then self:layoutTrade() end
+    local layout, line = self.tradeLayout, self.lineHeight
+    for index, text in ipairs(layout.headers[1]) do
+        self:drawText(text, PAD, layout.headerY + (index - 1) * line, .88, .88, .85, 1, UIFont.Small)
+    end
+    if not self.giftMode then
+        for index, text in ipairs(layout.headers[2]) do
+            self:drawText(text, self.survivorList.x, layout.headerY + (index - 1) * line, .88, .88, .85, 1, UIFont.Small)
+        end
+    end
+    local y = self.statusY
+    for _, text in ipairs(layout.status) do
+        self:drawText(text, PAD, y, .88, .88, .85, 1, UIFont.Small); y = y + line
+    end
+    for _, group in ipairs({ layout.counts, layout.help, layout.hidden }) do
+        for _, text in ipairs(group) do
+            self:drawText(text, PAD, y, .65, .65, .65, 1, UIFont.Small); y = y + line
+        end
     end
     self.doneButton.tooltip = self.status
 end

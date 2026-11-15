@@ -339,7 +339,9 @@ function Homecoming.greet(player, playerId, base, state, now)
     local lines = away >= Homecoming.LONG_ABSENCE_HOURS
         and Homecoming.reportFor(facts) or { Homecoming.lineFor(facts) }
     if type(lines) ~= "table" or #lines == 0 then return false end
-    pcall(function() speaker:faceThisObject(player) end)
+    local runtime = rawget(_G,"KnoxSurvivorRuntime")
+    local owner = runtime and runtime.getController and runtime.getController(speakerId)
+    if owner and owner.faceForAmbient then owner:faceForAmbient(player) end
     local feed = rawget(_G, "KnoxActivityFeed")
     if feed ~= nil and feed.speak ~= nil then
         for _, line in ipairs(lines) do

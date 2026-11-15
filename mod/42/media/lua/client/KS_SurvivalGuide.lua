@@ -1,4 +1,4 @@
--- Knox Survivors — the mod's page in the vanilla Survival Guide (F1), plus the
+-- Knox Survivors - the mod's page in the vanilla Survival Guide (F1), plus the
 -- one-time notice that points at it. Guide.PAGES is the only copy of the help
 -- text, so the pages and the greeting cannot disagree about how it is played.
 
@@ -19,61 +19,80 @@ Guide.SEEN_FIELD = "KnoxGuideSeen"
 -- One page, short enough to read in a pause. Every line names something the
 -- player can do now; no line describes a system that has no executor.
 Guide.PAGES = {
-    -- The list mirrors vanilla: one category row, then short indented pages. A
-    -- title as long as a sentence is what clipped every row at the list edge.
-    -- Every line names something the player can do, in the words the panel uses,
-    -- so the guide and the notebook cannot describe the same thing twice.
+    -- The vanilla guide's left-hand list is the tab strip; every entry below is
+    -- one tab for one part of playing. Titles stay short enough for the list,
+    -- and every line must name a control the mod really has: a guide page may
+    -- not describe a system that has no executor.
     { id = "KnoxSurvivors_Guide", title = "Knox Survivors", lines = {
-        "A few survivors, a county with other people in it, and a home you choose.",
+        "Knox Survivors adds persistent people to the county: people who travel with companions, live at a shared home, work with real supplies and act on their own.",
         "",
-        "Your people need food, water, beds, tools and a roof. They work, they travel for supplies, and they come back - or they do not.",
+        "The left-hand list is the tab strip. Each part of life with your people has its own page: recruiting, setting up a base, beds, storage and hauling, orders and jobs, autonomy, and threats and factions.",
         "",
         "Start here",
-        "1. Press F to talk to a survivor. Conversation builds trust, and trust is what lets you recruit.",
-        "2. Right-click the floor inside a house you want, then Knox Survivors > Establish Home Base.",
-        "3. Right-click a survivor you lead to give orders, or open the notebook to run the whole home.",
+        "1. Right-click a nearby survivor and choose Talk. In isometric view, you can also use F. With Viewpoint, use the crosshair interaction.",
+        "2. Inside the building you want, right-click the floor, open Knox Survivors, and choose Establish Home Base.",
+        "3. Open Orders in a companion's talk panel. The notebook runs the home while you are elsewhere.",
         "",
-        "F1 opens this guide at any time. The pages below cover the base, orders, people, storage and threats.",
+        "F1 opens and closes this guide; the key is rebindable in settings under Toggle Survival Guide.",
+        "The vanilla pages below ours belong to the base game. If a vanilla page looks wrong or is missing, check the 'Show Survival Guide' tick box at the bottom of this window, and tell the team which page you expected and what it showed.",
     } },
-    { id = "KnoxSurvivors_Guide_Base", title = "Your base", sub = true, lines = {
-        "A base is a building you have entered, cleared and claimed. Right-click the floor inside it and choose Establish Home Base.",
+    { id = "KnoxSurvivors_Guide_Recruit", title = "Recruiting", sub = true, lines = {
+        "Right-click a nearby survivor and choose Talk. In isometric view, press F instead; with Viewpoint, use the crosshair interaction.",
+        "",
+        "Conversation builds trust. Recruitment also depends on the person, their group and the situation, and someone can refuse.",
+        "A new join is part of your group: they can travel with you or live and work at home.",
+        "When a group grows, it can move into one of the larger group homes.",
+    } },
+    { id = "KnoxSurvivors_Guide_Base", title = "Setting up a base", sub = true, lines = {
+        "A base is a building you have entered, cleared and claimed. Right-click the floor inside it, open Knox Survivors and choose Establish Home Base.",
+        "It has to be cleared: zombies inside are a problem, not a detail.",
         "",
         "What a base does",
         "- It stores what your people eat, drink and work with.",
         "- It provides work: cooking, farming, water, repairs, barricades and hauling.",
-        "- It has to be cleared. Zombies inside are a problem, not a detail.",
         "",
-        "The notebook has four pages:",
+        "The notebook has five tabs:",
         "- Base & Work: boundary, areas, the job queue and storage.",
         "- Crew & Schedule: who lives here, their hours, roles and tonight's guard.",
         "- Stores & Stock: how much of each supply to keep, and the yard.",
-        "- Missions and World: trips away, and the county around you.",
+        "- Missions: dispatch teams and review their results.",
+        "- World: known people, groups and events.",
     } },
-    { id = "KnoxSurvivors_Guide_Orders", title = "Orders", sub = true, lines = {
-        "Right-click a survivor you lead to see the orders: Follow, Guard, Scavenge, Hold Position, Return to Base, Resume Normal Duty and Dismiss.",
-        "The talk panel (F) offers the same orders as buttons, along with conversation.",
+    { id = "KnoxSurvivors_Guide_Beds", title = "Beds", sub = true, lines = {
+        "Right-click a real bed inside your base, open Knox Survivors and choose Assign Bed.",
+        "Pick the person it belongs to: they use that bed when they sleep here. The menu shows who is assigned, and an Unassign entry frees the bed.",
+        "If an assigned bed stops being sleepable, the menu names the problem and offers a way out instead of failing silently at night.",
+    } },
+    { id = "KnoxSurvivors_Guide_Storage", title = "Storage & hauling", sub = true, lines = {
+        "Assign storage to your base, then check its category and filters. Residents move real items when a suitable job and destination are available.",
+        "",
+        "Container Item Filters adds a group, a native category, or one exact item type.",
+        "Role kits show what a resident needs. Missing equipment must come from real supplies; assigning a role does not create items.",
+        "Logs and building materials dropped on a yard floor become yard stock, and the yard is listed in the notebook.",
+        "",
+        "When residents organize at home, they pick up items lying loose on the floor and stock them where the filters and yards send them.",
+        "A supply run that ends while carrying stock sets it down at the yard's drop square instead of scattering it.",
+    } },
+    { id = "KnoxSurvivors_Guide_Orders", title = "Orders & jobs", sub = true, lines = {
+        "Talk to someone you lead and open Orders. Available actions depend on whether they are a companion or a resident.",
+        "The emote radial also includes Knox orders when enabled. Extra right-click orders are optional.",
         "",
         "People refuse work they cannot do, and they say what is missing. Nothing is repaired or supplied silently.",
         "An away team leaves for supplies and brings back what it found - or it does not come back.",
-        "A direct order outranks routine work. Order someone to follow you and their base job goes back to the queue.",
+        "A direct order outranks routine work: order someone to follow you and their base job returns to the queue.",
     } },
-    { id = "KnoxSurvivors_Guide_People", title = "People", sub = true, lines = {
-        "Every survivor has needs, a mood, trust and a schedule.",
-        "Talking raises trust. Hunger, thirst and exhaustion wear it down again.",
+    { id = "KnoxSurvivors_Guide_Autonomy", title = "Autonomy", sub = true, lines = {
+        "Your people act on their own when you are not commanding: they eat, drink, work and stop to rest when the body needs it instead of pushing through.",
         "",
-        "Crew & Schedule lists everyone who lives here and what they are doing right now.",
-        "A role is the work someone prefers when they are free. A preference decides which jobs they take when nothing is ordered. Neither one replaces a direct order.",
-        "Hours are painted, not typed: pick Sleep, Work, Patrol, Guard, Leisure or Free, then click the hour blocks. Save Hours applies the draft.",
-    } },
-    { id = "KnoxSurvivors_Guide_Storage", title = "Storage", sub = true, lines = {
-        "Give a container to a base once and it sorts itself: books to shelves, tools to toolboxes, and everything else to general storage.",
+        "A role is the work someone prefers when they are free; scheduled hours decide when they work. Either yields to a direct order.",
         "",
-        "Container Item Filters adds a group, a native category, or one exact item type.",
-        "A survivor's pack is filled from base storage before they leave on a supply run.",
-        "Logs and building materials can be dropped on a yard floor. A yard is a storage area with its own targets, and its stock is listed in the notebook.",
+        "They treat themselves with what is at hand: bandages, disinfectant, stitches, splints and antibiotics when they carry them.",
+        "Meeting a living stranger can be said out loud, once per remembered person, not repeated.",
+        "",
+        "People can die. The sandbox setting 'Your People Continue After Death' decides whether the rest of your people keep going.",
     } },
-    { id = "KnoxSurvivors_Guide_Threats", title = "Threats", sub = true, lines = {
-        "Other groups can raid an established base. Count your people, close the doors, and barricade the outside walls first.",
+    { id = "KnoxSurvivors_Guide_Threats", title = "Threats & factions", sub = true, lines = {
+        "Faction raids are experimental. Check Faction Raids in Sandbox; raids also need Knox Events, NPC Factions and hostile encounters. Prepare real weapons, supplies and guard posts; keep an exit usable.",
         "Reputation and trade decide whether a group is friendly, wary or hostile.",
         "A warning comes before a raid. The recent-events digest lists what happened afterwards.",
     } },
@@ -81,8 +100,8 @@ Guide.PAGES = {
 
 Guide.TEXT = table.concat(Guide.PAGES[1].lines, "<LINE>")
 
-Guide.NOTICE_TEXT = "You are not alone anymore. Press F1 and open the Knox Survivors page"
-    .. " of the Survival Guide to learn how to build a home, give orders and keep your people fed."
+Guide.NOTICE_TEXT = "You are not alone anymore. Press F1 and open the Knox Survivors chapters"
+    .. " of the Survival Guide: build a home, recruit people, assign beds and storage, give orders, and understand survivor autonomy."
 
 -- The wrap is a layout rule, not a notice rule: it lives in the shared layout
 -- module so the notice and every other paragraph break at one measurement.
@@ -92,30 +111,53 @@ Guide.wrapLines = UILayout.wrapLines
 -- page lived in a 150-pixel strip under a blank rectangle and needed a scrollbar
 -- for four lines. Knox pages carry no video: the area is collapsed and the
 -- description takes the whole right side.
+function Guide.layoutPage(panel)
+    if panel == nil or panel.videoRichText == nil or panel.descriptionRichText == nil
+        or panel.listBox == nil then return end
+    local video, text = panel.videoRichText, panel.descriptionRichText
+    if panel.knoxOriginalLayout == nil then
+        panel.knoxOriginalLayout = { videoHeight = video:getHeight(),
+            width=panel.getWidth~=nil and panel:getWidth() or nil,
+            height=panel.getHeight~=nil and panel:getHeight() or nil }
+    end
+    local page = panel.selectedItem
+    local knox = page ~= nil and type(page.id) == "string"
+        and page.id:find("KnoxSurvivors_Guide", 1, true) == 1
+    local original = panel.knoxOriginalLayout
+    if getCore~=nil and original.width~=nil and original.height~=nil then
+        local screenWidth,screenHeight=getCore():getScreenWidth(),getCore():getScreenHeight()
+        panel:setWidth(knox and math.min(original.width,screenWidth-32) or original.width)
+        panel:setHeight(knox and math.min(original.height,screenHeight-32) or original.height)
+        panel:setX(math.max(0,(screenWidth-panel:getWidth())/2))
+        panel:setY(math.max(0,(screenHeight-panel:getHeight())/2))
+    end
+    video:setVisible(not knox)
+    video:setHeight(knox and 0 or original.videoHeight)
+    text:setY(panel.listBox:getY()+(knox and 0 or original.videoHeight))
+    text:setHeight(math.max(1,panel.listBox:getHeight()-(knox and 0 or original.videoHeight)))
+    -- The native list can grow when labels are measured. Reflow against the
+    -- actual right-hand viewport, rather than retaining a stale paragraph width.
+    if panel.getWidth ~= nil and panel.listBox.getRight ~= nil then
+        text:setWidth(math.max(1, panel:getWidth() - panel.listBox:getRight()))
+    end
+    text:paginate()
+    video:paginate()
+end
+
 local function installTextOnlyLayout(guide)
     if guide == nil or guide.knoxTextOnly == true then return end
     guide.knoxTextOnly = true
-    local baseClick = guide.onClickList
-    local baseRestore = guide.restorePosition
-    local function expand(panel)
-        if panel == nil then return end
-        if panel.videoRichText ~= nil then
-            panel.videoRichText:setVisible(false)
-            panel.videoRichText:setHeight(0)
-        end
-        if panel.descriptionRichText ~= nil and panel.listBox ~= nil then
-            panel.descriptionRichText:setY(panel.listBox:getY())
-            panel.descriptionRichText:setHeight(panel.listBox:getHeight())
-            pcall(function() panel.descriptionRichText:paginate() end)
-        end
-    end
+    local baseClick, baseRestore = guide.onClickList, guide.restorePosition
     function guide:onClickList()
         if baseClick ~= nil then baseClick(self) end
-        expand(self)
+        Guide.layoutPage(self)
     end
     function guide:restorePosition()
         if baseRestore ~= nil then baseRestore(self) end
-        expand(self)
+        if self.knoxOriginalLayout ~= nil then
+            self.knoxOriginalLayout.width = self:getWidth()
+        end
+        Guide.layoutPage(self)
     end
 end
 

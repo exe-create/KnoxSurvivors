@@ -1,6 +1,7 @@
 require "ISUI/ISCollapsableWindowJoypad"
 require "ISUI/ISScrollingListBox"
 require "ISUI/ISButton"
+require "ISUI/ISLabel"
 require "ISUI/ISTextEntryBox"
 require "KS_BaseManager"
 require "KS_BaseStorage"
@@ -184,7 +185,8 @@ end
 
 function FilterWindow:createChildren()
     ISCollapsableWindowJoypad.createChildren(self)
-    local pad = math.max(8, UILayout.scaled(12))
+    UILayout.finishWindow(self, "Close filters")
+    local pad = math.max(8, math.min(12, UILayout.scaled(8)))
     local titleHeight = self:titleBarHeight()
     local instruction = self.isNew
         and ("Suggested for this container: "
@@ -194,17 +196,12 @@ function FilterWindow:createChildren()
     -- A label never wraps, so the instruction is measured into lines and the
     -- list starts below the last one. At a large interface scale the old single
     -- label ran past the list edge instead of reading as two calm lines.
-    local muted = UILayout.theme.muted
+    self.instructionText = instruction
+    self.instructionLabels = {}
     local instructionH = math.max(16, UILayout.scaled(20))
     local instructionTop = titleHeight + math.max(4, UILayout.scaled(6))
     local instructionLines = UILayout.wrapLines(instruction, self.width - pad * 2,
         function(value) return getTextManager():MeasureStringX(UIFont.Small, value) end)
-    for index, line in ipairs(instructionLines) do
-        local label = ISLabel:new(pad, instructionTop + (index - 1) * instructionH,
-            instructionH, line, muted[1], muted[2], muted[3], 1, UIFont.Small, true)
-        label:initialise()
-        self:addChild(label)
-    end
 
     -- Rows follow the interface font: a 26-pixel row clips the label at a
     -- large interface scale, so the list, the search box and the footer
@@ -266,26 +263,73 @@ function FilterWindow:createChildren()
     self.cancelButton:setAnchorRight(true)
     self.cancelButton:setAnchorBottom(true)
     self:applyModeLayout()
+    UILayout.trackWindow(self)
 end
 
 function FilterWindow:applyModeLayout()
-    if self.categoryList == nil or self.searchBox == nil then return end
-    local pad = 12
-    local titleHeight = self:titleBarHeight()
-    local footer = 26 + pad * 2 + 4
-    local listY = self.listY or (titleHeight + 32)
-    local top, height = listY, self.height - listY - footer
-    if self.mode == "items" then
-        self.searchBox:setVisible(true)
-        self.searchBox:setY(listY)
-        top = listY + 28
-        height = height - 28
-    else
-        self.searchBox:setVisible(false)
-        if self.searchBox.setText ~= nil then pcall(function() self.searchBox:setText("") end) end
+    if self.categoryList == nil or self.searchBox == nil or self.modeButton == nil then return end
+    local manager = getTextManager()
+    local fontH = manager:getFontHeight(UIFont.Small)
+    local pad = math.max(8, math.min(12, UILayout.scaled(8)))
+    local available = math.max(1, self.width - pad * 2)
+    local lineH = fontH + 4
+    local buttonH = math.max(24, fontH + 10)
+    local measure = function(value) return manager:MeasureStringX(UIFont.Small, value) end
+    local lines = UILayout.wrapLines(self.instructionText, available, measure)
+    local labelTop = self:titleBarHeight() + math.max(4, UILayout.scaled(6))
+    local controls = { self.modeButton, self.saveButton, self.cancelButton }
+    local footer = UILayout.footerPlacements(controls, available,
+        { spacing = 6, buttonHeight = buttonH, measure = measure })
+    local footerTop = self.height - pad - footer.height
+    local listGap = math.max(8, UILayout.scaled(10))
+    local searchSpace = self.mode == "items" and buttonH + 4 or 0
+    local rowHeight = math.max(1, tonumber(self.categoryList.itemheight) or buttonH)
+    local lineBudget = math.max(0, math.floor((footerTop - 6 - rowHeight - searchSpace
+        - labelTop - listGap) / lineH))
+    local visibleLines = math.min(#lines, lineBudget)
+    for index = 1, visibleLines do
+        local line = lines[index]
+        local label = self.instructionLabels[index]
+        if label == nil then
+            local muted = UILayout.theme.muted
+            label = ISLabel:new(pad, 0, lineH, "", muted[1], muted[2], muted[3], 1, UIFont.Small, true)
+            label:initialise(); self:addChild(label)
+            self.instructionLabels[index] = label
+        end
+        if index == visibleLines and visibleLines < #lines then line = line .. "..." end
+        label:setNameWithoutMoving(UILayout.fitText(UIFont.Small, line, available, measure))
+        label:setX(pad); label:setY(labelTop + (index - 1) * lineH); label:setHeight(lineH)
+        label.tooltip = self.instructionText
+        label:setVisible(true)
     end
-    self.categoryList:setY(top)
-    self.categoryList:setHeight(height)
+    for index = visibleLines + 1, #self.instructionLabels do self.instructionLabels[index]:setVisible(false) end
+    self.categoryList.tooltip = self.instructionText
+    local listY = labelTop + visibleLines * lineH + listGap
+    for _, placement in ipairs(footer.placements) do
+        local button = placement.control
+        button:setX(pad + placement.x); button:setY(footerTop + placement.y)
+        button:setWidth(placement.width); button:setHeight(placement.height)
+    end
+    self.searchBox:setX(pad); self.searchBox:setWidth(available)
+    self.searchBox:setHeight(buttonH)
+    self.searchBox:setVisible(self.mode == "items")
+    local top = listY
+    if self.mode == "items" then
+        self.searchBox:setY(listY)
+        top = self.searchBox:getBottom() + 4
+    elseif self.knoxLayoutMode ~= self.mode and self.searchBox.setText ~= nil then
+        pcall(function() self.searchBox:setText("") end)
+    end
+    self.categoryList:setX(pad); self.categoryList:setWidth(available)
+    self.categoryList:setY(top); self.categoryList:setHeight(math.max(1, footerTop - top - 6))
+    self.knoxLayoutWidth, self.knoxLayoutHeight, self.knoxLayoutMode = self.width, self.height, self.mode
+end
+
+function FilterWindow:prerender()
+    if self.knoxLayoutWidth ~= self.width or self.knoxLayoutHeight ~= self.height then
+        self:applyModeLayout()
+    end
+    ISCollapsableWindowJoypad.prerender(self)
 end
 
 local function matchesDisplayCategory(item, key)
@@ -628,8 +672,8 @@ function FilterUI.openZone(baseId, zoneId, playerNum)
     window:addToUIManager()
     window:setVisible(true)
     window:bringToTop()
-    window:setTitle("Depot Filters — "
-        .. tostring(KnoxPersistence.zoneDisplayLabel(zone, "Log Yard")))
+    window:setTitle("Depot Filters - "
+        .. tostring(KnoxPersistence.zoneDisplayLabel(zone, "Drop Point")))
     if JoypadState ~= nil and JoypadState.players[playerNum + 1] ~= nil then
         window.previousJoypadFocus = JoypadState.players[playerNum + 1].focus
         setJoypadFocus(playerNum, window.categoryList)

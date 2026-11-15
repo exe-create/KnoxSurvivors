@@ -1,27 +1,31 @@
 local Settings = rawget(_G, "KnoxSettings") or {}
 _G.KnoxSettings = Settings
 
+-- Mirrors sandbox-options.txt for a realistic, immersive default world: fewer
+-- people loaded at once, people met where you actually go, a county that thins
+-- out faster than it refills, and a slower drift into armed factions and raids.
 local DEFAULTS = {
     Enabled = true,
+    SurvivorStrength = 2,
     DisableSurvivorCaps = false,
     WorldPopulation = 420,
-    InitialGroupChance = 45,
+    InitialGroupChance = 35,
     InitialGroupMaxSize = 4,
-    InitialGroupCount = 48,
-    InitialFactionCount = 6,
+    InitialGroupCount = 40,
+    InitialFactionCount = 4,
     MaxActiveSurvivors = 24,
-    ActivationsPerUpdate = 2,
-    PopulationRefillDays = 7,
+    ActivationsPerUpdate = 1,
+    PopulationRefillDays = 14,
     MinimumSpawnDistance = 40,
-    SurvivorEncounterDistance = 220,
-    CompanionLimit = 4,
+    SurvivorEncounterDistance = 160,
+    CompanionLimit = 3,
     FollowerFormation = 1,
     FollowerSpacing = 1,
     ToolCupboardCapacity = 500,
     EnableExperimentalNpcDriving = false,
     EnableExperimentalEngineWork = false,
     NpcDrivingSpeed = 20,
-    SurvivorAimingAssist = 1,
+    SurvivorAimingAssist = 3,
     EFZFirearmCompatibility = false,
     SpawnWithSpouse = false,
     ContinueSurvivorsAfterPlayerDeath = true,
@@ -31,8 +35,8 @@ local DEFAULTS = {
     -- to a quieter county than a new game starts with.
     EnableKnoxEvents = true,
     AutomaticFactionEntries = true,
-    FactionEntryMinimumDays = 7,
-    FactionEntryIntervalDays = 10,
+    FactionEntryMinimumDays = 14,
+    FactionEntryIntervalDays = 14,
     PoliceNeighborhoodPatrols = true,
     PolicePatrolMargin = 16,
     MilitaryFacilityClearing = true,
@@ -42,8 +46,8 @@ local DEFAULTS = {
     AllowHostileEncounters = true,
     AllowAutonomousRetreat = false,
     AllowFactionRaids = true,
-    FactionRaidMinimumDays = 21,
-    FactionRaidIntervalDays = 10,
+    FactionRaidMinimumDays = 30,
+    FactionRaidIntervalDays = 14,
     ShowCompanionHUD = true,
     ShowActivityFeed = true,
     ShowSurvivorSpeech = true,
@@ -51,23 +55,29 @@ local DEFAULTS = {
     ShowRadialOrders = true,
     ShowLegacyContextCommands = false,
     AllowSurvivorDoorWindowOpening = true,
+    RequireCloseContact = true,
     CautiousTravel = true,
     BaseReading = true,
     BaseCooking = true,
-    ZombieEngagementDistance = 4,
+    ZombieEngagementDistance = 3,
     ShowSurvivorNameplates = true,
-    SurvivorNameplateDistance = 24,
+    SurvivorNameplateDistance = 12,
     AllowSurvivorPlayerCombat = true,
     UseReputation = true,
     EnableDeveloperTools = false,
     IgnoreJobResourceRequirements = false,
     DeveloperScenario = 1,
     DeveloperSpawnDistance = 10,
+    EnableDevSpectate = false,
+    DevSpectateCategory = 1,
+    EnableDebugSpectateBrowser = false,
     AllowDestructiveDeveloperTests = false,
     ShowDeveloperDiagnostics = false,
     AutoGenerateBaseWorkAreas = true,
     AllowSurvivorsTreatPlayer = true,
 }
+
+local SPECTATE_CATEGORIES = { "any", "solo", "group", "faction", "police", "military", "other" }
 
 local SCENARIOS = {
     [1] = "none",
@@ -99,6 +109,12 @@ local function integer(name, minimum, maximum)
     end
     number = math.floor(number)
     return math.max(minimum, math.min(maximum, number))
+end
+
+function Settings.survivorStrength()
+    local tier = value("SurvivorStrength")
+    if type(tier) ~= "number" or tier ~= math.floor(tier) or tier < 1 or tier > 4 then return 2 end
+    return tier
 end
 
 function Settings.baseCookingEnabled()
@@ -146,7 +162,6 @@ function Settings.capsDisabled()
 end
 
 function Settings.maxActiveSurvivors()
-    if Settings.capsDisabled() then return math.huge end
     return integer("MaxActiveSurvivors", 1, 128)
 end
 
@@ -209,6 +224,13 @@ function Settings.allowSurvivorDoorWindowOpening()
     return value("AllowSurvivorDoorWindowOpening") ~= false
 end
 
+-- Owner option, on by default: ordering a survivor requires standing close.
+-- Following the player never does (owner direction 2026-11-12): leaders are
+-- tracked by their live square, sight or not. On keeps the old close-contact
+-- ordering admission and changes nothing else.
+function Settings.requireCloseContact()
+    return value("RequireCloseContact") == true
+end
 function Settings.survivorAimingAssist()
     return integer("SurvivorAimingAssist", 3, 5)
 end
@@ -360,6 +382,21 @@ end
 
 function Settings.developerSpawnDistance()
     return integer("DeveloperSpawnDistance", 6, 30)
+end
+
+-- Developer spectator. The category selects who is watched automatically; the
+-- debug browser is a separate opt-in because it needs an actual debug launch.
+function Settings.devSpectateEnabled()
+    return Settings.enabled() and value("EnableDevSpectate") == true
+end
+
+function Settings.devSpectateCategory()
+    return SPECTATE_CATEGORIES[integer("DevSpectateCategory", 1, 7)] or "any"
+end
+
+function Settings.debugSpectateBrowserEnabled()
+    return Settings.devSpectateEnabled()
+        and value("EnableDebugSpectateBrowser") == true
 end
 
 function Settings.allowDestructiveDeveloperTests()

@@ -1,3 +1,4 @@
+local KS_SafeCall = require "KS_SafeCall"
 require "Moveables/ISMoveableSpriteProps"
 require "Moveables/ISMoveablesAction"
 require "TimedActions/ISTimedActionQueue"
@@ -14,13 +15,9 @@ _G.KnoxBaseRepairs = Repairs
 local MAX_SCAN_RADIUS = 36
 
 local function safeCall(object, method, ...)
-    if object == nil or object == false or object == true
-        or object[method] == nil then
-        return nil
-    end
-    local success, value = pcall(object[method], object, ...)
-    if success then return value end
-    return nil
+    if object == false or object == true then return nil end
+    local value = KS_SafeCall.invoke(object, method, ...)
+    return value
 end
 
 local function instanceOf(object, className)
@@ -39,11 +36,25 @@ local function isStructure(object)
         or instanceOf(object, "IsoBarricade")
 end
 
+-- The installed repair path already decides whether a structure can be
+-- mended (ISMoveableSpriteProps.fromObjectForRepair -> canRepairObject,
+-- read below); this rule answers only "is it damaged enough to bother".
+-- A 20% floor made a nearly-gone door the one thing the scan could not
+-- see, so the survivor walked past the wall that was about to fail.
+function Repairs.needsRepair(health, maximum)
+    health, maximum = tonumber(health), tonumber(maximum)
+    if health == nil or health ~= health or health <= 0
+        or maximum == nil or maximum ~= maximum or maximum <= 0 then
+        return false
+    end
+    return health <= maximum * 0.95
+end
+
 local function damaged(object)
-    local health = tonumber(safeCall(object, "getHealth")) or 0
-    local maximum = tonumber(safeCall(object, "getMaxHealth")) or 0
-    local fraction = maximum > 0 and health / maximum or 1
-    return maximum > 0 and fraction >= 0.20 and fraction <= 0.95
+    return Repairs.needsRepair(
+        safeCall(object, "getHealth"),
+        safeCall(object, "getMaxHealth")
+    )
 end
 
 local function repairProps(object, character, discovery)

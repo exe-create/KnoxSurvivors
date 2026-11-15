@@ -322,7 +322,19 @@ local function applyIdentity(character, profile, preservePhysiology)
         end
     end
     local nutrition = preservePhysiology and nutritionSnapshot(character) or nil
-    character:applyTraits(knownTraits)
+    -- Live 42.22.2 evidence (f:5401/f:8701): this exposed call raised on
+    -- return (ReturnValues.put:61 via LuaJavaInvoker.call:185) mid-identity.
+    -- Guard the one observed boundary: a raise is now a named refusal and the
+    -- remaining identity steps are skipped (fail closed), so ensure aborts
+    -- activation and marks nothing half-identified. The engine's own break
+    -- dialog is not silenced here; root-cause waits on the ZombieBuddy-off
+    -- discriminator boot.
+    local traitsOk, traitsError = pcall(function()
+        character:applyTraits(knownTraits)
+    end)
+    if not traitsOk then
+        return false, "apply_traits_runtime_error=" .. tostring(traitsError)
+    end
     restoreNutrition(character, nutrition)
     character:applyProfessionRecipes()
     character:applyCharacterTraitsRecipes()
@@ -348,6 +360,74 @@ local function restoreSkills(character, skills)
     end
 end
 
+-- Build an authored starting profile with the same definition and conflict owner
+-- used for generated survivors. Missing trait data means a legacy automatic roll.
+function Capabilities.authoredProfile(record, previous)
+    if type(record) ~= "table" then return previous end
+    local creator = rawget(_G, "KnoxCreator")
+    if creator == nil then return previous end
+    local profile = previous
+    if type(record.traits) == "string" then
+        local profession = findProfession(record.professionId or record.profession)
+        if profession == nil then return nil, "creator_profession_missing" end
+        local ids, definitions = {}, {}
+        appendGrantedTraits(profession, ids, definitions)
+        for _, id in ipairs(creator.decodeTraits(record.traits) or {}) do
+            local definition = findTrait(id)
+            if definition ~= nil and not definition:isFree() then
+                addTrait(definition, ids, definitions)
+            end
+        end
+        table.sort(ids)
+        profile = { version = PROFILE_VERSION, professionId = professionId(profession),
+            traitIds = ids, skills = {}, generatedBy = "creator" }
+    end
+    if profile == nil then return nil, "creator_profile_missing" end
+    profile.skills = profile.skills or {}
+    for id, level in pairs(creator.decodeSkills(record.skills)) do
+        profile.skills[id] = {level = level, xp = 0}
+    end
+    profile.creatorInitialized = true
+    return profile
+end
+
+-- Reconcile optional choices after changing occupation and reject conflicting
+-- additions; profession-granted traits remain implicit and cannot be removed.
+function Capabilities.creatorTraitChoices(profession, traits, addId)
+    local creator = rawget(_G, "KnoxCreator")
+    if creator == nil then return nil, "creator_unavailable" end
+    local requested = {}
+    for _, id in ipairs(traits or {}) do requested[#requested + 1] = id end
+    if addId ~= nil then
+        local prior, reason = Capabilities.authoredProfile({profession=profession,
+            traits=creator.encodeTraits(requested), skills=""}, nil)
+        if prior == nil then return nil, reason end
+        local candidate = findTrait(addId)
+        if candidate == nil or candidate:isFree() then return nil, "trait_unavailable" end
+        for _, id in ipairs(prior.traitIds) do
+            local existing = findTrait(id)
+            if existing ~= nil and (id == addId or candidate:isMutuallyExclusive(existing)) then
+                return nil, "trait_conflicts"
+            end
+        end
+        requested[#requested + 1] = addId
+    end
+    local profile, reason = Capabilities.authoredProfile({profession=profession,
+        traits=creator.encodeTraits(requested), skills=""}, nil)
+    if profile == nil then return nil, reason end
+    if addId ~= nil then
+        if not contains(profile.traitIds, addId) then return nil, "trait_conflicts" end
+        for _, id in ipairs(requested) do
+            if not contains(profile.traitIds, id) then return nil, "trait_conflicts" end
+        end
+    end
+    local selected = {}
+    for _, id in ipairs(requested) do
+        if contains(profile.traitIds, id) and not contains(selected, id) then selected[#selected + 1] = id end
+    end
+    return selected
+end
+
 function Capabilities.ensure(
     id,
     character,
@@ -358,9 +438,27 @@ function Capabilities.ensure(
     local profile = KnoxPersistence.getSurvivorCapabilities(id)
     local result = "existing"
     if profile == nil then
-        profile, result = Capabilities.generate(id, preferredProfessionId, denyProfessions)
+        local record = initializeNew == true and KnoxPersistence.getSurvivorCreatorRecord ~= nil
+            and KnoxPersistence.getSurvivorCreatorRecord(id) or nil
+        if record ~= nil and type(record.traits) == "string" then
+            profile, result = Capabilities.authoredProfile(record, nil)
+        else
+            profile, result = Capabilities.generate(id, preferredProfessionId, denyProfessions)
+        end
         if profile == nil or not KnoxPersistence.setSurvivorCapabilities(id, profile) then
             return nil, result
+        end
+    end
+    if initializeNew == true and (profile.creatorInitialized ~= true)
+        and profile.capturedAtHours == nil and KnoxPersistence.getSurvivorCreatorRecord ~= nil then
+        local record = KnoxPersistence.getSurvivorCreatorRecord(id)
+        if record ~= nil then
+            local authored, reason = Capabilities.authoredProfile(record, profile)
+            if authored == nil then return nil, reason end
+            profile = authored
+            if not KnoxPersistence.setSurvivorCapabilities(id, profile) then
+                return nil, "creator_profile_save_failed"
+            end
         end
     end
     if character ~= nil and not appliedCharacters[character] then
@@ -380,8 +478,8 @@ end
 
 -- Capability precedence is centralized here so population allocation and
 -- first materialization cannot disagree. Authored event professions are
--- strict. Contextual spawn/building evidence is advisory and may fall through
--- to another candidate or the ordinary deterministic vanilla roll.
+-- strict. Facility roles require matching building evidence; other contextual
+-- candidates may fall through to the ordinary deterministic civilian roll.
 function Capabilities.ensureForOrigin(
     id,
     character,
@@ -399,14 +497,16 @@ function Capabilities.ensureForOrigin(
     local lastReason = nil
     local candidates = KnoxSurvivorOrigins.professionCandidates(origin, id)
     for _, professionId in ipairs(candidates) do
-        local profile, reason = Capabilities.ensure(
-            id,
-            character,
-            initializeNew,
-            professionId
-        )
-        if profile ~= nil then return profile, "contextual:" .. tostring(reason) end
-        lastReason = reason
+        if KnoxSurvivorOrigins.professionAllowedAtOrigin(professionId,origin) then
+            local profile, reason = Capabilities.ensure(
+                id,
+                character,
+                initializeNew,
+                professionId
+            )
+            if profile ~= nil then return profile, "contextual:" .. tostring(reason) end
+            lastReason = reason
+        end
     end
     -- No usable facility evidence means an ordinary person. Facility
     -- professions are denied rather than rolled here, so a household survivor

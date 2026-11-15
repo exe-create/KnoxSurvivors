@@ -152,9 +152,9 @@ function StartingGear.initialize(id, character, bridge, loadoutTheme)
             .. " equipment=" .. equipped
 end
 
--- A created survivor's chosen weapon is carried, not equipped: the existing
--- equip action still decides the hand slot, and a refusal to add the item is a
--- real failure rather than a silent empty-handed body.
+-- Hold the creator's chosen weapon in the native hands. A fresh one-handed
+-- choice also clears the initializer's old off-hand reference; the old item
+-- remains in the real inventory. A two-handed choice shares one item, not copies.
 function StartingGear.applyChosenWeapon(id, character, fullType)
     if character == nil or character:getInventory() == nil then
         return false, "inventory_unavailable"
@@ -163,11 +163,18 @@ function StartingGear.applyChosenWeapon(id, character, fullType)
     if not fullType:match("^[A-Za-z][A-Za-z0-9_]*%.[A-Za-z][A-Za-z0-9_]*$") then
         return false, "invalid_item"
     end
-    local added = {}
-    if not add(character:getInventory(), fullType, added) then
-        return false, "add_failed:" .. fullType
-    end
-    return true, "added=" .. fullType
+    local ok, item = pcall(function() return character:getInventory():AddItem(fullType) end)
+    if not ok or item == nil then return false, "add_failed:" .. fullType end
+    local equipped = pcall(function()
+        character:setPrimaryHandItem(item)
+        character:setSecondaryHandItem(nil)
+        if (item.isTwoHandWeapon ~= nil and item:isTwoHandWeapon())
+            or (item.isRequiresEquippedBothHands ~= nil and item:isRequiresEquippedBothHands()) then
+            character:setSecondaryHandItem(item)
+        end
+    end)
+    if not equipped then return false, "equip_failed:" .. fullType end
+    return true, "equipped=" .. fullType
 end
 
 -- The creator's chosen pack. Each item is added to the same real inventory the
@@ -188,6 +195,43 @@ function StartingGear.applyItems(character, items)
         if not add(inventory, fullType, added) then
             return false, "add_failed:" .. fullType
         end
+    end
+    return true, "added=" .. tostring(#added)
+end
+
+-- Use the actual worn authored container; never redirect promised contents.
+function StartingGear.applyBagItems(character, bagType, items)
+    if type(items) ~= "table" or #items == 0 then return true, "none" end
+    if character == nil or character:getInventory() == nil then return false, "inventory_unavailable" end
+    if type(bagType) ~= "string" or bagType == "" then return false, "bag_not_selected" end
+    local bag, inventory = nil, character:getInventory()
+    local ok = pcall(function()
+        local list = inventory:getItems()
+        for i = 0, list:size() - 1 do
+            local item = list:get(i)
+            if item:getFullType() == bagType and instanceof(item, "InventoryContainer")
+                and character:isEquipped(item) then bag = item; break end
+        end
+    end)
+    if not ok or bag == nil then return false, "authored_bag_unavailable" end
+    local container = bag:getInventory()
+    if container == nil then return false, "bag_inventory_unavailable" end
+    local added = {}
+    for _, fullType in ipairs(items) do
+        local item
+        pcall(function() item = instanceItem(fullType) end)
+        local room = false
+        if item ~= nil then pcall(function() room = container:hasRoomFor(character, item) end) end
+        if item == nil or not room then
+            for _, previous in ipairs(added) do container:Remove(previous) end
+            return false, item == nil and ("item_unavailable:" .. tostring(fullType)) or "bag_full"
+        end
+        local addedOk, result = pcall(function() return container:AddItem(item) end)
+        if not addedOk or result == nil then
+            for _, previous in ipairs(added) do container:Remove(previous) end
+            return false, "bag_add_failed:" .. tostring(fullType)
+        end
+        added[#added + 1] = item
     end
     return true, "added=" .. tostring(#added)
 end

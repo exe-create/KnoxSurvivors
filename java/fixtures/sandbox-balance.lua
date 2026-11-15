@@ -37,6 +37,24 @@ assert(S.companionLimit() <= 6,
 assert(S.maxActiveSurvivors() <= 32,
     "loaded bodies stay bounded, got " .. tostring(S.maxActiveSurvivors()))
 assert(S.activationsPerUpdate() <= 4, "loading stays spread across updates")
+local previousSandbox=SandboxVars
+SandboxVars={KnoxSurvivors={DisableSurvivorCaps=true,MaxActiveSurvivors=24,ActivationsPerUpdate=2}}
+assert(S.capsDisabled() and S.maxActiveSurvivors()==24,
+    "uncapped county retains its configured automatic loaded-body budget")
+assert(S.activationBudget(24)==0 and S.activationBudget(23)==1,
+    "automatic activation respects remaining body slots even when county growth is uncapped")
+SandboxVars=previousSandbox
+
+-- Realistic, immersive default world (owner direction 2026-11-09): a small
+-- crew, fewer bodies loaded at once, people met where you actually go, a county
+-- that thins out faster than it refills, and a slower drift into factions.
+assert(S.maxActiveSurvivors() == 24, "loaded bodies default to 24, got " .. tostring(S.maxActiveSurvivors()))
+assert(S.activationsPerUpdate() == 1, "one new body per update, got " .. tostring(S.activationsPerUpdate()))
+assert(S.companionLimit() == 3, "a player leads three, got " .. tostring(S.companionLimit()))
+assert(S.zombieEngagementDistance() == 3, "survivors avoid fights unless close, got " .. tostring(S.zombieEngagementDistance()))
+assert(S.populationRefillDays() == 14, "the county refills every two weeks, got " .. tostring(S.populationRefillDays()))
+assert(S.factionEntryMinimumDays() == 14, "faction arrivals wait two weeks, got " .. tostring(S.factionEntryMinimumDays()))
+assert(S.factionRaidMinimumDays() == 30, "first raid waits a month, got " .. tostring(S.factionRaidMinimumDays()))
 
 -- People are met rarely enough to matter.
 assert(S.survivorEncounterDistance() <= 260,
@@ -67,5 +85,19 @@ assert(type(S.companionLimit()) == "number", "companion limit is a number")
 assert(type(S.showCompanionHUD()) == "boolean", "HUD switch is a boolean")
 assert(S.initialGroupChance() >= 0 and S.initialGroupChance() <= 100,
     "a percentage stays a percentage")
+
+-- Precedence (owner contract): the shipped defaults are fallbacks only. A stored
+-- sandbox table from an existing save, or a scenario preset, wins untouched.
+local savedVars = SandboxVars
+SandboxVars = { KnoxSurvivors = { MaxActiveSurvivors = 32, CompanionLimit = 2 } }
+assert(S.maxActiveSurvivors() == 32,
+    "an existing save keeps its stored loaded-body cap")
+assert(S.companionLimit() == 2, "an existing save keeps its stored companion limit")
+assert(SandboxVars.KnoxSurvivors.MaxActiveSurvivors == 32
+    and SandboxVars.KnoxSurvivors.CompanionLimit == 2,
+    "reading the preset never rewrites stored sandbox values")
+assert(S.worldPopulation() == 420,
+    "keys absent from an old save fall back to the shipped default")
+SandboxVars = savedVars
 
 print("Sandbox balance PASS county=true groups=small factions=few raids=late")

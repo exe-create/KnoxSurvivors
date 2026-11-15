@@ -31,9 +31,9 @@ assert(directive("building").purpose == "building", "a material run searches for
 local area = directive("food", 60)
 assert(area.kind == "loot_area" and area.z == 0,
     "a purposeful order keeps the same loaded-area search")
-assert(area.maxX - area.minX == 80,
-    "the search radius still clamps to forty tiles")
-assert(area.minX == 420 - 40 and area.minY == 430 - 40,
+assert(area.maxX - area.minX == 120,
+    "the search radius still uses the actual requested sixty tiles")
+assert(area.minX == 420 - 60 and area.minY == 430 - 60,
     "the search stays centred on the ordered destination")
 
 assert(Executor.missionLabel({ missionType = "food" }) == "Food run",

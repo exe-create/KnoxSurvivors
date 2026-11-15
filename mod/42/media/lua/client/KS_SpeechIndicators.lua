@@ -112,7 +112,7 @@ function Indicators.noteSpeech(speakerSquare, speakerId, party)
                     local dx, dy = screenDirection(hx, hy, sx, sy)
                     if dx ~= nil then
                         active[playerNum] = active[playerNum] or {}
-                        active[playerNum][tostring(speakerId or "?")] = {
+                        active[playerNum][tostring(speakerId or "-")] = {
                             dx = dx, dy = dy, dist = dist,
                             untilMs = nowMs() + Indicators.DURATION_MS,
                             party = party == true,

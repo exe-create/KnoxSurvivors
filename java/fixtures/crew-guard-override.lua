@@ -136,25 +136,25 @@ view.guardOverrideBtn = button()
 local saved = {}
 local draft = {}
 for hour = 1, 24 do draft[hour] = baseline[hour] end
-assert(statusText(nil, nil, nil) == "Default schedule — Anything.",
+assert(statusText(nil, nil, nil) == "Default schedule - Anything.",
     "no saved rota reads as the default")
 assert(statusText(saved, draft, nil) == "Saved schedule.",
     "a clean draft reads as saved")
 draft[5] = "work"
-assert(statusText(saved, draft, nil) == "Unsaved changes — select Save Hours.",
+assert(statusText(saved, draft, nil) == "Unsaved changes - select Save Hours.",
     "a dirty draft warns before anything else")
 assert(statusText(saved, draft, { assignment = "guard", expiresAtHours = 16 })
-    == "Unsaved changes — select Save Hours.",
+    == "Unsaved changes - select Save Hours.",
     "a dirty draft keeps its warning over an active temporary order")
 draft[5] = "sleep"
 assert(statusText(saved, draft, { assignment = "guard", expiresAtHours = 16 })
-    == "Temporary guard duty until 16:00 — saved hours unchanged.",
+    == "Temporary guard duty until 16:00 - saved hours unchanged.",
     "the clean temporary line names the duty and boundary")
 assert(statusText(saved, draft, { assignment = "guard", expiresAtHours = 4 })
-    == "Temporary guard duty until 04:00 — saved hours unchanged.",
+    == "Temporary guard duty until 04:00 - saved hours unchanged.",
     "the Night boundary is rendered with two digits")
 assert(statusText(saved, draft, { assignment = "guard", expiresAtHours = 24 })
-    == "Temporary guard duty until 00:00 — saved hours unchanged.",
+    == "Temporary guard duty until 00:00 - saved hours unchanged.",
     "the Dusk boundary is rendered as midnight")
 
 -- The click path must refuse early, set guard in the two accepted windows, and

@@ -4,6 +4,8 @@ assert(type(C.runBaseIdleChoice) == "function", "the base idle executor is loade
 
 local allowed = {
     move = true, rest = true, snack = true, tidy = true, socialize = true, tv = true,
+    -- Curiosity replaced the reading tail, so it is an executable choice now.
+    muse = true,
 }
 for round = 0, 80 do
     for _, id in ipairs({ "resident-a", "resident-b", "resident-c" }) do
@@ -28,6 +30,7 @@ local function mock(flags)
     c.beginAmbientSocial = method("socialize")
     c.beginAmbientWatch = method("tv")
     c.beginBaseOrganize = method("tidy")
+    c.beginAmbientMusing = method("muse")
     c.beginAmbientBaseRest = method("rest")
     flags.rest = flags.rest ~= false
     return c
@@ -47,6 +50,7 @@ succeeds("snack")
 succeeds("socialize")
 succeeds("tv")
 succeeds("tidy")
+succeeds("muse")
 
 local function fallsBack(choice)
     local c = mock({})
@@ -60,6 +64,7 @@ fallsBack("snack")
 fallsBack("socialize")
 fallsBack("tv")
 fallsBack("tidy")
+fallsBack("muse")
 
 local rest = mock({})
 assert(C.runBaseIdleChoice(rest, 100, "rest") == true)

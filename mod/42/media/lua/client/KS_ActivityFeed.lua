@@ -240,11 +240,11 @@ function ActivityFeed.digestText()
     local rows = {}
     for _, group in ipairs(groups) do
         rows[#rows + 1] = "<RGB:0.72,0.70,0.64> " .. group.name
-            .. " · " .. tostring(group.count)
+            .. ", " .. tostring(group.count)
         for _, entry in ipairs(group.entries) do
             local count = tonumber(entry.count) or 1
             rows[#rows + 1] = entry.colour .. " " .. entry.text
-                .. (count > 1 and (" ×" .. tostring(count)) or "")
+                .. (count > 1 and (" x" .. tostring(count)) or "")
         end
     end
     return table.concat(rows, " <LINE> ")
@@ -259,6 +259,12 @@ end
 
 local function fitText(text, maximumWidth)
     return UILayout.fitText(UIFont.Small, text, maximumWidth)
+end
+
+local function digestPosition(width, height, screenW, screenH)
+    local x = math.max(0, math.min(18, screenW - width))
+    local y = math.max(0, screenH - height - 42)
+    return x, y
 end
 
 local DigestWindow = ISCollapsableWindow:derive("KnoxNoticeDigestWindow")
@@ -288,6 +294,7 @@ function DigestWindow:createChildren()
         self.closeButton:setEnable(true)
         self.closeButton.target = self
         self.closeButton.onclick = DigestWindow.close
+    UILayout.finishWindow(self, "Close recent events")
     end
     local titleHeight = self:titleBarHeight()
     local pad = 10
@@ -380,12 +387,12 @@ function NoticeRail:render()
         local count = tonumber(toast.count) or 1
         local countWidth = count > 1
             and (getTextManager():MeasureStringX(UIFont.Small,
-                "×" .. tostring(count)) + 8) or 0
+                "x" .. tostring(count)) + 8) or 0
         local textWidth = self.width - 16 - countWidth
         self:drawText(fitText(toast.text, textWidth), 10, top + 4,
             THEME.bone[1], THEME.bone[2], THEME.bone[3], alpha, UIFont.Small)
         if count > 1 then
-            self:drawTextRight("×" .. tostring(count), self.width - 8, top + 4,
+            self:drawTextRight("x" .. tostring(count), self.width - 8, top + 4,
                 THEME.muted[1], THEME.muted[2], THEME.muted[3], alpha,
                 UIFont.Small)
         end
@@ -420,9 +427,12 @@ end
 local function ensureDigest()
     if ActivityFeed.window ~= nil then return ActivityFeed.window end
     if getCore == nil then return nil end
-    local x = 18
-    local y = math.max(18, getCore():getScreenHeight() - DIGEST_HEIGHT - 42)
-    local window = DigestWindow:new(x, y)
+    local window = DigestWindow:new(0, 0)
+    local x, y = digestPosition(window.width, window.height,
+        getCore():getScreenWidth(), getCore():getScreenHeight())
+    window:setX(x); window:setY(y)
+    UILayout.clampWindow(window)
+    UILayout.trackWindow(window)
     window:initialise()
     window:addToUIManager()
     window:setVisible(false)

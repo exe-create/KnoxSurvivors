@@ -4,6 +4,7 @@ local Layout = require "KS_SurvivorUILayout"
 require "ISUI/ISContextMenu"
 require "ISUI/ISScrollingListBox"
 require "ISUI/ISButton"
+require "KS_OrderCatalog"
 local Compat = rawget(_G, "KnoxViewpointCompatibility") or {}
 _G.KnoxViewpointCompatibility = Compat
 local installed, selection = false, nil
@@ -130,41 +131,52 @@ end
 -- builds have handed over {object=...}, {character=...} and bare bodies, and a
 -- build that hands over neither used to leave the crosshair with nothing of ours
 -- on it while the vanilla player shell still offered its own broken row.
-local function aimedCharacter(player)
-    local target = currentTarget()
+local function targetField(target, key)
+    local ok, value = pcall(function() return target[key] end)
+    return ok and value or nil
+end
+local function aimedCharacter(player, target)
     if target == nil then return nil end
     local runtime = rawget(_G, "KnoxSurvivorRuntime")
     if runtime == nil or runtime.idForCharacter == nil then return nil end
-    -- The body is a Java userdata, not a Lua table; filtering on type(table)
-    -- skipped every real character and left the crosshair with no Knox rows.
-    for _, candidate in ipairs({ target.object, target.character, target.player, target }) do
+    -- Iterate field names: ipairs over sparse candidate values stops at the
+    -- first missing object and never tries character/player or the bare body.
+    for _, key in ipairs({ "object", "character", "player" }) do
+        local candidate = targetField(target, key)
         if candidate ~= nil then
             local ok, id = pcall(runtime.idForCharacter, candidate)
             if ok and id ~= nil then return candidate, id end
         end
     end
-    return nil
+    local ok, id = pcall(runtime.idForCharacter, target)
+    if ok and id ~= nil then return target, id end
 end
 
---- The person under the crosshair as an interaction target, or nil. One
---- resolver for the key, the crosshair rows and any later caller.
-function Compat.aimedTarget(player)
+-- One rejection diagnostic per session, including direct aim/key attempts.
+local function rejectedTarget(reason)
+    if not Compat.reportedRejectedTarget then
+        Compat.reportedRejectedTarget = true
+        print("[KnoxSurvivors][Viewpoint] aim rejected: " .. reason)
+    end
+    return nil
+end
+function Compat.aimedTarget(player, descriptor)
     if player == nil then return nil end
     local runtime = rawget(_G, "KnoxSurvivorRuntime")
-    local character, id = aimedCharacter(player)
-    local target = currentTarget()
-    if id == nil and target ~= nil and target.square ~= nil and runtime ~= nil
+    local target = descriptor or currentTarget()
+    local character, id = aimedCharacter(player, target)
+    local square = target ~= nil and targetField(target, "square") or nil
+    if id == nil and square ~= nil and runtime ~= nil
         and runtime.nearestToSquare ~= nil then
-        -- The descriptor carried no body. The square under the crosshair still
-        -- names the person standing on it, and nobody else.
-        local ok, found = pcall(runtime.nearestToSquare, target.square, 0.75)
+        local ok, found = pcall(runtime.nearestToSquare, square, 0.75)
         if ok then id = found end
     end
     if character == nil and id ~= nil and runtime ~= nil and runtime.getCharacter ~= nil then
         local ok, live = pcall(runtime.getCharacter, id)
         if ok then character = live end
     end
-    if character == nil or not visibleSurvivor(player, character) then return nil end
+    if character == nil then return rejectedTarget("no survivor candidate") end
+    if not visibleSurvivor(player, character) then return rejectedTarget("survivor not visible or in reach") end
     local view = rawget(_G, "KnoxSurvivorViewModel")
     local snapshot = view ~= nil and view.getSurvivor ~= nil
         and view.getSurvivor(id, player:getPlayerNum()) or nil
@@ -181,6 +193,17 @@ local function directSurvivorActions(player, id, character, add)
                     or not visibleSurvivor(p, character) then return false end
                 return run(p)
             end })
+    end
+    local shelter=rawget(_G,"KnoxNightShelter")
+    if shelter~=nil and shelter.pendingVisit(player,id)~=nil then
+        for _,choice in ipairs({{key="IGUI_Knox_AllowOvernight",label="Allow overnight stay",accepted=true},
+            {key="IGUI_Knox_RefuseOvernight",label="Refuse overnight stay",accepted=false}}) do
+            local accepted=choice.accepted
+            local label=KnoxOrderCatalog.text(choice.key,choice.label)
+            addAction(label,false,function(p)
+                return KnoxOrderCatalog.withFeedback(label,shelter.respond,p,id,accepted)
+            end)
+        end
     end
     addAction("Talk", true, function(p)
         local interaction = rawget(_G, "KnoxSurvivorInteractionUI")
@@ -245,7 +268,10 @@ collect = function(target, player, add)
     -- Viewpoint calls this with its own target descriptor. A build that hands
     -- us something unexpected must not break its crosshair list.
     if target == nil or player == nil or type(add) ~= "function" then return end
-    if not Compat.usesNativeAdapter() then return end
+    if not Compat.usesNativeAdapter() then
+        rejectedTarget("adapter gate (camera/settings/registration)")
+        return
+    end
     -- One line per session: which target Viewpoint handed us and whether it
     -- resolved to a survivor. Without it a silent crosshair cannot be told
     -- apart from an unaimed one between playtests.
@@ -254,7 +280,7 @@ collect = function(target, player, add)
         print("[KnoxSurvivors][Viewpoint] first target kind=" .. tostring(target.kind)
             .. " object=" .. tostring(target.object ~= nil)
             .. " square=" .. tostring(target.square ~= nil)
-            .. " resolved=" .. tostring(Compat.aimedTarget(player) ~= nil))
+            .. " resolved=" .. tostring(Compat.aimedTarget(player, target) ~= nil))
     end
     if selection ~= nil then
         if selection.player == player and not selection.pendingConfirm and near(player, target.square) then
@@ -268,7 +294,7 @@ collect = function(target, player, add)
         return
     end
     local runtime = rawget(_G, "KnoxSurvivorRuntime")
-    local aimed = Compat.aimedTarget(player)
+    local aimed = Compat.aimedTarget(player, target)
     local id = aimed ~= nil and aimed.id or nil
     if id ~= nil then
         -- Validate the body that was actually resolved, not the descriptor.

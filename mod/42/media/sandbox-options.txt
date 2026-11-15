@@ -3,6 +3,9 @@ VERSION = 1,
 option KnoxSurvivors.Enabled = {
     type = boolean, default = true, page = KnoxSurvivors_GettingStarted, translation = KnoxSurvivors_Enabled,
 }
+option KnoxSurvivors.SurvivorStrength = {
+    type = enum, numValues = 4, default = 2, page = KnoxSurvivors_Survivors, translation = KnoxSurvivors_SurvivorStrength,
+}
 option KnoxSurvivors.SpawnWithSpouse = {
     type = boolean, default = false, page = KnoxSurvivors_GettingStarted, translation = KnoxSurvivors_SpawnWithSpouse,
 }
@@ -22,7 +25,7 @@ option KnoxSurvivors.ShowSurvivorNameplates = {
     type = boolean, default = true, page = KnoxSurvivors_GettingStarted, translation = KnoxSurvivors_ShowSurvivorNameplates,
 }
 option KnoxSurvivors.SurvivorNameplateDistance = {
-    type = integer, min = 8, max = 40, default = 24, page = KnoxSurvivors_GettingStarted, translation = KnoxSurvivors_SurvivorNameplateDistance,
+    type = integer, min = 8, max = 40, default = 12, page = KnoxSurvivors_GettingStarted, translation = KnoxSurvivors_SurvivorNameplateDistance,
 }
 option KnoxSurvivors.OrderGestures = {
     type = boolean, default = true, page = KnoxSurvivors_GettingStarted, translation = KnoxSurvivors_OrderGestures,
@@ -38,19 +41,19 @@ option KnoxSurvivors.WorldPopulation = {
     type = integer, min = 0, max = 8192, default = 420, page = KnoxSurvivors_People, translation = KnoxSurvivors_WorldPopulation,
 }
 option KnoxSurvivors.PopulationRefillDays = {
-    type = integer, min = 0, max = 30, default = 7, page = KnoxSurvivors_People, translation = KnoxSurvivors_PopulationRefillDays,
+    type = integer, min = 0, max = 30, default = 14, page = KnoxSurvivors_People, translation = KnoxSurvivors_PopulationRefillDays,
 }
 option KnoxSurvivors.InitialGroupChance = {
-    type = integer, min = 0, max = 100, default = 45, page = KnoxSurvivors_People, translation = KnoxSurvivors_InitialGroupChance,
+    type = integer, min = 0, max = 100, default = 35, page = KnoxSurvivors_People, translation = KnoxSurvivors_InitialGroupChance,
 }
 option KnoxSurvivors.InitialGroupMaxSize = {
     type = integer, min = 2, max = 6, default = 4, page = KnoxSurvivors_People, translation = KnoxSurvivors_InitialGroupMaxSize,
 }
 option KnoxSurvivors.InitialGroupCount = {
-    type = integer, min = 0, max = 512, default = 48, page = KnoxSurvivors_People, translation = KnoxSurvivors_InitialGroupCount,
+    type = integer, min = 0, max = 512, default = 40, page = KnoxSurvivors_People, translation = KnoxSurvivors_InitialGroupCount,
 }
 option KnoxSurvivors.InitialFactionCount = {
-    type = integer, min = 0, max = 64, default = 6, page = KnoxSurvivors_People, translation = KnoxSurvivors_InitialFactionCount,
+    type = integer, min = 0, max = 64, default = 4, page = KnoxSurvivors_People, translation = KnoxSurvivors_InitialFactionCount,
 }
 option KnoxSurvivors.DisableSurvivorCaps = {
     type = boolean, default = false, page = KnoxSurvivors_People, translation = KnoxSurvivors_DisableSurvivorCaps,
@@ -59,17 +62,17 @@ option KnoxSurvivors.MaxActiveSurvivors = {
     type = integer, min = 1, max = 128, default = 24, page = KnoxSurvivors_People, translation = KnoxSurvivors_MaxActiveSurvivors,
 }
 option KnoxSurvivors.ActivationsPerUpdate = {
-    type = integer, min = 1, max = 4, default = 2, page = KnoxSurvivors_People, translation = KnoxSurvivors_ActivationsPerUpdate,
+    type = integer, min = 1, max = 4, default = 1, page = KnoxSurvivors_People, translation = KnoxSurvivors_ActivationsPerUpdate,
 }
 option KnoxSurvivors.MinimumSpawnDistance = {
     type = integer, min = 25, max = 150, default = 40, page = KnoxSurvivors_People, translation = KnoxSurvivors_MinimumSpawnDistance,
 }
 option KnoxSurvivors.SurvivorEncounterDistance = {
-    type = integer, min = 120, max = 500, default = 220, page = KnoxSurvivors_People, translation = KnoxSurvivors_SurvivorEncounterDistance,
+    type = integer, min = 120, max = 500, default = 160, page = KnoxSurvivors_People, translation = KnoxSurvivors_SurvivorEncounterDistance,
 }
 
 option KnoxSurvivors.CompanionLimit = {
-    type = integer, min = 1, max = 12, default = 4, page = KnoxSurvivors_Survivors, translation = KnoxSurvivors_CompanionLimit,
+    type = integer, min = 1, max = 12, default = 3, page = KnoxSurvivors_Survivors, translation = KnoxSurvivors_CompanionLimit,
 }
 option KnoxSurvivors.FollowerFormation = {
     type = enum, numValues = 2, default = 1, page = KnoxSurvivors_Survivors, translation = KnoxSurvivors_FollowerFormation, valueTranslation = KnoxSurvivors_FollowerFormation,
@@ -90,7 +93,7 @@ option KnoxSurvivors.AllowAutonomousRetreat = {
     type = boolean, default = false, page = KnoxSurvivors_Survivors, translation = KnoxSurvivors_AllowAutonomousRetreat,
 }
 option KnoxSurvivors.ZombieEngagementDistance = {
-    type = integer, min = 2, max = 16, default = 4, page = KnoxSurvivors_Survivors, translation = KnoxSurvivors_ZombieEngagementDistance,
+    type = integer, min = 2, max = 16, default = 3, page = KnoxSurvivors_Survivors, translation = KnoxSurvivors_ZombieEngagementDistance,
 }
 option KnoxSurvivors.SurvivorAimingAssist = {
     type = enum, numValues = 5, default = 3,
@@ -151,10 +154,10 @@ option KnoxSurvivors.AutomaticFactionEntries = {
     type = boolean, default = true, page = KnoxSurvivors_Events, translation = KnoxSurvivors_AutomaticFactionEntries,
 }
 option KnoxSurvivors.FactionEntryMinimumDays = {
-    type = integer, min = 1, max = 90, default = 7, page = KnoxSurvivors_Events, translation = KnoxSurvivors_FactionEntryMinimumDays,
+    type = integer, min = 1, max = 90, default = 14, page = KnoxSurvivors_Events, translation = KnoxSurvivors_FactionEntryMinimumDays,
 }
 option KnoxSurvivors.FactionEntryIntervalDays = {
-    type = integer, min = 1, max = 30, default = 10, page = KnoxSurvivors_Events, translation = KnoxSurvivors_FactionEntryIntervalDays,
+    type = integer, min = 1, max = 30, default = 14, page = KnoxSurvivors_Events, translation = KnoxSurvivors_FactionEntryIntervalDays,
 }
 option KnoxSurvivors.PoliceNeighborhoodPatrols = {
     type = boolean, default = true, page = KnoxSurvivors_Events, translation = KnoxSurvivors_PoliceNeighborhoodPatrols,
@@ -172,10 +175,10 @@ option KnoxSurvivors.AllowFactionRaids = {
     type = boolean, default = true, page = KnoxSurvivors_Events, translation = KnoxSurvivors_AllowFactionRaids,
 }
 option KnoxSurvivors.FactionRaidMinimumDays = {
-    type = integer, min = 1, max = 90, default = 21, page = KnoxSurvivors_Events, translation = KnoxSurvivors_FactionRaidMinimumDays,
+    type = integer, min = 1, max = 90, default = 30, page = KnoxSurvivors_Events, translation = KnoxSurvivors_FactionRaidMinimumDays,
 }
 option KnoxSurvivors.FactionRaidIntervalDays = {
-    type = integer, min = 1, max = 30, default = 10, page = KnoxSurvivors_Events, translation = KnoxSurvivors_FactionRaidIntervalDays,
+    type = integer, min = 1, max = 30, default = 14, page = KnoxSurvivors_Events, translation = KnoxSurvivors_FactionRaidIntervalDays,
 }
 
 option KnoxSurvivors.EnableDeveloperTools = {
@@ -186,6 +189,18 @@ option KnoxSurvivors.DeveloperScenario = {
 }
 option KnoxSurvivors.DeveloperSpawnDistance = {
     type = integer, min = 6, max = 30, default = 10, page = KnoxSurvivors_Developer, translation = KnoxSurvivors_DeveloperSpawnDistance,
+}
+option KnoxSurvivors.EnableDevSpectate = {
+    type = boolean, default = false, page = KnoxSurvivors_Developer, translation = KnoxSurvivors_EnableDevSpectate,
+}
+option KnoxSurvivors.DevSpectateCategory = {
+    type = enum, numValues = 7, default = 1, page = KnoxSurvivors_Developer, translation = KnoxSurvivors_DevSpectateCategory, valueTranslation = KnoxSurvivors_DevSpectateCategory,
+}
+option KnoxSurvivors.EnableDebugSpectateBrowser = {
+    type = boolean, default = false, page = KnoxSurvivors_Developer, translation = KnoxSurvivors_EnableDebugSpectateBrowser,
+}
+option KnoxSurvivors.RequireCloseContact = {
+    type = boolean, default = true, page = KnoxSurvivors_Survivors, translation = KnoxSurvivors_RequireCloseContact,
 }
 option KnoxSurvivors.AllowDestructiveDeveloperTests = {
     type = boolean, default = false, page = KnoxSurvivors_Developer, translation = KnoxSurvivors_AllowDestructiveDeveloperTests,

@@ -18,7 +18,7 @@ public final class KnoxUnifiedZombieBuddyVerifier {
         com.knoxsurvivors.zombiebuddy.Main.main(new String[0]);
         var patches = PatchEngine.collectPatches("com.knoxsurvivors.zombiebuddy", KnoxAgent.class.getClassLoader());
         Set<String> found = patches.stream().map(Class::getSimpleName).collect(Collectors.toSet());
-        if (!found.equals(Set.of("CallbackEligibility", "HumanEligibility", "TargetVisibility")))
+        if (!found.equals(Set.of("CallbackEligibility", "HumanEligibility", "TargetVisibility", "SurvivorStrength")))
             throw new AssertionError("Released scanner did not discover all adapter advice: " + found);
         com.knoxsurvivors.zombiebuddy.Main.main(new String[0]);
         if (!"zombiebuddy".equals(KnoxAgent.getRuntimeSource())) throw new AssertionError("Wrong owner");

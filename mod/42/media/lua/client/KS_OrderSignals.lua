@@ -108,6 +108,16 @@ function Signals.acknowledge(leader, member)
     return ok and visible and Signals.play(member, "yes") or false
 end
 
+-- Only accepted speech calls this. The voice owns its cooldown; play retains
+-- native action/aiming guards and the existing bounded emote lifetime.
+function Signals.dialogue(actor, event)
+    local emotes = { base_greet = "wavehi", base_social = "yes", accept_cigarette = "yes",
+        cant_lift = "thumbsdown", cant_lift_bitten = "thumbsdown", order_refused_wary = "thumbsdown",
+        player_attack_warning = "stop", base_musing_frightened = "stop" }
+    local emote = emotes[event]
+    return emote ~= nil and Signals.play(actor, emote) or false
+end
+
 -- Autonomous leaders use the same readable gestures as player-issued orders.
 -- Only nearby loaded followers acknowledge; the group objective remains the
 -- durable authority and this helper never changes movement or task state.

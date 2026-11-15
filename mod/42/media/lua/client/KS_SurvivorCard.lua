@@ -6,6 +6,7 @@ require "XpSystem/ISUI/ISCharacterScreen"
 require "XpSystem/ISUI/ISCharacterInfo"
 require "XpSystem/ISUI/ISHealthPanel"
 require "XpSystem/ISUI/ISCharacterProtection"
+require "ISUI/ISContextMenu"
 require "XpSystem/ISUI/ISClothingInsPanel"
 require "KS_SurvivorViewModel"
 local CompanionInventory = require "KS_CompanionInventory"
@@ -26,6 +27,24 @@ local MAX_LOCAL_PLAYERS = 4
 local REFRESH_MS = 500
 local WINDOW_WIDTH = 620
 local WINDOW_HEIGHT = 540
+
+-- The card is the same character sheet the player opens - same tabs, same
+-- vanilla panels - so it takes the player's own window footprint when the
+-- build exposes it. That keeps the health, protection and skills pages the same
+-- size as the player's at any resolution, instead of one guessed constant that
+-- is wrong on both a 1080p and a 1440p screen. A missing or absurd window falls
+-- back to the tuned constants above.
+local function playerWindowSize(playerNum)
+    if type(getPlayerInfoPanel) ~= "function" then return nil end
+    local ok, info = pcall(getPlayerInfoPanel, playerNum)
+    if not ok or info == nil then return nil end
+    local widthOk, width = pcall(function() return info:getWidth() end)
+    local heightOk, height = pcall(function() return info:getHeight() end)
+    if not (widthOk and heightOk) then return nil end
+    if type(width) ~= "number" or type(height) ~= "number" then return nil end
+    if width < 320 or height < 240 then return nil end
+    return width, height
+end
 local PADDING = 10
 local SECTION_GAP = 8
 
@@ -80,6 +99,54 @@ local function trimText(font, text, maximumWidth)
     return UILayout.fitText(font, text, maximumWidth)
 end
 
+-- Detail rows grow inside the existing scroller. A short value stays beside
+-- its label; a long one gets the full line instead of losing its reason.
+local function drawCardText(view, text, x, y, width, font, colour)
+    local manager = getTextManager()
+    local lines = UILayout.wrapLines(tostring(text or ""), math.max(1, width),
+        function(value) return manager:MeasureStringX(font, value) end)
+    local lineH = manager:getFontHeight(font)
+    for _, line in ipairs(lines) do
+        view:drawText(line, x, y, colour[1], colour[2], colour[3], 1, font)
+        y = y + lineH + 2
+    end
+    return y
+end
+
+local function drawCardDetail(view, label, value, x, y, width, labelColour, valueColour)
+    local manager = getTextManager()
+    local font = UIFont.Small
+    local title, text = tostring(label), tostring(value or "Unknown")
+    if manager:MeasureStringX(font, title) + 12 + manager:MeasureStringX(font, text) <= width then
+        view:drawText(title, x, y, labelColour[1], labelColour[2], labelColour[3], 1, font)
+        view:drawTextRight(text, x + width, y, valueColour[1], valueColour[2], valueColour[3], 1, font)
+        return y + manager:getFontHeight(font) + 4
+    end
+    y = drawCardText(view, title, x, y, width, font, labelColour)
+    return drawCardText(view, text, x, y, width, font, valueColour) + 2
+end
+
+local function placeCardButtons(view, contentY, width, fontH)
+    local manager = getTextManager()
+    local measure = function(text) return manager:MeasureStringX(UIFont.Small, text) end
+    local medical = view.medicalButton
+    local title = medical.knoxLabel or "Medical Check"
+    if measure(title) + 24 > width then title = "Medical" end
+    if medical.title ~= title then medical:setTitle(title) end
+    local footer = UILayout.footerPlacements({view.inventoryButton,medical}, width,
+        {buttonHeight=fontH+10,spacing=6,measure=measure})
+    local top = math.max(contentY + SECTION_GAP, view.height - footer.height - PADDING)
+    for _, slot in ipairs(footer.placements) do
+        local button = slot.control
+        local x, y = PADDING + slot.x, top + slot.y
+        if button.x ~= x then button:setX(x) end
+        if button.y ~= y then button:setY(y) end
+        if button.width ~= slot.width then button:setWidth(slot.width) end
+        if button.height ~= slot.height then button:setHeight(slot.height) end
+    end
+    return top + footer.height + PADDING
+end
+
 local function dayLabel(value)
     local days = tonumber(value)
     if days == nil then
@@ -89,50 +156,16 @@ local function dayLabel(value)
     return tostring(days) .. (days == 1 and " day" or " days")
 end
 
-local function compactList(values, maximum)
-    local output = {}
-    for _, value in ipairs(values or {}) do
-        if type(value) == "string" and value ~= "" then
-            output[#output + 1] = value
-            if #output >= (maximum or 3) then break end
-        end
-    end
-    return #output > 0 and table.concat(output, ", ") or "None"
-end
-
-local function compactSkills(values, maximum)
-    local output = {}
-    for id, saved in pairs(values or {}) do
-        local level = type(saved) == "table" and tonumber(saved.level) or nil
-        if level ~= nil and level > 0 then
-            output[#output + 1] = { id = tostring(id), level = math.floor(level) }
-        end
-    end
-    table.sort(output, function(a, b)
-        if a.level == b.level then return a.id < b.id end
-        return a.level > b.level
-    end)
-    local labels = {}
-    for index = 1, math.min(#output, maximum or 3) do
-        labels[#labels + 1] = output[index].id .. " " .. tostring(output[index].level)
-    end
-    return #labels > 0 and table.concat(labels, ", ") or "No trained skills yet"
-end
-
 local function companionSnapshot(playerNum, survivorId)
+    -- A character sheet needs one person, not a fresh projection of the whole
+    -- companion roster on every half-second refresh.
+    if KnoxSurvivorViewModel.getSurvivor ~= nil then
+        local ok, snapshot = pcall(KnoxSurvivorViewModel.getSurvivor, survivorId, playerNum)
+        if ok then return snapshot end
+        return nil
+    end
     for _, snapshot in ipairs(KnoxSurvivorViewModel.getForPlayer(playerNum) or {}) do
         if snapshot.id == survivorId then
-            return snapshot
-        end
-    end
-    -- Base residents and known survivors are listed by the Notebook but are
-    -- not in the companion roster. Fall back to the full record so View Card
-    -- works for them instead of silently doing nothing.
-    if KnoxSurvivorViewModel.getSurvivor ~= nil then
-        local ok, snapshot = pcall(function()
-            return KnoxSurvivorViewModel.getSurvivor(survivorId, playerNum)
-        end)
-        if ok and snapshot ~= nil then
             return snapshot
         end
     end
@@ -218,7 +251,7 @@ local function fitViews(window)
     end
 end
 
--- Knox tab — misc history / current job only. Vanilla tabs now cover portrait, traits, skills, health, protection, temperature.
+-- Knox tab - misc history / current job only. Vanilla tabs now cover portrait, traits, skills, health, protection, temperature.
 local KnoxPanel = ISPanelJoypad:derive("KnoxSurvivorKnoxPanel")
 
 function KnoxPanel:prerender()
@@ -259,23 +292,17 @@ function KnoxPanel:prerender()
         y = y + smallH + 8
     end
     local function keyValue(label, value, col)
-        local c = col or COL_VALUE
-        self:drawText(tostring(label), PADDING, y, COL_LABEL[1], COL_LABEL[2], COL_LABEL[3], 1, UIFont.Small)
-        local labelWidth = getTextManager():MeasureStringX(UIFont.Small, tostring(label)) + PADDING
-        self:drawTextRight(trimText(UIFont.Small, tostring(value or "Unknown"), math.max(1, w - labelWidth)), PADDING + w, y, c[1], c[2], c[3], 1, UIFont.Small)
-        y = y + smallH + 4
+        y = drawCardDetail(self, label, value, PADDING, y, w, COL_LABEL, col or COL_VALUE)
     end
 
-    self:drawText(trimText(UIFont.Medium, snapshot.displayName, w), PADDING, y, COL_VALUE[1], COL_VALUE[2], COL_VALUE[3], 1, UIFont.Medium)
-    local mediumH = getTextManager():getFontHeight(UIFont.Medium)
-    y = y + mediumH + 4
+    y = drawCardText(self, snapshot.displayName, PADDING, y, w, UIFont.Medium, COL_VALUE) + 2
     local age = snapshot.ageYears ~= nil and "Age " .. tostring(snapshot.ageYears) or ""
     if age ~= "" then
         self:drawText(age, PADDING, y, COL_LABEL[1], COL_LABEL[2], COL_LABEL[3], 1, UIFont.Small)
         y = y + smallH + 2
     end
-    self:drawText("Survived " .. dayLabel(snapshot.daysSurvived) .. "  |  Known " .. dayLabel(snapshot.daysKnown), PADDING, y, COL_DIM[1], COL_DIM[2], COL_DIM[3], 1, UIFont.Small)
-    y = y + smallH + SECTION_GAP
+    y = drawCardText(self, "Survived " .. dayLabel(snapshot.daysSurvived) .. "  |  Known " .. dayLabel(snapshot.daysKnown),
+        PADDING, y, w, UIFont.Small, COL_DIM) + SECTION_GAP
 
     sectionHeader("History")
     keyValue("Time Alive", dayLabel(snapshot.daysSurvived))
@@ -291,11 +318,9 @@ function KnoxPanel:prerender()
             local detail = type(entry) == "table" and entry.detail or nil
             if type(detail) == "string" and detail ~= "" then
                 detail = detail:gsub("[\r\n\t]", " ")
-                memory = memory .. " — " .. detail
+                memory = memory .. " - " .. detail
             end
-            self:drawText(trimText(UIFont.Small, memory, w), PADDING, y,
-                COL_VALUE[1], COL_VALUE[2], COL_VALUE[3], 1, UIFont.Small)
-            y = y + smallH + 3
+            y = drawCardText(self, memory, PADDING, y, w, UIFont.Small, COL_VALUE) + 1
         end
     end
     y = y + 4
@@ -396,12 +421,7 @@ function KnoxPanel:prerender()
     sectionHeader("Relationship")
     local function standingRow(title, value, tone)
         local col = standingTone(tone)
-        self:drawText(tostring(title), PADDING, y,
-            COL_LABEL[1], COL_LABEL[2], COL_LABEL[3], 1, UIFont.Small)
-        self:drawTextRight(trimText(UIFont.Small, tostring(value or "Unknown"),
-            math.max(20, w - 100)), PADDING + w, y,
-            col[1], col[2], col[3], 1, UIFont.Small)
-        y = y + smallH + 2
+        y = drawCardDetail(self, title, value, PADDING, y, w, COL_LABEL, col)
         return col
     end
     local function standingBar(fill, col, signedBar)
@@ -423,9 +443,7 @@ function KnoxPanel:prerender()
     end
     local function standingDetail(text)
         if text == nil or text == "" then return end
-        self:drawText(trimText(UIFont.Small, tostring(text), w), PADDING, y,
-            COL_DIM[1], COL_DIM[2], COL_DIM[3], 1, UIFont.Small)
-        y = y + smallH + 1
+        y = drawCardText(self, text, PADDING, y, w, UIFont.Small, COL_DIM)
     end
     -- The faction's own colour, derived from its name, so a card reads as the
     -- same group the nameplate above the person does.
@@ -445,11 +463,14 @@ function KnoxPanel:prerender()
         and names.companyPlace(facts) or nil
     local companySize = facts ~= nil and math.floor(tonumber(facts.memberCount) or 0) or 0
     if facts ~= nil and facts.isLeader == true and companySize >= 2 then
-        keyValue("Household", companyPlace ~= nil
-            and (companySize .. " people · " .. companyPlace) or (companySize .. " people"))
+        local householdName = type(facts.name) == "string" and facts.name ~= ""
+            and facts.name or "Household"
+        local householdDetail = companyPlace ~= nil
+            and (companySize .. " people, " .. companyPlace) or (companySize .. " people")
+        keyValue("Household", householdName .. " - " .. householdDetail)
     elseif companyName ~= nil then
         keyValue("With", companyPlace ~= nil
-            and (companyName .. " · " .. companyPlace) or companyName)
+            and (companyName .. ", " .. companyPlace) or companyName)
     end
     -- Personal standing and faction standing are always two rows. The person's
     -- trust is never presented as the faction's reputation, and an unknown
@@ -461,10 +482,8 @@ function KnoxPanel:prerender()
         if standing.hostile == true then
             -- Behaviour, not the personal band: a trusting person in a hostile
             -- faction is dangerous without their own history being rewritten.
-            self:drawText(trimText(UIFont.Small,
-                standing.hostileText or "Hostile right now", w), PADDING, y,
-                0.86, 0.34, 0.30, 1, UIFont.Small)
-            y = y + smallH + 1
+            y = drawCardText(self, standing.hostileText or "Hostile right now",
+                PADDING, y, w, UIFont.Small, {0.86, 0.34, 0.30})
         end
         standingDetail(standing.deltaText)
         standingDetail(standing.nextText)
@@ -489,21 +508,7 @@ function KnoxPanel:prerender()
         and tostring(math.max(0, math.floor(snapshot.relationshipMeetings))) or nil)
     if snapshot.isSpouse then keyValue("Relationship", "Spouse", COL_ACCENT) end
     keyValue("Group", snapshot.affiliation and snapshot.affiliation.kind or "independent")
-    local buttonH = smallH + 10
-    -- Pin the buttons to the content end, or the panel bottom when the
-    -- content is short, so they never float mid-panel with dead space
-    -- below. Scroll height and button position only rewrite on change:
-    -- vanilla clamps the scroll offset on every setScrollHeight, so
-    -- per-frame rewrites are what made the bar jump.
-    local buttonY = y + SECTION_GAP
-    local minButtonY = self.height - buttonH - PADDING
-    if buttonY < minButtonY then buttonY = minButtonY end
-    if self.knoxButtonY ~= buttonY then
-        self.knoxButtonY = buttonY
-        self.inventoryButton:setY(buttonY)
-        self.medicalButton:setY(buttonY)
-    end
-    local contentH = buttonY + buttonH + PADDING
+    local contentH = placeCardButtons(self, y, w, smallH)
     if self.knoxScrollH ~= contentH then
         self.knoxScrollH = contentH
         self:setScrollHeight(contentH)
@@ -559,10 +564,11 @@ function Window:createChildren()
     ISCollapsableWindowJoypad.createChildren(self)
     self.pinButton:setVisible(false)
     self.collapseButton:setVisible(false)
+    UILayout.finishWindow(self, "Close survivor card")
 
     local th = self:titleBarHeight()
     local rh = self:resizeWidgetHeight()
-    -- ISTabPanel matching ISCharacterInfoWindow:117 — tabPadX 10, equalTabWidth false
+    -- ISTabPanel matching ISCharacterInfoWindow:117 - tabPadX 10, equalTabWidth false
     self.panel = ISTabPanel:new(0, th, self.width, self.height - th - rh)
     self.panel:initialise()
     self.panel.tabPadX = 10
@@ -578,10 +584,31 @@ function Window:createChildren()
     self.knoxView = nil
 end
 
+local function cardCharacter(window)
+    local snapshot = window.snapshot
+    if snapshot == nil then return nil end
+    local body = KnoxSurvivorViewModel.resolveLiveCharacter(snapshot.id)
+    if body == nil then return nil end
+    if snapshot.loaded == true then return body end
+    -- loaded on the knowledge snapshot means directly visible, not whether a
+    -- native body exists. Nearby owned residents/companions remain inspectable
+    -- under the same permission and reach checks as their inventory.
+    if CompanionInventory and CompanionInventory.canManage then
+        local accepted = CompanionInventory.canManage(window.playerNum,snapshot.id,body)
+        if accepted then return body end
+    end
+    return nil
+end
+
 local function ensureViews(window)
     if window.panel == nil then return end
-    local survivor = window.snapshot ~= nil and window.snapshot.loaded
-        and KnoxSurvivorViewModel.resolveLiveCharacter(window.snapshot.id) or nil
+    -- Vanilla tab names come from the translation table. An unloaded or
+    -- renamed table made every addView below index a nil global, so a missing
+    -- entry now falls back to the plain word instead of aborting the card.
+    local tabText = type(xpSystemText) == "table" and xpSystemText
+        or { info = "Info", skills = "Skills", health = "Health",
+             protection = "Protection", clothingIns = "Clothing" }
+    local survivor = cardCharacter(window)
 
     -- Native body/portrait children retain the original character. Recreate on
     -- selection or shell changes, including unload, rather than showing stale data.
@@ -598,10 +625,25 @@ local function ensureViews(window)
         window.boundSurvivor = survivor
     end
 
+    -- The Knox tab is built before any vanilla panel: a vanilla view that fails
+    -- to construct used to leave the whole card blank while the window stayed
+    -- on screen, with the failure swallowed by the caller (2026-11-09 report).
+    if window.knoxView == nil then
+        local view = KnoxPanel:new(0, 8, window.panel.width, window.panel.height - 8)
+        view:initialise()
+        view.window = window
+        window.knoxView = view
+        window.panel:addView("Knox", view)
+        UILayout.bindView(view)
+    end
+
     -- A persisted survivor can be known to the Notebook while its live shell
     -- is streamed out. Vanilla character views dereference `char` during
     -- addView/prerender, so keep the Knox tab available and wait for a real
     -- IsoPlayer before creating those views.
+    -- A failing vanilla panel is named once instead of silently blanking the
+    -- card; the Knox tab above already gives the card real content.
+    local viewsOk, viewError = pcall(function()
     if survivor ~= nil and window.infoView == nil then
         local view = ISCharacterScreen:new(0, 8, window.panel.width, 400, window.playerNum)
         view:initialise()
@@ -637,7 +679,7 @@ local function ensureViews(window)
             pcall(function() view:loadProfession() end)
             view:loadBeardAndHairStyle()
         end
-        -- Hide vanilla change buttons for survivor — no haircut and no discovered media here.
+        -- Hide vanilla change buttons for survivor - no haircut and no discovered media here.
         if view.hairButton ~= nil then view.hairButton:setVisible(false); view.hairButton:setEnable(false) end
         if view.beardButton ~= nil then view.beardButton:setVisible(false); view.beardButton:setEnable(false) end
         if view.literatureButton ~= nil then view.literatureButton:setVisible(false); view.literatureButton:setEnable(false) end
@@ -660,10 +702,7 @@ local function ensureViews(window)
             self:drawText("KNOX", 16, y + 2, COL_SEC_HDR[1], COL_SEC_HDR[2], COL_SEC_HDR[3], 0.8, UIFont.Small)
             y = y + rowH + 4
             local function kv(label, value)
-                local vw = math.max(20, w - 70)
-                self:drawText(tostring(label), 10, y, COL_LABEL[1], COL_LABEL[2], COL_LABEL[3], 1, UIFont.Small)
-                self:drawTextRight(trimText(UIFont.Small, tostring(value or "Unknown"), vw), 10 + w, y, COL_VALUE[1], COL_VALUE[2], COL_VALUE[3], 1, UIFont.Small)
-                y = y + rowH
+                y = drawCardDetail(self, label, value, 10, y, w, COL_LABEL, COL_VALUE)
             end
             kv("Time Alive", dayLabel(snap.daysSurvived))
             kv("Known", dayLabel(snap.daysKnown))
@@ -699,7 +738,7 @@ local function ensureViews(window)
                     kv("Supply Runs", tactics.lootRuns and "Joins" or "Stays home")
                 end
             end
-            kv("Base / Activity", trimText(UIFont.Small, snap.locationLabel .. " — " .. (snap.orderLabel or ""), w - 70))
+            kv("Base / Activity", (snap.locationLabel or "Unknown") .. " - " .. (snap.orderLabel or ""))
             local act = snap.activity or "Idle"
             if snap.distanceTiles ~= nil then act = act .. " (" .. tostring(math.floor(snap.distanceTiles+0.5)) .. " tiles)" end
             kv("Activity", act)
@@ -712,7 +751,7 @@ local function ensureViews(window)
             end
         end
         window.infoView = view
-        window.panel:addView(xpSystemText.info, view)
+        window.panel:addView(tabText.info, view)
         UILayout.bindView(view)
     end
     if survivor ~= nil and window.skillsView == nil then
@@ -746,7 +785,7 @@ local function ensureViews(window)
             view.reloadSkillBar = true
         end
         window.skillsView = view
-        window.panel:addView(xpSystemText.skills, view)
+        window.panel:addView(tabText.skills, view)
         UILayout.bindView(view)
     end
     if window.healthView == nil and survivor ~= nil then
@@ -763,16 +802,40 @@ local function ensureViews(window)
         window.healthView = view
         -- addView/addChild instantiates the panel and calls createChildren once.
         -- Calling it manually here duplicated both vanilla body presentations.
-        window.panel:addView(xpSystemText.health, view)
+        window.panel:addView(tabText.health, view)
         -- This embedded tab is inspection only; actual treatment uses the
         -- existing Medical Check action and its native doctor/patient window.
         view.doBodyPartContextMenu = function() end
         if view.listbox ~= nil then view.listbox.onRightMouseUp = function() end end
         if view.bodyPartPanel ~= nil then view.bodyPartPanel.onRightMouseUp = function() end end
+        -- Vanilla's Fitness panel is the player's own exercise surface. It is
+        -- hidden here, so its space is the honest place for the one control
+        -- that asks THIS survivor to work out: the same native action, on their
+        -- body, through the exercise owner.
+        -- ISButton.new does arithmetic on height (`height - 2`). A height that
+        -- arrives as a Java value raises "__sub not defined" and took the whole
+        -- vanilla view build down with it (2026-11-10 console), so pass a plain
+        -- number and keep the shared constant's value when it is numeric.
+        local exerciseHeight = math.floor(tonumber(BUTTON_HGT) or 24)
+        local exerciseBtn = ISButton:new(0, 0, 150, exerciseHeight, "Exercise", window, Window.onExercise)
+        exerciseBtn:initialise()
+        exerciseBtn:setVisible(false)
+        exerciseBtn.tooltip = "Ask this survivor to exercise where they stand."
+        view:addChild(exerciseBtn)
+        view.exerciseBtn = exerciseBtn
         local healthRender = view.render
         view.render = function(self)
             healthRender(self)
             self.fitness:setVisible(false)
+            local button = self.exerciseBtn
+            if button ~= nil then
+                -- Bottom-left is where vanilla puts its own panel buttons and
+                -- where this inspection tab leaves room, unlike the hidden
+                -- fitness block whose geometry belongs to the player's screen.
+                local x, y = 12, math.max(8, self:getHeight() - button.height - 8)
+                button:setX(x); button:setY(y)
+                button:setVisible(self:isVisible() and self:getHeight() >= 80)
+            end
         end
         view.onJoypadDown = function(self, button, joypadData)
             window:onJoypadDown(button, joypadData)
@@ -803,7 +866,7 @@ local function ensureViews(window)
         view.bodyOutline = getTexture("media/ui/defense/" .. view.sex .. "_base.png")
         pcall(function() view:create() end)
         window.protectionView = view
-        window.panel:addView(xpSystemText.protection, view)
+        window.panel:addView(tabText.protection, view)
         UILayout.bindView(view)
     end
     if window.clothingView == nil and survivor ~= nil then
@@ -817,7 +880,7 @@ local function ensureViews(window)
         view.playerNum = survivor:getPlayerNum()
         view.char = survivor
         window.clothingView = view
-        window.panel:addView(xpSystemText.clothingIns, view)
+        window.panel:addView(tabText.clothingIns, view)
         UILayout.bindView(view)
         -- See visibleContentBottom: vanilla reports one constant height for
         -- both temperature styles, so this must run after bindView (which
@@ -828,13 +891,10 @@ local function ensureViews(window)
             UILayout.fitView(self)
         end
     end
-    if window.knoxView == nil then
-        local view = KnoxPanel:new(0, 8, window.panel.width, window.panel.height - 8)
-        view:initialise()
-        view.window = window
-        window.knoxView = view
-        window.panel:addView("Knox", view)
-        UILayout.bindView(view)
+
+    end)
+    if not viewsOk then
+        print("[KnoxSurvivors][Card] vanilla view build failed: " .. tostring(viewError))
     end
 
     -- Bind all vanilla views to the selected survivor (never local player)
@@ -960,6 +1020,47 @@ function Window:onMouseUpOutside(x, y)
     return true
 end
 
+-- One button, one question: which bodyweight exercise. The picker is the
+-- ordinary context menu, so no new window is introduced, and the exercise
+-- owner keeps the gates and the native action queue.
+function Window:onExercise(button)
+    local exercise = rawget(_G, "KnoxSurvivorExercise")
+    local player = getSpecificPlayer(self.playerNum)
+    if exercise == nil or exercise.start == nil or player == nil or self.survivorId == nil then
+        return
+    end
+    local blocked = exercise.refusal ~= nil and exercise.refusal(player, self.survivorId) or nil
+    local function complain(reason)
+        local text = exercise.refusalText ~= nil and exercise.refusalText(reason)
+            or "They cannot exercise right now."
+        if type(HaloTextHelper) == "table" and HaloTextHelper.addBadText ~= nil then
+            HaloTextHelper.addBadText(player, text)
+        end
+    end
+    if blocked ~= nil then
+        complain(blocked)
+        return
+    end
+    local rows = exercise.exercises ~= nil and exercise.exercises() or {}
+    local menu = nil
+    if #rows > 0 and type(ISContextMenu) == "table" and ISContextMenu.get ~= nil then
+        local opened, value = pcall(ISContextMenu.get, self.playerNum, getMouseX(), getMouseY())
+        if opened then menu = value end
+    end
+    if menu == nil then
+        local started, reason = exercise.start(player, self.survivorId, "squats")
+        if started ~= true then complain(reason) end
+        return
+    end
+    for _, row in ipairs(rows) do
+        local kind = row.type
+        menu:addOption(tostring(row.label), player, function()
+            local started, reason = exercise.start(player, self.survivorId, kind)
+            if started ~= true then complain(reason) end
+        end)
+    end
+end
+
 function Window:onJoypadDown(button, joypadData)
     if button == Joypad.BButton then
         self:close()
@@ -1005,14 +1106,22 @@ end
 function Window:new(playerNum)
     local _, _, screenWidth, screenHeight = screenBounds(playerNum)
     local scale = math.max(1, getTextManager():getFontHeight(UIFont.Small) / 14)
-    local width = math.min(math.floor(WINDOW_WIDTH * scale), math.max(1, screenWidth - 20))
-    local height = math.min(math.floor(WINDOW_HEIGHT * scale), math.max(1, screenHeight - 20))
+    local infoWidth, infoHeight = playerWindowSize(playerNum)
+    local width = math.min(infoWidth or math.floor(WINDOW_WIDTH * scale),
+        math.max(1, screenWidth - 20))
+    local height = math.min(infoHeight or math.floor(WINDOW_HEIGHT * scale),
+        math.max(1, screenHeight - 20))
     local window = ISCollapsableWindowJoypad:new(0, 0, width, height)
+    -- Install this class before anything touches the window. Any call that needs
+    -- a javaObject instantiates the element, and `instantiate` calls
+    -- `createChildren` through whatever metatable is installed at that moment.
+    -- Tracking first therefore built the vanilla children only: this class's tab
+    -- panel never existed and the card opened blank (2026-11-10 report).
+    setmetatable(window, self)
+    self.__index = self
     -- One scale rule, one clamp: the card is the largest Knox window and the
     -- first thing a small display loses.
     UILayout.trackWindow(window)
-    setmetatable(window, self)
-    self.__index = self
     window.playerNum = playerNum
     window.survivorId = nil
     window.snapshot = nil
@@ -1136,8 +1245,11 @@ local function onResolutionChange()
     for _, window in pairs(windows) do
         local _, _, sw, sh = screenBounds(window.playerNum)
         local scale = math.max(1, getTextManager():getFontHeight(UIFont.Small) / 14)
-        local nw = math.min(math.floor(WINDOW_WIDTH * scale), math.max(1, sw - 20))
-        local nh = math.min(math.floor(WINDOW_HEIGHT * scale), math.max(1, sh - 20))
+        local infoWidth, infoHeight = playerWindowSize(window.playerNum)
+        local nw = math.min(infoWidth or math.floor(WINDOW_WIDTH * scale),
+            math.max(1, sw - 20))
+        local nh = math.min(infoHeight or math.floor(WINDOW_HEIGHT * scale),
+            math.max(1, sh - 20))
         window:setWidth(nw)
         window:setHeight(nh)
         if window.panel ~= nil then

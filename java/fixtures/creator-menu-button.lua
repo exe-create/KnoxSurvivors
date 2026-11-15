@@ -3,8 +3,8 @@
 -- provable without a running game.
 local Creator = assert(rawget(_G, "KnoxCreator"), "creator model missing")
 
-assert(Creator.MENU_BUTTON_LABEL == "KS Creator",
-    "the button is named KS Creator, got " .. tostring(Creator.MENU_BUTTON_LABEL))
+assert(Creator.MENU_BUTTON_LABEL == "Knox Creator",
+    "the button names Knox Creator, got " .. tostring(Creator.MENU_BUTTON_LABEL))
 assert(Creator.menuButtonVisible({ mainScreen = true, subScreen = false,
     inGame = false }) == true,
     "the main menu is the one screen that shows the button")

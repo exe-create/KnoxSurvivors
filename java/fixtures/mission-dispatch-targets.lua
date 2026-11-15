@@ -2,7 +2,7 @@
 -- The dispatch owner needs a real loaded square, so the chooser offers the
 -- buildings the player can see: this fixture proves the destination scan (dedupe,
 -- nearest first, own home skipped, radius and limit honoured) and that the
--- place → mission → party chain calls the one existing dispatch owner with the
+-- place -> mission -> party chain calls the one existing dispatch owner with the
 -- chosen place's nearest square, and issues nothing when any step is cancelled.
 local T = KnoxMissionTargets
 assert(type(T) == "table" and type(T.scan) == "function",
@@ -11,7 +11,9 @@ assert(type(T) == "table" and type(T.scan) == "function",
 local function building(id, name)
     return {
         getIDString = function() return id end,
-        getDef = function() return { getName = function() return name end } end,
+        getDef = function() return setmetatable({getID=function() return id end}, {__index=function(_,key)
+            error("Unsupported BuildingDef getter: " .. tostring(key))
+        end}) end,
     }
 end
 
@@ -47,8 +49,8 @@ assert(places[1].id == "shed-1" and places[1].distance == 1,
     "the nearest building comes first")
 assert(places[1].square:getX() == 1,
     "a building is represented by its nearest square, not a later one")
-assert(places[1].name == "Shed (1, 0)", "the label names the building and where it is")
-assert(places[2].id == "store-1" and places[2].name == "General store (5, 0)",
+assert(places[1].name == "Building (1, 0)", "the label names the building and where it is")
+assert(places[2].id == "store-1" and places[2].name == "Building (5, 0)",
     "the far building keeps its own name")
 for _, place in ipairs(places) do
     assert(place.id ~= "home-1", "the player's own home is never a mission destination")
@@ -154,7 +156,7 @@ assert(calls[1].size == 2, "the second choice is still a real size")
 
 answers = { { "shed-1" }, { "scout" }, { "3" } }
 run({ availability = function() return 9, nil end })
-assert(entryCounts[3] == 3, "the list never grows past the three-resident cap")
+assert(entryCounts[3] == 9, "all available residents are offered without a cap")
 assert(calls[1].size == 3, "a larger available crew still dispatches the chosen size")
 
 assert(#T.partyChoices(0) == 0 and #T.partyChoices(nil) == 0,
@@ -164,7 +166,7 @@ assert(#twoChoices == 2 and twoChoices[1].id == T.PARTY_CHOICES[1].id
     and twoChoices[2].name == T.PARTY_CHOICES[2].name,
     "trimmed choices keep the real labels in their real order")
 assert(#T.partyChoices(2.9) == 2, "a fractional count is floored, not rounded up")
-assert(#T.partyChoices(99) == #T.PARTY_CHOICES, "a huge count is still capped")
+assert(#T.partyChoices(99) == 99, "even a large available crew has no size ceiling")
 
 -- The check is asked after the mission type, with that type and the chosen place.
 local asked = nil

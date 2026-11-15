@@ -249,7 +249,7 @@ local function ensureFactionZones(base, faction)
             x1 = outer:getX() + 7, y1 = outer:getY() - 2,
             x2 = outer:getX() + 11, y2 = outer:getY() + 2,
             z = outer:getZ(), priority = 70,
-        }, "Log Yard")
+        }, "Drop Point")
         -- Corpse drop sits west of the wood lot for the same exclusivity reason.
         ensureFactionZone(base, "corpse", {
             x1 = outer:getX() - 10, y1 = outer:getY() - 1,
@@ -384,6 +384,33 @@ local AUTO_BED_QUALITY = {
 }
 local factionBedAttemptedMembership = {}
 
+-- A stored claim names a bed only while that bed still exists. The installed
+-- moveables pickup removes the furniture itself and never touches a claim
+-- (ISMoveableSpriteProps:pickUpMoveable -> pickUpMoveableInternal), so this
+-- reader must not keep treating the record as an assignment. An unloaded
+-- square is unknown and keeps its claim; a loaded square without the claimed
+-- bed means the furniture is gone (picked up, scrapped or destroyed).
+local function claimBedLive(ref)
+    local cell = getCell ~= nil and getCell() or nil
+    if cell == nil then return true end
+    local ok, live = pcall(function()
+        local square = cell:getGridSquare(tonumber(ref.x) or 0,
+            tonumber(ref.y) or 0, tonumber(ref.z) or 0)
+        if square == nil or square.getObjects == nil then return true end
+        local objects = square:getObjects()
+        for index = 0, objects:size() - 1 do
+            local object = objects:get(index)
+            if object ~= nil and tonumber(object:getObjectIndex()) == tonumber(ref.objectIndex) then
+                local properties = object:getProperties()
+                return properties ~= nil
+                    and tostring(properties:get("BedType") or "") ~= ""
+            end
+        end
+        return false
+    end)
+    return not ok or live == true
+end
+
 local function bedReferenceKey(ref)
     return table.concat({ tostring(ref.x), tostring(ref.y), tostring(ref.z),
         tostring(ref.objectIndex) }, ":")
@@ -393,7 +420,7 @@ end
 -- resident records. Only loaded native beds in that exact building are
 -- considered; no bed, square, or body is created by this pass.
 local function discoverFactionBeds(base, faction)
-    local area = base ~= nil and (base.home or faction.homeBase) or nil
+    local area = base ~= nil and (base.home or (faction ~= nil and faction.homeBase) or base) or nil
     local cell = getCell ~= nil and getCell() or nil
     local buildingId = area ~= nil and area.buildingId or nil
     local minX, minY = area ~= nil and tonumber(area.minX), area ~= nil and tonumber(area.minY)
@@ -450,14 +477,213 @@ local function discoverFactionBeds(base, faction)
     return beds
 end
 
+BaseManager.discoverFactionBeds = discoverFactionBeds
+
+local function reportBedShortage(base, missing, faction)
+    local attempt = factionBedAttemptedMembership[base.id]
+    if attempt == nil then return end
+    attempt.missingBedCount = #missing
+    if #missing == 0 then attempt.noticeKey = nil; return end
+    local key = table.concat(missing, ",")
+    if attempt.noticeKey == key then return end
+    local feed = rawget(_G, "KnoxActivityFeed")
+    if feed == nil or feed.event == nil then return end
+    local line = #missing == 1 and "One resident still has no bed."
+        or (tostring(#missing) .. " residents still have no bed.")
+    local label = faction ~= nil and faction.name or base.label
+    if type(label) == "string" and label ~= "" then line = label .. ": " .. line end
+    if feed.event(line .. " We'll make do for now.") ~= false then attempt.noticeKey = key end
+end
+
+-- Reuse the bed owner's measured shortage. A packed or unpacked bag already
+-- carried, stored or lying at home covers one future placement, not one bed.
+function BaseManager.needsBedCraft(base)
+    local attempt = base ~= nil and factionBedAttemptedMembership[base.id] or nil
+    local missing = attempt ~= nil and tonumber(attempt.missingBedCount) or 0
+    if missing <= 0 or worldAge() - (attempt.atHours or 0) > 0.5 then return false end
+    local storage = rawget(_G, "KnoxBaseStorage")
+    if storage == nil or storage.operationalPolicies == nil
+        or storage.walkFloorItems == nil then return false end
+    local count, seen = 0, {}
+    local function itemVisitor(item)
+        if item == nil or seen[item] then return end
+        seen[item] = true
+        if string.match(tostring(item:getFullType()), "^Base%.SleepingBag_") then count = count + 1 end
+    end
+    local function walk(container, depth)
+        if container == nil or depth > 4 then return end
+        local items = container:getItems()
+        for i = 0, items:size() - 1 do
+            local item = items:get(i)
+            if not seen[item] then
+                itemVisitor(item)
+                if item:IsInventoryContainer() then walk(item:getInventory(), depth + 1) end
+            end
+        end
+    end
+    local ok, readable = pcall(function()
+        for _, id in ipairs(KnoxPersistence.getBaseResidentIds(base.id)) do
+            local body = KnoxSurvivorRuntime.getCharacter(id)
+            if body == nil then return false end
+            walk(body:getInventory(), 0)
+        end
+        for _, policy in ipairs(storage.operationalPolicies(base)) do
+            local resolved = storage.resolvePolicy(policy)
+            if resolved == nil then return false end
+            walk(resolved.container, 0)
+        end
+        return storage.walkFloorItems(base, itemVisitor)
+    end)
+    return ok and readable == true and count < missing
+end
+
+function BaseManager.bedCraftPlan(base, character)
+    local actions = rawget(_G, "KnoxInventoryActions")
+    if character == nil or actions == nil or not BaseManager.needsBedCraft(base)
+        or not BaseManager.containsSquare(base, character:getCurrentSquare()) then return nil end
+    if actions.craftPlan(character, "SewHideSleepingBag", base) ~= nil then return { phase = "craft" } end
+    return actions.craftSupplyTransfer ~= nil and actions.craftSupplyTransfer(character, "SewHideSleepingBag", base) or nil
+end
+
+function BaseManager.bedCollectionApproach(base, character, item, sourceSquare)
+    local storage = rawget(_G, "KnoxBaseStorage")
+    local origin = character ~= nil and character:getCurrentSquare() or nil
+    if sourceSquare == nil or origin == nil or storage == nil or storage.approachSquare == nil
+        or not BaseManager.containsSquare(base, sourceSquare) then return nil end
+    local approach = storage.approachSquare({source = {square = sourceSquare}}, character)
+    if approach == nil or approach == origin or not BaseManager.containsSquare(base, approach)
+        or approach:getZ() ~= origin:getZ() or approach:getZ() ~= sourceSquare:getZ()
+        or (approach:getX() - sourceSquare:getX())^2 + (approach:getY() - sourceSquare:getY())^2 > 2 then return nil end
+    return { phase = "move", item = item, approach = approach }
+end
+
+function BaseManager.bedFloorCollectionAllowed(base, character, object, item, forTravel)
+    local ok, allowed = pcall(function()
+        local square = object ~= nil and object:getSquare() or nil
+        local origin = character ~= nil and character:getCurrentSquare() or nil
+        if square == nil or origin == nil or item == nil or object:getItem() ~= item
+            or item:getWorldItem() ~= object or not square:getWorldObjects():contains(object)
+            or not BaseManager.containsSquare(base, square) or square:getZ() ~= origin:getZ()
+            or (forTravel ~= true and (square:getX() - origin:getX())^2
+                + (square:getY() - origin:getY())^2 > 2) then return false end
+        local runtime, looting = rawget(_G, "KnoxSurvivorRuntime"), rawget(_G, "KnoxSurvivorLooting")
+        local id = runtime ~= nil and runtime.idForCharacter ~= nil and runtime.idForCharacter(character) or nil
+        return id ~= nil and looting ~= nil and looting.canLootSquare ~= nil
+            and looting.canLootSquare(id, square) == true
+    end)
+    return ok and allowed == true
+end
+
+function BaseManager.bedPreparationPlan(base, character)
+    local attempt = base ~= nil and factionBedAttemptedMembership[base.id] or nil
+    if character == nil or attempt == nil or (attempt.missingBedCount or 0) <= 0
+        or worldAge() - (attempt.atHours or 0) > 0.5
+        or not BaseManager.containsSquare(base, character:getCurrentSquare()) then return nil end
+    local root = character:getInventory()
+    local seen = {}
+    local function find(container, depth)
+        if container == nil or seen[container] or depth > 4 then return nil end
+        seen[container] = true
+        local items = container:getItems()
+        for i = 0, items:size() - 1 do
+            local item = items:get(i)
+            local fullType = tostring(item:getFullType())
+            if string.match(fullType, "^Base%.SleepingBag_") then
+                if container ~= root then return { phase = "retrieve", item = item } end
+                if string.match(fullType, "_Packed$") then
+                    if KnoxInventoryActions.craftPlan(character, "UnpackSleepingBag", base, item) ~= nil then
+                        return { phase = "unpack", item = item, outputType = string.gsub(fullType, "_Packed$", "") }
+                    end
+                elseif item ~= character:getPrimaryHandItem() and item ~= character:getSecondaryHandItem() then
+                    local props = ISMoveableSpriteProps.new(item:getWorldSprite())
+                    local origin, cell = character:getCurrentSquare(), getCell()
+                    for x = origin:getX() - 1, origin:getX() + 1 do
+                        for y = origin:getY() - 1, origin:getY() + 1 do
+                            local square = cell:getGridSquare(x, y, origin:getZ())
+                            if square ~= nil and square ~= origin and BaseManager.containsSquare(base, square)
+                                and props.isMoveable and props:canPlaceMoveable(character, square, item) then
+                                local left, top = props:getSpriteGridTopLeft(x, y)
+                                local footprint = props:getMultiTileSquares(left, top, origin:getZ()) or { square }
+                                local inside = #footprint > 0
+                                for _, tile in ipairs(footprint) do
+                                    if not BaseManager.containsSquare(base, tile) then inside = false end
+                                end
+                                if inside then
+                                    local before, objects = {}, square:getObjects()
+                                    for j = 0, objects:size() - 1 do before[objects:get(j)] = true end
+                                    return { phase = "place", item = item, square = square, props = props, before = before }
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            if item:IsInventoryContainer() then
+                local nested = find(item:getInventory(), depth + 1)
+                if nested ~= nil then return nested end
+            end
+        end
+    end
+    local ok, plan = pcall(find, root, 0)
+    if not ok or plan ~= nil then return ok and plan or nil end
+    local storage = rawget(_G, "KnoxBaseStorage")
+    if storage == nil or storage.findItemType == nil then return nil end
+    local storedPlan
+    local found, _, item = pcall(storage.findItemType, base, function(candidate)
+        if not string.match(tostring(candidate:getFullType()), "^Base%.SleepingBag_") then return false end
+        local source, origin = candidate:getContainer(), character:getCurrentSquare()
+        local square = source ~= nil and source:getSourceGrid() or nil
+        if square == nil or square:getZ() ~= origin:getZ() or not BaseManager.containsSquare(base, square)
+            or not KnoxInventoryActions.canTakeWorldStock(character, source, root) then return false end
+        if (square:getX() - origin:getX())^2 + (square:getY() - origin:getY())^2 <= 2 then
+            storedPlan = { phase = "retrieve", item = candidate }
+        else
+            storedPlan = BaseManager.bedCollectionApproach(base, character, candidate, square)
+        end
+        return storedPlan ~= nil
+    end, character)
+    if found and item ~= nil then return storedPlan end
+    if storage.walkFloorItems == nil then return nil end
+    local floorPlan
+    local scanned, readable = pcall(storage.walkFloorItems, base, function(candidate)
+        if floorPlan == nil and string.match(tostring(candidate:getFullType()), "^Base%.SleepingBag_") then
+            local object = candidate:getWorldItem()
+            if BaseManager.bedFloorCollectionAllowed(base, character, object, candidate) then
+                floorPlan = { phase = "grab", item = candidate, object = object }
+            elseif BaseManager.bedFloorCollectionAllowed(base, character, object, candidate, true) then
+                floorPlan = BaseManager.bedCollectionApproach(base, character, candidate, object:getSquare())
+            end
+        end
+    end)
+    return scanned and readable == true and floorPlan or nil
+end
+
+function BaseManager.bedPlacementComplete(base, plan)
+    if plan == nil or plan.phase ~= "place" or plan.item:getContainer() ~= nil then return false end
+    local objects = plan.square:getObjects()
+    for i = 0, objects:size() - 1 do
+        local object = objects:get(i)
+        local props = object:getProperties()
+        if not plan.before[object] and object:getObjectIndex() >= 0 and props ~= nil
+            and AUTO_BED_QUALITY[tostring(props:get("BedType") or "")] ~= nil then
+            local attempt = factionBedAttemptedMembership[base.id]
+            if attempt ~= nil then attempt.atHours = -1 end
+            return true
+        end
+    end
+    return false
+end
+
 local function ensureFactionBeds(base, faction)
-    if base == nil or faction == nil or base.ownerKind ~= "faction"
+    if base == nil or faction == nil or (base.ownerKind ~= "faction" and base.ownerKind ~= "group")
         or base.ownerId ~= faction.id or KnoxPersistence.setFactionResidentBed == nil then
         return 0
     end
     local members, seen = {}, {}
     local function append(id)
         if type(id) ~= "string" or seen[id] then return end
+        local duty = KnoxPersistence.getSurvivorDuty(id)
+        if duty == nil or duty.mode ~= "base" or duty.baseId ~= base.id then return end
         seen[id] = true
         members[#members + 1] = id
     end
@@ -469,21 +695,28 @@ local function ensureFactionBeds(base, faction)
         return a < b
     end)
 
-    local unassignedLoaded = {}
+    local unassignedLoaded, anyUnassigned = {}, false
     for _, id in ipairs(members) do
         local policies = KnoxPersistence.getSurvivorPolicies ~= nil
             and KnoxPersistence.getSurvivorPolicies(id) or nil
         local assigned = type(policies) == "table" and policies.assignedBed or nil
-        if assigned == nil or (type(assigned) == "table"
+        -- The installed pickup removes the bed but never the claim record; a
+        -- claim whose furniture is gone cannot count as an assignment.
+        local removed = type(assigned) == "table" and not claimBedLive(assigned)
+        if assigned == nil or removed or (type(assigned) == "table"
             and assigned.autoFactionId == faction.id
             and assigned.autoBaseId ~= base.id) then
+            anyUnassigned = true
             local runtime = rawget(_G, "KnoxSurvivorRuntime")
             local character = runtime ~= nil and runtime.getCharacter ~= nil
                 and runtime.getCharacter(id) or nil
             if character ~= nil then unassignedLoaded[#unassignedLoaded + 1] = id end
         end
     end
-    if #unassignedLoaded == 0 then return 0 end
+    if #unassignedLoaded == 0 then
+        if not anyUnassigned then reportBedShortage(base, {}, faction) end
+        return 0
+    end
     local signature = base.id .. ":" .. table.concat(unassignedLoaded, ",")
     local now = worldAge()
     local previous = factionBedAttemptedMembership[base.id]
@@ -493,10 +726,14 @@ local function ensureFactionBeds(base, faction)
     end
     factionBedAttemptedMembership[base.id] = {
         signature = signature, atHours = now,
+        noticeKey = type(previous) == "table" and previous.noticeKey or nil,
     }
 
     local beds = discoverFactionBeds(base, faction)
-    if #beds == 0 then return 0 end
+    if #beds == 0 then
+        reportBedShortage(base, unassignedLoaded, faction)
+        return 0
+    end
     local runtime = rawget(_G, "KnoxSurvivorRuntime")
 
     local claimed = {}
@@ -517,7 +754,10 @@ local function ensureFactionBeds(base, faction)
         local canRefresh = type(assigned) == "table"
             and assigned.autoFactionId == faction.id
             and assigned.autoBaseId ~= base.id
-        if assigned == nil or canRefresh then
+        -- Being counted as unassigned is not enough: the assignment itself must
+        -- not skip a resident whose own claim names a bed that no longer exists.
+        local removed = type(assigned) == "table" and not claimBedLive(assigned)
+        if assigned == nil or removed or canRefresh then
             local character = runtime ~= nil and runtime.getCharacter ~= nil
                 and runtime.getCharacter(id) or nil
             if character ~= nil then
@@ -553,13 +793,28 @@ local function ensureFactionBeds(base, faction)
             end
         end
     end
+    local missing = {}
+    for _, id in ipairs(unassignedLoaded) do
+        local policies = KnoxPersistence.getSurvivorPolicies ~= nil
+            and KnoxPersistence.getSurvivorPolicies(id) or nil
+        local assigned = policies ~= nil and policies.assignedBed or nil
+        if policies ~= nil and (assigned == nil
+            or (type(assigned) == "table" and not claimBedLive(assigned))
+            or (type(assigned) == "table"
+                and assigned.autoFactionId == faction.id and assigned.autoBaseId ~= base.id)) then
+            missing[#missing + 1] = id
+        end
+    end
+    reportBedShortage(base, missing, faction)
     return assignedCount
 end
 
 -- BASE BED ROSTER (pure)
 -- The Notebook's bed view reads the existing per-survivor assignedBed
--- record. This is a projection only: it never scans for a bed, assigns one,
--- clears one or writes a survivor record. A companion is listed only when
+-- record. This is a projection only: it never assigns a bed, clears one or
+-- writes a survivor record, and it only asks the existing liveness reader
+-- whether the claimed furniture is still standing. A companion is listed
+-- only when
 -- they already hold a bed; every living base resident is listed so a missing
 -- assignment is visible rather than silently absent.
 function BaseManager.bedRoster(base, playerId)
@@ -594,6 +849,11 @@ function BaseManager.bedRoster(base, playerId)
                 bed = { x = x, y = y, z = z, objectIndex = objectIndex }
             end
         end
+        -- A stored claim names a bed only while that bed still stands: the
+        -- installed pickup removes the furniture and never the claim, so the
+        -- roster must not show a picked-up bed as one this resident has. An
+        -- unloaded square is unknown and keeps the recorded claim.
+        if bed ~= nil and not claimBedLive(bed) then bed = nil end
         if bed == nil and includeWithoutBed ~= true then return end
         local roomName = nil
         if bed ~= nil then
@@ -835,7 +1095,7 @@ function BaseManager.attentionItems(facts)
         local dry = source.waterSource == "dry" and shortage.category == "water"
         add({
             key = "reserve",
-            title = label .. " is " .. tostring(shortageMissing) .. " below target" .. stock,
+            title = label .. ": " .. tostring(shortageMissing) .. " below target" .. stock,
             detail = dry and "The taps are dry; stored water is the whole supply."
                 or "Assigned storage is below the target.",
             action = "review_stock",
@@ -1086,6 +1346,8 @@ function BaseManager.baseLineModel(status)
     end
     return {
         expanded = item ~= nil,
+        quietLabel = type(status.facts) == "table" and status.facts.stockKnown == true
+            and "no urgent issues" or "supplies unverified",
         itemKey = item ~= nil and item.key or nil,
         itemAction = item ~= nil and item.action or nil,
         actionLabel = item ~= nil and tostring(item.actionLabel or "Review") or "",
@@ -1126,6 +1388,64 @@ function BaseManager.getForOwner(ownerKind, ownerId)
     return KnoxPersistence.getBaseForOwner(ownerKind, ownerId)
 end
 
+-- HOME DEFENCE ASSIGNMENT (pure)
+-- Who answers for this site. A group home is answered by that group, and whether
+-- the group holds a home at all is its kind's statement, not a name check here.
+-- The alarm path and the offline fixture read this one function, so the decision
+-- and the fight cannot disagree.
+--
+-- `base` is the stored base record (ownerKind/ownerId). `survivor` carries what
+-- the caller already knows: its id, its faction id, its creator kind, the base it
+-- is resident at, and - when the group made an explicit choice - `defendsHome`.
+-- An explicit choice always wins over the kind. A person with no creator record
+-- keeps the behaviour this path already had: the group's own home is defended.
+function BaseManager.defenceAssignment(base, survivor, options)
+    if type(base) ~= "table" then return nil, "no_base" end
+    if type(survivor) ~= "table" then return nil, "no_survivor" end
+    if type(survivor.id) ~= "string" or survivor.id == "" then
+        return nil, "no_survivor"
+    end
+    local explicit = nil
+    if type(survivor.defendsHome) == "boolean" then
+        explicit = survivor.defendsHome
+    elseif type(options) == "table" and type(options.defendsHome) == "boolean" then
+        explicit = options.defendsHome
+    end
+    if base.ownerKind == "player" then
+        if survivor.dutyBaseId ~= nil
+            and tostring(survivor.dutyBaseId) == tostring(base.id) then
+            return true, "resident"
+        end
+        return false, "not_a_resident"
+    end
+    if base.ownerKind == "group" then
+        local persistence = rawget(_G,"KnoxPersistence")
+        if survivor.groupId ~= base.ownerId or survivor.dutyBaseId ~= base.id
+            or persistence == nil or persistence.isGroupBaseMember == nil
+            or not persistence.isGroupBaseMember(base,survivor.id,true) then
+            return false,"another_group_home"
+        end
+    elseif base.ownerKind ~= "faction" then return false, "not_a_home" end
+    if type(base.ownerId) ~= "string" or base.ownerId == "" then
+        return false, "no_owner"
+    end
+    if base.ownerKind == "faction" and (survivor.factionId == nil
+        or tostring(survivor.factionId) ~= tostring(base.ownerId)) then
+        return false, "another_group_home"
+    end
+    local defends = explicit
+    if defends == nil and type(survivor.kind) == "string" then
+        local creator = rawget(_G, "KnoxCreator")
+        local behaviour = creator ~= nil and creator.behaviourFor ~= nil
+            and creator.behaviourFor(survivor.kind) or nil
+        if behaviour == nil then return false, "unknown_kind" end
+        defends = behaviour.defendsHome == true
+    end
+    if defends == false then return false, "kind_does_not_defend" end
+    return true, "own_group_home"
+end
+-- END HOME DEFENCE ASSIGNMENT
+
 function BaseManager.establishPlayerBase(player, square)
     if player == nil or square == nil then
         return nil, "invalid_location"
@@ -1156,7 +1476,8 @@ function BaseManager.establishPlayerBase(player, square)
         faction.homeBaseId = base.id
         BaseManager.syncStructureProtection()
     end
-    return base, result
+    local starter = base ~= nil and BaseManager.applyStarterLayout(base.id, square:getBuilding(), square:getZ(), playerId, player) or nil
+    return base, result, starter
 end
 
 -- Additional player base (outpost) in another building. The primary home
@@ -1179,6 +1500,14 @@ function BaseManager.establishOutpost(player, square)
             and other.home.buildingId == area.buildingId then
             return other, "existing"
         end
+    end
+    -- A second site is earned by a settlement that has outgrown its own
+    -- beds, food and water (design/SOCIETY_AND_AUTONOMY.md, owner
+    -- revision 2026-11-04). Unmeasured settlements keep their old path.
+    local capacity = rawget(_G, "KnoxSettlementCapacity")
+    if capacity ~= nil and capacity.expansionEarned ~= nil and owned[1] ~= nil then
+        local earned, capacityReason = capacity.expansionEarned(owned[1])
+        if not earned then return nil, capacityReason or "settlement_has_room" end
     end
     local territory = territoryAround(area, PLAYER_BASE_YARD_PADDING)
     if blockedBySurvivorSafehouse(territory) then
@@ -1266,12 +1595,16 @@ function BaseManager.ensureFactionBase(faction)
             ensureFactionStorage(base)
         end
         for _, survivorId in ipairs(faction.memberIds or {}) do
-            local resident, residentResult = KnoxPersistence.setFactionBaseResident(
-                survivorId,
-                faction.id,
-                base.id,
-                worldAge()
-            )
+            local duty = KnoxPersistence.getSurvivorDuty(survivorId)
+            local assigned = duty and duty.mode == "base" and KnoxPersistence.getBase(duty.baseId) or nil
+            -- An existing outpost assignment is authoritative. Primary-home
+            -- refresh must never march every garrison across the county.
+            local resident, residentResult = true, "existing"
+            local origin = faction.militaryCommand and KnoxPersistence.getSurvivorOrigin(survivorId) or nil
+            local localMember = not faction.militaryCommand or (origin and base.home and origin.buildingId == base.home.buildingId)
+            if localMember and (assigned == nil or assigned.ownerKind ~= "faction" or assigned.ownerId ~= faction.id) then
+                resident, residentResult = KnoxPersistence.setFactionBaseResident(survivorId, faction.id, base.id, worldAge())
+            end
             -- Base creation can happen while the leader is still active in the
             -- world. Notify that runtime immediately so it drops stale roaming
             -- or faction-scouting intent and begins resident duty on its next
@@ -1295,8 +1628,109 @@ function BaseManager.ensureFactionBase(faction)
     return base, base ~= nil and result or "failed"
 end
 
+-- Establish only a real, loaded military origin building occupied by one of
+-- this command's members. The ordinary base, resident, work-area and safehouse
+-- owners do the work; there is no second garrison roster or home registry.
+function BaseManager.ensureMilitaryOutposts(faction)
+    if not faction or not faction.militaryCommand then return 0 end
+    if KnoxSettings.allowNPCFactions and not KnoxSettings.allowNPCFactions() then return 0 end
+    local sites, count = {}, 0
+    for _, id in ipairs(faction.memberIds or {}) do
+        local origin = KnoxPersistence.getSurvivorOrigin(id)
+        if origin and origin.source == "world_building" and origin.context == "military" and origin.buildingId then
+            local site = sites[origin.buildingId] or {members={}}
+            sites[origin.buildingId] = site
+            site.members[#site.members + 1] = id
+            local character = KnoxSurvivorRuntime.getCharacter(id)
+            local square = character and character:getCurrentSquare() or nil
+            local area = square and areaFromBuilding(square:getBuilding(), square) or nil
+            if area and area.buildingId == origin.buildingId then site.area = area end
+        end
+    end
+    local basesByBuilding = {}
+    for _, base in ipairs(KnoxPersistence.getBasesForOwner("faction", faction.id)) do
+        local buildingId = base.home and base.home.buildingId
+        if buildingId and not basesByBuilding[buildingId] then basesByBuilding[buildingId] = base end
+    end
+    local keys = {}
+    for key in pairs(sites) do keys[#keys + 1] = key end
+    table.sort(keys)
+    for _, key in ipairs(keys) do
+        local site = sites[key]
+        local base = basesByBuilding[key]
+        if not base and site.area then
+            local area, blocked = site.area, false
+            for _, existing in pairs(KnoxPersistence.getBases()) do
+                local bounds = existing.territory or existing.home
+                if bounds then
+                    local maxX = bounds.maxX or bounds.minX + (bounds.width or 1) - 1
+                    local maxY = bounds.maxY or bounds.minY + (bounds.height or 1) - 1
+                    if area.minX <= maxX and area.minX + area.width - 1 >= bounds.minX
+                        and area.minY <= maxY and area.minY + area.height - 1 >= bounds.minY then blocked = true; break end
+                end
+            end
+            local ok, safehouse = pcall(function()
+                return SafeHouse.getSafehouseOverlapping(area.minX,area.minY,area.minX+area.width,area.minY+area.height)
+            end)
+            if not ok or (safehouse and tostring(safehouse:getOwner()) ~= "KnoxSurvivors:" .. faction.id) then blocked = true end
+            if not blocked then
+                base = KnoxPersistence.createBase("faction", faction.id, area, worldAge(), nil, true)
+                if base then
+                    base.name = "Fort Knox Military - " .. (KnoxPersistence.getSurvivorOrigin(site.members[1]).region or "Military facility")
+                    count = count + 1
+                    if not faction.homeBase then faction.homeBase, faction.homeBaseId = area, base.id end
+                end
+            end
+        end
+        if base then
+            for _, id in ipairs(site.members) do
+                local duty = KnoxPersistence.getSurvivorDuty(id)
+                -- Keep explicit work at another valid command base. A world
+                -- survivor becomes a resident of their own origin facility.
+                local assigned = duty and duty.mode == "base" and KnoxPersistence.getBase(duty.baseId) or nil
+                if not assigned or assigned.ownerKind ~= "faction" or assigned.ownerId ~= faction.id then
+                    local changed = KnoxPersistence.setFactionBaseResident(id, faction.id, base.id, worldAge())
+                    if changed then KnoxSurvivorRuntime.notifyDutyChanged(id) end
+                end
+            end
+            if KnoxSettings.autoGenerateBaseWorkAreas() then
+                ensureFactionZones(base, faction); ensureFactionStorage(base); ensureFactionBeds(base, faction)
+            end
+            if KnoxFactionSafehouse then KnoxFactionSafehouse.ensure(faction, base) end
+            BaseManager.applyFactionIntent(base, faction, BaseManager.factionIntentFacts(faction, base), worldAge())
+        end
+    end
+    return count
+end
+
+-- Unpromoted homes share ordinary zones, stock and beds. Only a loaded member
+-- at the home gains duty; absent members remain travelers until they arrive.
+function BaseManager.ensureGroupBase(group)
+    local base = group ~= nil and KnoxPersistence.getBaseForOwner("group",group.id) or nil
+    if base == nil or group.factionId ~= nil then return nil,"not_ready" end
+    local runtime = rawget(_G,"KnoxSurvivorRuntime")
+    if type(group.name)=="string" and group.name~="" and base.name=="Survivor Camp" then
+        base.name=group.name.." Home"
+    end
+    for _,id in ipairs(group.memberIds or {}) do
+        local character = runtime ~= nil and runtime.getCharacter ~= nil and runtime.getCharacter(id) or nil
+        if character ~= nil then
+            local changed,result=KnoxPersistence.setGroupBaseResident(id,group.id,base.id,character,worldAge())
+            if changed and result~="existing" and runtime.notifyDutyChanged ~= nil then runtime.notifyDutyChanged(id) end
+        end
+    end
+    if KnoxSettings.autoGenerateBaseWorkAreas() then
+        ensureFactionZones(base,group)
+        ensureFactionStorage(base)
+        ensureFactionBeds(base,group)
+    end
+    return base,"existing"
+end
+
 function BaseManager.ensureFactionBases()
+    for _,group in pairs(KnoxPersistence.getTravelGroups()) do BaseManager.ensureGroupBase(group) end
     for _, faction in pairs(KnoxPersistence.getFactions()) do
+        BaseManager.ensureMilitaryOutposts(faction)
         BaseManager.ensureFactionBase(faction)
     end
 end
@@ -1336,6 +1770,71 @@ function BaseManager.containsSquare(base, square)
     end
     return false
 end
+
+-- BASE GENERATOR MAINTENANCE (pure)
+-- A loaded generator belongs to a base by the square it stands on, never by a
+-- saved object index: vanilla uses that index only as a liveness check. The
+-- selection rule is the contract's: connected only, then lowest fuel
+-- percentage, then nearest base-home centre, then object index as the final
+-- in-session tie-break. Nothing here writes state or invents a target.
+function BaseManager.generatorBelongsToBase(base, generator)
+    if base == nil or generator == nil or generator.getSquare == nil then
+        return false
+    end
+    local okSquare, square = pcall(function() return generator:getSquare() end)
+    if not okSquare or square == nil then return false end
+    local okIndex, index = pcall(function() return generator:getObjectIndex() end)
+    if not okIndex or tonumber(index) == nil or tonumber(index) == -1 then
+        return false
+    end
+    return BaseManager.containsSquare(base, square) == true
+end
+
+function BaseManager.generatorMaintenanceTarget(base, generators)
+    local home = base ~= nil and (base.territory or base.home) or nil
+    if home == nil then return nil end
+    local minX, minY = tonumber(home.minX), tonumber(home.minY)
+    local maxX = home.maxX ~= nil and tonumber(home.maxX)
+        or (minX ~= nil and minX + (tonumber(home.width) or 1) - 1) or nil
+    local maxY = home.maxY ~= nil and tonumber(home.maxY)
+        or (minY ~= nil and minY + (tonumber(home.height) or 1) - 1) or nil
+    local centerX = minX ~= nil and maxX ~= nil and (minX + maxX) / 2 or nil
+    local centerY = minY ~= nil and maxY ~= nil and (minY + maxY) / 2 or nil
+    local target, targetFuel, targetDistance, targetIndex
+    for _, generator in pairs(type(generators) == "table" and generators or {}) do
+        if BaseManager.generatorBelongsToBase(base, generator) then
+            local okConnected, connected = pcall(function() return generator:isConnected() end)
+            local okFuel, fuel = pcall(function()
+                return tonumber(generator:getFuelPercentage())
+            end)
+            if okConnected and connected == true and okFuel and fuel ~= nil
+                and fuel == fuel and fuel >= 0 then
+                local square = generator:getSquare()
+                local x = square ~= nil and tonumber(square:getX()) or nil
+                local y = square ~= nil and tonumber(square:getY()) or nil
+                local distance = math.huge
+                if centerX ~= nil and centerY ~= nil and x ~= nil and y ~= nil then
+                    local dx, dy = x - centerX, y - centerY
+                    distance = dx * dx + dy * dy
+                end
+                local okIndex, index = pcall(function()
+                    return tonumber(generator:getObjectIndex())
+                end)
+                index = okIndex and index or math.huge
+                local better = target == nil or fuel < targetFuel
+                    or (fuel == targetFuel and distance < targetDistance)
+                    or (fuel == targetFuel and distance == targetDistance
+                        and index < targetIndex)
+                if better then
+                    target, targetFuel = generator, fuel
+                    targetDistance, targetIndex = distance, index
+                end
+            end
+        end
+    end
+    return target
+end
+-- END BASE GENERATOR MAINTENANCE
 
 function BaseManager.setTerritory(player, baseId, firstSquare, secondSquare)
     local base = BaseManager.get(baseId)
@@ -1842,6 +2341,15 @@ function BaseManager.canPerformTask(survivorId, baseId, task)
         return false, "capabilities_missing"
     end
     local character = KnoxSurvivorRuntime.getCharacter(survivorId)
+    if task ~= nil and task.type == "craft_bed" then
+        if BaseManager.bedCraftPlan(base, character) == nil then
+            return false, "bed_recipe_unavailable"
+        end
+    end
+    if task ~= nil and task.type == "prepare_bed"
+        and BaseManager.bedPreparationPlan(base, character) == nil then
+        return false, "bed_preparation_unavailable"
+    end
     local square=character~=nil and character:getCurrentSquare() or nil
     local jobs=rawget(_G,"KnoxBaseJobs")
     local atWork=square~=nil and jobs~=nil and jobs.containsWorkSquare~=nil
@@ -1870,6 +2378,21 @@ function BaseManager.canPerformTask(survivorId, baseId, task)
         local refusal = needs.heavyWorkRefusal(character, taskType)
         if refusal ~= nil then
             return false, tostring(refusal)
+        end
+    end
+    -- The sky is a reason a person gives at this same gate: an outdoor task is
+    -- refused while the body is soaked or out of temperature, so the planner
+    -- defers it instead of sending a resident out to fail it. Indoor work and a
+    -- body that cannot be read are untouched.
+    if needs ~= nil and needs.weatherWorkRefusal ~= nil and task ~= nil
+        and square ~= nil then
+        local outside = false
+        local readOk = pcall(function() outside = square:isOutside() == true end)
+        if readOk and outside then
+            local weather = needs.weatherWorkRefusal(character, true)
+            if weather ~= nil then
+                return false, "weather=" .. tostring(weather)
+            end
         end
     end
     return meetsRequirements(
@@ -2048,10 +2571,6 @@ local function layoutContainers(bounds)
         end
     end
     return result
-end
-
-local function layoutContainerCount(bounds)
-    return #layoutContainers(bounds)
 end
 
 local function layoutObjectSquare(object)
@@ -2268,8 +2787,54 @@ local function layoutCollectFallbackStorage(base, rooms, entries, proposed, used
     end
 end
 
-local function layoutClassifyRoom(name, containers, cookingAppliance)
+-- What stands in a room outranks what the map called it: a toilet, bathtub
+-- or shower makes a bathroom whatever the room name says. Sprite names are the
+-- only read; a room with no fixtures keeps its name-based classification.
+local LAYOUT_BATHROOM_WORDS = { "toilet", "bathtub", "bath tub", "shower", "urinal" }
+local LAYOUT_LIVING_WORDS = { "sofa", "couch", "armchair", "television", "bookcase", "bookshelf" }
+local LAYOUT_BED_WORDS = { "bed" }
+
+local function layoutSpriteName(object)
+    if object == nil or object.getSprite == nil then return "" end
+    local ok, sprite = pcall(function() return object:getSprite() end)
+    if not ok or sprite == nil or sprite.getName == nil then return "" end
+    local read, name = pcall(function() return sprite:getName() end)
+    return read and layoutText(name) or ""
+end
+
+local function layoutRoomFixtures(bounds)
+    local result = { bathroom = false, living = false, bed = false }
+    local cell = getCell ~= nil and getCell() or nil
+    if bounds == nil or cell == nil then return result end
+    for x = bounds.x1, bounds.x2 do
+        for y = bounds.y1, bounds.y2 do
+            local square = cell:getGridSquare(x, y, bounds.z)
+            local okObjects, objects = pcall(function() return square:getObjects() end)
+            if okObjects and objects ~= nil and objects.size ~= nil
+                and objects.get ~= nil then
+                for index = 0, objects:size() - 1 do
+                    local name = layoutSpriteName(objects:get(index))
+                    if name ~= "" then
+                        if layoutContainsAny(name, LAYOUT_BATHROOM_WORDS) then
+                            result.bathroom = true
+                        elseif layoutContainsAny(name, LAYOUT_LIVING_WORDS) then
+                            result.living = true
+                        elseif layoutContainsAny(name, LAYOUT_BED_WORDS) then
+                            result.bed = true
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return result
+end
+
+local function layoutClassifyRoom(name, containers, cookingAppliance, fixtures)
     local text = layoutText(name)
+    -- Fixtures win over the name: a bathroom stays a bathroom even when the
+    -- building data calls it a living room, so it never becomes a work area.
+    if type(fixtures) == "table" and fixtures.bathroom == true then return nil end
     if text == "" then return nil end
     for _, word in ipairs(LAYOUT_SKIP_WORDS) do
         if layoutContains(text, word) then return nil end
@@ -2292,6 +2857,7 @@ end
 -- One room classifier for the whole mod: the layout proposal and a claimed
 -- building's room map must never grow two word lists.
 BaseManager.classifyRoom = layoutClassifyRoom
+BaseManager.roomFixtures = layoutRoomFixtures
 
 local function layoutHasType(base, zoneType)
     for _, zone in pairs(base ~= nil and base.zones or {}) do
@@ -2547,7 +3113,7 @@ end
 -- woodcutting executor; it does not add a tree, storage or task.
 local LAYOUT_OUTDOOR_SIZE = 3
 local LAYOUT_OUTDOOR_LABELS = {
-    woodcutting = "Wood Lot", log_processing = "Log Yard",
+    woodcutting = "Wood Lot", log_processing = "Drop Point",
 }
 
 local function layoutHomeArea(base, z)
@@ -2682,6 +3248,24 @@ local function layoutOutdoorEntries(base, z)
     return entries
 end
 
+-- Initial setup uses the existing real-room proposal and canonical writers.
+-- Forestry remains an explicit player choice rather than automatic tree work.
+function BaseManager.applyStarterLayout(baseId, building, z, playerId, leader)
+    local proposed, reason = BaseManager.proposeLayout(baseId, building, z, leader)
+    if reason ~= "proposed" then return {added=0,assigned=0,reason=reason} end
+    -- Storage stays the player's to assign: claiming a base no longer files
+    -- containers by itself. The proposal still lists them in the menu, and NPC
+    -- faction and group homes keep their automatic siting (ensureFactionStorage).
+    local entries = {}
+    for _, entry in ipairs(proposed) do
+        if entry.zoneType ~= "woodcutting" and entry.zoneType ~= "log_processing" then
+            entries[#entries+1]=entry
+        end
+    end
+    local applied, refusal = BaseManager.applyLayout(baseId, entries, playerId, leader)
+    return applied or {added=0,assigned=0,reason=refusal}
+end
+
 function BaseManager.proposeLayout(baseId, building, z, leader)
     local base = KnoxPersistence.getBase(baseId)
     if base == nil then return {}, "base_missing" end
@@ -2712,7 +3296,9 @@ function BaseManager.proposeLayout(baseId, building, z, leader)
             local containerCount = #containers
             local reachable = layoutRoomReachable(bounds, leader)
             local cookingAppliance = layoutRoomHasCookingAppliance(bounds)
-            local zoneType, label = layoutClassifyRoom(roomName, containerCount, cookingAppliance)
+            local fixtures = layoutRoomFixtures(bounds)
+            local zoneType, label = layoutClassifyRoom(
+                roomName, containerCount, cookingAppliance, fixtures)
             if zoneType ~= nil and not layoutHasType(base, zoneType) then
                 local area = (bounds.x2 - bounds.x1 + 1) * (bounds.y2 - bounds.y1 + 1)
                 local current = best[zoneType]
@@ -2817,7 +3403,7 @@ function BaseManager.applyLayout(baseId, entries, playerId, leader)
         local zoneType = type(entry) == "table" and entry.zoneType or nil
         local bounds = type(entry) == "table" and entry.bounds or nil
         if type(zoneType) ~= "string" or type(bounds) ~= "table" then
-            skipped[#skipped + 1] = { zoneType = tostring(zoneType or "?"), reason = "invalid_entry" }
+            skipped[#skipped + 1] = { zoneType = tostring(zoneType or "unspecified"), reason = "invalid_entry" }
         elseif layoutHasType(base, zoneType) then
             skipped[#skipped + 1] = { zoneType = zoneType, reason = "existing" }
         else
@@ -2836,7 +3422,7 @@ function BaseManager.applyLayout(baseId, entries, playerId, leader)
         local containerIndex = type(entry) == "table" and tonumber(entry.containerIndex) or nil
         if type(category) ~= "string" or object == nil or containerIndex == nil then
             storageSkipped[#storageSkipped + 1] = {
-                category = tostring(category or "?"), reason = "invalid_storage_entry",
+                category = tostring(category or "unspecified"), reason = "invalid_storage_entry",
             }
         elseif layoutStorageAssigned(base, category) then
             storageSkipped[#storageSkipped + 1] = {
@@ -2874,12 +3460,9 @@ end
 -- END BASE LAYOUT PROPOSAL
 
 -- BASE RADIO ARRIVAL (pure)
--- D7.3: a broadcast is a call for help, and help is a real person on the road
--- the county already walks. The chance comes from the operator's Electrical
--- level, the interval is one world day, and the answer is decided by a roll
--- handed in by the caller so the rule is checkable without a save. Nothing
--- here stores anything: the base's radio record owns the last call and the
--- world population owner already owns who arrives.
+-- Radio arrival odds use the operator's Electrical level and a caller-supplied roll.
+-- Calls are limited to once per world day. The base radio record tracks the
+-- last call; world population handles the survivor arrival. These helpers store no state.
 local RADIO_ARRIVAL_INTERVAL_HOURS = 24
 
 -- The strongest living resident answers, exactly as the context menu decides
@@ -2902,7 +3485,7 @@ function BaseManager.radioArrivalChance(operatorLevel)
     local steps = math.floor(level)
     if steps < 1 then steps = 1 end
     if steps > 6 then steps = 6 end
-    -- Whole percent, not accumulated tenths: 0.10 + 0.05 is 0.15000000000000002 in binary floating point, and odds that drift by a bit are odds nobody can state.
+    -- Compute the percentage in integer steps before converting to a probability.
     return (10 + 5 * steps) / 100
 end
 

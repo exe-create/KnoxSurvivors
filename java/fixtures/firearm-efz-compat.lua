@@ -43,6 +43,9 @@ KnoxSettings={efzFirearmCompatibility=function() return false end,
     survivorAimingAssist=function() return 1 end}
 local wanted=KnoxFirearmSupport.wantsRanged("codec-person",actor,target,false)
 assert(wanted==false,"disabled EFZ option must retain the ordinary choice")
+local groupWanted, groupReason = KnoxFirearmSupport.wantsRanged("codec-person",actor,target,false,true)
+assert(groupWanted==false and groupReason=="group_melee_preference",
+    "a party with usable steel prefers melee so gunfire does not pull the horde in")
 KnoxSettings.efzFirearmCompatibility=function() return true end
 wanted=KnoxFirearmSupport.wantsRanged("codec-person",actor,target,false)
 assert(wanted==true,"EFZ option should recognize a carried gun with compatible ammo")

@@ -7,6 +7,7 @@ require "Vehicles/TimedActions/ISCloseVehicleDoor"
 require "KS_Settings"
 require "KS_VehicleNavigation"
 require "Vehicles/TimedActions/ISSwitchVehicleSeat"
+require "Vehicles/TimedActions/ISStartVehicleEngine"
 
 -- Native entry/seat/exit actions and physics, with bounded Knox route planning
 -- on loaded ground. Driving remains opt-in until live physics acceptance.
@@ -24,6 +25,7 @@ local ACTION_TIMEOUT_MS = 45000
 local DRIVER_DISTANCE = 18
 local DRIVER_STOP_DISTANCE = 2.5
 local DRIVER_TIMEOUT_MS = 180000
+local ENGINE_START_TIMEOUT_MS = 15000
 local PLAYER_SYNC_DISTANCE_SQUARED = 30 * 30
 local HANDOFF_DRIVER_DISTANCE = 18
 local HANDOFF_WAIT_MS = 10000
@@ -200,6 +202,16 @@ local function retryAwaitingExits()
 end
 
 function CompanionVehicles.cancel(character, keepPassengers)
+    if character ~= nil and character.isDead ~= nil and character:isDead() then
+        local persistence, runtime = rawget(_G, "KnoxPersistence"), rawget(_G, "KnoxSurvivorRuntime")
+        local id = runtime ~= nil and runtime.idForCharacter ~= nil and runtime.idForCharacter(character) or nil
+        local record = id ~= nil and persistence ~= nil and persistence.getVehicleAssignmentForSurvivor ~= nil
+            and persistence.getVehicleAssignmentForSurvivor(id) or nil
+        if record ~= nil and record.claimSource == "autonomous" and record.driverId == id
+            and persistence.clearVehicleAssignment ~= nil then
+            persistence.clearVehicleAssignment(record.vehicleKey, "claimant_dead")
+        end
+    end
     if awaitingExit[character] ~= nil then awaitingExit[character] = nil end
     local run = driverRuns[character]
     stopDriver(character)
@@ -276,7 +288,8 @@ end
 local function queueActions(character, vehicle, seat, actions, options)
     local runtime = rawget(_G, "KnoxSurvivorRuntime")
     local id = runtime ~= nil and runtime.idForCharacter(character) or nil
-    if id == nil or runtime.prepareVehicle == nil or not runtime.prepareVehicle(id) then
+    if id == nil or (not (options ~= nil and options.alreadyPrepared)
+        and (runtime.prepareVehicle == nil or not runtime.prepareVehicle(id))) then
         return false, "survivor_busy"
     end
     local request = { vehicle = vehicle, seat = seat, survivorId = id,
@@ -791,6 +804,12 @@ local function tickTakeovers(now)
         elseif not request.vehicle:isSeatOccupied(0)
             and request.vehicle:getSeat(companion) == request.seat then
             takeoverRequests[companion] = nil
+            local persistence = rawget(_G, "KnoxPersistence")
+            local assignment = persistence ~= nil and persistence.getVehicleAssignmentFor ~= nil
+                and persistence.getVehicleAssignmentFor(request.vehicle) or nil
+            if assignment ~= nil and assignment.claimSource == "autonomous" then
+                persistence.clearVehicleAssignment(assignment.vehicleKey, "player_takeover")
+            end
             if KnoxActivityFeed ~= nil and KnoxActivityFeed.event ~= nil then
                 KnoxActivityFeed.event("The driver seat is free. Take the wheel.")
             end
@@ -856,7 +875,7 @@ end
 -- driver run is the one place that already knows who is in the car, so the
 -- assignment mirrors that fact instead of inventing a second ownership: it is
 -- written when a run starts and released when the run ends.
-local function recordAssignment(character, vehicle, role)
+local function recordAssignment(character, vehicle, role, claimSource)
     local persistence = rawget(_G, "KnoxPersistence")
     local runtime = rawget(_G, "KnoxSurvivorRuntime")
     if persistence == nil or persistence.setVehicleAssignment == nil
@@ -878,11 +897,12 @@ local function recordAssignment(character, vehicle, role)
     if ownerId == nil or ownerId == "" then return end
     local hours = getGameTime ~= nil and getGameTime() ~= nil
         and tonumber(getGameTime():getWorldAgeHours()) or 0
-    pcall(persistence.setVehicleAssignment, {
+    local ok, record = pcall(persistence.setVehicleAssignment, {
         vehicleKey = key, ownerKind = ownerKind, ownerId = ownerId,
         driverId = id, passengerIds = {}, role = role or "transport",
-        createdAtHours = hours,
+        createdAtHours = hours, claimSource = claimSource,
     }, hours)
+    return ok and record ~= nil
 end
 
 local function releaseAssignment(character, vehicle)
@@ -900,11 +920,14 @@ local function releaseAssignment(character, vehicle)
         key = type(record) == "table" and record.vehicleKey or nil
     end
     if key ~= nil then
-        pcall(persistence.clearVehicleAssignment, key, "run_ended")
+        local record = persistence.getVehicleAssignment ~= nil and persistence.getVehicleAssignment(key) or nil
+        local dead = character ~= nil and character.isDead ~= nil and character:isDead()
+        if record ~= nil and record.claimSource == "autonomous" and not dead then return end
+        pcall(persistence.clearVehicleAssignment, key, dead and "claimant_dead" or "run_ended")
     end
 end
 
-local function startDrive(character,vehicle,destination)
+local function startDrive(character,vehicle,destination,options)
     if KnoxSettings==nil or not KnoxSettings.enableExperimentalNpcDriving() then return false,"npc_driving_disabled" end
     if character==nil or vehicle==nil then return false,"vehicle_unavailable" end
     -- One survivor belongs to one vehicle. A live assignment for a different
@@ -921,13 +944,20 @@ local function startDrive(character,vehicle,destination)
             return false,"already_assigned_elsewhere"
         end
     end
+    local travelOwner = rawget(_G, "KnoxNpcVehicleTravel")
+    if travelOwner ~= nil and travelOwner.claimAdmission ~= nil then
+        local allowed, why = travelOwner.claimAdmission(character, vehicle,
+            options ~= nil and options.autonomousClaim == true)
+        if not allowed then return false, why end
+    elseif options ~= nil and options.autonomousClaim == true then
+        return false, "vehicle_claim_unavailable"
+    end
     local occupied=character:getVehicle()
     if occupied~=nil and occupied~=vehicle then return false,"already_in_vehicle" end
     if CompanionVehicles.isBusy(character) then return false,"vehicle_action_pending" end
     local driver=vehicle:getDriver()
     if driver~=nil and driver~=character then return false,"driver_seat_occupied" end
     if driver~=character and math.abs(vehicle:getCurrentSpeedKmHour())>1 then return false,"vehicle_moving" end
-    if not vehicle:isEngineRunning() then return false,"vehicle_engine_off" end
     if not vehicle:isDriveable() then return false,"vehicle_not_driveable" end
     -- One admission owner. If the shared travel module is absent there is no
     -- audited key/fuel/lock verdict, so driving fails closed instead of growing
@@ -954,7 +984,7 @@ local function startDrive(character,vehicle,destination)
         local runtime=rawget(_G,"KnoxSurvivorRuntime")
         local id=runtime~=nil and runtime.idForCharacter(character) or nil
         if id==nil or not runtime.prepareVehicle(id) then return false,"survivor_busy" end
-        phase="driving"
+        phase="boarding"
     else
         if occupied~=vehicle and not usableDriverSeat(character,vehicle) then return false,"driver_seat_unavailable" end
         if occupied==vehicle and (vehicle:isSeatOccupied(0) or reserved(vehicle,0,character)
@@ -979,15 +1009,20 @@ local function startDrive(character,vehicle,destination)
     driverRuns[character]={vehicle=vehicle,route=route,index=1,goal=route[#route],
         geometry=geometry,phase=phase,deadline=getTimestampMs()+DRIVER_TIMEOUT_MS,
         health=health(character),lastProgress=getTimestampMs(),lastX=vehicle:getX(),lastY=vehicle:getY()}
-    recordAssignment(character,vehicle,"transport")
+    local claimed = options ~= nil and options.autonomousClaim == true
+    local recorded = recordAssignment(character,vehicle,"transport",claimed and "autonomous" or nil)
+    if claimed and not recorded then
+        CompanionVehicles.cancel(character)
+        return false,"vehicle_claim_unavailable"
+    end
     return true,destination~=nil and "driving_to_destination" or "driving_ahead"
 end
 
 function CompanionVehicles.driveAhead(character,vehicle)
     return startDrive(character,vehicle,nil)
 end
-function CompanionVehicles.driveTo(character,vehicle,x,y,z)
-    return startDrive(character,vehicle,{x=x,y=y,z=z})
+function CompanionVehicles.driveTo(character,vehicle,x,y,z,options)
+    return startDrive(character,vehicle,{x=x,y=y,z=z},options)
 end
 function CompanionVehicles.stopDriving(character)
     local active=driverRuns[character]~=nil
@@ -1018,7 +1053,7 @@ function CompanionVehicles.setRunPassengers(character, vehicle, roster)
 end
 
 local function finishDrive(character,reason)
-    -- The assignment mirrors the run, so it is released with it.
+    -- Ordinary run assignments end here; autonomous claims survive a stop.
     local ended=driverRuns[character]
     -- cancel() settles the attached passenger roster as part of teardown,
     -- so every abort and arrival shares one rollback owner.
@@ -1036,19 +1071,42 @@ local function tickDrive(character,run,now)
     if now>=run.deadline or character:isDead() or not KnoxSettings.enableExperimentalNpcDriving() then
         finishDrive(character,"interrupted");return
     end
+    local healthNow=health(character)
+    if healthNow~=nil and run.health~=nil and healthNow<run.health then
+        finishDrive(character,"interrupted");return
+    end
     if run.phase=="boarding" then
-        if character:getVehicle()==vehicle and vehicle:getDriver()==character then
+        if character:getVehicle()~=vehicle or vehicle:getDriver()~=character then
+            if not CompanionVehicles.isBusy(character) then finishDrive(character,"boarding_failed") end
+            return
+        end
+        if CompanionVehicles.isBusy(character) then return end
+        if vehicle:isEngineRunning() then
             run.phase="driving";run.lastProgress=now
-        elseif not CompanionVehicles.isBusy(character) then finishDrive(character,"boarding_failed") end
+        else
+            resetDriverControls(run,character)
+            local built,action=pcall(function() return assert(ISStartVehicleEngine:new(character)) end)
+            if not built then finishDrive(character,"vehicle_start_action_unavailable");return end
+            local queued=queueActions(character,vehicle,0,{action},{alreadyPrepared=true})
+            if not queued then finishDrive(character,"vehicle_start_action_failed");return end
+            run.phase="starting";run.startDeadline=now+ENGINE_START_TIMEOUT_MS
+        end
         return
     end
     if character:getVehicle()~=vehicle or vehicle:getDriver()~=character then
         finishDrive(character,"driver_changed");return
     end
+    if run.phase=="starting" then
+        if vehicle:isEngineRunning() and not CompanionVehicles.isBusy(character) then
+            run.phase="driving";run.lastProgress=now
+        elseif now>=run.startDeadline then
+            finishDrive(character,"vehicle_engine_off")
+        end
+        return
+    end
     local current=vehicle:getSquare()
     local controller=vehicle:getController()
     local controls=controller~=nil and controller:getClientControls() or nil
-    local healthNow=health(character)
     if current==nil or controls==nil or not vehicle:isDriveable() or not vehicle:isEngineRunning()
         or (healthNow~=nil and run.health~=nil and healthNow<run.health) then
         finishDrive(character,"vehicle_unavailable");return

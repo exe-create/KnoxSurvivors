@@ -112,13 +112,17 @@ local function containerObjects(worldobjects, bases)
 end
 
 function BaseContextMenu.establish(player, square)
-    local base, result = KnoxBaseManager.establishPlayerBase(player, square)
+    local base, result, starter = KnoxBaseManager.establishPlayerBase(player, square)
     if base ~= nil and result == "existing" then
         KnoxActivityFeed.event("This building is already your home base.")
     elseif base ~= nil and result == "move_confirmation_required" then
         KnoxActivityFeed.event("You already have a home base. Use Move Home Base Here to confirm a move.")
     elseif base ~= nil then
-        KnoxActivityFeed.event("Home base established.")
+        local setup = starter and (tonumber(starter.added) or 0) + (tonumber(starter.assigned) or 0) or 0
+        KnoxActivityFeed.event(setup > 0
+            and ("Home base established: " .. tostring(starter.added or 0) .. " starter work areas, "
+                .. tostring(starter.assigned or 0) .. " storage assignments. Review Base & Work.")
+            or "Home base established. Use Layout Proposal to review available work areas and storage.")
     else
         KnoxActivityFeed.event("Could not establish a base here: " .. tostring(result) .. ".")
     end
@@ -307,7 +311,15 @@ local function bedReference(object)
     }
 end
 
+-- Admission comes from the sleep owner, not a second list: only furniture
+-- vanilla's sleep transition would animate (a declared BedType, or the
+-- tent/shelter special case) can be assigned. A vehicle seat is a different
+-- native path and is not offered here.
 local function isBedObject(object)
+    local needs = rawget(_G, "KnoxSurvivorNeeds")
+    if needs ~= nil and needs.sleepAdmissible ~= nil then
+        return needs.sleepAdmissible(object) == true
+    end
     if object == nil or object.getProperties == nil then return false end
     local ok, properties = pcall(function() return object:getProperties() end)
     if not ok or properties == nil then return false end
@@ -404,6 +416,48 @@ function BaseContextMenu.unassignBed(target)
         or ("Could not unassign bed: " .. tostring(reason)))
 end
 
+-- A saved assignment can point at furniture this build will not sleep on (a
+-- chair assigned by an older build, a removed sprite). Read it, never clear it
+-- behind the player's back: surface it here so it can be re-homed on the same
+-- surface that made it. An unloaded square is unknown, not stale.
+local function staleBedAssignees(candidates)
+    local stale = {}
+    for _, candidate in ipairs(candidates) do
+        local policies = nil
+        pcall(function()
+            if KnoxPersistence.getSurvivorPolicies ~= nil then
+                policies = KnoxPersistence.getSurvivorPolicies(candidate.id)
+            end
+        end)
+        local assigned = type(policies) == "table" and policies.assignedBed or nil
+        if type(assigned) == "table" then
+            local square, object = nil, nil
+            pcall(function()
+                square = getCell() ~= nil and getCell():getGridSquare(
+                    tonumber(assigned.x) or 0,
+                    tonumber(assigned.y) or 0,
+                    tonumber(assigned.z) or 0
+                ) or nil
+                local objects = square ~= nil and square:getObjects() or nil
+                if objects ~= nil then
+                    for index = 0, objects:size() - 1 do
+                        local candidateObject = objects:get(index)
+                        if candidateObject ~= nil
+                            and candidateObject:getObjectIndex()
+                                == tonumber(assigned.objectIndex) then
+                            object = candidateObject
+                            break
+                        end
+                    end
+                end
+            end)
+            if square ~= nil and not isBedObject(object) then
+                stale[#stale + 1] = candidate
+            end
+        end
+    end
+    return stale
+end
 local function addBedMenu(parent, base, player, playerId, worldobjects)
     local bed = nil
     for _, object in ipairs(worldobjects or {}) do
@@ -417,6 +471,17 @@ local function addBedMenu(parent, base, player, playerId, worldobjects)
     local root = parent:addOption("Assign Bed", nil, nil)
     local menu = ISContextMenu:getNew(parent)
     parent:addSubMenu(root, menu)
+    -- Re-homing: an assignment this build cannot sleep on is named here with
+    -- the way out, instead of being ignored the next night.
+    for _, staleCandidate in ipairs(staleBedAssignees(candidates)) do
+        local status = menu:addOption(
+            staleCandidate.name .. ": assigned bed is not sleepable here",
+            nil, nil)
+        status.notAvailable = true
+        menu:addOption("Unassign " .. staleCandidate.name .. "'s bed",
+            { survivorId = staleCandidate.id, playerId = playerId },
+            BaseContextMenu.unassignBed)
+    end
     if current ~= nil then
         local status = menu:addOption("Assigned: " .. current.name, nil, nil)
         status.notAvailable = true
@@ -794,7 +859,7 @@ function BaseContextMenu.orderBarricadeHere(player, base, square)
     KnoxActivityFeed.event(assigned > 0
         and (tostring(assigned) .. (assigned == 1 and " resident assigned; " or " residents assigned; ")
             .. tostring(queued) .. " window jobs ordered.")
-        or ("Barricade work queued (" .. tostring(queued) .. ") — residents will take it."))
+        or ("Barricade work queued (" .. tostring(queued) .. ") - residents will take it."))
 end
 
 function BaseContextMenu.burnCorpsesHere(player, base, square)
@@ -818,7 +883,7 @@ local function addStorageMenu(parent, base, object, playerNum)
         local kind = container ~= nil and string.lower(tostring(container:getType() or "")) or ""
         local unusable = kind == "corpse" or kind:find("water", 1, true) ~= nil
             or kind:find("rain", 1, true) ~= nil
-        local option = parent:addOption("Set Filters…", base.id,
+        local option = parent:addOption("Set Filters...", base.id,
             BaseContextMenu.openStorageFilters, object, 0, playerNum)
         option.notAvailable = unusable
         return
@@ -870,7 +935,7 @@ local function addStorageMenu(parent, base, object, playerNum)
             local kind = string.lower(tostring(container:getType() or ""))
             local unusable = kind == "corpse" or kind:find("water", 1, true) ~= nil
                 or kind:find("rain", 1, true) ~= nil
-            local filtersOption = targetMenu:addOption("Set Filters…", base.id,
+            local filtersOption = targetMenu:addOption("Set Filters...", base.id,
                 BaseContextMenu.openStorageFilters, object, containerIndex, playerNum)
             filtersOption.notAvailable = unusable
         end
@@ -978,7 +1043,7 @@ function BaseContextMenu.onFill(playerNum, context, worldobjects, test)
         local depotZone = KnoxBaseStorage.depotZoneAt ~= nil
             and KnoxBaseStorage.depotZoneAt(base, square:getX(), square:getY(), square:getZ()) or nil
         if depotZone ~= nil then
-            menu:addOption("Depot Filters — " .. tostring(depotZone.label or "Depot"),
+            menu:addOption("Depot Filters - " .. tostring(depotZone.label or "Depot"),
                 player, BaseContextMenu.openDepotFilters, depotZone)
         end
         local currentIntent = KnoxPersistence.getBaseIntent ~= nil
@@ -1041,7 +1106,7 @@ function BaseContextMenu.onFill(playerNum, context, worldobjects, test)
                     local width = math.abs((tonumber(bounds.x2) or 0) - (tonumber(bounds.x1) or 0)) + 1
                     local height = math.abs((tonumber(bounds.y2) or 0) - (tonumber(bounds.y1) or 0)) + 1
                     local line = layoutMenu:addOption(
-                        tostring(entry.label or entry.zoneType) .. " — "
+                        tostring(entry.label or entry.zoneType) .. " - "
                             .. tostring(entry.zoneType) .. " ("
                             .. tostring(width) .. "x" .. tostring(height) .. ")",
                         nil, nil)
@@ -1050,14 +1115,14 @@ function BaseContextMenu.onFill(playerNum, context, worldobjects, test)
                 for _, entry in ipairs(storageEntries) do
                     local line = layoutMenu:addOption(
                         "Storage: " .. tostring(entry.label or entry.category)
-                            .. " (" .. tostring(entry.category) .. ") — "
+                            .. " (" .. tostring(entry.category) .. ") - "
                             .. tostring(entry.roomLabel or "container"),
                         nil, nil)
                     line.notAvailable = true
                 end
                 layoutMenu:addOption("Apply Layout", player,
                     BaseContextMenu.applyLayout, layoutBase, entries)
-                layoutMenu:addOption("Edit Work Areas…", BaseContextMenu,
+                layoutMenu:addOption("Edit Work Areas...", BaseContextMenu,
                     BaseContextMenu.openSetup, playerNum)
                 layoutMenu:addOption("Dismiss", player,
                     BaseContextMenu.dismissLayout, layoutBase)
@@ -1127,10 +1192,10 @@ function BaseContextMenu.radioStatusText(parts)
     elseif source.battery == true then power = "battery"
     else power = "no power" end
     local line = "Radio: " .. (source.on == true and "switched on" or "switched off")
-        .. " · " .. power
+        .. ", " .. power
     local range = tonumber(source.range)
     if range ~= nil and range > 0 then
-        line = line .. " · transmit " .. tostring(math.floor(range))
+        line = line .. ", transmit " .. tostring(math.floor(range))
     end
     return line
 end
@@ -1158,7 +1223,7 @@ local function baseRadioObject(worldobjects, base)
     return nil
 end
 
-function BaseContextMenu.toggleRadio(radio, player, on)
+function BaseContextMenu.toggleRadio(player, radio, on, base)
     if radio == nil then return end
     local device = nil
     pcall(function() device = radio:getDeviceData() end)
@@ -1168,6 +1233,14 @@ function BaseContextMenu.toggleRadio(radio, player, on)
         return device:getIsTurnedOn()
     end)
     local feed = rawget(_G, "KnoxActivityFeed")
+    if ok and nowOn == false and on == false and base ~= nil then
+        local persistence = rawget(_G, "KnoxPersistence")
+        if persistence ~= nil and persistence.setBaseRadioMode ~= nil then
+            local owner = persistence.ensurePlayerId(player)
+            local hours = getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
+            persistence.setBaseRadioMode(base.id, owner, "off", hours)
+        end
+    end
     if feed == nil or feed.event == nil then return end
     if ok and nowOn == on then
         feed.event(on == true and "Radio switched on." or "Radio switched off.")
@@ -1225,12 +1298,13 @@ end
 -- Setting a mode writes the one record and moves the real device with it: on to
 -- listen or call, off to off. A call also puts one line through the audited
 -- device text so the set visibly transmits, and says plainly that no answer has
--- come back — the arrival roll is a later pass, not an invented reply here.
-function BaseContextMenu.setRadioMode(radio, base, playerId, mode, worldAgeHours)
+-- come back - the arrival roll is a later pass, not an invented reply here.
+function BaseContextMenu.setRadioMode(player, radio, base, playerId, mode, worldAgeHours)
     if radio == nil or base == nil then return end
     local persistence = rawget(_G, "KnoxPersistence")
     local feed = rawget(_G, "KnoxActivityFeed")
     if persistence == nil or persistence.setBaseRadioMode == nil then return end
+    local previous = persistence.getBaseRadioMode(base.id)
     local ok, detail = persistence.setBaseRadioMode(base.id, playerId, mode, worldAgeHours)
     if ok ~= true then
         if feed ~= nil and feed.event ~= nil then
@@ -1240,8 +1314,19 @@ function BaseContextMenu.setRadioMode(radio, base, playerId, mode, worldAgeHours
     end
     local device = nil
     pcall(function() device = radio:getDeviceData() end)
-    if device ~= nil then
-        pcall(function() device:setIsTurnedOn(mode ~= "off") end)
+    local switched, nowOn = pcall(function()
+        if device == nil then return nil end
+        device:setIsTurnedOn(mode ~= "off")
+        return device:getIsTurnedOn()
+    end)
+    if not switched or nowOn ~= (mode ~= "off") then
+        -- A saved broadcast cannot stand in for a device that never switched.
+        persistence.setBaseRadioMode(base.id, playerId, previous, worldAgeHours)
+        if feed ~= nil and feed.event ~= nil then
+            feed.event(mode ~= "off" and "The radio will not switch on here."
+                or "The radio will not switch off here.")
+        end
+        return false, "device_refused"
     end
     if mode == "broadcast" then
         local square = nil
@@ -1289,7 +1374,7 @@ addRadioMenu = function(menu, base, player, worldobjects)
     }), nil, nil)
     status.notAvailable = true
     menu:addOption(on and "Switch Radio Off" or "Switch Radio On", player,
-        BaseContextMenu.toggleRadio, radio, not on)
+        BaseContextMenu.toggleRadio, radio, not on, base)
     local persistence = rawget(_G, "KnoxPersistence")
     local playerId = persistence ~= nil and persistence.ensurePlayerId ~= nil
         and persistence.ensurePlayerId(player) or nil

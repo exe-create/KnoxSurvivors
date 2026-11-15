@@ -21,7 +21,7 @@ assert(cautious.known == true and cautious.label == "Cautious", "50 trust is cau
 assert(cautious.fill > 0.499 and cautious.fill < 0.501, "50 trust fills half the bar")
 assert(cautious.nextLabel == "Trusting" and cautious.nextAt == 70, "next band is trusting")
 assert(cautious.nextText == "20 to Trusting", "threshold in words: " .. tostring(cautious.nextText))
-assert(cautious.delta == 4 and cautious.deltaText == "+4 · defended them",
+assert(cautious.delta == 4 and cautious.deltaText == "+4 - defended them",
     "the last real change is named: " .. tostring(cautious.deltaText))
 
 local trusted = view.personal({ trust = 85 })
@@ -41,10 +41,10 @@ assert(view.personal({ trust = 30, lastTrustDelta = 0 }).deltaText == nil,
 assert(view.personal({ trust = 30, lastTrustCause = "defense" }).deltaText == nil,
     "a cause without a delta does not invent a number")
 local unknown = view.personal({ trust = 30, lastTrustDelta = 3, lastTrustCause = "??" })
-assert(unknown.deltaText == "+3 · their trust changed",
+assert(unknown.deltaText == "+3 - their trust changed",
     "an unknown cause never leaks an internal code")
 assert(view.personal({ trust = 30, lastTrustDelta = -12, lastTrustCause = "insult" }).deltaText
-    == "-12 · was insulted", "a negative change keeps its sign and cause")
+    == "-12 - was insulted", "a negative change keeps its sign and cause")
 assert(view.personal({ trust = 0 }).fill == 0, "zero fills none of the bar")
 assert(view.personal({ trust = 100 }).fill == 1, "full trust fills the bar")
 assert(view.personal({ trust = 140 }).fill == 1, "a legacy out-of-range score clamps")
@@ -63,7 +63,7 @@ local neutral = view.faction({ disposition = "neutral", reputation = 0,
 assert(neutral.label == "Neutral" and neutral.shortLabel == "Neutral"
     and neutral.fill == 0.5 and neutral.zero == 0.5,
     "zero faction reputation sits on the zero tick")
-assert(neutral.deltaText == "+2 · you helped defend them",
+assert(neutral.deltaText == "+2 - you helped defend them",
     "faction chip uses the faction side's wording: " .. tostring(neutral.deltaText))
 
 local allied = view.faction({ disposition = "allied", reputation = 40 }, "Watch")
@@ -74,7 +74,7 @@ local enemy = view.faction({ disposition = "hostile", reputation = -100,
     lastReputationDelta = -20, lastReputationCause = "aggression" }, "Watch")
 assert(enemy.label == "Hostile" and enemy.tone == "hostile" and enemy.fill == 0,
     "hostile reputation fills the far left")
-assert(enemy.deltaText == "-20 · you attacked one of them",
+assert(enemy.deltaText == "-20 - you attacked one of them",
     "hostile action is named on the faction bar")
 
 local capped = view.faction({ disposition = "allied", reputation = 250 }, "Watch")
@@ -86,7 +86,7 @@ assert(oldReason.deltaText == nil,
     "an old save with only a reason does not invent a delta")
 local legacyDelta = view.faction({ disposition = "hostile", reputation = -20,
     lastReputationDelta = -20, reason = "player_aggression" }, "Watch")
-assert(legacyDelta.deltaText == "-20 · you attacked one of them",
+assert(legacyDelta.deltaText == "-20 - you attacked one of them",
     "a legacy reason still worded through the current cause table")
 
 -- 5. Personal and faction never merge. One trusting person in a hostile

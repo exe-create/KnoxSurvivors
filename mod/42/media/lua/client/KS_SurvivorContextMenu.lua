@@ -14,6 +14,7 @@ require "KS_CompanionInventory"
 require "KS_Settings"
 require "KS_TradeUI"
 require "KS_OrderCatalog"
+require "KS_MissionTargets"
 pcall(require, "KS_SurvivorInteractionUI")
 if rawget(_G, "KnoxOrderCatalog") == nil then
     _G.KnoxOrderCatalog = { label = function(_, _, fallback) return fallback or "Order" end }
@@ -30,6 +31,11 @@ local function refreshHud(playerNum)
         hud.refresh(playerNum)
     end
 end
+
+require "ISUI/ISPanel"
+require "ISUI/ISButton"
+require "ISUI/ISTextEntryBox"
+require "ISUI/ISLabel"
 
 local function runService(playerNum, callback, survivorId)
     local player = getSpecificPlayer(playerNum)
@@ -86,10 +92,6 @@ local function legacyCommandsVisible()
     return false
 end
 
-local function onTalk(_, playerNum, survivorId)
-    runService(playerNum, KnoxCompanionService.talk, survivorId)
-end
-
 local function onOpenInteraction(_, playerNum, survivorId)
     local player = getSpecificPlayer(playerNum)
     local interaction = rawget(_G, "KnoxSurvivorInteractionUI")
@@ -113,18 +115,6 @@ local function onOpenInteraction(_, playerNum, survivorId)
             feed.event("Could not open survivor interaction.")
         end
     end
-end
-
-local function onAskNeeds(_, playerNum, survivorId)
-    runService(playerNum, function(player, id)
-        return KnoxCompanionService.issueOrder(player, id, "check_needs")
-    end, survivorId)
-end
-
-local function onSocialAct(_, playerNum, survivorId, act)
-    runService(playerNum, function(player, id)
-        return KnoxCompanionService.socialAct(player, id, act)
-    end, survivorId)
 end
 
 local function onTrade(_, playerNum, survivorId)
@@ -397,16 +387,52 @@ local function onBoardPlayerVehicle(_, playerNum, survivorId)
     end, survivorId)
 end
 
+local function drivingOrdersEnabled()
+    local settings = rawget(_G, "KnoxSettings")
+    return settings ~= nil and settings.enableExperimentalNpcDriving ~= nil
+        and settings.enableExperimentalNpcDriving() == true
+end
+SurvivorContextMenu.drivingOrdersEnabled = drivingOrdersEnabled
+
 local function onDriveAhead(_, playerNum, survivorId)
     runService(playerNum, function(player, id)
+        if not drivingOrdersEnabled() then return false, "npc_driving_disabled" end
         return KnoxCompanionService.issueOrder(player, id, "drive_ahead")
     end, survivorId)
 end
 
 local function onDriveNearestVehicle(_, playerNum, survivorId)
     runService(playerNum, function(player, id)
+        if not drivingOrdersEnabled() then return false, "npc_driving_disabled" end
         return KnoxCompanionService.issueOrder(player, id, "drive_nearest_vehicle")
     end, survivorId)
+end
+
+-- One owner for the vehicle rows, shared by the live menu and the offline gate
+-- fixture. Passenger boarding and leaving stay available without the wheel.
+function SurvivorContextMenu.addVehicleOrderOptions(menu, player, playerNum, survivorId)
+    if menu == nil or player == nil or player.getVehicle == nil then return end
+    local companion = KnoxSurvivorRuntime ~= nil and KnoxSurvivorRuntime.getCharacter ~= nil
+        and KnoxSurvivorRuntime.getCharacter(survivorId) or nil
+    if companion ~= nil and companion.getVehicle ~= nil and companion:getVehicle() ~= nil then
+        menu:addOption(KnoxOrderCatalog.label("exit_vehicle"), SurvivorContextMenu,
+            onExitVehicle, playerNum, survivorId)
+    elseif player:getVehicle() ~= nil then
+        menu:addOption(KnoxOrderCatalog.label("enter_vehicle"), SurvivorContextMenu,
+            onBoardPlayerVehicle, playerNum, survivorId)
+        if drivingOrdersEnabled() then
+            local drive = menu:addOption(
+                KnoxOrderCatalog.label("drive_ahead", "Take Driver Seat & Drive"),
+                SurvivorContextMenu, onDriveAhead, playerNum, survivorId)
+            local vehicle = player:getVehicle()
+            if vehicle.isDriver ~= nil and vehicle:isDriver(player) then
+                drive.notAvailable = true
+            end
+        end
+    elseif drivingOrdersEnabled() then
+        menu:addOption(KnoxOrderCatalog.label("drive_nearest_vehicle"),
+            SurvivorContextMenu, onDriveNearestVehicle, playerNum, survivorId)
+    end
 end
 
 local function onExitVehicle(_, playerNum, survivorId)
@@ -541,6 +567,156 @@ local function onBaseJobPreference(_, playerNum, survivorId, preference)
     runService(playerNum, function(player, id)
         return KnoxCompanionService.issueOrder(player, id, preference)
     end, survivorId)
+end
+
+-- One text prompt for the one genuinely new order. It writes through the same
+-- supply-order field as the preset survival orders, so trip planning, permission
+-- checks and cancel behave identically.
+-- The dialog class is built on first use. Deriving it at file load made this
+-- module impossible to load in a headless harness (or any context without the
+-- UI modules), which is exactly how the roster went untested before.
+local FetchItemDialog = nil
+local function fetchItemDialogClass()
+    if FetchItemDialog ~= nil then return FetchItemDialog end
+    if type(ISPanel) ~= "table" and type(ISPanel) ~= "userdata" then return nil end
+    local dialog = ISPanel:derive("KNFetchItemDialog")
+    function dialog:new(x, y, w, h, playerNum, survivorId)
+        local o = ISPanel.new(self, x, y, w, h)
+        o.playerNum = playerNum
+        o.survivorId = survivorId
+        return o
+    end
+    function dialog:createChildren()
+        self.title = ISLabel:new(12, 10, 20, "Fetch which item? (Module.Type)", 1, 1, 1, 1, UIFont.Small, true)
+        self.title:initialise()
+        self:addChild(self.title)
+        self.entry = ISTextEntryBox:new("", 12, 36, self.width - 24, 24)
+        self.entry:initialise()
+        self.entry:instantiate()
+        self:addChild(self.entry)
+        local ok = ISButton:new(self.width - 200, self.height - 32, 88, 24, "Order", self,
+            dialog.onOrder)
+        ok:initialise()
+        ok:instantiate()
+        self:addChild(ok)
+        local cancel = ISButton:new(self.width - 104, self.height - 32, 88, 24, "Cancel", self,
+            dialog.onCancel)
+        cancel:initialise()
+        cancel:instantiate()
+        self:addChild(cancel)
+    end
+    function dialog:onOrder()
+        local text = self.entry ~= nil and self.entry:getText() or ""
+        SurvivorContextMenu.orderItemFetch(self.playerNum, self.survivorId, text)
+        self:setVisible(false)
+        self:removeFromUIManager()
+    end
+    function dialog:onCancel()
+        self:setVisible(false)
+        self:removeFromUIManager()
+    end
+    FetchItemDialog = dialog
+    return dialog
+end
+
+function SurvivorContextMenu.orderItemFetch(playerNum, survivorId, fullType)
+    runService(playerNum, function(player, id)
+        return KnoxCompanionService.requestItemFetch(player, id, fullType)
+    end, survivorId)
+end
+
+function SurvivorContextMenu.promptItemFetch(playerNum, survivorId)
+    local player = getSpecificPlayer(playerNum)
+    if player == nil then return end
+    local class = fetchItemDialogClass()
+    if class == nil then return end
+    local dialog = class:new(0, 0, 420, 130, playerNum, survivorId)
+    dialog:initialise()
+    dialog:addToUIManager()
+    dialog:setAlwaysOnTop(true)
+    dialog:setX((getCore():getScreenWidth() - dialog:getWidth()) / 2)
+    dialog:setY((getCore():getScreenHeight() - dialog:getHeight()) / 2)
+end
+
+-- The order builders the per-survivor menu already uses, lifted so the base
+-- roster can call exactly the same options. Nothing is duplicated and nothing
+-- new is stored: job preference, stay home, cancel and fetch all end in the
+-- writers they already used.
+function SurvivorContextMenu.addBaseOrderOptions(ordersMenu, playerNum, survivorId, duty, compact)
+    duty = type(duty) == "table" and duty or {}
+    local jobs = ordersMenu:addOption("Base Work Orders", nil, nil)
+    local jobsMenu = ISContextMenu:getNew(ordersMenu)
+    ordersMenu:addSubMenu(jobs, jobsMenu)
+    for _, preference in ipairs(KnoxOrderCatalog.basePreferenceOrder) do
+        local choice = KnoxOrderCatalog.get(preference)
+        local label = preference == "hauling" and "Move Corpses"
+            or (choice ~= nil and choice.label or preference)
+        local option = jobsMenu:addOption(label, SurvivorContextMenu,
+            onBaseJobPreference, playerNum, survivorId, preference)
+        jobsMenu:setOptionChecked(option, duty.jobPreference == preference
+            or (duty.jobPreference == nil and preference == "auto"))
+    end
+    local supply = ordersMenu:addOption("Survival Orders", nil, nil)
+    local supplyMenu = ISContextMenu:getNew(ordersMenu)
+    ordersMenu:addSubMenu(supply, supplyMenu)
+    for _, kind in ipairs({ "find_food", "find_water", "find_medical", "find_weapon", "find_tools",
+        "find_wood", "find_materials", "find_clothing", "find_ammo", "find_fuel" }) do
+        supplyMenu:addOption(KnoxOrderCatalog.label(kind), SurvivorContextMenu, onNeedOrder,
+            playerNum, survivorId, kind)
+    end
+    local cancelSupply = ordersMenu:addOption(
+        KnoxOrderCatalog.label("resume_normal_duty"), SurvivorContextMenu,
+        onResumeNormalDuty, playerNum, survivorId
+    )
+    cancelSupply.notAvailable = duty.baseSupplyOrder == nil
+    local stayHome = duty.allowLootRuns ~= true
+    local supplyOption = ordersMenu:addOption(
+        "Stay Home During Supply Runs",
+        SurvivorContextMenu, onResidentLootRuns, playerNum, survivorId, stayHome
+    )
+    ordersMenu:setOptionChecked(supplyOption, stayHome)
+    local fetch = ordersMenu:addOption("Fetch a Specific Item", SurvivorContextMenu,
+        SurvivorContextMenu.promptItemFetch, playerNum, survivorId)
+    fetch.notAvailable = compact == true
+end
+
+-- Standing in your own base should be enough to run it. The roster lists every
+-- resident and opens the same builders above, so the player no longer has to
+-- hover each survivor to give an order.
+function SurvivorContextMenu.dispatchCrew(_, playerNum, base)
+    local player = getSpecificPlayer(playerNum)
+    local targets = rawget(_G, "KnoxMissionTargets")
+    if player == nil or base == nil or targets == nil or targets.dispatchFlow == nil then return false end
+    return targets.dispatchFlow(playerNum, { player = player, base = base })
+end
+
+function SurvivorContextMenu.populateRoster(menu, playerNum, base)
+    local player = getSpecificPlayer(playerNum)
+    if player == nil or base == nil then return end
+    local residentIds = KnoxPersistence.getBaseResidentIds(base.id)
+    local rows = KnoxOrderCatalog.baseRosterModel(residentIds, KnoxPersistence.getSurvivorDuty)
+    if #rows == 0 then
+        local empty = menu:addOption("No residents at this base", nil, nil)
+        empty.notAvailable = true
+        return
+    end
+    menu:addOption("Send a Gather / Scavenge Crew", SurvivorContextMenu,
+        SurvivorContextMenu.dispatchCrew, playerNum, base)
+    for _, row in ipairs(rows) do
+        local snapshot = KnoxSurvivorViewModel.getSurvivor(row.id, playerNum)
+        local name = snapshot ~= nil and snapshot.displayName or row.id
+        local root = menu:addOption(name, nil, nil)
+        local sub = ISContextMenu:getNew(menu)
+        menu:addSubMenu(root, sub)
+        SurvivorContextMenu.addBaseOrderOptions(sub, playerNum, row.id,
+            KnoxPersistence.getSurvivorDuty(row.id) or {})
+        local service = rawget(_G, "KnoxCompanionService")
+        local choices = service ~= nil and service.baseChoicesFor ~= nil
+            and service.baseChoicesFor(player) or {}
+        local sendHome = sub:addOption("Send Home to Another Base", SurvivorContextMenu,
+            onReturnToBase, playerNum, row.id)
+        sendHome.notAvailable = type(choices) ~= "table" or #choices < 2
+    end
 end
 
 local function onDismissConfirmed(_, button, playerNum, survivorId)
@@ -678,6 +854,18 @@ function SurvivorContextMenu.populate(menu, playerNum, survivorId, surface)
     local distance = distanceToPlayer(player, survivorId)
     local closeEnough = distance ~= nil and distance <= CONVERSATION_DISTANCE
     if not commands then
+        local shelter=rawget(_G,"KnoxNightShelter")
+        if shelter~=nil and shelter.pendingVisit(player,survivorId)~=nil then
+            for _,choice in ipairs({{label=KnoxOrderCatalog.text("IGUI_Knox_AllowOvernight","Allow overnight stay"),accepted=true},
+                {label=KnoxOrderCatalog.text("IGUI_Knox_RefuseOvernight","Refuse overnight stay"),accepted=false}}) do
+                local accepted=choice.accepted
+                menu:addOption(choice.label,nil,function()
+                    return runService(playerNum,function(host,id)
+                        return shelter.respond(host,id,accepted)
+                    end,survivorId)
+                end)
+            end
+        end
         local talk = menu:addOption("Talk", SurvivorContextMenu,
             onOpenInteraction, playerNum, survivorId)
         if not closeEnough then unavailable(talk) end
@@ -706,6 +894,26 @@ function SurvivorContextMenu.populate(menu, playerNum, survivorId, surface)
     if not owned then
         if not commands and showCommands then addRecruitOption(menu, player, survivorId, closeEnough) end
         return true
+    end
+
+    if duty.mode == "companion" or duty.mode == "base" then
+        local medicalRoot = menu:addOption("Medical Help", nil, nil)
+        local medicalMenu = ISContextMenu:getNew(menu)
+        menu:addSubMenu(medicalRoot, medicalMenu)
+        medicalMenu:addOption("Ask for Medical Help", SurvivorContextMenu, function(_, number, id)
+            runService(number, function(player, survivor)
+                return KnoxCompanionService.issueOrder(player, survivor, "medical_help")
+            end, id)
+        end, playerNum, survivorId)
+        local medicalPolicies = KnoxPersistence.getSurvivorPolicies(survivorId) or {}
+        for _, choice in ipairs({{"Auto Medical: On", true}, {"Auto Medical: Off", false}}) do
+            local option = medicalMenu:addOption(choice[1], SurvivorContextMenu, function(_, number, id, allowed)
+                runService(number, function(player, survivor)
+                    return KnoxCompanionService.setAutoMedical(player, survivor, allowed)
+                end, id)
+            end, playerNum, survivorId, choice[2])
+            medicalMenu:setOptionChecked(option, (medicalPolicies.autoMedical ~= false) == choice[2])
+        end
     end
 
     if duty.mode == "companion" and not commands then
@@ -758,37 +966,7 @@ function SurvivorContextMenu.populate(menu, playerNum, survivorId, surface)
         local ordersMenu = ISContextMenu:getNew(menu)
         menu:addSubMenu(orders, ordersMenu)
         addAutoEquipmentMenu(ordersMenu, playerNum, survivorId)
-        local jobs = ordersMenu:addOption("Base Work Orders", nil, nil)
-        local jobsMenu = ISContextMenu:getNew(ordersMenu)
-        ordersMenu:addSubMenu(jobs, jobsMenu)
-        for _, preference in ipairs(KnoxOrderCatalog.basePreferenceOrder) do
-            local choice = KnoxOrderCatalog.get(preference)
-            local label = preference == "hauling" and "Move Corpses"
-                or (choice ~= nil and choice.label or preference)
-            local option = jobsMenu:addOption(label, SurvivorContextMenu,
-                onBaseJobPreference, playerNum, survivorId, preference)
-            jobsMenu:setOptionChecked(option, duty.jobPreference == preference
-                or (duty.jobPreference == nil and preference == "auto"))
-        end
-        local supply = ordersMenu:addOption("Survival Orders", nil, nil)
-        local supplyMenu = ISContextMenu:getNew(ordersMenu)
-        ordersMenu:addSubMenu(supply, supplyMenu)
-        for _, kind in ipairs({ "find_food", "find_water", "find_medical", "find_weapon", "find_tools",
-            "find_wood", "find_materials", "find_clothing", "find_ammo", "find_fuel" }) do
-            supplyMenu:addOption(KnoxOrderCatalog.label(kind), SurvivorContextMenu, onNeedOrder,
-                playerNum, survivorId, kind)
-        end
-        local cancelSupply = ordersMenu:addOption(
-            KnoxOrderCatalog.label("resume_normal_duty"), SurvivorContextMenu,
-            onResumeNormalDuty, playerNum, survivorId
-        )
-        cancelSupply.notAvailable = duty.baseSupplyOrder == nil
-        local stayHome = duty.allowLootRuns ~= true
-        local supplyOption = ordersMenu:addOption(
-            "Stay Home During Supply Runs",
-            SurvivorContextMenu, onResidentLootRuns, playerNum, survivorId, stayHome
-        )
-        ordersMenu:setOptionChecked(supplyOption, stayHome)
+        SurvivorContextMenu.addBaseOrderOptions(ordersMenu, playerNum, survivorId, duty)
         end
     elseif duty.mode == "companion" then
         if showCommands then
@@ -830,25 +1008,7 @@ function SurvivorContextMenu.populate(menu, playerNum, survivorId, surface)
         movementMenu:addOption(KnoxOrderCatalog.label("go_to"), SurvivorContextMenu, onMoveToPlayer, playerNum, survivorId)
         movementMenu:addOption(KnoxOrderCatalog.label("guard"), SurvivorContextMenu, onGuardHere, playerNum, survivorId)
         movementMenu:addOption(KnoxOrderCatalog.label("patrol_area"), SurvivorContextMenu, onPatrolHere, playerNum, survivorId)
-        local companion = KnoxSurvivorRuntime.getCharacter(survivorId)
-        if companion ~= nil and companion:getVehicle() ~= nil then
-            ordersMenu:addOption(KnoxOrderCatalog.label("exit_vehicle"), SurvivorContextMenu,
-                onExitVehicle, playerNum, survivorId)
-        elseif player:getVehicle() ~= nil then
-            ordersMenu:addOption(KnoxOrderCatalog.label("enter_vehicle"), SurvivorContextMenu,
-                onBoardPlayerVehicle, playerNum, survivorId)
-            local drive = ordersMenu:addOption(
-                KnoxOrderCatalog.label("drive_ahead", "Take Driver Seat & Drive"),
-                SurvivorContextMenu, onDriveAhead, playerNum, survivorId)
-            if player.getVehicle ~= nil and player:getVehicle() ~= nil
-                and player:getVehicle().isDriver ~= nil
-                and player:getVehicle():isDriver(player) then
-                drive.notAvailable = true
-            end
-        else
-            ordersMenu:addOption(KnoxOrderCatalog.label("drive_nearest_vehicle"),
-                SurvivorContextMenu, onDriveNearestVehicle, playerNum, survivorId)
-        end
+        SurvivorContextMenu.addVehicleOrderOptions(ordersMenu, player, playerNum, survivorId)
         local tacticsRoot = ordersMenu:addOption("Tactics & Behavior", nil, nil)
         local tacticsMenu = ISContextMenu:getNew(ordersMenu)
         ordersMenu:addSubMenu(tacticsRoot, tacticsMenu)
@@ -868,9 +1028,9 @@ function SurvivorContextMenu.populate(menu, playerNum, survivorId, surface)
         tacticsMenu:addSubMenu(stanceRoot, stanceMenu)
         local stance = duty.combatStance or "defensive"
         for _, choice in ipairs({
-            { "Passive — stay close", "passive" },
-            { "Defensive — protect us", "defensive" },
-            { "Aggressive — clear threats", "aggressive" },
+            { "Passive - stay close", "passive" },
+            { "Defensive - protect us", "defensive" },
+            { "Aggressive - clear threats", "aggressive" },
         }) do
             local option = stanceMenu:addOption(choice[1], SurvivorContextMenu,
                 onCombatStance, playerNum, survivorId, choice[2])
@@ -996,8 +1156,8 @@ end
 
 -- The vanilla player shell offers a Medical Check for any IsoPlayer, and every
 -- Knox survivor is one. On our NPCs that row cannot open the health panel, so
--- the aim list showed a medical check that did nothing while ours — the one that
--- walks over, takes the conversation lease and opens the native panel — had no
+-- the aim list showed a medical check that did nothing while ours - the one that
+-- walks over, takes the conversation lease and opens the native panel - had no
 -- room. Drop vanilla's single row for the survivor we are about to populate.
 local function dropVanillaMedicalCheck(context)
     -- The option list is a Java ArrayList: reading it through size()/get()/
@@ -1038,6 +1198,34 @@ local function onFillWorldObjectContextMenu(playerNum, context, worldObjects, te
         return ISWorldObjectContextMenu.setTest()
     end
 
+    -- The base roster belongs to the square the player stands on, not to a
+    -- survivor under the cursor, so it is offered before the survivor search.
+    local rosterPlayer = getSpecificPlayer(playerNum)
+    local rosterManager = rawget(_G, "KnoxBaseManager")
+    local rosterPlayerId = rosterPlayer ~= nil and KnoxCompanionService ~= nil
+        and KnoxCompanionService.getPlayerId ~= nil
+        and KnoxCompanionService.getPlayerId(rosterPlayer) or nil
+    local rosterBase = rosterPlayerId ~= nil and rosterManager ~= nil
+        and rosterManager.getForOwner ~= nil
+        and rosterManager.getForOwner("player", rosterPlayerId) or nil
+    local rosterSquare = rosterPlayer ~= nil and rosterPlayer:getCurrentSquare() or nil
+    if rosterBase ~= nil and rosterSquare ~= nil and rosterBase.home ~= nil then
+        local home = rosterBase.home
+        local minX, minY = tonumber(home.minX), tonumber(home.minY)
+        local maxX = tonumber(home.maxX)
+            or (minX ~= nil and minX + (tonumber(home.width) or 0) - 1)
+        local maxY = tonumber(home.maxY)
+            or (minY ~= nil and minY + (tonumber(home.height) or 0) - 1)
+        if minX ~= nil and minY ~= nil and maxX ~= nil and maxY ~= nil
+            and rosterSquare:getX() >= minX and rosterSquare:getX() <= maxX
+            and rosterSquare:getY() >= minY and rosterSquare:getY() <= maxY then
+            local rosterOption = context:addOptionOnTop("Base Roster", nil, nil)
+            local rosterMenu = ISContextMenu:getNew(context)
+            context:addSubMenu(rosterOption, rosterMenu)
+            SurvivorContextMenu.populateRoster(rosterMenu, playerNum, rosterBase)
+        end
+    end
+
     -- This id is a Knox survivor, so the shell's own medical row is the broken
     -- one; retire it before our options are built into the same menu.
     dropVanillaMedicalCheck(context)
@@ -1059,6 +1247,8 @@ local function onFillWorldObjectContextMenu(playerNum, context, worldObjects, te
     SurvivorContextMenu.populate(subMenu, playerNum, survivorId)
 end
 
-Events.OnFillWorldObjectContextMenu.Add(onFillWorldObjectContextMenu)
+if Events ~= nil and Events.OnFillWorldObjectContextMenu ~= nil then
+    Events.OnFillWorldObjectContextMenu.Add(onFillWorldObjectContextMenu)
+end
 
 return SurvivorContextMenu

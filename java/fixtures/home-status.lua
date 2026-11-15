@@ -92,6 +92,9 @@ local clear = assert(M.baseLineModel({ home = 2, away = 0, dead = 0,
     attention = 0, items = {} }), "a clear status has a model")
 assert(clear.expanded == false and clear.title == "" and clear.attention == 0,
     "a clear line stays one row")
+assert(clear.quietLabel == "supplies unverified", "no known shortage is not proof of stocked shelves")
+local known = assert(M.baseLineModel({home=2,attention=0,items={},facts={stockKnown=true}}))
+assert(known.quietLabel == "no urgent issues", "observed stock permits a bounded quiet status")
 assert(M.baseLineModel(nil) == nil, "a missing status has no line model")
 
 assert(M.standingOrderText("Shelter", status, "Miller Farm")

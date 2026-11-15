@@ -8,6 +8,105 @@ end
 local ZombieAwareness = rawget(_G, "KnoxZombieAwareness") or {}
 _G.KnoxZombieAwareness = ZombieAwareness
 
+-- One cell zombie list per tick
+-- Awareness, threat scans, pressure reads and combat positioning all ask the
+-- same cell for the identical candidate set inside one frame. They now share the
+-- single list handle, keyed by cell identity and tick, instead of each asking the
+-- cell again. Nothing is copied and nothing outlives the tick that filled it.
+local zombieListTick, zombieListCell, zombieList = nil, nil, nil
+function ZombieAwareness.zombieList(cell, ticks)
+    if cell == nil then cell = getCell ~= nil and getCell() or nil end
+    if cell == nil or cell.getZombieList == nil then return nil end
+    local tick = tonumber(ticks)
+    if tick == nil then tick = ZombieAwareness.currentTicks end
+    if zombieList ~= nil and tick ~= nil and zombieListTick == tick
+        and zombieListCell == cell then
+        return zombieList
+    end
+    local ok, list = pcall(cell.getZombieList, cell)
+    if not ok then return nil end
+    zombieListTick, zombieListCell, zombieList = tick, cell, list
+    return list
+end
+-- End of the shared zombie list cache
+
+-- One zombie fact set per tick
+-- The stealth, retreat and acquisition passes inside one scan ask the same
+-- zombie for the same square, death, corpse, target and climb state. They are
+-- read once per tick and dropped at the next tick; this holds no decision,
+-- copies nothing out of the tick, and does not change what any pass evaluates.
+local factsTick, facts = nil, setmetatable({}, { __mode = "k" })
+function ZombieAwareness.zombieFacts(zombie, ticks)
+    if zombie == nil then return nil end
+    local tick = tonumber(ticks)
+    if tick == nil then tick = ZombieAwareness.currentTicks end
+    if tick == nil then return nil end
+    if tick ~= factsTick then
+        factsTick = tick
+        facts = setmetatable({}, { __mode = "k" })
+    end
+    local cached = facts[zombie]
+    if cached ~= nil then return cached end
+    local fact = { square = nil, x = nil, y = nil, z = nil, dead = false,
+        corpse = false, target = nil, climbing = false, ignored = false,
+        onFloor = false, crawling = false }
+    if zombie.getCurrentSquare ~= nil then
+        local ok, square = pcall(zombie.getCurrentSquare, zombie)
+        if ok and square ~= nil then
+            fact.square = square
+            fact.x, fact.y, fact.z = square:getX(), square:getY(), square:getZ()
+        end
+    end
+    if zombie.isDead ~= nil then
+        local ok, dead = pcall(zombie.isDead, zombie)
+        fact.dead = ok and dead == true
+    end
+    fact.corpse = isCorpseProxy(zombie)
+    if zombie.getTarget ~= nil then
+        local ok, target = pcall(zombie.getTarget, zombie)
+        fact.target = ok and target or nil
+    end
+    if zombie.isClimbing ~= nil then
+        local ok, climbing = pcall(zombie.isClimbing, zombie)
+        fact.climbing = ok and climbing == true
+    end
+    if zombie.isOnFloor ~= nil then
+        local ok, onFloor = pcall(zombie.isOnFloor, zombie)
+        fact.onFloor = ok and onFloor == true
+    end
+    if zombie.isCrawling ~= nil then
+        local ok, crawling = pcall(zombie.isCrawling, zombie)
+        fact.crawling = ok and crawling == true
+    end
+    local classifier = rawget(_G, "KnoxThreatClassifier")
+    fact.ignored = classifier ~= nil and classifier.ignoreForeignNpc ~= nil
+        and classifier.ignoreForeignNpc(zombie) == true
+    facts[zombie] = fact
+    return fact
+end
+
+-- One active-player list per tick. Threat evaluation asks whether each
+-- candidate is a player; rebuilding the same short list per candidate was the
+-- repeated part, not the identity test.
+local playersTick, players = nil, nil
+function ZombieAwareness.playerList(ticks)
+    local tick = tonumber(ticks)
+    if tick == nil then tick = ZombieAwareness.currentTicks end
+    if tick == nil then return nil end
+    if tick ~= playersTick then
+        playersTick = tick
+        players = {}
+        if getNumActivePlayers ~= nil and getSpecificPlayer ~= nil then
+            local count = tonumber(getNumActivePlayers()) or 1
+            for index = 0, math.max(0, count - 1) do
+                local player = getSpecificPlayer(index)
+                if player ~= nil then players[#players + 1] = player end
+            end
+        end
+    end
+    return players
+end
+
 -- Off-slot IsoPlayer shells cannot use IsoPlayer.updateLOS because it writes into
 -- local-player lighting. This module supplies only the missing discovery/perception
 -- edge; zombie locomotion, attack state, animation, hit rolls, and damage stay vanilla.
@@ -190,7 +289,8 @@ function ZombieAwareness.update(controllers, orderedIds, ticks)
     if ticks % 15 ~= 0 then
         return
     end
-    local zombies = getCell():getZombieList()
+    ZombieAwareness.currentTicks = ticks
+    local zombies = ZombieAwareness.zombieList(getCell(), ticks)
     if zombies == nil or zombies:isEmpty() then
         return
     end

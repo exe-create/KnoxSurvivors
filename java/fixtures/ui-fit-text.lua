@@ -28,10 +28,13 @@ assert(string.sub(fitted, 1, 5) == "Tools",
 assert(string.sub(fitted, 1, 5) ~= string.sub(long, 1, 5) or #fitted < #long,
     "a cut text is shorter than the original")
 
--- A slot too narrow even for the suffix returns the suffix alone rather than
--- drawing characters past the edge.
-assert(L.fitText(nil, "Workshop", 2, measure) == "...",
-    "a slot narrower than the suffix shows only the suffix")
+-- The truncation mark must fit too; it cannot spill out of a tiny label slot.
+assert(L.fitText(nil, "Workshop", 2, measure) == "..",
+    "a slot narrower than the suffix shortens the suffix")
+for _, width in ipairs({0.5,1,2,3,4,8}) do
+    assert(measure(L.fitText(nil,"Workshop",width,measure))<=width,
+        "every positive measured slot bounds the entire output, including dots")
+end
 
 -- No width means no fitting rule: the caller asked for the whole text.
 assert(L.fitText(nil, "Workshop", 0, measure) == "Workshop", "no width keeps the text")
@@ -42,3 +45,34 @@ assert(L.fitText(nil, "Workshop", nil, measure) == "Workshop", "no width keeps t
 local tail = L.fitText(nil, long, 24, measure)
 assert(string.sub(long, 1, #tail - 3) == string.sub(tail, 1, #tail - 3),
     "the fitted text is a prefix of the original, got '" .. tail .. "'")
+
+-- Compare against exhaustive valid prefixes, including non-uniform glyph widths.
+local function weighted(text)
+    local width=0
+    for i=1,#text do width=width+(text:sub(i,i)=="W" and 3 or 1) end
+    return width
+end
+for _,text in ipairs({"WWide toolbox",long,"IIIWWWii",string.rep("Long household ",8)}) do
+    for width=3,weighted(text) do
+        local expected=text
+        if weighted(text)>width then
+            local best=""
+            for n=0,#text do
+                local prefix=text:sub(1,n)
+                if weighted(prefix.."...")<=width then best=prefix end
+            end
+            expected=best.."..."
+        end
+        assert(L.fitText(nil,text,width,weighted)==expected,"binary fit preserves the longest measured ASCII prefix")
+    end
+end
+local accented=string.char(195,169)
+local emoji=string.char(240,159,140,191)
+assert(L.fitText(nil,accented:rep(8),4,measure)=="...", "narrow truncation never emits half a two-byte glyph")
+assert(L.fitText(nil,accented:rep(8),5,measure)==accented.."...", "a whole accented glyph is retained when it fits")
+assert(L.fitText(nil,emoji:rep(8),6,measure)=="..." and L.fitText(nil,emoji:rep(8),7,measure)==emoji.."...",
+    "four-byte glyphs also stay whole")
+local calls=0
+local result=L.fitText(nil,string.rep("Building ",128),20,function(text) calls=calls+1;return #text end)
+assert(#result==20 and calls<=20,"long labels fit with bounded font measurements: "..calls)
+print("UI text fit PASS longestPrefix=true utf8Whole=true longLabelMeasurements="..calls.." nativeFrameTime=NOT_VERIFIED")

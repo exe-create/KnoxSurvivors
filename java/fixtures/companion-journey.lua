@@ -65,7 +65,17 @@ assert(p.setPlayerCompanion("codec-person","codec-owner","follow",12))
 c:setCompanionOrder("codec-owner",leader,"follow",1)
 assert(c:beginCompanionFollow(3))
 body.visible=false;leader.x=9000
-assert(c:resolvePlayerPartyAnchor(4):getX()==102,"contact loss cannot reveal hidden leader")
+-- Owner direction, 2026-11-06: Require Close Contact is off by default, so a
+-- companion always knows where the player went and following continues indoors.
+assert(c:resolvePlayerPartyAnchor(4):getX()==9000,
+    "with the option off a companion still knows where the player went")
+-- Owner direction, 2026-11-12, superseding 2026-11-06: leaders never need to
+-- be seen. The option now gates order admission only; followers always read
+-- the live square, so the hidden leader is tracked even with it on.
+KnoxSettings.requireCloseContact=function() return true end
+assert(c:resolvePlayerPartyAnchor(41):getX()==9000,
+    "with Require Close Contact on the live leader is still tracked")
+KnoxSettings.requireCloseContact=function() return false end
 -- The native bridge has admitted an attack and the graph is executing its frames.
 nativeCombat=true;c.state="COMBAT";body.swing=true
 local resetBefore=resets;before=moves
@@ -88,7 +98,13 @@ assert(c.state=="FLEEING" and not nativeCombat and moves==before+1,"one native e
 assert(not c:retreatIsSafelyClear(false,{nearestDistanceSquared=math.huge},10))
 assert(c:retreatIsSafelyClear(false,{nearestDistanceSquared=math.huge},11))
 c:finishDecision(12)
-assert(c:beginCompanionFollow(13) and c.formationTargetX==102,"recovery resumes known Follow without hidden tracking")
+-- Owner direction, 2026-11-12, superseding 2026-11-06: leaders never need to
+-- be seen, so recovery resumes Follow on the live square even with the
+-- option on. The breadcrumb path below is dead code in this journey.
+KnoxSettings.requireCloseContact=function() return true end
+assert(c:beginCompanionFollow(13) and c.state=="COMPANION_FOLLOW"
+    and math.abs((c.formationTargetX or 0)-9000)<=3,"recovery resumes Follow on a formation slot by the live leader")
+KnoxSettings.requireCloseContact=function() return false end
 assert(p.getSurvivorDuty("codec-person").order=="follow")
 assert(p.getObserverKnowledge("codec-other","codec-person").seen.value.position.x==50,
     "another observer cannot inherit the journey's information")

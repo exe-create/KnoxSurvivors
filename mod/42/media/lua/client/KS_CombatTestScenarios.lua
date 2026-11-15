@@ -35,6 +35,24 @@ local definitions = {
 }
 
 local active = nil
+-- The scenario ticker is installed only while a test is armed and removed on
+-- the same teardown that clears `active`, so an idle game pays one no-op call
+-- less per tick and a finished test cannot leave a handler behind.
+local tickerInstalled = false
+local update
+local function installTicker()
+    if tickerInstalled or Events == nil or Events.OnTick == nil
+        or Events.OnTick.Add == nil then return end
+    tickerInstalled = true
+    Events.OnTick.Add(update)
+end
+local function removeTicker()
+    if not tickerInstalled then return end
+    if Events ~= nil and Events.OnTick ~= nil and Events.OnTick.Remove ~= nil then
+        Events.OnTick.Remove(update)
+    end
+    tickerInstalled = false
+end
 local lastResult = nil
 local trackedZombies = {}
 local preferredOwners = setmetatable({}, { __mode = "k" })
@@ -70,6 +88,7 @@ function CombatTests.cleanup(silent)
     trackedZombies = {}
     preferredOwners = setmetatable({}, { __mode = "k" })
     local fixtureIds = active ~= nil and active.fixtureIds or nil
+    removeTicker()
     active = nil
     if type(fixtureIds) == "table" and #fixtureIds > 0
         and KnoxSurvivorAutonomy.cleanupDeveloperScenario ~= nil then
@@ -178,12 +197,13 @@ local function report(status, reason)
     }
     if tostring(status) == "FAIL" or tostring(status) == "PARTIAL" then
         KnoxActivityFeed.event("Combat test " .. tostring(active.definition.label) .. ": "
-            .. tostring(status) .. " — " .. tostring(brief))
+            .. tostring(status) .. " - " .. tostring(brief))
     else
         KnoxActivityFeed.event("Combat test " .. tostring(active.definition.label) .. ": "
             .. tostring(status) .. " (" .. tostring(reason) .. ").")
     end
     active.finished = true
+    removeTicker()
 end
 
 local function zombieAction(zombie)
@@ -310,12 +330,13 @@ function CombatTests.start(playerNum, scenario, aimLevel)
         survivorHits = 0,
         zombieDamage = 0,
         zombiesKilled = 0,
-        rangedShotCount = 0,
+        rangedHookAttemptCount = 0,
         rangedRequestSeen = false,
-        rangedDamageObserved = false,
-        rangedDamageDistance = nil,
+        healthChangeNearRangedAttempt = false,
+        healthChangeDistance = nil,
         rangedStateById = {},
-        shotsById = {},
+        hookAttemptsById = {},
+        hookAttemptBaselineById = {},
         humanDamage = 0,
         opponentHealth = {},
         opponents = {},
@@ -324,6 +345,7 @@ function CombatTests.start(playerNum, scenario, aimLevel)
         crawlerConfigured = definition.crawler ~= true,
         finished = false,
     }
+    installTicker()
     for _, id in ipairs(ids) do
         local controller = status.controllers ~= nil and status.controllers[id] or nil
         if controller ~= nil and controller.character ~= nil then
@@ -479,7 +501,7 @@ function CombatTests.start(playerNum, scenario, aimLevel)
     return true
 end
 
-local function update()
+update = function()
     if active == nil or active.finished then
         return
     end
@@ -497,10 +519,14 @@ local function update()
                 active.zombieDamage = active.zombieDamage + (previous - current)
             end
             active.survivorHealth[id] = current
-            local shots = KnoxFirearmSupport.nativeShotCount ~= nil
-                and KnoxFirearmSupport.nativeShotCount(character) or 0
-            active.rangedShotCount = math.max(active.rangedShotCount or 0, shots)
-            active.shotsById[id] = math.max(active.shotsById[id] or 0, shots)
+            local attempts = KnoxFirearmSupport.nativeHookAttemptCount ~= nil
+                and KnoxFirearmSupport.nativeHookAttemptCount(character) or 0
+            if active.hookAttemptBaselineById[id] == nil then
+                active.hookAttemptBaselineById[id] = attempts
+            end
+            attempts = math.max(0, attempts - active.hookAttemptBaselineById[id])
+            active.rangedHookAttemptCount = math.max(active.rangedHookAttemptCount or 0, attempts)
+            active.hookAttemptsById[id] = math.max(active.hookAttemptsById[id] or 0, attempts)
             local bridge = rawget(_G, "KnoxJavaBridge")
             local diagnostics = bridge ~= nil and bridge.getNpcCombatDiagnostics ~= nil
                 and tostring(bridge:getNpcCombatDiagnostics(id)) or ""
@@ -510,7 +536,7 @@ local function update()
             active.rangedRequestSeen = active.rangedRequestSeen
                 or (ranged and attacks > 0)
             active.rangedStateById[id] = {
-                active = ranged and attacks > 0 and shots > 0 and distance >= 4,
+                active = ranged and attacks > 0 and attempts > 0 and distance >= 4,
                 distance = distance,
             }
         end
@@ -596,19 +622,19 @@ local function update()
                 local current = characterHealth(target)
                 if current < previous - 0.01 then
                     active.humanDamage = active.humanDamage + (previous - current)
-                    if (active.shotsById[attackerId] or 0) > 0 then
-                        active.rangedDamageObserved = true
+                    if (active.hookAttemptsById[attackerId] or 0) > 0 then
+                        active.healthChangeNearRangedAttempt = true
                     end
                 end
                 active.opponentHealth[targetId] = current
             end
         end
-        local bothFired = #active.ids == 2
+        local bothAttempted = #active.ids == 2
         for _, id in ipairs(active.ids) do
-            bothFired = bothFired and (active.shotsById[id] or 0) > 0
+            bothAttempted = bothAttempted and (active.hookAttemptsById[id] or 0) > 0
         end
-        if bothFired and active.rangedDamageObserved and active.humanDamage > 0 then
-            report("PASS", "native_ranged_human_damage_observed")
+        if bothAttempted and active.healthChangeNearRangedAttempt and active.humanDamage > 0 then
+            report("PARTIAL", "firearm_hook_attempts_and_health_change_observed_unattributed")
             CombatTests.writeSnapshot()
             return
         end
@@ -641,8 +667,8 @@ local function update()
                 active.survivorHits = active.survivorHits + 1
                 local ranged = active.rangedStateById[active.zombieOwners[index]]
                 if ranged ~= nil and ranged.active then
-                    active.rangedDamageObserved = true
-                    active.rangedDamageDistance = ranged.distance
+                    active.healthChangeNearRangedAttempt = true
+                    active.healthChangeDistance = ranged.distance
                 end
             end
             if okHealth then active.zombieHealth[zombie] = current end
@@ -652,9 +678,9 @@ local function update()
                 or variableBoolean(zombie, "AttackDidDamage")
         end
     end
-    if active.definition.firearm ~= true and active.rangedShotCount > 0
-        and active.rangedRequestSeen and active.rangedDamageObserved then
-        report("PASS", "native_ranged_damage_observed")
+    if active.definition.firearm ~= true and active.rangedHookAttemptCount > 0
+        and active.rangedRequestSeen and active.healthChangeNearRangedAttempt then
+        report("PARTIAL", "firearm_hook_attempt_and_health_change_observed_unattributed")
         CombatTests.writeSnapshot()
         return
     end
@@ -695,7 +721,7 @@ local function update()
     -- 0 == 0 ended the test on its first tick before staging could run.
     if active.elapsed >= TIMEOUT_TICKS
         or (#active.zombies > 0 and active.zombiesKilled >= #active.zombies) then
-        local reason = active.definition.firearm == true and "no_native_ranged_damage"
+        local reason = active.definition.firearm == true and "firearm_damage_unconfirmed"
             or (active.survivorHits > 0 and "survivor_damage_only")
             or (active.attackActionSeen and "zombie_attack_animation_without_damage"
                 or "no_two_way_combat")
@@ -706,7 +732,5 @@ local function update()
         CombatTests.writeSnapshot()
     end
 end
-
-Events.OnTick.Add(update)
 
 return CombatTests

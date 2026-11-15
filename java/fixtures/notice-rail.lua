@@ -77,7 +77,9 @@ Feed.note("1 injury.",{group="Scavenging",priority="danger",now=30001})
 local groups=Feed.digestGroups()
 assert(#groups==1 and groups[1].name=="Scavenging" and groups[1].count==2,
     "caller-supplied groups replace the priority default")
-assert(Feed.digestText():find("Scavenging · 2",1,true)~=nil,
+-- The separator is ASCII by the owner UI rule (2026-11-04): the digest used
+-- a middle dot, which the in-game font renders as a placeholder glyph.
+assert(Feed.digestText():find("Scavenging, 2",1,true)~=nil,
     "the digest names the group and its real count")
 
 Feed.clear()

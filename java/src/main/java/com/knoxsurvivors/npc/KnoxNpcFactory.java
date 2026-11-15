@@ -73,6 +73,7 @@ final class KnoxNpcFactory {
         isoPlayerClass.getField("serverPlayerIndex").setInt(body, -1);
         isoPlayerClass.getMethod("setOnlineID", short.class).invoke(body, (short) -1);
         isoPlayerClass.getMethod("setUsername", String.class).invoke(body, "Knox Survivor");
+        initializeNpcRole(body, classFor(body, "zombie.characters.Role"));
         isoPlayerClass.getMethod("setGhostMode", boolean.class).invoke(body, false);
 
         invoke(body, "setCurrent", square.getClass(), square);
@@ -98,6 +99,15 @@ final class KnoxNpcFactory {
         }
 
         return new KnoxNpc(id, body, x, y, z);
+    }
+
+    // Build 42 safehouse/context checks dereference role even for an NPC shell.
+    // A fresh native Role has no capabilities. Never borrow the local player's
+    // role (which may be admin), or use setRole(String), a client network request.
+    static void initializeNpcRole(Object body, Class<?> roleType)
+        throws ReflectiveOperationException {
+        Object role = roleType.getConstructor(String.class).newInstance("Knox Survivor");
+        body.getClass().getField("role").set(body, role);
     }
 
     static void remove(KnoxNpc npc) throws ReflectiveOperationException {
@@ -239,6 +249,24 @@ final class KnoxNpcFactory {
         List<float[]> exactRoute = new ArrayList<>(1);
         exactRoute.add(new float[] { targetX + 0.5f, targetY + 0.5f, targetZ });
         npc.setMovementRoute(exactRoute);
+    }
+
+    // A checked combat step uses the same captured-route input as walking.
+    static boolean beginCombatStep(KnoxNpc npc, float x, float y, float z)
+        throws ReflectiveOperationException {
+        Object body = npc.getBody();
+        float startX = ((Number) invoke(body, "getX")).floatValue();
+        float startY = ((Number) invoke(body, "getY")).floatValue();
+        float startZ = ((Number) invoke(body, "getZ")).floatValue();
+        if (!acceptMovementRoute(npc, startX, startY, startZ,
+            List.of(new float[] {x, y, z}))) return false;
+        invoke(invoke(body, "getPathFindBehavior2"), "cancel");
+        return true;
+    }
+
+    static void stopCombatStep(KnoxNpc npc) throws ReflectiveOperationException {
+        npc.clearMovementRoute();
+        clearHumanMovementIntent(npc.getBody());
     }
 
     static String tickMovement(KnoxNpc npc) throws ReflectiveOperationException {
@@ -638,9 +666,17 @@ final class KnoxNpcFactory {
         int z = ((Number) invoke(currentSquare, "getZ")).intValue();
 
         float[] node = npc.currentMovementNode();
-        while (node != null && KnoxMovementGeometry.nodeReached(
-            x, y, z, node[0], node[1], node[2], npc.movementNodeTolerance()
-        )) {
+        // Intermediate nodes release on their occupied tile or after the body
+        // passes toward the next node. This avoids turning a running body back
+        // toward a node it crossed between controller ticks.
+        // Final goals keep their existing node tolerance. Occupying the tile
+        // alone can leave combat out of reach or repeat a short ordinary route.
+        while (node != null && ((npc.nextMovementNode() == null
+            ? KnoxMovementGeometry.arrived(x, y, z, node[0], node[1],
+                KnoxMovementGeometry.floorZ(node[2]), npc.movementNodeTolerance())
+            : KnoxMovementGeometry.nodeReached(x, y, z, node[0], node[1], node[2],
+                npc.movementNodeTolerance()))
+            || KnoxMovementGeometry.nodeBehind(x, y, z, node, npc.nextMovementNode(), 1.5f))) {
             npc.advanceMovementRoute();
             node = npc.currentMovementNode();
         }
@@ -661,7 +697,7 @@ final class KnoxNpcFactory {
             );
             int[] failedEdge = {(int) Math.floor(node[0]), (int) Math.floor(node[1])};
             if ((int) Math.floor(node[2]) == currentZ
-                && (Math.abs(failedEdge[0] - currentX) > 1 || Math.abs(failedEdge[1] - currentY) > 1)) {
+                && Math.abs(failedEdge[0] - currentX) + Math.abs(failedEdge[1] - currentY) > 1) {
                 failedEdge = KnoxMovementGeometry.nextRouteTile(x, y, node[0], node[1]);
             }
             npc.rememberTraversalFailure(
@@ -689,6 +725,15 @@ final class KnoxNpcFactory {
         return "ManualRoute";
     }
 
+    private static boolean diagonalCornerCut(Object current, Object firstOrth, Object secondOrth, Object next)
+        throws ReflectiveOperationException {
+        Class<?> squareClass = current.getClass();
+        return (Boolean) invoke(current, "isBlockedTo", squareClass, firstOrth)
+            || (Boolean) invoke(firstOrth, "isBlockedTo", squareClass, next)
+            || (Boolean) invoke(current, "isBlockedTo", squareClass, secondOrth)
+            || (Boolean) invoke(secondOrth, "isBlockedTo", squareClass, next);
+    }
+
     private static String handleRouteTransition(KnoxNpc npc, Object body, float[] node)
         throws ReflectiveOperationException {
         Object currentSquare = invoke(body, "getCurrentSquare");
@@ -714,11 +759,30 @@ final class KnoxNpcFactory {
         // stair geometry updates character Z as the survivor walks the stairs.
         // Never snap or mutate Z here.
         if (nextZ != currentZ) {
+            // A same-column rope edge uses the same native admission/actions
+            // as ISClimbSheetRopeAction. XY-changing stair nodes keep walking.
+            if (deltaX == 0 && deltaY == 0 && Math.abs(nextZ - currentZ) == 1) {
+                boolean down = nextZ < currentZ;
+                boolean rope = (Boolean) invoke(body, down ? "canClimbDownSheetRope" : "canClimbSheetRope",
+                    classFor(body, GRID_SQUARE_CLASS), currentSquare);
+                if (rope) {
+                    if (!npc.isClimbingAllowed()) return "FAILED_CLIMBING_DISABLED";
+                    if (npc.isTraversalCoolingDown(currentX,currentY,currentZ,nextX,nextY,nextZ)) return "FAILED_EDGE_COOLDOWN";
+                    npc.useTraversalInteractionTarget(currentSquare);
+                    if ("CLIMB_ATTEMPTED".equals(npc.getTraversalInteractionStage())) return "ManualRoute";
+                    clearHumanMovementIntent(body);
+                    invoke(body, down ? "climbDown" : "climb");
+                    npc.setTraversalInteractionStage("CLIMB_ATTEMPTED");
+                    npc.noteClimbEdge(currentX,currentY,currentZ,nextX,nextY,nextZ);
+                    return down ? "STARTED_ROPE_DESCENT" : "STARTED_ROPE_CLIMB";
+                }
+            }
             return Math.abs(nextZ - currentZ) == 1
                 ? "CLEAR"
                 : "FAILED_INVALID_Z_CHANGE";
         }
-        if (Math.abs(deltaX) > 1 || Math.abs(deltaY) > 1) {
+        // An adjacent diagonal endpoint can cross a cardinal edge first, too.
+        if (Math.abs(deltaX) + Math.abs(deltaY) > 1) {
             int[] edge = KnoxMovementGeometry.nextRouteTile(
                 ((Number) invoke(body, "getX")).floatValue(),
                 ((Number) invoke(body, "getY")).floatValue(), node[0], node[1]
@@ -748,7 +812,41 @@ final class KnoxNpcFactory {
                 currentSquare.getClass(),
                 nextSquare
             );
-            return blocked ? "FAILED_BLOCKED_DIAGONAL" : "CLEAR";
+            if (blocked) {
+                return "FAILED_BLOCKED_DIAGONAL";
+            }
+            // A diagonal isBlockedTo can read clear while the body would still
+            // clip the wall corner: both cardinal corner-cut steps must be open
+            // or the step wedges the survivor instead of failing by name.
+            if (Math.abs(deltaX) == 1 && Math.abs(deltaY) == 1) {
+                Object firstOrth = invoke(
+                    cell,
+                    "getGridSquare",
+                    int.class,
+                    int.class,
+                    int.class,
+                    currentX + deltaX,
+                    currentY,
+                    nextZ
+                );
+                Object secondOrth = invoke(
+                    cell,
+                    "getGridSquare",
+                    int.class,
+                    int.class,
+                    int.class,
+                    currentX,
+                    currentY + deltaY,
+                    nextZ
+                );
+                if (firstOrth == null || secondOrth == null) {
+                    return "FAILED_BLOCKED_DIAGONAL";
+                }
+                if (diagonalCornerCut(currentSquare, firstOrth, secondOrth, nextSquare)) {
+                    return "FAILED_BLOCKED_DIAGONAL";
+                }
+            }
+            return "CLEAR";
         }
 
         Object door = invoke(currentSquare, "getDoorTo", currentSquare.getClass(), nextSquare);
@@ -824,8 +922,13 @@ final class KnoxNpcFactory {
                 smashed,
                 barricaded,
                 canClimb,
+                !smashed || (Boolean) invoke(window, "isGlassRemoved"),
                 npc.getTraversalInteractionStage()
             );
+            if (action == KnoxTraversalPolicy.WindowAction.CLEAR_GLASS) {
+                npc.setTraversalInteractionStage("GLASS_REQUIRED");
+                return "WINDOW_GLASS_REQUIRED";
+            }
             if (action == KnoxTraversalPolicy.WindowAction.FAIL_BARRICADED) {
                 return "FAILED_BARRICADED_WINDOW";
             }
@@ -969,6 +1072,7 @@ final class KnoxNpcFactory {
                 direction
             );
             npc.setTraversalInteractionStage("CLIMB_ATTEMPTED");
+            npc.noteClimbEdge(currentX, currentY, currentZ, nextX, nextY, nextZ);
             return "STARTED_FENCE_CLIMB";
         }
 
@@ -1013,6 +1117,7 @@ final class KnoxNpcFactory {
                 direction
             );
             npc.setTraversalInteractionStage("CLIMB_ATTEMPTED");
+            npc.noteClimbEdge(currentX, currentY, currentZ, nextX, nextY, nextZ);
             return "STARTED_WALL_CLIMB";
         }
 
@@ -1026,6 +1131,30 @@ final class KnoxNpcFactory {
             nextSquare
         );
         return blocked ? "FAILED_STATIC_BLOCKAGE" : "CLEAR";
+    }
+
+    /** Bounded facts on the existing terminal-stall log, never an extra poll. */
+    static String movementObstacleContext(KnoxNpc npc) {
+        try {
+            Object square=invoke(npc.getBody(), "getCurrentSquare");
+            if (square==null) return "objects=unloaded";
+            List<?> objects=(List<?>) invoke(square, "getObjects");
+            StringBuilder context=new StringBuilder("objects=[");
+            for (int index=0;index<Math.min(6,objects.size());index++) {
+                if(index>0) context.append(',');
+                Object object=objects.get(index);
+                String name=object.getClass().getSimpleName();
+                try {
+                    Object sprite=invoke(object,"getSprite");
+                    if(sprite!=null) name=String.valueOf(invoke(sprite,"getName"));
+                } catch (ReflectiveOperationException ignored) { }
+                name=name.replace('\n',' ').replace('\r',' ').replace('\t',' ');
+                context.append(name,0,Math.min(64,name.length()));
+            }
+            return context.append("] count=").append(objects.size()).toString();
+        } catch (ReflectiveOperationException | RuntimeException unreadable) {
+            return "objects=unreadable";
+        }
     }
 
     static boolean windowLandingClear(Object body, Object square) throws ReflectiveOperationException {
@@ -1131,30 +1260,26 @@ final class KnoxNpcFactory {
         moveDirection.getClass().getField("x").setFloat(moveDirection, directionX);
         moveDirection.getClass().getField("y").setFloat(moveDirection, directionY);
         invoke(body, "setJustMoved", boolean.class, true);
-        invoke(
-            body,
-            "setDirectionAngle",
-            float.class,
-            (float) Math.toDegrees(Math.atan2(directionY, directionX))
-        );
+        if (!keepCombatFacing(npc.isCombatActive(), (Boolean) invoke(body, "isAiming"))) {
+            invoke(body, "setDirectionAngle", float.class,
+                (float) Math.toDegrees(Math.atan2(directionY, directionX)));
+        }
 
         // Vanilla-feel locomotion: walk default, run to close moderate gaps, sprint rarely for long reposition. Respects endurance/fatigue.
-        float endurance = 1.0f;
-        float fatigue = 0.0f;
-        try {
-            Object stats = invoke(body, "getStats");
-            Class<?> statClass = Class.forName("zombie.characters.CharacterStat", false, body.getClass().getClassLoader());
-            Object endKey = statClass.getField("ENDURANCE").get(null);
-            endurance = ((Number) stats.getClass().getMethod("get", statClass).invoke(stats, endKey)).floatValue();
-            Object fatigueKey = statClass.getField("FATIGUE").get(null);
-            fatigue = ((Number) stats.getClass().getMethod("get", statClass).invoke(stats, fatigueKey)).floatValue();
-        } catch (ReflectiveOperationException ignored) {
-        }
+        float[] stamina = staminaFor(body);
+        float endurance = stamina[0];
+        float fatigue = stamina[1];
         float health = locomotionHealth(body);
         boolean nativeCanSprint = false;
         try {
             nativeCanSprint = (Boolean) invoke(body, "canSprint");
         } catch (ReflectiveOperationException ignored) {
+        }
+        boolean doorwayAhead = false;
+        try {
+            doorwayAhead = doorwayEdgeAhead(body, nextX, nextY);
+        } catch (ReflectiveOperationException ignored) {
+            // An unreadable edge is not a doorway: ordinary pacing stays available.
         }
         KnoxLocomotionPolicy.Decision locomotion = KnoxLocomotionPolicy.decide(
             pace,
@@ -1162,7 +1287,8 @@ final class KnoxNpcFactory {
             endurance,
             fatigue,
             health,
-            nativeCanSprint
+            nativeCanSprint,
+            doorwayAhead
         );
         boolean shouldRun = !draggingCorpse && locomotion.running();
         boolean shouldSprint = !draggingCorpse && locomotion.sprinting();
@@ -1225,6 +1351,29 @@ final class KnoxNpcFactory {
         }
     }
 
+    /** Endurance/fatigue for one body, or NaN/NaN when the body cannot answer.
+     *  A failed read is unknown stamina, never a fully rested survivor: the same
+     *  fail-closed contract locomotionHealth already keeps for health. */
+    static float[] staminaFor(Object body) {
+        try {
+            Object stats = invoke(body, "getStats");
+            Class<?> statClass = Class.forName(
+                "zombie.characters.CharacterStat", false, body.getClass().getClassLoader());
+            Object endKey = statClass.getField("ENDURANCE").get(null);
+            float endurance = ((Number) stats.getClass().getMethod("get", statClass)
+                .invoke(stats, endKey)).floatValue();
+            Object fatigueKey = statClass.getField("FATIGUE").get(null);
+            float fatigue = ((Number) stats.getClass().getMethod("get", statClass)
+                .invoke(stats, fatigueKey)).floatValue();
+            if (!Float.isFinite(endurance) || !Float.isFinite(fatigue)) {
+                return new float[] {Float.NaN, Float.NaN};
+            }
+            return new float[] {endurance, fatigue};
+        } catch (ReflectiveOperationException | RuntimeException unreadable) {
+            return new float[] {Float.NaN, Float.NaN};
+        }
+    }
+
     static float locomotionHealth(Object body) {
         try {
             Object damage = invoke(body, "getBodyDamage");
@@ -1247,6 +1396,10 @@ final class KnoxNpcFactory {
         invoke(body, "setRunning", boolean.class, false);
         invoke(body, "setSprinting", boolean.class, false);
         invoke(body, "setSneaking", boolean.class, sneaking);
+    }
+
+    static boolean keepCombatFacing(boolean combatActive, boolean aiming) {
+        return combatActive && aiming;
     }
 
     private static void clearHumanMovementIntent(Object body) throws ReflectiveOperationException {
@@ -1277,6 +1430,36 @@ final class KnoxNpcFactory {
     private static Object getAiComponent(Object body) throws ReflectiveOperationException {
         Class<?> aiComponentClass = classFor(body, "zombie.characters.component.AIComponent");
         return invoke(body, "getECSComponent", Class.class, aiComponentClass);
+    }
+
+    /** True when the first boundary toward the next route node is a doorway.
+     *  Sparse native segments use the same immediate edge as traversal. Exact
+     *  diagonal corners never guess which cardinal doorway the body will use. */
+    private static boolean doorwayEdgeAhead(Object body, float nextX, float nextY)
+        throws ReflectiveOperationException {
+        Object current = invoke(body, "getCurrentSquare");
+        if (current == null) return false;
+        int currentX = ((Number) invoke(current, "getX")).intValue();
+        int currentY = ((Number) invoke(current, "getY")).intValue();
+        int currentZ = ((Number) invoke(current, "getZ")).intValue();
+        int nextTileX = (int) Math.floor(nextX);
+        int nextTileY = (int) Math.floor(nextY);
+        if (Math.abs(nextTileX - currentX) + Math.abs(nextTileY - currentY) > 1) {
+            int[] edge = KnoxMovementGeometry.nextRouteTile(
+                ((Number) invoke(body, "getX")).floatValue(),
+                ((Number) invoke(body, "getY")).floatValue(), nextX, nextY
+            );
+            nextTileX = edge[0]; nextTileY = edge[1];
+        }
+        if (Math.abs(nextTileX - currentX) + Math.abs(nextTileY - currentY) != 1) {
+            return false;
+        }
+        Object cell = invoke(body, "getCell");
+        if (cell == null) return false;
+        Object nextSquare = invoke(cell, "getGridSquare",
+            int.class, int.class, int.class, nextTileX, nextTileY, currentZ);
+        if (nextSquare == null) return false;
+        return invoke(current, "getDoorTo", current.getClass(), nextSquare) != null;
     }
 
     private static float distance(float firstX, float firstY, float secondX, float secondY) {

@@ -10,19 +10,28 @@ public final class KnoxSwipeStateTransformerVerifier {
     }
 
     public static void main(String[] arguments) throws Exception {
-        if (arguments.length < 1 || arguments.length > 2) {
+        if (arguments.length != 4) {
             throw new IllegalArgumentException(
-                "Expected the Project Zomboid jar path and optional patched-class output path"
+                "Expected game jar, project root, artifact and ZombieBuddy jar"
             );
         }
         byte[] original;
         byte[] impactOriginal;
+        byte[] damageOriginal;
         try (ZipFile gameJar = new ZipFile(Path.of(arguments[0]).toFile())) {
             original = gameJar.getInputStream(
                 gameJar.getEntry("zombie/ai/states/SwipeStatePlayer.class")
             ).readAllBytes();
             impactOriginal = gameJar.getInputStream(gameJar.getEntry("zombie/CombatManager.class")).readAllBytes();
+            damageOriginal = gameJar.getInputStream(gameJar.getEntry("zombie/characters/IsoGameCharacter.class")).readAllBytes();
         }
+        verifyStrengthShape(damageOriginal);
+        byte[] damage = KnoxSwipeStateTransformer.patchStrengthForVerification(damageOriginal);
+        if (Arrays.equals(damage, damageOriginal)) throw new AssertionError("Strength seam not patched");
+        try {
+            KnoxSwipeStateTransformer.patchStrengthForVerification(damage);
+            throw new AssertionError("Strength shape must fail closed");
+        } catch (java.io.IOException expected) { }
         byte[] patched = KnoxSwipeStateTransformer.patchForVerification(original);
         byte[] impact = KnoxSwipeStateTransformer.patchImpactForVerification(impactOriginal);
         byte[] human = KnoxSwipeStateTransformer.patchHumanForVerification(impact);
@@ -50,14 +59,41 @@ public final class KnoxSwipeStateTransformerVerifier {
         if (Arrays.equals(original, patched)) {
             throw new AssertionError("Transformer did not change SwipeStatePlayer");
         }
-        if (arguments.length == 2) {
-            Path output = Path.of(arguments[1]);
-            Files.createDirectories(output.getParent());
-            Files.write(output, patched);
-        }
+        com.knoxsurvivors.runtime.KnoxStrengthFixtureVerifier.verify(Path.of(arguments[1]), Path.of(arguments[2]), Path.of(arguments[3]), false,
+            (classes, bytes) -> KnoxSwipeStateTransformer.patchStrengthForVerification(bytes));
         System.out.println(
             "combat transformer verified calls=" + KnoxSwipeStateTransformer.getLastPatchCount()
         );
+    }
+
+    private static void verifyStrengthShape(byte[] original) throws Exception {
+        byte[] prefix = {(byte)0x2a,(byte)0x2b,(byte)0x2c,(byte)0x25,(byte)0x15,4,(byte)0x17,5,(byte)0xb6};
+        int position = -1, count = 0;
+        for (int i=0;i+22<original.length;i++) {
+            boolean match=true;
+            for (int j=0;j<prefix.length;j++) if (original[i+j]!=prefix[j]) { match=false; break; }
+            if (!match) continue;
+            byte[] candidate=original.clone(); candidate[i]=0x2b;
+            try { KnoxSwipeStateTransformer.patchStrengthForVerification(candidate); }
+            catch (java.io.IOException expected) { position=i; count++; }
+        }
+        if (count != 1) throw new AssertionError("Installed strength argument shape must be unique: " + count);
+        byte[] wrong=original.clone(); wrong[position]=0x2b;
+        failsWithoutMutation(wrong, "wrong argument shape");
+        byte[] duplicate=original.clone(); System.arraycopy(original,position,duplicate,position+11,11);
+        failsWithoutMutation(duplicate, "duplicate strength call");
+        byte[] missing=KnoxSwipeStateTransformer.patchStrengthForVerification(original);
+        failsWithoutMutation(missing, "missing target call");
+        System.out.println("strength shape verified wrong=true duplicate=true missing=true original_unchanged=true");
+    }
+
+    private static void failsWithoutMutation(byte[] input, String label) throws Exception {
+        byte[] before=input.clone();
+        try {
+            KnoxSwipeStateTransformer.patchStrengthForVerification(input);
+            throw new AssertionError(label + " must fail closed");
+        } catch (java.io.IOException expected) { }
+        if (!Arrays.equals(before,input)) throw new AssertionError(label + " mutated original");
     }
 
     private static void verifyPairs() {

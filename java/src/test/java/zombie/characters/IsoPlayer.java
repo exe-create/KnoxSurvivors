@@ -2,6 +2,8 @@ package zombie.characters;
 
 /** Offline native-shaped human health fixture; never included in the mod jar. */
 public class IsoPlayer {
+    public final MoveDirection playerMoveDir = new MoveDirection();
+    public static final class MoveDirection { public float x, y; }
     public final BodyDamage damage = new BodyDamage();
     public boolean dead;
     public float getHealth() { return 1.0f; }

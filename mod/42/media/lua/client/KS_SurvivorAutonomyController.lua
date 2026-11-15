@@ -8,6 +8,7 @@ require "TimedActions/ISTimedActionQueue"
 require "TimedActions/ISRestAction"
 require "TimedActions/ISSitOnGround"
 require "TimedActions/ISSmashWindow"
+require "TimedActions/ISRemoveBrokenGlass"
 require "Util/AdjacentFreeTileFinder"
 require "KS_TravelRouting"
 require "KS_SurvivorNeeds"
@@ -18,6 +19,7 @@ require "KS_ActivityFeed"
 require "KS_SurvivorDialogue"
 require "KS_GroupSupport"
 require "KS_SurvivorLooting"
+require "KS_CombatPositioning"
 require "KS_EquipmentIntelligence"
 require "KS_FactionBaseScouting"
 require "KS_FactionSafehouse"
@@ -125,10 +127,85 @@ local function canonicalBaseTask(task)
     return task
 end
 
-local THINK_MIN_TICKS = 30
+-- Tuning values for one file. They are table fields, not top-level locals: the
+-- Build 42 compiler rejects a chunk at 200 top-level locals, and this file has to
+-- stay well under that ceiling to have room to grow.
+local TUNE = {
+    THINK_MIN_TICKS = 30,
+    THREAT_SCAN_TICKS = 15,
+    COMBAT_RETARGET_COOLDOWN_TICKS = 90,
+-- Let a reloaded firearm finish before the next combat attempt. Yielding and
+-- instantly re-engaging produces run-stop-run stutter.
+    COMBAT_RANGED_YIELD_DELAY_TICKS = 45,
+-- After a kill, followers sprint back to a slot that drifted during the fight.
+-- A short settle window keeps the next zombie from interrupting mid-sprint.
+    COMBAT_POST_KILL_FORMATION_DELAY_TICKS = 60,
+    THREAT_IMMEDIATE_RADIUS = 3.5,
+-- A visible zombie inside this band is treated as closing on the survivor and
+-- outranks a distant assisted sighting. Chosen to sit outside the immediate
+-- band but inside ordinary reach, so it changes priority, not engagement.
+    THREAT_CLOSING_RADIUS = 6,
+    THREAT_VISIBLE_RADIUS = 16,
+    THREAT_MEMORY_TICKS = 120,
+    THREAT_SELF_TARGET_RADIUS = 20,
+-- A companion should help with a threat it can see across the yard, not only
+-- one brushing the player. Twelve tiles was inside a single room's reach.
+    THREAT_GROUP_ASSIST_RADIUS = 16,
+    COMBAT_DISENGAGE_RADIUS = 18,
+    -- How far a member's fight calls the rest of the party in. A horde is
+    -- one problem; the group answers it together instead of strung out.
+    GROUP_COMBAT_RALLY_RADIUS = 20,
+
+    THREAT_FAILURE_COOLDOWN_TICKS = 900,
+    SUPPLY_RETRY_TICKS = 600,
+-- A native action that refuses to queue (or a work target that went stale
+-- between claim and arrival) must not be reclaimed on the next think. The
+-- failure log line this installs is also the field diagnosis for
+-- window-to-window walks that never barricade.
+    BASE_TASK_ACTION_FAILURE_TICKS = 900,
+    EXPLORATION_SCAN_RADIUS = 12,
+    EXPLORATION_RETRY_TICKS = 180,
+-- A loaded away member walks to its own search area instead of teleporting.
+-- Native collection starts after approach; individual bounded search windows
+-- still resolve their own loaded squares and real containers.
+    AWAY_TRAVEL_SEARCH_RADIUS_SQUARED = 225,
+-- Retry native route failures without manufacturing an empty search receipt.
+    AWAY_TRAVEL_FAILURE_LIMIT = 6,
+-- Reconsider the next container promptly after a successful search. The old
+-- delay made a building look abandoned after one container even though the
+-- exploration scan was still valid.
+    LOOT_TRAVEL_COOLDOWN_TICKS = 360,
+    EMPTY_SEARCH_COOLDOWN_TICKS = 1800,
+    BLOCKED_AREA_COOLDOWN_TICKS = 3600,
+    LOCKED_DOOR_MIN_ENDURANCE = 0.40,
+    ROAM_MIN_RADIUS = 6,
+    ROAM_MAX_RADIUS = 48,
+    FORMATION_FAILURE_MAX_COOLDOWN_TICKS = 720,
+    MOVEMENT_FAILURE_COOLDOWN_TICKS = 180,
+    MOVEMENT_FAILURE_MAX_COOLDOWN_TICKS = 1440,
+-- Hang watchdog for job travel: zero displacement for a sustained window
+-- fails fast instead of riding out the full state timeout and re-queuing
+-- the same unreachable approach forever.
+    TASK_TRAVEL_STALL_TICKS = 300,
+    TASK_TRAVEL_STALL_DISTANCE_SQUARED = 2.25,
+    ENTRY_SCAN_RADIUS = 16,
+    FLEE_SCAN_RADIUS = 12,
+    FLEE_TARGET_DISTANCE = 12,
+    FLEE_RECHECK_TICKS = 45,
+    FLEE_PLAN_TICKS = 240,
+    FLEE_SAFE_CONFIRM_SCANS = 2,
+    FLEE_CLEAR_DISTANCE_SQUARED = 64,
+    FLEE_DISENGAGE_TICKS = 600,
+-- A rally corner is a destination inside a home, not a panicked stride: the
+-- lane test is allowed to look across the building, and the threat scan that
+-- feeds it covers the same distance.
+    RALLY_LANE_STEPS = 40,
+    BASE_ALARM_TICKS = 1800,
+}
+TUNE.THREAT_MAX_DISTANCE_SQUARED = math.max(TUNE.THREAT_VISIBLE_RADIUS,
+    TUNE.THREAT_SELF_TARGET_RADIUS, TUNE.THREAT_GROUP_ASSIST_RADIUS, TUNE.COMBAT_DISENGAGE_RADIUS) ^ 2
+
 Controller.TUNING.THINK_JITTER_TICKS = 45
-local THREAT_SCAN_TICKS = 15
-local COMBAT_RETARGET_COOLDOWN_TICKS = 90
 -- Stickier retargeting: frequent 15-tick re-evaluation with a small margin makes
 -- two nearby zombies trade ownership every scan, restarting native combat and
 -- looking like sporadic kiting/spinning. Require a clear improvement instead.
@@ -140,25 +217,14 @@ Controller.TUNING.COMBAT_EMERGENCY_SCORE_MARGIN = 120
 -- the nearest of 8 neighbours every beginCombat shifts the destination 1-2
 -- tiles even when nothing moved, which native combat turns into sidesteps.
 Controller.TUNING.COMBAT_APPROACH_REUSE_DISTANCE_SQUARED = 2
--- Let a reloaded firearm finish before the next combat attempt. Yielding and
--- instantly re-engaging produces run-stop-run stutter.
-local COMBAT_RANGED_YIELD_DELAY_TICKS = 45
--- After a kill, followers sprint back to a slot that drifted during the fight.
--- A short settle window keeps the next zombie from interrupting mid-sprint.
-local COMBAT_POST_KILL_FORMATION_DELAY_TICKS = 60
-local THREAT_IMMEDIATE_RADIUS = 3.5
-local THREAT_VISIBLE_RADIUS = 16
-local THREAT_MEMORY_TICKS = 120
 Controller.TUNING.THREAT_MEMORY_SCORE_PENALTY = 48
-local THREAT_SELF_TARGET_RADIUS = 20
--- A companion should help with a threat it can see across the yard, not only
--- one brushing the player. Twelve tiles was inside a single room's reach.
-local THREAT_GROUP_ASSIST_RADIUS = 16
 Controller.TUNING.GROUP_COMBAT_LEASH_RADIUS = 16
-local COMBAT_DISENGAGE_RADIUS = 18
-local THREAT_MAX_DISTANCE_SQUARED = math.max(THREAT_VISIBLE_RADIUS,
-    THREAT_SELF_TARGET_RADIUS, THREAT_GROUP_ASSIST_RADIUS, COMBAT_DISENGAGE_RADIUS) ^ 2
-local THREAT_FAILURE_COOLDOWN_TICKS = 900
+-- A follower's fight is bounded by the person they follow. Install: the native
+-- combat owner has no notion of "my player is over there", so a companion in an
+-- aggressive stance would chase a zombie across the street while the player
+-- kept walking. Ten tiles keeps it inside the same street; the disengage below
+-- is measured from the leader, not from the map.
+Controller.TUNING.FOLLOWER_LEASH_RADIUS = 10
 -- Dawn sweep: a survivor that slept under a roof wakes up and clears the
 -- yard first. While the window holds, the engagement radius widens so the
 -- dead that gathered overnight are fought instead of walked past. Attacker
@@ -170,32 +236,8 @@ Controller.TUNING.SUPPLY_SCAN_RADIUS = 12
 -- self-care detour. The single elected worker may look two streets out for
 -- real loaded containers before the existing native route begins.
 Controller.TUNING.BASE_SUPPLY_SCAN_RADIUS = 24
-local SUPPLY_RETRY_TICKS = 600
--- A native action that refuses to queue (or a work target that went stale
--- between claim and arrival) must not be reclaimed on the next think. The
--- failure log line this installs is also the field diagnosis for
--- window-to-window walks that never barricade.
-local BASE_TASK_ACTION_FAILURE_TICKS = 900
-local EXPLORATION_SCAN_RADIUS = 12
-local EXPLORATION_RETRY_TICKS = 180
--- A loaded away member walks to its own search area instead of teleporting.
--- The radius matches the executor's 30-tile container scan so the arrival
--- point stays inside the area that will actually be searched.
-local AWAY_TRAVEL_SEARCH_RADIUS_SQUARED = 225
--- Bounded native movement failures before the member searches where it stands
--- and reports the real (possibly empty) result instead of stalling forever.
-local AWAY_TRAVEL_FAILURE_LIMIT = 6
 Controller.TUNING.CONVENIENT_INSPECTION_RADIUS = 2
--- Reconsider the next container promptly after a successful search. The old
--- delay made a building look abandoned after one container even though the
--- exploration scan was still valid.
-local LOOT_TRAVEL_COOLDOWN_TICKS = 360
 Controller.TUNING.LOOT_CONTAINER_ITEM_LIMIT = 4
-local EMPTY_SEARCH_COOLDOWN_TICKS = 1800
-local BLOCKED_AREA_COOLDOWN_TICKS = 3600
-local LOCKED_DOOR_MIN_ENDURANCE = 0.40
-local ROAM_MIN_RADIUS = 6
-local ROAM_MAX_RADIUS = 48
 Controller.TUNING.ROAM_GOAL_COOLDOWN_TICKS = 7200
 Controller.TUNING.ROAM_FAILURE_COOLDOWN_TICKS = 7200
 Controller.TUNING.ROAM_MEMORY_LIMIT = 12
@@ -261,26 +303,6 @@ Controller.TUNING.FORMATION_REFRESH_TICKS = 45
 Controller.TUNING.FORMATION_ROUTE_COMMIT_TICKS = 90
 Controller.TUNING.FORMATION_BOTTLENECK_WAIT_TICKS = 90
 Controller.TUNING.FORMATION_FAILURE_COOLDOWN_TICKS = 180
-local FORMATION_FAILURE_MAX_COOLDOWN_TICKS = 720
-local MOVEMENT_FAILURE_COOLDOWN_TICKS = 180
-local MOVEMENT_FAILURE_MAX_COOLDOWN_TICKS = 1440
--- Hang watchdog for job travel: zero displacement for a sustained window
--- fails fast instead of riding out the full state timeout and re-queuing
--- the same unreachable approach forever.
-local TASK_TRAVEL_STALL_TICKS = 300
-local TASK_TRAVEL_STALL_DISTANCE_SQUARED = 2.25
-local ENTRY_SCAN_RADIUS = 16
-local FLEE_SCAN_RADIUS = 12
-local FLEE_TARGET_DISTANCE = 12
-local FLEE_RECHECK_TICKS = 45
-local FLEE_PLAN_TICKS = 240
-local FLEE_SAFE_CONFIRM_SCANS = 2
-local FLEE_CLEAR_DISTANCE_SQUARED = 64
-local FLEE_DISENGAGE_TICKS = 600
--- A rally corner is a destination inside a home, not a panicked stride: the
--- lane test is allowed to look across the building, and the threat scan that
--- feeds it covers the same distance.
-local RALLY_LANE_STEPS = 40
 
 -- Short-lived, loaded-world coordination only.  This is deliberately not
 -- persistence: a flee route is a reaction to the zombies visible right now,
@@ -309,7 +331,6 @@ end
 -- their normal movement and threat scans, then resume base life on expiry.
 -- Loaded-world only, like supply leases.
 local baseAlarmsByBase = {}
-local BASE_ALARM_TICKS = 1800
 
 function Controller.baseAlarmFor(baseId)
     return baseAlarmsByBase[tostring(baseId or "")]
@@ -317,6 +338,30 @@ end
 
 -- Called when this resident starts combat: an intruder inside home
 -- or camp raises an alarm so off-duty members converge.
+-- The alarm used to require the threat square to be inside the building, so a
+-- zombie thumping the outside wall - or a hostile person at the fence - could
+-- never raise it. The perimeter is the base's own bounds opened by a margin and
+-- the writer stays this same one; only the admission test is widened.
+function Controller.basePerimeter(bounds, margin)
+    if type(bounds) ~= "table" then return nil end
+    local minX, minY = tonumber(bounds.minX), tonumber(bounds.minY)
+    if minX == nil or minY == nil then return nil end
+    local pad = math.max(0, tonumber(margin) or 8)
+    local maxX = tonumber(bounds.maxX) or (minX + (tonumber(bounds.width) or 0) - 1)
+    local maxY = tonumber(bounds.maxY) or (minY + (tonumber(bounds.height) or 0) - 1)
+    return { minX = minX - pad, minY = minY - pad, maxX = maxX + pad, maxY = maxY + pad }
+end
+
+function Controller.perimeterContains(bounds, square, margin)
+    local perimeter = Controller.basePerimeter(bounds, margin)
+    if perimeter == nil or square == nil then return false end
+    local okX, x = pcall(function() return square:getX() end)
+    local okY, y = pcall(function() return square:getY() end)
+    if not okX or not okY or tonumber(x) == nil or tonumber(y) == nil then return false end
+    return x >= perimeter.minX and x <= perimeter.maxX
+        and y >= perimeter.minY and y <= perimeter.maxY
+end
+
 function Controller:soundBaseAlarm(targetSquare)
     if targetSquare == nil then
         return false
@@ -331,6 +376,10 @@ function Controller:soundBaseAlarm(targetSquare)
         end)
         inside = ok and result == true
     end
+    if not inside and Controller.perimeterContains(
+        self.base.home or self.base.territory, targetSquare, 8) then
+        inside = true
+    end
     if not inside then
         return Controller.soundCampAlarm(self, targetSquare, self.currentTicks or 0)
     end
@@ -339,7 +388,7 @@ function Controller:soundBaseAlarm(targetSquare)
         x = targetSquare:getX(),
         y = targetSquare:getY(),
         z = targetSquare:getZ(),
-        untilTick = ticks + BASE_ALARM_TICKS,
+        untilTick = ticks + TUNE.BASE_ALARM_TICKS,
     }
     return true
 end
@@ -349,6 +398,8 @@ end
 -- keeps this from turning a yard or neighbouring street into a combat patrol.
 function Controller:isResidentHomeIntruder(threat)
     local home = self.base ~= nil and self.base.home or nil
+    -- No home means no intruder question; do not read three squares to answer it.
+    if home == nil then return false end
     local here = self.character ~= nil and self.character:getCurrentSquare() or nil
     local there = threat ~= nil and threat:getCurrentSquare() or nil
     if home == nil or here == nil or there == nil or here:getZ() ~= there:getZ() then
@@ -391,7 +442,7 @@ function Controller.soundCampAlarm(self, targetSquare, ticks)
         x = targetSquare:getX(),
         y = targetSquare:getY(),
         z = targetSquare:getZ(),
-        untilTick = (tonumber(ticks) or 0) + BASE_ALARM_TICKS,
+        untilTick = (tonumber(ticks) or 0) + TUNE.BASE_ALARM_TICKS,
     }
     return true
 end
@@ -437,7 +488,7 @@ Controller.LAST_STAND_FAILURES = 3
 Controller.LAST_STAND_FAILURE_WINDOW = 600
 Controller.LAST_STAND_TICKS = 600
 Controller.LAST_STAND_LINES = {
-    "Can't shake them. Fine — come on then!",
+    "Can't shake them. Fine - come on then!",
     "Screw it. I'm not dying running.",
     "No way out? Then let's finish this!",
     "This is it. Come and get me!",
@@ -593,6 +644,245 @@ end
 -- normal threat scan engages anything still there, and expiry resumes base
 -- life. Guards, patrols, and tasked residents keep their posts; a resident
 -- with nothing to fight with stays clear instead (see `baseAlarmAnswer`).
+-- A zombie working on the building is a threat the residents cannot see
+-- through the wall, and a sighting-based alarm never fires for it: the banging
+-- is on the far side of the house, so everybody sits until the barrier fails.
+-- The engine already knows which object a zombie is thumping
+-- (IsoZombie.getThumpTarget, read from the installed projectzomboid.jar), so a
+-- thumper standing against this home's own walls is the alarm condition.  The
+-- writer and every answer path below stay the ones that already exist; this
+-- only supplies the trigger they were missing.  One scan per site per few
+-- seconds, never per resident per tick.
+-- Musing is the idle voice the base was missing. The category follows the
+-- resident's own moodles, so it expresses a feeling that actually exists rather
+-- than inventing one.
+function Controller.musingEvent(state)
+    state = type(state) == "table" and state or {}
+    local pain = tonumber(state.pain) or 0
+    local panic = tonumber(state.panic) or 0
+    local tired = math.max(tonumber(state.tired) or 0, tonumber(state.endurance) or 0)
+    local hungry = math.max(tonumber(state.hungry) or 0, tonumber(state.thirst) or 0)
+    if pain >= 2 then return "base_musing_hurt" end
+    if hungry >= 2 then return "base_musing_hungry" end
+    if tired >= 2 then return "base_musing_tired" end
+    if panic >= 2 then return "base_musing_frightened" end
+    return "base_musing"
+end
+
+-- A greeting needs the player close and respects the same acceptance cadence
+-- the resident-to-resident greeting already uses; combat silences it.
+function Controller.greetDecision(distanceSquared, ticks, nextAt)
+    local distance = tonumber(distanceSquared)
+    local now = tonumber(ticks) or 0
+    if distance == nil or distance > 36 then return nil end
+    if now < (tonumber(nextAt) or 0) then return nil end
+    return "wave"
+end
+
+function Controller:feelState()
+    local moodles = safeMethod(self.character, "getMoodles", nil)
+    local function level(name)
+        local kind = MoodleType ~= nil and MoodleType[name] or nil
+        if kind == nil then return 0 end
+        local value = tonumber(safeMethod(moodles, "getMoodleLevel", nil, kind)) or 0
+        if value ~= value or value < 0 then return 0 end
+        return value
+    end
+    return {
+        pain = level("PAIN"), panic = level("PANIC"), tired = level("TIRED"),
+        endurance = level("ENDURANCE"), hungry = level("HUNGRY"), thirst = level("THIRST"),
+    }
+end
+
+-- The walk is the existing movement owner and the line is the existing dialogue
+-- owner; a failed walk falls through to the existing rest owner rather than
+-- inventing a new standing-around state.
+function Controller:beginAmbientMusing(ticks)
+    if self.character == nil or self.base == nil or self.combatTarget ~= nil then return false end
+    local now = tonumber(ticks) or 0
+    if now < (self.nextMusingAt or 0) then return false end
+    local feeling = self:feelState()
+    pcall(sayDialogue, self.character, self.id, Controller.musingEvent(feeling), now, 2400)
+    self.nextMusingAt = now + 2400 + Controller.baseIdleJitter(self.id) * 4
+    if (tonumber(feeling.tired) or 0) >= 2 or (tonumber(feeling.endurance) or 0) >= 2 then
+        return self:beginAmbientBaseRest(ticks, true) == true
+    end
+    if self:beginBaseMovement(ticks, false) then
+        self.activeDecision = "base_musing"
+        return true
+    end
+    return self:beginAmbientBaseRest(ticks) == true
+end
+
+-- The party a controller already carries answers the formation order: the
+-- travel group it belongs to (leader plus members, hostile or not), or the base
+-- roster for a resident at home. Nothing new is stored; both are existing fields.
+function Controller:formationParty()
+    if self.character == nil then return nil end
+    if self.groupLeader ~= nil then
+        local index, size = nil, 0
+        for _, member in ipairs(self.groupMembers or {}) do
+            if member ~= nil then
+                size = size + 1
+                if member == self.character then index = size end
+            end
+        end
+        if index == nil then
+            -- The list can omit this body; the slot the group assigned is the
+            -- fallback, kept off the leader's tile.
+            index = math.max(2, (tonumber(self.groupFormationSlot) or 1) + 1)
+            size = math.max(index, tonumber(self.groupSize) or index)
+        end
+        if size < 2 then return nil end
+        return self.groupLeader, size, index
+    end
+    local persistence = rawget(_G, "KnoxPersistence")
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    if self.baseId == nil or persistence == nil or runtime == nil
+        or persistence.getBaseResidentIds == nil or runtime.getCharacter == nil then
+        return nil
+    end
+    local ids = persistence.getBaseResidentIds(self.baseId)
+    if type(ids) ~= "table" or #ids < 2 then return nil end
+    if tostring(ids[1]) == tostring(self.id) then return nil end
+    local leader = runtime.getCharacter(ids[1])
+    local index = nil
+    for position, id in ipairs(ids) do
+        if tostring(id) == tostring(self.id) then index = position break end
+    end
+    if leader == nil or index == nil then return nil end
+    return leader, #ids, index
+end
+
+-- A grouped fighter walks to its own formation slot behind the group leader.
+-- The slot comes from the same positioning module the fight uses, so the walk
+-- and the fight cannot disagree about spacing, and it re-forms after a break-off
+-- because a fighter with no fight left still belongs in the formation.
+function Controller:squadStep(ticks)
+    if self.character == nil then return false end
+    if self.state == "COMBAT" then return false end
+    local now = tonumber(ticks) or 0
+    -- A zombie fight keeps its existing movement owner. Formation is for a party
+    -- fighting people, so a zombie target must change nothing at all.
+    local mark = self.combatTarget
+    if mark ~= nil and mark.isZombie ~= nil and mark:isZombie() == true then return false end
+    local leader, size, index = self:formationParty()
+    if leader == nil or index == nil or index < 2 or (size or 0) < 2 then return false end
+    local leaderSquare = leader:getCurrentSquare()
+    local here = self.character:getCurrentSquare()
+    if leaderSquare == nil or here == nil or leaderSquare:getZ() ~= here:getZ() then return false end
+    local threat = self.combatTarget
+    local threatSquare = threat ~= nil and threat:getCurrentSquare() or nil
+    local distance = threatSquare ~= nil
+        and (here:getX() - threatSquare:getX()) ^ 2 + (here:getY() - threatSquare:getY()) ^ 2
+        or 0
+    local positioning = rawget(_G, "KnoxCombatPositioning")
+    if positioning == nil or positioning.squadSlot == nil then return false end
+    -- Under fire is the threat memory the controller already keeps; no new flag.
+    local underFire = self.baseUnderFire == true
+    if not underFire and self.perceivedThreats ~= nil then
+        for _ in pairs(self.perceivedThreats) do underFire = true break end
+    end
+    local spacing = positioning.squadSpacing(underFire, distance > 0 and distance <= 36)
+    local targetX, targetY = positioning.squadSlot(leaderSquare:getX(), leaderSquare:getY(),
+        index, spacing, self.formationShape or "column")
+    local cell = getCell ~= nil and getCell() or nil
+    local slot = cell ~= nil and cell:getGridSquare(targetX, targetY, here:getZ()) or nil
+    if slot == nil or not slot:canStand() then return false end
+    if (slot:getX() - here:getX()) ^ 2 + (slot:getY() - here:getY()) ^ 2 <= spacing * spacing then
+        return false
+    end
+    -- Retain a valid issued route between refreshes. Holding it is still a
+    -- formation decision, so an idle think must not interrupt the follow.
+    -- Retain a valid issued route between refreshes. Holding it is still a
+    -- formation decision, so an idle think must not interrupt the follow.
+    local memo = self.formationSlotTarget
+    local retained = now < (tonumber(self.nextFormationRefresh) or 0) and memo ~= nil
+        and memo.x == slot:getX() and memo.y == slot:getY() and memo.z == slot:getZ()
+    local moving = slot.getMovingObjects ~= nil and slot:getMovingObjects() or nil
+    if moving ~= nil and moving:size() > 0 then return false end
+    if retained then
+        if self.activeDecision ~= "squad_formation"
+            or now >= (tonumber(self.formationCommitUntil) or 0) then return false end
+    else
+        local result = tostring(self.bridge:moveNpc(self.id, slot))
+        if result:find("MOVE_STARTED", 1, true) ~= 1 then return false end
+        self.nextFormationRefresh = now + 15
+        self.formationSlotTarget = { x = slot:getX(), y = slot:getY(), z = slot:getZ() }
+    end
+    self.activeDecision = "squad_formation"
+    -- Both an accepted move and its retained route renew the same commitment.
+    self.formationCommitUntil = now + 90
+    return true
+end
+
+function Controller:raiseStructuralAlarm(ticks)
+    local home = self.base ~= nil and self.base.home or nil
+    local character = self.character
+    if home == nil or self.baseId == nil or character == nil then return false end
+    local now = tonumber(ticks) or 0
+    if now < (tonumber(self.nextStructuralAlarm) or 0) then return false end
+    local minX, minY = tonumber(home.minX), tonumber(home.minY)
+    if minX == nil or minY == nil then return false end
+    local maxX = tonumber(home.maxX) or (minX + (tonumber(home.width) or 0) - 1)
+    local maxY = tonumber(home.maxY) or (minY + (tonumber(home.height) or 0) - 1)
+    local here = character:getCurrentSquare()
+    if here == nil then return false end
+    local cell = getCell ~= nil and getCell() or nil
+    local zombies = cell ~= nil and cell.getZombieList ~= nil and cell:getZombieList() or nil
+    if zombies == nil then return false end
+    self.nextStructuralAlarm = now + 60
+    local z = here:getZ()
+    local count = zombies:size()
+    for i = 0, count - 1 do
+        local zombie = zombies:get(i)
+        local square = zombie ~= nil and zombie:getCurrentSquare() or nil
+        if square ~= nil and square:getZ() == z then
+            local x, y = square:getX(), square:getY()
+            -- A thumper stands against the wall, so the test is the home's
+            -- bounds opened by two tiles, not the interior.
+            if x >= minX - 2 and x <= maxX + 2 and y >= minY - 2 and y <= maxY + 2 then
+                local ok, target = pcall(function() return zombie:getThumpTarget() end)
+                if ok and target ~= nil then
+                    return self:soundBaseAlarm(square) == true
+                end
+            end
+        end
+    end
+    -- A hostile person at the fence is the same alarm. The residents cannot see
+    -- through walls any more than they can see a thumper on the far side, and an
+    -- armed human outside is more dangerous than the zombie. Loaded survivors
+    -- only: the duty record says who lives here, and the creator record says who
+    -- is hostile, so no second threat ledger is introduced.
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    local persistence = rawget(_G, "KnoxPersistence")
+    if runtime ~= nil and runtime.activeIds ~= nil then
+        local ids = runtime.activeIds()
+        for _, otherId in ipairs(type(ids) == "table" and ids or {}) do
+            if tostring(otherId) ~= tostring(self.id) then
+                local other = runtime.getCharacter ~= nil and runtime.getCharacter(otherId) or nil
+                local otherSquare = other ~= nil and other:getCurrentSquare() or nil
+                if otherSquare ~= nil and otherSquare:getZ() == z then
+                    local ox, oy = otherSquare:getX(), otherSquare:getY()
+                    if ox >= minX - 8 and ox <= maxX + 8 and oy >= minY - 8 and oy <= maxY + 8 then
+                        local duty = persistence ~= nil and persistence.getSurvivorDuty ~= nil
+                            and persistence.getSurvivorDuty(otherId) or nil
+                        local resident = type(duty) == "table" and duty.mode == "base"
+                            and duty.baseId == self.baseId
+                        local record = persistence ~= nil
+                            and persistence.getSurvivorCreatorRecord ~= nil
+                            and persistence.getSurvivorCreatorRecord(otherId) or nil
+                        if not resident and type(record) == "table" and record.attitude == "hostile" then
+                            return self:soundBaseAlarm(otherSquare) == true
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return false
+end
+
 function Controller:answerBaseAlarm(ticks)
     local key = nil
     if self.baseId ~= nil and self.base ~= nil and self.baseTask == nil then
@@ -605,6 +895,31 @@ function Controller:answerBaseAlarm(ticks)
     local alarm = baseAlarmsByBase[key]
     if type(alarm) ~= "table" then
         return false
+    end
+    -- The site's own decision before anybody walks: a group home is answered by
+    -- that group, and the group's kind says whether it holds a home at all. The
+    -- alarm stays standing for whoever it does belong to; this only refuses one
+    -- body, never cancels the alarm.
+    if self.base ~= nil then
+        local manager = rawget(_G, "KnoxBaseManager")
+        if manager ~= nil and manager.defenceAssignment ~= nil then
+            local persistence = rawget(_G, "KnoxPersistence")
+            local group = persistence ~= nil
+                and persistence.getFactionForSurvivor ~= nil
+                and persistence.getFactionForSurvivor(self.id) or nil
+            local record = persistence ~= nil
+                and persistence.getSurvivorCreatorRecord ~= nil
+                and persistence.getSurvivorCreatorRecord(self.id) or nil
+            local assigned = manager.defenceAssignment(self.base, {
+                id = self.id,
+                factionId = group ~= nil and group.id or self.factionId,
+                groupId = persistence ~= nil and persistence.getTravelGroupFor ~= nil
+                    and (persistence.getTravelGroupFor(self.id) or {}).id or nil,
+                kind = record ~= nil and record.profile or nil,
+                dutyBaseId = self.baseId,
+            })
+            if assigned ~= true then return false end
+        end
     end
     -- The base owner names the square a civilian falls back to; a camp has no
     -- territory of its own here, so its alarm keeps the stand-clear answer.
@@ -789,6 +1104,69 @@ local function distanceSquared(first, second)
     return dx * dx + dy * dy
 end
 
+-- One visibility read per survivor-threat pair per tick. The stealth, retreat
+-- and acquisition passes in one scan ask the same question; native perception
+-- cannot change between Lua calls inside one tick.
+local function canSeeThreat(self, threat)
+    local character = self.character
+    if character == nil or threat == nil then return false end
+    local tick = tonumber(self.currentTicks)
+    if tick == nil then
+        local ok, visible = pcall(character.CanSee, character, threat)
+        return ok and visible == true
+    end
+    local cache = self.threatVisibilityCache
+    if cache == nil or cache.tick ~= tick then
+        cache = { tick = tick, values = {} }
+        self.threatVisibilityCache = cache
+    end
+    local value = cache.values[threat]
+    if value == nil then
+        local ok, visible = pcall(character.CanSee, character, threat)
+        value = (ok and visible == true) and 1 or 0
+        cache.values[threat] = value
+    end
+    return value == 1
+end
+
+-- One disposition read per survivor pair per tick. The retreat, threat and
+-- ally passes inside one scan ask the same relationship question about the
+-- same people; persistence resolves it from the same record every time.
+local function survivorDisposition(self, otherId)
+    local tick = tonumber(self.currentTicks)
+    if tick == nil or KnoxPersistence.getSurvivorDisposition == nil then
+        return KnoxPersistence.getSurvivorDisposition(self.id, otherId)
+    end
+    local cache = self.dispositionCache
+    if cache == nil or cache.tick ~= tick then
+        cache = { tick = tick, values = {} }
+        self.dispositionCache = cache
+    end
+    local value = cache.values[otherId]
+    if value == nil then
+        value = KnoxPersistence.getSurvivorDisposition(self.id, otherId)
+        cache.values[otherId] = value
+    end
+    return value
+end
+
+-- Hoisted so the hot threat path passes a function plus arguments to pcall
+-- instead of building one closure per zombie, threat candidate and leader
+-- square. Isolation is unchanged: a failing native call still returns false
+-- and is swallowed by the same caller.
+local function isZombieThreat(threat)
+    if instanceof ~= nil then return instanceof(threat, "IsoZombie") end
+    return threat:isZombie()
+end
+
+local function squareOf(character)
+    return character:getCurrentSquare()
+end
+
+local function isClimbing(zombie)
+    return zombie:isClimbing()
+end
+
 local function navigationDistanceSquared(first, second)
     if first == nil or second == nil or first:getZ() ~= second:getZ() then
         return math.huge
@@ -893,6 +1271,13 @@ end
 
 function Controller.travelPaceFor(distance, sameBuilding, context)
     return travelPaceFor(distance, sameBuilding, context)
+end
+
+-- A need order sends a survivor to a source precisely so the need can be met
+-- there. Base, group and mission orders keep their own errand and still refuse.
+function Controller.allowsNeedWaterSource(directiveKind)
+    local kind = tostring(directiveKind or "")
+    return kind == "find_water" or kind == "find_food" or kind == "find_medical"
 end
 
 -- Called on intermediate arrival: resume the stored final destination via a
@@ -1128,6 +1513,20 @@ function Controller.formationSharesInterior(anchor, candidate)
     return true
 end
 
+function Controller.formationSquareAvailable(square, character)
+    if square == nil or not Controller.squareCanStand(square)
+        or Controller.squareOccupiedByOther(square, character) then return false end
+    -- Native canStand allows furniture next to windows and fences for
+    -- traversal. A final formation slot needs an actual clear standing floor.
+    local ok, clear = pcall(function()
+        if square.TreatAsSolidFloor ~= nil and square:TreatAsSolidFloor() ~= true then return false end
+        if square.isSolid ~= nil and square:isSolid() ~= false then return false end
+        if square.isSolidTrans ~= nil and square:isSolidTrans() ~= false then return false end
+        return true
+    end)
+    return ok and clear
+end
+
 local function findFormationTarget(anchor, follower, slotIndex, survivorId, options)
     local anchorSquare = anchor ~= nil and anchor:getCurrentSquare() or nil
     local followerSquare = follower ~= nil and follower:getCurrentSquare() or nil
@@ -1173,12 +1572,13 @@ local function findFormationTarget(anchor, follower, slotIndex, survivorId, opti
     )
     if target ~= nil and target ~= anchorSquare
         and Controller.formationSharesInterior(anchorSquare, target)
-        and (target == followerSquare or target:canStand()) then
+        and Controller.formationSquareAvailable(target, follower) then
         return target
     end
     if options ~= nil and options.noFallback == true then return nil end
     local fallback = AdjacentFreeTileFinder.Find(anchorSquare, follower)
     if fallback ~= nil and Controller.formationSharesInterior(anchorSquare, fallback)
+        and Controller.formationSquareAvailable(fallback, follower)
         and (fallback:getX() ~= anchorSquare:getX()
         or fallback:getY() ~= anchorSquare:getY()
         or fallback:getZ() ~= anchorSquare:getZ()) then
@@ -1279,9 +1679,8 @@ function Controller:findPlayerPartyFormationTarget(anchor, anchorSquare, preserv
         }
     ) or nil
     local function available(square)
-        if square == nil or not Controller.squareCanStand(square)
-            or not Controller.formationSharesInterior(anchorSquare, square)
-            or Controller.squareOccupiedByOther(square, self.character) then
+        if not Controller.formationSquareAvailable(square, self.character)
+            or not Controller.formationSharesInterior(anchorSquare, square) then
             return false
         end
         local bucket = self.reservations ~= nil
@@ -1554,12 +1953,15 @@ local function threatReservationCount(reservations, zombie, excludeId)
     return count
 end
 
-local function threatAttackerLimit(reason)
+local function threatAttackerLimit(reason, human, targetingSelf)
+    -- Zombie leases spread helpers across a horde. Human opponents are not a
+    -- shared work item, and a lease can never veto personal contact defense.
+    if human or targetingSelf then return math.huge end
     if reason == "active_target" then
         return 3
     end
-    if reason == "group_target" or reason == "immediate"
-        or reason == "player_target" then
+    if reason == "group_target" or reason == "immediate" or reason == "closing"
+        or reason == "player_target" or reason == "climbing" then
         return 2
     end
     return 1
@@ -1621,8 +2023,9 @@ local function targetsGroupMember(self, target)
     local targetId = runtime ~= nil and runtime.idForCharacter ~= nil
         and runtime.idForCharacter(target)
         or nil
-    if targetId ~= nil and KnoxPersistence.areSurvivorsAllied ~= nil then
-        return KnoxPersistence.areSurvivorsAllied(self.id, targetId)
+    if targetId ~= nil and KnoxPersistence.getSurvivorDisposition ~= nil then
+        local disposition = survivorDisposition(self, targetId)
+        return disposition == "self" or disposition == "allied"
     end
     return false
 end
@@ -1631,7 +2034,7 @@ local function targetsAnyPlayer(target, distance)
     if target == nil then
         return false
     end
-    local maxDist2 = THREAT_GROUP_ASSIST_RADIUS * THREAT_GROUP_ASSIST_RADIUS
+    local maxDist2 = TUNE.THREAT_GROUP_ASSIST_RADIUS * TUNE.THREAT_GROUP_ASSIST_RADIUS
     if distance > maxDist2 then
         return false
     end
@@ -1683,9 +2086,43 @@ local function hostileHuman(self, character, knownSurvivorId)
             if now < defenseUntil then return true end
             self.allyDefenseThreats[survivorId] = nil
         end
-        local relationHostile = KnoxPersistence.areSurvivorsHostile ~= nil
-            and KnoxPersistence.areSurvivorsHostile(self.id, survivorId) or false
+        local relationHostile = KnoxPersistence.getSurvivorDisposition ~= nil
+            and survivorDisposition(self, survivorId) == "hostile" or false
         if relationHostile then return true end
+        -- A lone survivor the owner made hostile (a shove, a theft) carries
+        -- its own player flag and no faction row, so this companion read it
+        -- as neutral and the fight stayed 1v1 on the player. The player's
+        -- flag is the record the companion's own human counterpart already
+        -- reads: answer whoever is at war with the person we follow.
+        if KnoxPersistence.isSurvivorHostileToPlayer ~= nil
+            and KnoxPersistence.ensurePlayerId ~= nil then
+            local owner = self.companionTarget or self.groupLeader
+            if owner == nil and getSpecificPlayer ~= nil then
+                owner = getSpecificPlayer(0)
+            end
+            local ownerOk, ownerId = pcall(KnoxPersistence.ensurePlayerId, owner)
+            if not ownerOk then ownerId = nil end
+            if ownerId ~= nil
+                and KnoxPersistence.isSurvivorHostileToPlayer(survivorId, ownerId) then
+                return true
+            end
+        end
+        -- The faction table outranks unwitnessed neutrality between survivors
+        -- too, mirroring the player branch below: a war the diplomacy ledger
+        -- already records needs no personal blow. Same faction never matches;
+        -- the threat evaluator still applies its own distance, line of sight
+        -- and role leash, so this grants no map-wide aggression.
+        if KnoxPersistence.getSurvivorAffiliation ~= nil
+            and KnoxPersistence.getFactionRelationship ~= nil then
+            local ownAffiliation = KnoxPersistence.getSurvivorAffiliation(self.id)
+            local otherAffiliation = KnoxPersistence.getSurvivorAffiliation(survivorId)
+            local ownFaction = ownAffiliation ~= nil and ownAffiliation.factionId or nil
+            local otherFaction = otherAffiliation ~= nil and otherAffiliation.factionId or nil
+            if ownFaction ~= nil and otherFaction ~= nil and ownFaction ~= otherFaction then
+                local relation = KnoxPersistence.getFactionRelationship(ownFaction, otherFaction)
+                if relation ~= nil and relation.disposition == "hostile" then return true end
+            end
+        end
         -- The raid record outranks the relationship table here. Two survivors
         -- with no diplomacy row between them read neutral, so without this a
         -- resident treated a named raider standing inside his own base as a
@@ -1727,6 +2164,67 @@ local function hostileHuman(self, character, knownSurvivorId)
                 end
             end
         end
+        -- Back the player's own fight: if our principal or a group member
+        -- struck this candidate, it is hostile to us too. This is the
+        -- player's-hostility mirror of the struck-ally check above: no faction
+        -- war or personal row is needed when our own side drew first blood.
+        -- The native attack is read off the victim (the install's IsoPlayer
+        -- exposes no outgoing target), so the latch is the feud record: it
+        -- holds until someone else lands a blow. A player-affiliated candidate
+        -- stays exempt so one stray hit between friends never turns the party
+        -- on its own side. Distance, line of sight and leash still gate the
+        -- actual engagement.
+        -- Native log 2026-11-12 08:52: a Kahlua escape at the victim getter
+        -- below, so a missing method is never invoked - not even inside a
+        -- pcall. Breadcrumb anchor tables and stray non-character entries
+        -- simply have no latch to read and are skipped up front.
+        local okBy, hitBy = false, nil
+        if (type(character) == "table" or type(character) == "userdata")
+            and character.getAttackedBy ~= nil then
+            okBy, hitBy = pcall(character.getAttackedBy, character)
+        end
+        if okBy and hitBy ~= nil then
+            local principal = self:resolvePlayerPartyAnchor(0)
+            if (principal ~= nil and hitBy == principal)
+                or targetsGroupMember(self, hitBy) then
+                local affiliation = KnoxPersistence.getSurvivorAffiliation ~= nil
+                    and KnoxPersistence.getSurvivorAffiliation(survivorId) or nil
+                if affiliation == nil or affiliation.kind ~= "player" then
+                    return true
+                end
+            end
+        end
+        -- Answer their first blow the same way. The struck check above reads
+        -- the attacker's live target, which survivor shells do not expose
+        -- (the install's IsoPlayer has no getTarget), so a raider's opening
+        -- hit lands invisible there - including on us. The victim's latch
+        -- survives it: if this candidate struck us, our principal, or anyone
+        -- in our group, it is hostile too. One side's feud record feeds both
+        -- directions: our outgoing hits (above) and their incoming ones
+        -- (here), so a group brawl lights up on both sides instead of one.
+        -- Same friendly-fire exemption as above.
+        do
+            local principal = self:resolvePlayerPartyAnchor(0)
+            local victims = { self.character, principal, self.groupLeader, self.companionTarget }
+            for _, member in ipairs(self.groupMembers or {}) do
+                victims[#victims + 1] = member
+            end
+            for _, victim in ipairs(victims) do
+                if victim ~= nil and victim ~= character
+                    and (type(victim) == "table" or type(victim) == "userdata")
+                    and victim.getAttackedBy ~= nil then
+                    local okVictim, struckBy = pcall(victim.getAttackedBy, victim)
+                    if okVictim and struckBy == character then
+                        local affiliation = KnoxPersistence.getSurvivorAffiliation ~= nil
+                            and KnoxPersistence.getSurvivorAffiliation(survivorId) or nil
+                        if affiliation == nil or affiliation.kind ~= "player" then
+                            return true
+                        end
+                        break
+                    end
+                end
+            end
+        end
         return false
     end
     if not allowSurvivorPlayerCombat() then return false end
@@ -1757,6 +2255,17 @@ local function hostileHuman(self, character, knownSurvivorId)
                     and KnoxPersistence.getFactionRelationship(affiliation.factionId, playerFaction.id)
                     or nil
                 if relation ~= nil and relation.disposition == "allied" then return false end
+                -- The faction table outranks unwitnessed neutrality, mirroring
+                -- the survivor branch: a war the diplomacy ledger already
+                -- records needs no personal blow to start. The flag below is
+                -- the one a witness would set, so companions read the
+                -- attacker through the normal assist path.
+                if relation ~= nil and relation.disposition == "hostile" then
+                    if KnoxPersistence.setSurvivorHostileToPlayer ~= nil then
+                        KnoxPersistence.setSurvivorHostileToPlayer(self.id, playerId, true)
+                    end
+                    return true
+                end
             end
             -- Predatory survivors can initiate a fight when they actually
             -- perceive the player. The threat evaluator still supplies the
@@ -1776,16 +2285,36 @@ local function hostileHuman(self, character, knownSurvivorId)
 end
 
 local function combatAnchor(self)
-    if self.companionOrder ~= nil then
-        return self:resolvePlayerPartyAnchor(0)
+    -- Threat acquisition evaluates many nearby zombies in one scan. Resolving
+    -- the player-party anchor for each one repeats vision, contact and durable
+    -- contact writes; one answer per controller tick is the same leash fact.
+    local tick = tonumber(self.currentTicks)
+    local order, target, leader = self.companionOrder, self.companionTarget, self.groupLeader
+    local cache = self.combatAnchorCache
+    if tick ~= nil and cache ~= nil and cache.tick == tick
+        and cache.order == order and cache.target == target
+        and cache.leader == leader then
+        return cache.anchor
     end
-    return self.groupLeader
+    local anchor
+    if order ~= nil then
+        anchor = self:resolvePlayerPartyAnchor(0)
+    else
+        anchor = leader
+    end
+    if tick ~= nil then
+        self.combatAnchorCache = { tick = tick, order = order, target = target,
+            leader = leader, anchor = anchor }
+    end
+    return anchor
+end
+
+function Controller:combatAnchor()
+    return combatAnchor(self)
 end
 
 function Controller:isFacilityClearingTarget(threat)
     local settings=rawget(_G,"KnoxSettings")
-    if settings~=nil and settings.militaryFacilityClearing~=nil
-        and not settings.militaryFacilityClearing() then return false end
     local task, base = self.baseTask, self.base
     if task == nil or (task.type ~= "guard" and task.type ~= "patrol")
         or task.state ~= "claimed" or task.claimedBy ~= self.id
@@ -1797,19 +2326,36 @@ function Controller:isFacilityClearingTarget(threat)
     local persistence = rawget(_G,"KnoxPersistence")
     if persistence == nil or persistence.getFaction == nil
         or persistence.getSurvivorDuty == nil or persistence.getSurvivorAffiliation == nil then return false end
-    local duty, affiliation = persistence.getSurvivorDuty(self.id), persistence.getSurvivorAffiliation(self.id)
-    local faction = persistence.getFaction(base.ownerId)
+    -- This runs once per zombie candidate per threat scan. The duty, affiliation
+    -- and faction records cannot change inside one tick, so read (and copy) them
+    -- once per tick per base instead of for every zombie standing in the facility.
+    local tick = self.currentTicks
+    local cached = self.facilityClearanceCache
+    if cached == nil or cached.tick ~= tick or cached.baseId ~= base.id then
+        cached = { tick = tick, baseId = base.id }
+        self.facilityClearanceCache = cached
+    end
+    if cached.checked == nil then
+        cached.checked = true
+        cached.duty = persistence.getSurvivorDuty(self.id)
+        cached.affiliation = persistence.getSurvivorAffiliation(self.id)
+        cached.faction = persistence.getFaction(base.ownerId)
+    end
+    local duty, affiliation, faction = cached.duty, cached.affiliation, cached.faction
     if duty == nil or duty.mode ~= "base" or duty.baseId ~= base.id
         or affiliation == nil or affiliation.kind ~= "faction" or affiliation.factionId ~= base.ownerId
-        or faction == nil or faction.kind ~= "npc" or faction.background ~= "military" then return false end
-    local ok, zombie = pcall(function()
-        if instanceof ~= nil then return instanceof(threat,"IsoZombie") end
-        return threat:isZombie()
-    end)
+        or faction == nil or faction.kind ~= "npc"
+        or (faction.background ~= "military" and faction.background ~= "law_enforcement") then return false end
+    if faction.background=="military" and settings~=nil and settings.militaryFacilityClearing~=nil
+        and not settings.militaryFacilityClearing() then return false end
+    if faction.background=="law_enforcement" and settings~=nil and settings.policeNeighborhoodPatrols~=nil
+        and not settings.policeNeighborhoodPatrols() then return false end
+    local ok, zombie = pcall(isZombieThreat, threat)
     if not ok or zombie ~= true then return false end
     local current, target = self.character:getCurrentSquare(), threat:getCurrentSquare()
     local patrol = rawget(_G,"KnoxCompanionPatrol")
     local area = base.territory or base.home
+    if faction.background=="law_enforcement" then area=task.target or area end
     local radius=settings~=nil and settings.militaryClearanceDistance~=nil
         and settings.militaryClearanceDistance() or 8
     return patrol ~= nil and current ~= nil and target ~= nil
@@ -1817,8 +2363,9 @@ function Controller:isFacilityClearingTarget(threat)
         and distanceSquared(current,target)<=radius*radius
 end
 
-local function withinDutyCombatLeash(self, threat)
-    local current, other = self.character:getCurrentSquare(), threat:getCurrentSquare()
+local function withinDutyCombatLeash(self, threat, origin, threatSquare)
+    local current = origin or self.character:getCurrentSquare()
+    local other = threatSquare or threat:getCurrentSquare()
     if current == nil or other == nil or current:getZ() ~= other:getZ() then return false end
     local distance = distanceSquared(current, other)
     -- Contact defense remains possible even while returning to a displaced post.
@@ -1852,7 +2399,15 @@ local function withinDutyCombatLeash(self, threat)
         if area.allFloors ~= true and other:getZ() ~= (tonumber(area.z) or 0) then return false end
     end
     local target = targetOf(threat)
+    -- A companion fights beside the player. A zombie already swinging at the
+    -- player is the party's fight, not a passing sighting the companion may
+    -- watch from ten tiles away: that is what made it stand by during the
+    -- player's melee. Scope: company survivors only, within assist radius.
+    local company = self.companionOrder == "follow" or self.companionTarget ~= nil
+        or self.groupLeader ~= nil or #(self.groupMembers or {}) > 0
+    local defendingPlayer = company and targetsAnyPlayer(target, distance)
     local attackingDuty = target == self.character or targetsGroupMember(self, target)
+        or defendingPlayer
     if self:isFacilityClearingTarget(threat) then return true end
     local runtime = rawget(_G,"KnoxSurvivorRuntime")
     local targetId = runtime ~= nil and runtime.idForCharacter ~= nil and runtime.idForCharacter(threat) or nil
@@ -1866,8 +2421,8 @@ local function withinDutyCombatLeash(self, threat)
     return attackingDuty and distance <= 16
 end
 
-local function withinCombatRoleLeash(self, threat)
-    if threat == nil or not withinDutyCombatLeash(self, threat) then
+local function withinCombatRoleLeash(self, threat, origin, threatSquare)
+    if threat == nil or not withinDutyCombatLeash(self, threat, origin, threatSquare) then
         return false
     end
     local target = targetOf(threat)
@@ -1875,11 +2430,11 @@ local function withinCombatRoleLeash(self, threat)
         return true
     end
     if targetsGroupMember(self, target) then
-        local survivorSquare = self.character:getCurrentSquare()
-        local threatSquare = threat:getCurrentSquare()
+        local survivorSquare = origin or self.character:getCurrentSquare()
+        local threatSquare = threatSquare or threat:getCurrentSquare()
         if survivorSquare ~= nil and threatSquare ~= nil
             and navigationDistanceSquared(survivorSquare, threatSquare)
-                <= THREAT_GROUP_ASSIST_RADIUS * THREAT_GROUP_ASSIST_RADIUS then
+                <= TUNE.THREAT_GROUP_ASSIST_RADIUS * TUNE.THREAT_GROUP_ASSIST_RADIUS then
             return true
         end
     end
@@ -1888,14 +2443,14 @@ local function withinCombatRoleLeash(self, threat)
         return true
     end
     local anchorSquare = anchor:getCurrentSquare()
-    local targetSquare = threat:getCurrentSquare()
+    local targetSquare = threatSquare or threat:getCurrentSquare()
     return anchorSquare ~= nil and targetSquare ~= nil
         and navigationDistanceSquared(anchorSquare, targetSquare)
             <= Controller.TUNING.GROUP_COMBAT_LEASH_RADIUS * Controller.TUNING.GROUP_COMBAT_LEASH_RADIUS
 end
 
 local function threatReasonAndBonus(
-    targetingSelf, targetingGroup, targetingPlayer, immediate
+    targetingSelf, targetingGroup, targetingPlayer, immediate, closing
 )
     if targetingSelf then
         return "active_target", immediate and 240 or 160, 5
@@ -1906,20 +2461,76 @@ local function threatReasonAndBonus(
     if immediate then
         return "immediate", 90, 3
     end
+    -- A zombie closing on the survivor outranks a distant fight someone else
+    -- is in. Without this a body six tiles away scored below one twelve
+    -- tiles away that merely had the player's name on it, so the survivor
+    -- walked off to help while the nearest one reached it (owner report:
+    -- they don't defend themselves, 2026-11-12).
+    if closing then
+        return "closing", 110, 4
+    end
     if targetingPlayer then
         return "player_target", 55, 2
     end
     return "visible", 0, 1
 end
 
-local function withinZombieEngagement(self, zombie, distance, targetingSelf, targetingGroup)
+function Controller:followerLeaderSquare()
+    if self.companionOrder ~= "follow" or self.companionTarget == nil then return nil end
+    local leader = self.companionTarget
+    if leader.getCurrentSquare == nil then return nil end
+    local ok, square = pcall(squareOf, leader)
+    return ok and square or nil
+end
+
+-- Contact defence is never refused: something already swinging at the
+-- companion is a fight it cannot walk away from. Everything else waits for the
+-- player to be within the leash.
+function Controller:withinFollowerLeash(zombie, distance)
+    local leader = self:followerLeaderSquare()
+    if leader == nil then return true end
+    local other = zombie ~= nil and zombie:getCurrentSquare() or nil
+    if other == nil then return true end
+    if tonumber(distance) ~= nil and distance <= 9 then return true end
+    local radius = Controller.TUNING.FOLLOWER_LEASH_RADIUS
+    return distanceSquared(leader, other) <= radius * radius
+end
+
+-- Engagement radius by who the zombie is already attacking. A companion must
+-- answer the player's fight, and its own: blows aimed at the survivor engage
+-- at the same distance as blows aimed at the player, not only inside the
+-- base self radius. Group targeting keeps its shorter lane.
+function Controller.threatEngagementRadius(base, targetingSelf, targetingGroup, targetingPlayer)
+    local radius = tonumber(base) or 4
+    if targetingGroup then radius = math.max(radius, 8) end
+    if targetingSelf then radius = math.max(radius, 12) end
+    if targetingPlayer then radius = math.max(radius, 12) end
+    return radius
+end
+
+local function withinZombieEngagement(self, zombie, distance, targetingSelf, targetingGroup,
+    targetingPlayer, closing)
     if self:isFacilityClearingTarget(zombie) then return true end
     if self:isResidentHomeIntruder(zombie) then return true end
+    -- A zombie coming over a fence or through a window between us is not
+    -- "outside the engagement radius": it is about to land inside it, and it
+    -- is the one moment it can be hit before it reaches the survivor.
+    local climbingOk, climbing = pcall(isClimbing, zombie)
+    if climbingOk and climbing == true and tonumber(distance) ~= nil and distance <= 144 then
+        return true
+    end
+    if not self:withinFollowerLeash(zombie, distance) then return false end
     if self.companionOrder ~= nil and self.companionCombatStance == "aggressive" then return true end
     local settings = rawget(_G, "KnoxSettings")
     local radius = settings ~= nil and settings.zombieEngagementDistance ~= nil
         and settings.zombieEngagementDistance() or 4
-    if targetingSelf or targetingGroup then radius = math.max(radius, 8) end
+    radius = Controller.threatEngagementRadius(
+        radius, targetingSelf, targetingGroup, targetingPlayer
+    )
+    -- Self defense starts before contact: a visible zombie already inside
+    -- ordinary reach is answered even though it has not acquired anyone yet.
+    -- The settings radius stays authoritative past this band.
+    if closing then radius = math.max(radius, TUNE.THREAT_CLOSING_RADIUS) end
     if zombie == self.combatTarget then radius = math.max(radius, 6) end
     if (self.nightSweepUntil or 0) > (self.currentTicks or 0) then
         radius = math.max(radius, Controller.TUNING.NIGHT_SWEEP_RADIUS)
@@ -1967,19 +2578,27 @@ local function releaseAllReservationsForOwner(reservations, id)
     return released
 end
 
-local function safeMethod(object, methodName, fallback, ...)
-    if object == nil then
-        return fallback
+-- Protected lookup stays live; reuse the accessor instead of allocating it per call.
+local safeMethod
+do
+    local function methodAt(object, methodName)
+        return object[methodName]
     end
-    local lookupOk, method = pcall(function() return object[methodName] end)
-    if not lookupOk or type(method) ~= "function" then
-        return fallback
+
+    safeMethod = function(object, methodName, fallback, ...)
+        if object == nil then
+            return fallback
+        end
+        local lookupOk, method = pcall(methodAt, object, methodName)
+        if not lookupOk or type(method) ~= "function" then
+            return fallback
+        end
+        local ok, value = pcall(method, object, ...)
+        if not ok or value == nil then
+            return fallback
+        end
+        return value
     end
-    local ok, value = pcall(method, object, ...)
-    if not ok or value == nil then
-        return fallback
-    end
-    return value
 end
 
 local function separatedByImmediateBarrier(first, second)
@@ -1989,6 +2608,99 @@ local function separatedByImmediateBarrier(first, second)
     if dx > 1 or dy > 1 or (dx == 0 and dy == 0) then return false end
     return safeMethod(first, "isBlockedTo", false, second)
         or safeMethod(first, "isHoppableTo", false, second)
+end
+
+-- GROUP COMBAT FOCUS (loaded world only)
+-- A party fights as one body. The signal is a native fact a member body
+-- already exposes -- it is swinging -- so this adds no second combat
+-- registry and no copied position table; the regroup owner moves.
+local function memberIsFighting(member)
+    if member == nil then return false end
+    if safeMethod(member, "isAttacking", false) == true then return true end
+    if safeMethod(member, "isAttackStarted", false) == true then return true end
+    local state = safeMethod(member, "getCurrentStateName", nil)
+    if type(state) ~= "string" then return false end
+    state = string.lower(state)
+    return string.find(state, "swipe", 1, true) ~= nil
+        or string.find(state, "attack", 1, true) ~= nil
+end
+
+-- True while a living ally stands with this survivor. An automatic weapon
+-- choice reads it; an explicit ranged order never does.
+function Controller:combatGroupPresent()
+    local leader = self.groupLeader
+    if leader ~= nil and leader ~= self.character
+        and safeMethod(leader, "isDead", false) ~= true then
+        return true
+    end
+    for _, member in ipairs(self.groupMembers or {}) do
+        if member ~= nil and member ~= self.character
+            and safeMethod(member, "isDead", false) ~= true then
+            return true
+        end
+    end
+    return false
+end
+
+-- The nearest group member already fighting inside the rally radius, or nil.
+-- Returning the member (not a copied square) keeps one movement authority:
+-- the existing regroup owner plans the route and the normal threat scan
+-- acquires whatever the survivor can actually see on arrival.
+function Controller:groupCombatRallyMember(ticks)
+    local origin = self.character ~= nil
+        and self.character:getCurrentSquare() or nil
+    if origin == nil then return nil end
+    local radius = tonumber(Controller.TUNING
+        and Controller.TUNING.GROUP_COMBAT_RALLY_RADIUS) or 20
+    local maxDistance = radius * radius
+    local best, bestDistance = nil, nil
+    local function consider(member)
+        if member == nil or member == self.character then return end
+        if safeMethod(member, "isDead", false) == true then return end
+        if not memberIsFighting(member) then return end
+        local square = member:getCurrentSquare()
+        if square == nil or square:getZ() ~= origin:getZ() then return end
+        local distance = distanceSquared(origin, square)
+        if distance <= maxDistance
+            and (bestDistance == nil or distance < bestDistance) then
+            best, bestDistance = member, distance
+        end
+    end
+    consider(self.groupLeader)
+    for _, member in ipairs(self.groupMembers or {}) do consider(member) end
+    return best
+end
+
+-- One rally call per bounded window: a group already fighting does not need
+-- every idle member re-pathing to it on every think.
+Controller.TUNING.GROUP_COMBAT_RALLY_COOLDOWN_TICKS = 300
+
+-- Standing still reads as brain-dead to a player. With no owner holding a
+-- route, shift to one free tile in the same room; bounded so it can never
+-- become a patrol, a doorway chase or a wall grind.
+Controller.TUNING.IDLE_REPOSITION_TICKS = 900
+
+function Controller:beginIdleReposition(ticks)
+    local current = self.character ~= nil
+        and self.character:getCurrentSquare() or nil
+    if current == nil then return false end
+    if ticks < (self.nextIdleReposition or 0) then return false end
+    self.nextIdleReposition = ticks
+        + (tonumber(Controller.TUNING and Controller.TUNING.IDLE_REPOSITION_TICKS) or 900)
+    if AdjacentFreeTileFinder == nil or AdjacentFreeTileFinder.Find == nil then
+        return false
+    end
+    local target = AdjacentFreeTileFinder.Find(current, self.character)
+    if target == nil or target == current then return false end
+    if current.getRoom ~= nil and target.getRoom ~= nil
+        and target:getRoom() ~= current:getRoom() then
+        return false
+    end
+    local result = tostring(self.bridge:moveNpc(self.id, target))
+    if string.find(result, "MOVE_STARTED", 1, true) ~= 1 then return false end
+    self.activeDecision = "idle_reposition"
+    self.nextThink = ticks + 90
+    return true
 end
 
 -- (wall/window gate inlined at evaluateThreat call site; see below)
@@ -2002,7 +2714,7 @@ function Controller:recordThreatPerception(threat, ticks, distance)
     self.perceivedThreats = self.perceivedThreats or setmetatable({}, { __mode = "k" })
     local memory = self.perceivedThreats[threat]
     local rollback = memory ~= nil and ticks < (memory.lastSeen or ticks)
-    if memory == nil or rollback or ticks - (memory.lastSeen or ticks) > THREAT_MEMORY_TICKS then
+    if memory == nil or rollback or ticks - (memory.lastSeen or ticks) > TUNE.THREAT_MEMORY_TICKS then
         memory = { firstSeen = ticks, firstDistance = distance, neutral = rollback }
         self.perceivedThreats[threat] = memory
     end
@@ -2010,16 +2722,44 @@ function Controller:recordThreatPerception(threat, ticks, distance)
     return memory
 end
 
-local function evaluateThreat(self, zombie, ticks)
-    local square = self.character:getCurrentSquare()
-    local zombieSquare = zombie ~= nil and zombie:getCurrentSquare() or nil
-    local distance = square ~= nil and zombieSquare ~= nil
-        and distanceSquared(square, zombieSquare) or math.huge
-    if square == nil or zombie == nil or zombie:isDead() or isCorpseProxy(zombie) or zombieSquare == nil
-        or zombieSquare:getZ() ~= square:getZ()
-        or distance > THREAT_MAX_DISTANCE_SQUARED
-        or threatUnavailable(self, zombie, ticks)
-        or not withinCombatRoleLeash(self, zombie) then
+local function evaluateThreat(self, zombie, ticks, scanOrigin)
+    local square = scanOrigin or self.character:getCurrentSquare()
+    -- The stealth, retreat and acquisition passes read the same zombie facts in
+    -- one tick; the awareness module serves that one read to all of them.
+    local awareness = rawget(_G, "KnoxZombieAwareness")
+    local facts = awareness ~= nil and awareness.zombieFacts ~= nil
+        and awareness.zombieFacts(zombie, ticks) or nil
+    local zombieSquare, dead, corpse, ignored, zombieTarget
+    if facts ~= nil then
+        zombieSquare, dead, corpse = facts.square, facts.dead, facts.corpse
+        ignored, zombieTarget = facts.ignored, facts.target
+    else
+        zombieSquare = zombie ~= nil and zombie:getCurrentSquare() or nil
+        dead = zombie ~= nil and zombie:isDead() == true
+        corpse = isCorpseProxy(zombie)
+        zombieTarget = targetOf(zombie)
+        local classifier = rawget(_G, "KnoxThreatClassifier")
+        ignored = classifier ~= nil and classifier.ignoreForeignNpc ~= nil
+            and classifier.ignoreForeignNpc(zombie) == true
+    end
+    local distance
+    if square ~= nil and facts ~= nil and facts.x ~= nil then
+        local dx, dy = facts.x - square:getX(), facts.y - square:getY()
+        distance = dx * dx + dy * dy
+    elseif square ~= nil and zombieSquare ~= nil then
+        distance = distanceSquared(square, zombieSquare)
+    else
+        distance = math.huge
+    end
+    if square == nil or zombie == nil or dead or corpse
+        or zombieSquare == nil
+        or (facts ~= nil and facts.z ~= nil and facts.z ~= square:getZ())
+        or (facts == nil and zombieSquare:getZ() ~= square:getZ())
+        or distance > TUNE.THREAT_MAX_DISTANCE_SQUARED
+        or ignored
+        or (threatUnavailable(self, zombie, ticks)
+            and not (zombieTarget ~= nil and zombieTarget == self.character))
+        or not withinCombatRoleLeash(self, zombie, square, zombieSquare) then
         if self.perceivedThreats ~= nil and zombie ~= nil then
             self.perceivedThreats[zombie] = nil
         end
@@ -2027,16 +2767,37 @@ local function evaluateThreat(self, zombie, ticks)
     end
     -- Escaping a crowd must not immediately become a fresh five-tile chase.
     -- Nearby self-defense remains available, but distant acquisition waits.
-    if ticks < (self.combatDisengageUntil or 0) and distance > 3.0625 then
+    -- The comment above promised nearby self-defence and the code did the
+    -- opposite: distance is squared, so this suppressed every zombie beyond
+    -- 1.75 tiles, which is the band the survivor was supposed to answer. A
+    -- zombie already attacking this survivor is a live hit, not acquisition,
+    -- so it is never suppressed; only distant, non-attacking ones wait out the
+    -- window (owner report: survivors stood among nearby zombies, 2026-11-10).
+    local attackingUs = zombieTarget ~= nil and zombieTarget == self.character
+    if ticks < (self.combatDisengageUntil or 0) and distance > 3.0625
+        and not attackingUs then
         return nil
     end
-    local humanThreat = hostileHuman(self, zombie)
+    -- A plain zombie is neither a survivor nor a player. Answer that from the
+    -- same cached roster the rest of the scan uses instead of re-running the
+    -- holder checks for every candidate; a human still takes the full path.
     local runtime = rawget(_G, "KnoxSurvivorRuntime")
-    local isHuman = humanThreat or (runtime ~= nil and runtime.idForCharacter ~= nil
-        and runtime.idForCharacter(zombie) ~= nil)
-    for playerNum = 0, math.max(0, (getNumActivePlayers ~= nil and getNumActivePlayers() or 1) - 1) do
-        if getSpecificPlayer(playerNum) == zombie then isHuman = true; break end
+    local survivorId = runtime ~= nil and runtime.idForCharacter ~= nil
+        and runtime.idForCharacter(zombie) or nil
+    local roster = awareness ~= nil and awareness.playerList ~= nil
+        and awareness.playerList(ticks) or nil
+    local knownPlayer = false
+    if roster ~= nil then
+        for index = 1, #roster do
+            if roster[index] == zombie then knownPlayer = true; break end
+        end
+    else
+        for playerNum = 0, math.max(0, (getNumActivePlayers ~= nil and getNumActivePlayers() or 1) - 1) do
+            if getSpecificPlayer(playerNum) == zombie then knownPlayer = true; break end
+        end
     end
+    local isHuman = survivorId ~= nil or knownPlayer
+    local humanThreat = isHuman and hostileHuman(self, zombie) or false
     if isHuman and not humanThreat then return nil end
     if humanThreat then
         -- Seeing a named raider inside the walls is enough to raise the alarm.
@@ -2044,24 +2805,26 @@ local function evaluateThreat(self, zombie, ticks)
         -- every resident was elsewhere in the base.
         self:soundAlarmForRaidIntruder(zombie, ticks)
     end
-    local target = targetOf(zombie)
+    local target = zombieTarget
     local targetingSelf = target == self.character
-        and distance <= THREAT_SELF_TARGET_RADIUS * THREAT_SELF_TARGET_RADIUS
+        and distance <= TUNE.THREAT_SELF_TARGET_RADIUS * TUNE.THREAT_SELF_TARGET_RADIUS
     local targetingGroup = target ~= self.character
         and targetsGroupMember(self, target)
-        and distance <= THREAT_GROUP_ASSIST_RADIUS * THREAT_GROUP_ASSIST_RADIUS
+        and distance <= TUNE.THREAT_GROUP_ASSIST_RADIUS * TUNE.THREAT_GROUP_ASSIST_RADIUS
     local targetingPlayer = targetsAnyPlayer(target, distance)
-    local immediate = distance <= THREAT_IMMEDIATE_RADIUS * THREAT_IMMEDIATE_RADIUS
-    if not isHuman and separatedByImmediateBarrier(square, zombieSquare) then
+    local immediate = distance <= TUNE.THREAT_IMMEDIATE_RADIUS * TUNE.THREAT_IMMEDIATE_RADIUS
+    -- A climbing body is crossing that barrier right now; refusing it here is
+    -- what made a survivor stand and watch a zombie come over the fence.
+    local climbing
+    if facts ~= nil then climbing = not isHuman and facts.climbing == true
+    else climbing = not isHuman and safeMethod(zombie, "isClimbing", false) == true end
+    if not isHuman and not climbing and separatedByImmediateBarrier(square, zombieSquare) then
         if self.perceivedThreats ~= nil then self.perceivedThreats[zombie] = nil end
         return nil
     end
     local visible = false
-    if distance <= THREAT_VISIBLE_RADIUS * THREAT_VISIBLE_RADIUS then
-        local success, result = pcall(function()
-            return self.character:CanSee(zombie)
-        end)
-        visible = success and result == true
+    if distance <= TUNE.THREAT_VISIBLE_RADIUS * TUNE.THREAT_VISIBLE_RADIUS then
+        visible = canSeeThreat(self, zombie)
     end
     -- Wall/window gate (inlined to respect Lua 5.1's 200-locals limit):
     -- A never-seen zed with no native LOS must not be acquired through a
@@ -2075,15 +2838,15 @@ local function evaluateThreat(self, zombie, ticks)
             blocked = true
         elseif square:getZ() ~= zombieSquare:getZ() then
             blocked = true
-        elseif visible == true then
+        elseif visible == true or climbing then
             blocked = false
         elseif (tonumber(distance) or math.huge) <= 2.25 and target == self.character then
             blocked = false
         else
             local memory = self.perceivedThreats ~= nil and self.perceivedThreats[zombie] or nil
             local fresh = memory ~= nil
-                and ticks - (memory.lastSeen or -THREAT_MEMORY_TICKS - 1) <= THREAT_MEMORY_TICKS
-                and distance <= COMBAT_DISENGAGE_RADIUS * COMBAT_DISENGAGE_RADIUS
+                and ticks - (memory.lastSeen or -TUNE.THREAT_MEMORY_TICKS - 1) <= TUNE.THREAT_MEMORY_TICKS
+                and distance <= TUNE.COMBAT_DISENGAGE_RADIUS * TUNE.COMBAT_DISENGAGE_RADIUS
             blocked = not fresh
         end
         if not isHuman and blocked then
@@ -2100,9 +2863,9 @@ local function evaluateThreat(self, zombie, ticks)
     else
         local memory = self.perceivedThreats[zombie]
         remembered = memory ~= nil
-            and ticks - (memory.lastSeen or -THREAT_MEMORY_TICKS - 1)
-                <= THREAT_MEMORY_TICKS
-            and distance <= COMBAT_DISENGAGE_RADIUS * COMBAT_DISENGAGE_RADIUS
+            and ticks - (memory.lastSeen or -TUNE.THREAT_MEMORY_TICKS - 1)
+                <= TUNE.THREAT_MEMORY_TICKS
+            and distance <= TUNE.COMBAT_DISENGAGE_RADIUS * TUNE.COMBAT_DISENGAGE_RADIUS
         if not remembered then
             self.perceivedThreats[zombie] = nil
             return nil
@@ -2110,7 +2873,11 @@ local function evaluateThreat(self, zombie, ticks)
     end
     -- Perception is not permission to hunt. Keep sightings for avoidance, while
     -- only nearby danger can interrupt a routine route or start an automatic fight.
-    if not isHuman and not withinZombieEngagement(self, zombie, distance, targetingSelf, targetingGroup) then
+    local closeBand = not isHuman and visible
+        and distance <= TUNE.THREAT_CLOSING_RADIUS * TUNE.THREAT_CLOSING_RADIUS
+    if not isHuman and not withinZombieEngagement(
+        self, zombie, distance, targetingSelf, targetingGroup, targetingPlayer, closeBand
+    ) then
         return nil
     end
     local reason, bonus, priority
@@ -2118,19 +2885,29 @@ local function evaluateThreat(self, zombie, ticks)
         reason, bonus, priority = "remembered", -Controller.TUNING.THREAT_MEMORY_SCORE_PENALTY, 0
     else
         reason, bonus, priority = threatReasonAndBonus(
-            targetingSelf, targetingGroup, targetingPlayer, immediate and visible
+            targetingSelf, targetingGroup, targetingPlayer, immediate and visible,
+            closeBand and not targetingSelf and not targetingGroup and not targetingPlayer
         )
     end
     local onFloor, crawling = false, false
-    if zombie.isOnFloor ~= nil then
-        local ok, value = pcall(function() return zombie:isOnFloor() end)
-        onFloor = ok and value == true
-    end
-    if zombie.isCrawling ~= nil then
-        local ok, value = pcall(function() return zombie:isCrawling() end)
-        crawling = ok and value == true
+    if facts ~= nil then
+        onFloor, crawling = facts.onFloor, facts.crawling
+    else
+        if zombie.isOnFloor ~= nil then
+            local ok, value = pcall(zombie.isOnFloor, zombie)
+            onFloor = ok and value == true
+        end
+        if zombie.isCrawling ~= nil then
+            local ok, value = pcall(zombie.isCrawling, zombie)
+            crawling = ok and value == true
+        end
     end
     local downed = onFloor and not crawling
+    if climbing then
+        -- Crossing the barrier is the survivor's window to hit it: rank it
+        -- above ordinary sightings and above the downed penalty.
+        reason, priority, bonus = "climbing", math.max(priority, 4), bonus + 60
+    end
     if downed then
         -- A knocked-down zombie remains a valid target, but it must not hide a
         -- standing attacker that is already reaching the survivor or an ally.
@@ -2143,7 +2920,7 @@ local function evaluateThreat(self, zombie, ticks)
         distance = math.sqrt(distance),
         distanceSquared = distance,
         reservationCount = reservationCount,
-        attackerLimit = threatAttackerLimit(reason),
+        attackerLimit = threatAttackerLimit(reason, isHuman, targetingSelf),
         score = distance - bonus + reservationCount * 24 + (downed and 120 or 0)
             + (humanThreat and -35 or 0),
         downed = downed,
@@ -2153,18 +2930,24 @@ end
 
 local function nearestThreat(self, ticks)
     local cell = getCell()
-    if self.character:getCurrentSquare() == nil or cell == nil then
+    -- One origin read serves every candidate in this scan.
+    local origin = self.character:getCurrentSquare()
+    if origin == nil or cell == nil then
         return nil
     end
     local nearest, nearestAwareness = nil, nil
-    local zombies = cell:getZombieList()
+    -- Shared per-tick list: several survivors scan in the same frame, and every
+    -- one of them used to ask the cell for the same zombie list again.
+    local awareness = rawget(_G, "KnoxZombieAwareness")
+    local zombies = awareness ~= nil and awareness.zombieList ~= nil
+        and awareness.zombieList(cell, ticks) or cell:getZombieList()
+    local scenarios = rawget(_G, "KnoxCombatTestScenarios")
+    local preferredNpcId = scenarios ~= nil and scenarios.preferredNpcId or nil
     for index = 0, zombies:size() - 1 do
         local zombie = zombies:get(index)
-        local scenarioOwner = rawget(_G, "KnoxCombatTestScenarios") ~= nil
-            and KnoxCombatTestScenarios.preferredNpcId ~= nil
-            and KnoxCombatTestScenarios.preferredNpcId(zombie) or nil
+        local scenarioOwner = preferredNpcId ~= nil and preferredNpcId(zombie) or nil
         if scenarioOwner == nil or scenarioOwner == self.id then
-            local awareness = evaluateThreat(self, zombie, ticks)
+            local awareness = evaluateThreat(self, zombie, ticks, origin)
             if awareness ~= nil
                 and awareness.reservationCount < awareness.attackerLimit
                 and (nearestAwareness == nil or awareness.score < nearestAwareness.score) then
@@ -2220,9 +3003,15 @@ local function shouldReplaceCombatTarget(self, candidate, awareness, ticks)
     if currentAwareness == nil then
         return true
     end
+    local actorSquare = self.character:getCurrentSquare()
+    local currentSquare = current ~= nil and current:getCurrentSquare() or nil
+    if actorSquare ~= nil and currentSquare ~= nil
+        and not safeMethod(self.character:getPrimaryHandItem(), "isRanged", false)
+        and KnoxCombatPositioning.keepMeleeTarget(distanceSquared(actorSquare,currentSquare),
+            currentAwareness.priority,candidateAwareness.priority) then return false end
     local improvement = currentAwareness.score - candidateAwareness.score
     local inCooldown = ticks - (self.lastCombatRetarget
-        or -COMBAT_RETARGET_COOLDOWN_TICKS) < COMBAT_RETARGET_COOLDOWN_TICKS
+        or -TUNE.COMBAT_RETARGET_COOLDOWN_TICKS) < TUNE.COMBAT_RETARGET_COOLDOWN_TICKS
     if inCooldown then
         return candidateAwareness.priority > currentAwareness.priority
             and improvement >= Controller.TUNING.COMBAT_EMERGENCY_SCORE_MARGIN
@@ -2231,7 +3020,9 @@ local function shouldReplaceCombatTarget(self, candidate, awareness, ticks)
 end
 
 local function shouldDropCombatTarget(self, ticks)
+    local classifier=rawget(_G,"KnoxThreatClassifier")
     local target = self.combatTarget
+    if classifier ~= nil and classifier.ignoreForeignNpc ~= nil and classifier.ignoreForeignNpc(target) then return true end
     local runtime = rawget(_G, "KnoxSurvivorRuntime")
     local human = target ~= nil and runtime ~= nil and runtime.idForCharacter ~= nil
         and runtime.idForCharacter(target) ~= nil
@@ -2254,8 +3045,19 @@ local function shouldDropCombatTarget(self, ticks)
         targetsGroupMember(self, targetObject)) then return true end
     -- An enemy can retain an old target after separation. That reference is
     -- not permission to abandon a base/group and chase across the map.
+    -- A follower led away from the player drops the fight even while the
+    -- target is inside the ordinary disengage radius: the leash is measured
+    -- from the person they follow, not from the map.
+    local leader = self:followerLeaderSquare()
+    if leader ~= nil then
+        local radius = Controller.TUNING.FOLLOWER_LEASH_RADIUS
+        if distanceSquared(survivorSquare, leader) > radius * radius
+            and distanceSquared(targetSquare, leader) > radius * radius then
+            return true
+        end
+    end
     local leash = targetObject == self.character
-        and THREAT_SELF_TARGET_RADIUS or COMBAT_DISENGAGE_RADIUS
+        and TUNE.THREAT_SELF_TARGET_RADIUS or TUNE.COMBAT_DISENGAGE_RADIUS
     if distanceSquared(survivorSquare, targetSquare) > leash * leash then return true end
     if targetObject == self.character or targetsGroupMember(self, targetObject) then
         return false
@@ -2327,10 +3129,23 @@ local function nearbyRetreatThreats(self, radius)
     local cell = getCell()
     local found, humans = {}, {}
     if square == nil or cell == nil then return found, humans end
-    local zombies = cell:getZombieList()
+    local awareness = rawget(_G, "KnoxZombieAwareness")
+    local tick = self.currentTicks
+    local zombies = awareness ~= nil and awareness.zombieList ~= nil
+        and awareness.zombieList(cell, tick) or cell:getZombieList()
+    local originX, originY, originZ = square:getX(), square:getY(), square:getZ()
+    local radiusSquared = radius * radius
     for i = 0, zombies:size() - 1 do
         local z = zombies:get(i)
-        if z ~= nil and not z:isDead() and not isCorpseProxy(z) and z:getCurrentSquare() ~= nil and z:getCurrentSquare():getZ() == square:getZ() then
+        local facts = awareness ~= nil and awareness.zombieFacts ~= nil
+            and awareness.zombieFacts(z, tick) or nil
+        if facts ~= nil then
+            if not facts.dead and not facts.corpse and facts.square ~= nil
+                and facts.z == originZ then
+                local dx, dy = facts.x - originX, facts.y - originY
+                if dx * dx + dy * dy <= radiusSquared then found[#found + 1] = z end
+            end
+        elseif z ~= nil and not z:isDead() and not isCorpseProxy(z) and z:getCurrentSquare() ~= nil and z:getCurrentSquare():getZ() == square:getZ() then
             if distanceSquared(square, z:getCurrentSquare()) <= radius * radius then
                 found[#found + 1] = z
             end
@@ -2351,15 +3166,33 @@ local function shouldRemainStealthy(self)
     local cautious = settings == nil or settings.cautiousTravel == nil or settings.cautiousTravel()
     local minimum = cautious and 1 or 3
     local nearby = 0
-    local zombies = cell:getZombieList()
+    local awareness = rawget(_G, "KnoxZombieAwareness")
+    local zombies = awareness ~= nil and awareness.zombieList ~= nil
+        and awareness.zombieList(cell, self.currentTicks) or cell:getZombieList()
+    local originX, originY, originZ = square:getX(), square:getY(), square:getZ()
     for index = 0, zombies:size() - 1 do
         local zombie = zombies:get(index)
-        local zombieSquare = zombie ~= nil and zombie:getCurrentSquare() or nil
-        if zombie ~= nil and not zombie:isDead() and not isCorpseProxy(zombie) and zombieSquare ~= nil
-            and zombieSquare:getZ() == square:getZ() then
-            local distance = distanceSquared(square, zombieSquare)
+        local facts = awareness ~= nil and awareness.zombieFacts ~= nil
+            and awareness.zombieFacts(zombie, self.currentTicks) or nil
+        local zombieSquare, dead, corpse, target
+        if facts ~= nil then
+            zombieSquare, dead, corpse, target = facts.square, facts.dead, facts.corpse, facts.target
+        else
+            zombieSquare = zombie ~= nil and zombie:getCurrentSquare() or nil
+            dead = zombie ~= nil and zombie:isDead() == true
+            corpse = isCorpseProxy(zombie)
+            target = zombie ~= nil and zombie:getTarget() or nil
+        end
+        if zombie ~= nil and not dead and not corpse and zombieSquare ~= nil
+            and zombieSquare:getZ() == originZ then
+            local distance
+            if facts ~= nil and facts.x ~= nil then
+                local dx, dy = facts.x - originX, facts.y - originY
+                distance = dx * dx + dy * dy
+            else
+                distance = distanceSquared(square, zombieSquare)
+            end
             if distance <= 144 then
-                local target = zombie:getTarget()
                 if distance <= 64 and (target == self.character or targetsGroupMember(self, target)
                     or targetsAnyPlayer(target, distance)) then return false end
                 if self:isResidentHomeIntruder(zombie)
@@ -2371,15 +3204,13 @@ local function shouldRemainStealthy(self)
                 -- closing. Sneaking past it only delays the bite to arm's
                 -- length, so drop stealth and let threat handling engage.
                 if target == nil and distance <= 36 then
-                    local okSeen, seen = pcall(function()
-                        return zombie:CanSee(self.character)
-                    end)
+                    local okSeen, seen = pcall(zombie.CanSee, zombie, self.character)
                     if okSeen and seen == true then return false end
                 end
                 -- Continue through the entire nearby set: a later attacker or
                 -- contact-range zombie must override an earlier quiet sighting.
                 if nearby < minimum or distance <= 4 then
-                    local ok, visible = pcall(function() return self.character:CanSee(zombie) end)
+                    local ok, visible = pcall(self.character.CanSee, self.character, zombie)
                     if ok and visible == true then
                         if distance <= 4 then return false end
                         nearby = nearby + 1
@@ -2511,7 +3342,7 @@ local function fleeLaneClear(origin, target, maxSteps)
     local steps = math.max(math.abs(dx), math.abs(dy))
     -- A stride away from a horde is short; a corner inside your own home can be
     -- the other side of the building, so the caller may widen the bound.
-    if steps > (tonumber(maxSteps) or (FLEE_TARGET_DISTANCE + 2)) then return false end
+    if steps > (tonumber(maxSteps) or (TUNE.FLEE_TARGET_DISTANCE + 2)) then return false end
     local previous = origin
     for step = 1, steps do
         local nextSquare = cell:getGridSquare(
@@ -2569,7 +3400,7 @@ local function rallyFleeSquares(self, ticks, origin)
                 { x = candidate.x, y = candidate.y },
                 function(fromX, fromY, toX, toY)
                     return cellStepOpen(cell, fromX, fromY, toX, toY, z)
-                end, { maxSteps = RALLY_LANE_STEPS })
+                end, { maxSteps = TUNE.RALLY_LANE_STEPS })
             if okReach and type(route) == "table" then
                 squares[#squares + 1] = square
             end
@@ -2578,15 +3409,37 @@ local function rallyFleeSquares(self, ticks, origin)
     return squares
 end
 
-local function fleeRouteSafety(origin, target, threats)
-    if origin == nil or target == nil then return nil end
-    local dx, dy = target:getX() - origin:getX(), target:getY() - origin:getY()
+-- Threat squares are read once per lane test, not once per direction. The
+-- eight escape lanes then share one numeric list; the arithmetic is the same.
+local function threatCoordinates(threats, tick)
+    local awareness = rawget(_G, "KnoxZombieAwareness")
+    local xs, ys, count = {}, {}, 0
+    for index = 1, #threats do
+        local zombie = threats[index]
+        local facts = awareness ~= nil and awareness.zombieFacts ~= nil
+            and awareness.zombieFacts(zombie, tick) or nil
+        local x, y
+        if facts ~= nil and facts.x ~= nil then
+            x, y = facts.x, facts.y
+        else
+            local square = zombie:getCurrentSquare()
+            if square ~= nil then x, y = square:getX(), square:getY() end
+        end
+        if x ~= nil then
+            count = count + 1
+            xs[count], ys[count] = x, y
+        end
+    end
+    return xs, ys
+end
+
+local function fleeRouteXY(originX, originY, targetX, targetY, xs, ys)
+    local dx, dy = targetX - originX, targetY - originY
     local length2 = dx * dx + dy * dy
     if length2 == 0 then return nil end
     local nearest, nearestStart = math.huge, math.huge
-    for _, zombie in ipairs(threats) do
-        local square = zombie:getCurrentSquare()
-        local zx, zy = square:getX() - origin:getX(), square:getY() - origin:getY()
+    for index = 1, #xs do
+        local zx, zy = xs[index] - originX, ys[index] - originY
         local startDistance = zx * zx + zy * zy
         nearestStart = math.min(nearestStart, startDistance)
         local progress = math.max(0, math.min(1, (zx * dx + zy * dy) / length2))
@@ -2594,10 +3447,19 @@ local function fleeRouteSafety(origin, target, threats)
         -- Already-touching attackers must not prevent movement away, but a safe
         -- endpoint across a zombie is not a safe route through that zombie.
         if clearance < math.min(startDistance, 1.5625) - 0.01 then return nil end
-        nearest = math.min(nearest, distanceSquared(target, square))
+        local tdx, tdy = xs[index] - targetX, ys[index] - targetY
+        nearest = math.min(nearest, tdx * tdx + tdy * tdy)
     end
     if nearest < math.huge and nearest <= nearestStart + 0.25 then return nil end
     return nearest
+end
+
+local function fleeRouteSafety(origin, target, threats, tick)
+    if origin == nil or target == nil then return nil end
+    local dx, dy = target:getX() - origin:getX(), target:getY() - origin:getY()
+    if dx * dx + dy * dy == 0 then return nil end
+    local xs, ys = threatCoordinates(threats, tick)
+    return fleeRouteXY(origin:getX(), origin:getY(), target:getX(), target:getY(), xs, ys)
 end
 
 local function fleeDestinationAvailable(self, square, ticks)
@@ -2608,13 +3470,15 @@ local function fleeDestinationAvailable(self, square, ticks)
     return fleeLaneClear(self.character:getCurrentSquare(), square)
 end
 
-local function openEscapeLaneCount(origin, threats)
+local function openEscapeLaneCount(origin, threats, tick)
     local cell = getCell()
     if origin == nil or cell == nil or #threats == 0 then return 0 end
+    local originX, originY, originZ = origin:getX(), origin:getY(), origin:getZ()
+    local xs, ys = threatCoordinates(threats, tick)
     local currentNearest = math.huge
-    for _, zombie in ipairs(threats) do
-        currentNearest = math.min(currentNearest,
-            distanceSquared(origin, zombie:getCurrentSquare()))
+    for index = 1, #xs do
+        local dx, dy = xs[index] - originX, ys[index] - originY
+        currentNearest = math.min(currentNearest, dx * dx + dy * dy)
     end
     local count = 0
     for _, direction in ipairs({
@@ -2622,12 +3486,13 @@ local function openEscapeLaneCount(origin, threats)
         { -1, 0 }, { -1, -1 }, { 0, -1 }, { 1, -1 },
     }) do
         local candidate = cell:getGridSquare(
-            origin:getX() + direction[1] * 3,
-            origin:getY() + direction[2] * 3,
-            origin:getZ()
+            originX + direction[1] * 3,
+            originY + direction[2] * 3,
+            originZ
         )
         if candidate ~= nil and candidate:canStand() and fleeLaneClear(origin, candidate) then
-            local nearest = fleeRouteSafety(origin, candidate, threats)
+            local nearest = fleeRouteXY(originX, originY,
+                candidate:getX(), candidate:getY(), xs, ys)
             if nearest ~= nil and nearest >= currentNearest + 1 then
                 count = count + 1
             end
@@ -2705,10 +3570,10 @@ function Controller:retreatAwarenessPressure(origin, threats)
                 close = close + 1
                 if memory ~= nil and not memory.neutral and memory.firstSeen ~= nil
                     and memory.firstDistance ~= nil then
-                    if memory.firstDistance <= THREAT_IMMEDIATE_RADIUS * THREAT_IMMEDIATE_RADIUS
+                    if memory.firstDistance <= TUNE.THREAT_IMMEDIATE_RADIUS * TUNE.THREAT_IMMEDIATE_RADIUS
                         and self.currentTicks - memory.firstSeen < 60 then
                         surprise = .75
-                    elseif memory.firstDistance > THREAT_IMMEDIATE_RADIUS * THREAT_IMMEDIATE_RADIUS
+                    elseif memory.firstDistance > TUNE.THREAT_IMMEDIATE_RADIUS * TUNE.THREAT_IMMEDIATE_RADIUS
                         and self.currentTicks > memory.firstSeen then
                         prepared = prepared + 1
                     end
@@ -2968,7 +3833,7 @@ local function fleeAssessment(self)
             health = 100, endurance = 1, risk = 0, immediate = 0,
             escapeLanes = 0, nearestDistanceSquared = math.huge }
     end
-    local threats, humans = nearbyRetreatThreats(self, FLEE_SCAN_RADIUS)
+    local threats, humans = nearbyRetreatThreats(self, TUNE.FLEE_SCAN_RADIUS)
     -- Human injuries/needs use BodyDamage's 0..100 health. IsoGameCharacter's
     -- generic health field may remain 1 while this same survivor is wounded.
     local bodyDamage = safeMethod(self.character, "getBodyDamage", nil)
@@ -2980,17 +3845,32 @@ local function fleeAssessment(self)
     local bleeding, severe = injuryRisk(self.character)
     local reach, skill, condition = weaponCapacity(self.character)
     condition = tonumber(condition) or 0
-    local allies = nearbyAllyCount(self, FLEE_SCAN_RADIUS)
+    local allies = nearbyAllyCount(self, TUNE.FLEE_SCAN_RADIUS)
     local observed, humansObserved, immediate, close, targeting, contact = 0, 0, 0, 0, 0, 0
     local nearest = math.huge
     local armourKinds, unknownArmourContext, observedThreats = {}, false, {}
+    local awareness = rawget(_G, "KnoxZombieAwareness")
+    local originX, originY = origin:getX(), origin:getY()
     for _, threat in ipairs(threats) do
-        local square = safeMethod(threat, "getCurrentSquare", nil)
+        local facts = awareness ~= nil and awareness.zombieFacts ~= nil
+            and awareness.zombieFacts(threat, self.currentTicks) or nil
+        local square, target
+        if facts ~= nil then
+            square, target = facts.square, facts.target
+        else
+            square = safeMethod(threat, "getCurrentSquare", nil)
+            target = targetOf(threat)
+        end
         if square ~= nil then
-            local distance = distanceSquared(origin, square)
-            local target = targetOf(threat)
+            local distance
+            if facts ~= nil and facts.x ~= nil then
+                local dx, dy = facts.x - originX, facts.y - originY
+                distance = dx * dx + dy * dy
+            else
+                distance = distanceSquared(origin, square)
+            end
             local targetsUs = target == self.character or targetsGroupMember(self, target)
-            local visible = safeMethod(self.character, "CanSee", false, threat) == true
+            local visible = canSeeThreat(self, threat)
             -- Do not retreat from an unseen non-attacker behind a wall. A real
             -- attacker still counts even if the survivor has not yet acquired
             -- visual confirmation.
@@ -3011,7 +3891,7 @@ local function fleeAssessment(self)
                 end
                 if humans[threat] then humansObserved = humansObserved + 1 end
                 nearest = math.min(nearest, distance)
-                if distance <= THREAT_IMMEDIATE_RADIUS * THREAT_IMMEDIATE_RADIUS then
+                if distance <= TUNE.THREAT_IMMEDIATE_RADIUS * TUNE.THREAT_IMMEDIATE_RADIUS then
                     immediate = immediate + 1
                 end
                 if distance <= 36 then close = close + 1 end
@@ -3020,7 +3900,7 @@ local function fleeAssessment(self)
             end
         end
     end
-    local escapeLanes = openEscapeLaneCount(origin, threats)
+    local escapeLanes = openEscapeLaneCount(origin, threats, self.currentTicks)
     local armour = 1
     if observed == 0 or unknownArmourContext then armour = 0 else
         for kind in pairs(armourKinds) do
@@ -3056,7 +3936,7 @@ local function fleeAssessment(self)
         + math.max(0, observed - allies * 2) + bleeding * 2 + severe * 3
         + (endurance <= 0.25 and 2 or 0) + (health ~= nil and health <= 55 and 2 or 0)
         + moodleCaution + crowdPressure + awarenessPressure
-        - defence - confidence - playerInfluence - armour - desperation - terrainDefence
+ - defence - confidence - playerInfluence - armour - desperation - terrainDefence
     local threatened = immediate > 0 or targeting > 0
     local retreat, tieBias = Controller.retreatAdmission(escapeLanes, threatened,
         critical, vulnerable, outnumbered, contact, observed, allies, pressure, self.id)
@@ -3141,7 +4021,7 @@ local function retreatClearDistance(assessment)
     local fit = assessment ~= nil and (assessment.health or 0) > 55
         and (assessment.endurance or 0) > .25 and (assessment.bleeding or 0) == 0
         and (assessment.severe or 0) == 0
-    return fit and 9 or FLEE_CLEAR_DISTANCE_SQUARED
+    return fit and 9 or TUNE.FLEE_CLEAR_DISTANCE_SQUARED
 end
 
 local function retreatIsSafelyClear(self, stillUnsafe, assessment, ticks)
@@ -3156,7 +4036,7 @@ local function retreatIsSafelyClear(self, stillUnsafe, assessment, ticks)
     if ticks ~= nil and self.fleeLastSafeScan == ticks then return false end
     self.fleeLastSafeScan = ticks
     self.fleeSafeScans = (self.fleeSafeScans or 0) + 1
-    return self.fleeSafeScans >= FLEE_SAFE_CONFIRM_SCANS
+    return self.fleeSafeScans >= TUNE.FLEE_SAFE_CONFIRM_SCANS
 end
 
 function Controller:retreatIsSafelyClear(stillUnsafe, assessment, ticks)
@@ -3193,7 +4073,7 @@ local function findFleeTarget(self, ticks)
     local cell = getCell()
     if origin == nil or cell == nil then return nil end
     local awayX, awayY = 0, 0
-    local threats = nearbyRetreatThreats(self, FLEE_SCAN_RADIUS + FLEE_TARGET_DISTANCE)
+    local threats = nearbyRetreatThreats(self, TUNE.FLEE_SCAN_RADIUS + TUNE.FLEE_TARGET_DISTANCE)
     for _, zombie in ipairs(threats) do
         local zs = zombie ~= nil and zombie:getCurrentSquare() or nil
         if zombie ~= nil and not zombie:isDead() and not isCorpseProxy(zombie) and zs ~= nil
@@ -3201,7 +4081,7 @@ local function findFleeTarget(self, ticks)
             local dx = origin:getX() - zs:getX()
             local dy = origin:getY() - zs:getY()
             local distance2 = dx * dx + dy * dy
-            if distance2 <= (FLEE_SCAN_RADIUS + 4) ^ 2 and distance2 > 0 then
+            if distance2 <= (TUNE.FLEE_SCAN_RADIUS + 4) ^ 2 and distance2 > 0 then
                 -- Nearby bodies matter more than the edge of the horde. This
                 -- points the escape route away from the actual pressure instead
                 -- of letting several distant zombies cancel one close threat.
@@ -3236,7 +4116,7 @@ local function findFleeTarget(self, ticks)
     end
     local best, bestScore = nil, -math.huge
     for _, direction in ipairs(directions) do
-        for distance = FLEE_TARGET_DISTANCE, 2, -1 do
+        for distance = TUNE.FLEE_TARGET_DISTANCE, 2, -1 do
             local x = math.floor(origin:getX() + direction.x * distance + 0.5)
             local y = math.floor(origin:getY() + direction.y * distance + 0.5)
             local square = cell:getGridSquare(x, y, origin:getZ())
@@ -3284,7 +4164,7 @@ local function findEmergencyFleeTarget(self, ticks)
     local origin = self.character:getCurrentSquare()
     local cell = getCell()
     if origin == nil or cell == nil then return nil end
-    local threats = nearbyRetreatThreats(self, FLEE_SCAN_RADIUS + FLEE_TARGET_DISTANCE)
+    local threats = nearbyRetreatThreats(self, TUNE.FLEE_SCAN_RADIUS + TUNE.FLEE_TARGET_DISTANCE)
     if #threats == 0 then return nil end
     local currentNearest = math.huge
     for _, zombie in ipairs(threats) do
@@ -3296,7 +4176,7 @@ local function findEmergencyFleeTarget(self, ticks)
         { 1, 0 }, { 1, 1 }, { 0, 1 }, { -1, 1 },
         { -1, 0 }, { -1, -1 }, { 0, -1 }, { 1, -1 },
     }
-    for distance = math.min(FLEE_TARGET_DISTANCE, 8), 1, -1 do
+    for distance = math.min(TUNE.FLEE_TARGET_DISTANCE, 8), 1, -1 do
         for _, direction in ipairs(directions) do
             local square = cell:getGridSquare(
                 origin:getX() + direction[1] * distance,
@@ -3372,14 +4252,14 @@ local function groupFleeTarget(self, ticks)
         end
         if fleeDestinationAvailable(self, square, ticks)
             and fleeRouteSafety(current, square,
-                nearbyRetreatThreats(self, FLEE_SCAN_RADIUS + FLEE_TARGET_DISTANCE)) ~= nil then
+                nearbyRetreatThreats(self, TUNE.FLEE_SCAN_RADIUS + TUNE.FLEE_TARGET_DISTANCE)) ~= nil then
             return square, true
         end
     end
     local center = cell:getGridSquare(plan.x, plan.y, plan.z)
     return center ~= nil and center:canStand() and fleeDestinationAvailable(self, center, ticks)
         and fleeRouteSafety(self.character:getCurrentSquare(), center,
-            nearbyRetreatThreats(self, FLEE_SCAN_RADIUS + FLEE_TARGET_DISTANCE)) ~= nil
+            nearbyRetreatThreats(self, TUNE.FLEE_SCAN_RADIUS + TUNE.FLEE_TARGET_DISTANCE)) ~= nil
         and center or nil, true
 end
 
@@ -3477,15 +4357,35 @@ local function markPendingAreaBlocked(self, ticks, reason)
     local container = self.pendingSupply ~= nil and self.pendingSupply.container or nil
     local area = containerArea(container)
     if area ~= nil then
-        self.blockedAreas[area] = ticks + BLOCKED_AREA_COOLDOWN_TICKS
+        self.blockedAreas[area] = ticks + TUNE.BLOCKED_AREA_COOLDOWN_TICKS
     end
     self.forceTravel = true
     print(
         "[KnoxSurvivors][Autonomy] id=" .. self.id
             .. " blocked-area=" .. tostring(reason)
-            .. " retry=" .. tostring(BLOCKED_AREA_COOLDOWN_TICKS)
+            .. " retry=" .. tostring(TUNE.BLOCKED_AREA_COOLDOWN_TICKS)
     )
 end
+
+-- PATH FAILURE CLASSIFICATION (pure)
+-- A blocked diagonal or an ordinary obstacle is one refused approach: the
+-- engine would not take that line to that square, not the room. Only a
+-- failure that says the place cannot be reached ends the order (owner
+-- console, 2026-11-10: skipped-unreachable-container
+-- movement=FailedObstacle:FAILED_BLOCKED_DIAGONAL with retry=3600 left
+-- survivors standing with a spent order for an hour).
+function Controller.transientPathFailure(movement)
+    local kind = tostring(movement or "")
+    if kind == "" then return false end
+    if kind:find("unreachable", 1, true) or kind:find("NO_PATH", 1, true)
+        or kind:find("FailedWrongFloorOrPosition", 1, true) then
+        return false
+    end
+    return kind:find("FailedObstacle", 1, true) ~= nil
+        or kind:find("FAILED_BLOCKED", 1, true) ~= nil
+        or kind:find("Failed", 1, true) ~= nil
+end
+-- END PATH FAILURE CLASSIFICATION
 
 function Controller:hasNeedEscort()
     if self.baseId ~= nil or self.baseTask ~= nil then return false end
@@ -3509,7 +4409,7 @@ function Controller:allowNeedDetour(square, ticks, checkRoute)
     -- Reuse short-lived perceptions; do not add a population scan per container.
     for threat, memory in pairs(self.perceivedThreats or {}) do
         local threatSquare = safeMethod(threat, "getCurrentSquare", nil)
-        if ticks - (memory.lastSeen or 0) <= THREAT_MEMORY_TICKS
+        if ticks - (memory.lastSeen or 0) <= TUNE.THREAT_MEMORY_TICKS
             and not safeMethod(threat, "isDead", true)
             and threatSquare ~= nil and threatSquare:getZ() == square:getZ()
             and (distanceSquared(threatSquare, square) <= 36
@@ -3531,6 +4431,16 @@ Controller.waterSourceBoundaryContains = function(self, square)
     return self ~= nil and self.campId ~= nil and self.camp ~= nil
         and camps ~= nil and camps.contains ~= nil
         and camps.contains(self.camp, square) == true
+end
+
+-- Only ordinary personal needs may retry a different source sooner. Explicit
+-- orders and supply/task/away runs retain their existing route backoff.
+function Controller.isOrdinaryNeedRoute(self, goal)
+    return (goal == "find_food" or goal == "find_water" or goal == "find_medical")
+        and self.baseSupplyOrder == nil and self.baseSupplyTrip ~= true
+        and self.baseTaskSupplySearch ~= true and self.companionDirective == nil
+        and self.companionOrder == nil and self.groupObjective == nil
+        and self.awayTeamId == nil
 end
 
 local function findSupply(self, goal, ticks, matcher)
@@ -3570,23 +4480,28 @@ local function findSupply(self, goal, ticks, matcher)
     local function findWaterSource(square)
         if not waterSourceAllowed(square) then return nil end
         local objects = square:getObjects()
+        local best = nil
         for index = 0, objects:size() - 1 do
             local source = objects:get(index)
             local state = KnoxSurvivorNeeds.waterSourceState(source)
             if state ~= nil and state.available == true
                 and (not state.tainted or allowTaintedWater)
+                and not containerUnavailable(self, source, ticks)
                 and not reservedByOther(self.reservations, "waterSources", source, self.id) then
-                local approach = AdjacentFreeTileFinder.Find(square, self.character)
-                if approach ~= nil and self:allowNeedDetour(approach, ticks) then
-                    return { goal = goal, waterSource = source,
-                        waterSourceAmount = state.amount, tainted = state.tainted,
-                        approach = approach }
-                end
+                best = KnoxSurvivorNeeds.betterWaterSource(best, state)
             end
         end
-        return nil
+        if best == nil then return nil end
+        local approach = AdjacentFreeTileFinder.Find(square, self.character)
+        if approach == nil or not self:allowNeedDetour(approach, ticks) then
+            return nil
+        end
+        return { goal = goal, waterSource = best.source,
+            waterSourceAmount = best.amount, tainted = best.tainted,
+            approach = approach }
     end
     local function inspect(container, square, seen, policy)
+        if not KnoxSurvivorLooting.canLootSquare(self.id, square) then return nil end
         if container == nil or (restocking and assigned[container] ~= nil) or not container:isExistYet()
             or containerUnavailable(self, container, ticks) or areaUnavailable(self, container, ticks)
             or not self:allowNeedDetour(square, ticks, false) then return nil end
@@ -3640,9 +4555,35 @@ local function findSupply(self, goal, ticks, matcher)
                     and ((tonumber(policy.x) or math.huge) - origin:getX()) ^ 2
                         + ((tonumber(policy.y) or math.huge) - origin:getY()) ^ 2 <= 128 * 128 then
                     local resolved = storage.resolvePolicy(policy)
-                    local supply = resolved ~= nil and inspect(
-                        resolved.container, resolved.square, nil, policy
-                    ) or nil
+                    local supply = nil
+                    if resolved ~= nil and goal == "find_food" and matcher == nil
+                        and storage.findSurvivalSupply ~= nil then
+                        local square = resolved.square
+                        local approach = nil
+                        local ok, selected = pcall(storage.findSurvivalSupply, self.base, self.character, "food", {
+                            policy = policy, policies = policies,
+                            acceptContainer = function(container)
+                                return KnoxSurvivorLooting.canLootSquare(self.id, square)
+                                    and not containerUnavailable(self, container, ticks)
+                                    and (container ~= resolved.container
+                                        or container:isExistYet()
+                                            and not areaUnavailable(self, container, ticks))
+                                    and self:allowNeedDetour(square, ticks, false)
+                            end,
+                            acceptItem = function(item)
+                                if reservedByOther(self.reservations, "items", item, self.id) then return false end
+                                approach = AdjacentFreeTileFinder.Find(square, self.character)
+                                return approach ~= nil and self:allowNeedDetour(approach, ticks)
+                            end,
+                        })
+                        if ok and selected ~= nil then
+                            supply = {goal = goal, item = selected.item, container = selected.source,
+                                approach = approach, assignedFood = true, foodBase = self.base, foodBaseId = self.baseId,
+                                foodPolicy = policy, foodRoot = resolved.container}
+                        end
+                    elseif resolved ~= nil then
+                        supply = inspect(resolved.container, resolved.square, nil, policy)
+                    end
                     if supply ~= nil then return supply end
                 end
             end
@@ -3811,9 +4752,16 @@ local function findExploration(self, ticks, directive, options)
             if centre ~= nil then scanOrigin = centre end
         end
     end
+    if directive ~= nil and directive.awayMission == true then
+        local centre=getCell():getGridSquare(directive.scanX,directive.scanY,
+            tonumber(directive.z) or origin:getZ())
+        if centre == nil then return nil end
+        scanOrigin=centre
+    end
     local fallback = nil
     local nearestLoot = nil
     local preferredLoot = nil
+    local vehicleLoot, seenVehicles = nil, {}
     local function buildingKey(square)
         local building = safeMethod(square, "getBuilding", nil)
         local definition = safeMethod(building, "getDef", nil)
@@ -3826,7 +4774,7 @@ local function findExploration(self, ticks, directive, options)
     -- its existing options untouched.
     local planOptions = nil
     if directive ~= nil and directive.purpose ~= nil then
-        planOptions = { purpose = directive.purpose }
+        planOptions = { purpose = directive.purpose, allowFallback=directive.allowFallback }
     elseif partySupport then
         planOptions = { foodOnly = true }
     elseif self.baseSupplyParty == true then
@@ -3835,9 +4783,9 @@ local function findExploration(self, ticks, directive, options)
             supplyInventories = self.baseSupplyPartyInventories or {},
         }
     end
-    local scanRadius = directive ~= nil and 30
+    local scanRadius = directive ~= nil and (directive.scanRadius or 30)
         or self.baseSupplyParty == true and Controller.TUNING.BASE_SUPPLY_SCAN_RADIUS
-        or EXPLORATION_SCAN_RADIUS
+        or TUNE.EXPLORATION_SCAN_RADIUS
     for radius = 0, scanRadius do
         for dx = -radius, radius do
             for dy = -radius, radius do
@@ -3852,9 +4800,37 @@ local function findExploration(self, ticks, directive, options)
                         withinPlayerRadius = square ~= nil
                             and square:getZ() == playerAnchor:getZ()
                             and navigationDistanceSquared(square, playerAnchor)
-                                <= EXPLORATION_SCAN_RADIUS * EXPLORATION_SCAN_RADIUS
+                                <= TUNE.EXPLORATION_SCAN_RADIUS * TUNE.EXPLORATION_SCAN_RADIUS
                     end
-                    if square ~= nil and withinPlayerRadius then
+                    if square ~= nil and withinPlayerRadius
+                        and KnoxSurvivorLooting.canLootSquare(self.id, square) then
+                        -- Occasional autonomous searches only; vehicle stock remains
+                        -- behind the same reservations and real transfer receipts.
+                        if directive == nil and not partySupport and vehicleLoot == nil
+                            and math.floor((tonumber(ticks) or 0) / 600) % 4 == 0
+                            and not isOwnPlayerBaseSquare(self, square) then
+                            local vehicle = safeMethod(square, "getVehicleContainer", nil)
+                            if vehicle ~= nil and not seenVehicles[vehicle] then
+                                seenVehicles[vehicle] = true
+                                vehicleLoot = KnoxSurvivorLooting.vehicleCandidate(self.character,
+                                    self.id, vehicle, Controller.TUNING.LOOT_CONTAINER_ITEM_LIMIT,
+                                    self:scavengingForSettlement(), planOptions,
+                                    function(container, approach)
+                                        return not containerUnavailable(self, container, ticks)
+                                            and not areaUnavailable(self, container, ticks)
+                                            and not reservedByOther(self.reservations, "containers", container, self.id)
+                                            and self:allowNeedDetour(approach, ticks)
+                                    end)
+                                if vehicleLoot ~= nil then
+                                    for _, candidate in ipairs(vehicleLoot.items) do
+                                        if reservedByOther(self.reservations, "items", candidate.item, self.id) then
+                                            vehicleLoot = nil
+                                            break
+                                        end
+                                    end
+                                end
+                            end
+                        end
                         local objects = square:getObjects()
                         for objectIndex = 0, objects:size() - 1 do
                             local object = objects:get(objectIndex)
@@ -3898,8 +4874,8 @@ local function findExploration(self, ticks, directive, options)
                                             or (approach:getZ() == playerAnchor:getZ()
                                                 and navigationDistanceSquared(
                                                     approach, playerAnchor
-                                                ) <= EXPLORATION_SCAN_RADIUS
-                                                    * EXPLORATION_SCAN_RADIUS)
+                                                ) <= TUNE.EXPLORATION_SCAN_RADIUS
+                                                    * TUNE.EXPLORATION_SCAN_RADIUS)
                                         -- Ordered takes (loot directives, raid/event
                                         -- takes) and settlement scavenging plan
                                         -- for the group; idle self-scavenging
@@ -3928,6 +4904,7 @@ local function findExploration(self, ticks, directive, options)
                                         if #available > 0 then
                                             local candidate = {
                                                 goal = "explore",
+                                                awayMission = directive ~= nil and directive.awayMission == true,
                                                 items = available,
                                                 container = container,
                                                 approach = approach,
@@ -3963,7 +4940,7 @@ local function findExploration(self, ticks, directive, options)
             end
         end
     end
-    return preferredLoot or nearestLoot or fallback
+    return preferredLoot or nearestLoot or vehicleLoot or fallback
 end
 
 -- (bounded follower-loot reach check is inlined at the formation call site)
@@ -4016,14 +4993,18 @@ local function rememberRoamDestination(self, key, ticks, cooldown)
     end
 end
 
-local function zombiePressureAt(square, radius)
+local function zombiePressureAt(square, radius, observer)
     local cell = getCell()
     if square == nil or cell == nil then
         return 0
     end
     local count = 0
     local nearest, nearestDistance = nil, nil
-    local zombies = cell:getZombieList()
+    local nearestVisible, nearestVisibleDistance = nil, nil
+    local awareness = rawget(_G, "KnoxZombieAwareness")
+    local sharedTicks = observer ~= nil and observer.currentTicks or nil
+    local zombies = awareness ~= nil and awareness.zombieList ~= nil
+        and awareness.zombieList(cell, sharedTicks) or cell:getZombieList()
     for index = 0, zombies:size() - 1 do
         local zombie = zombies:get(index)
         local zombieSquare = zombie ~= nil and zombie:getCurrentSquare() or nil
@@ -4032,13 +5013,19 @@ local function zombiePressureAt(square, radius)
             local distance = distanceSquared(square, zombieSquare)
             if distance <= radius * radius then
                 count = count + 1
+                if observer ~= nil and observer.CanSee ~= nil then
+                    local ok, visible = pcall(observer.CanSee, observer, zombie)
+                    if ok and visible == true and (nearestVisibleDistance == nil or distance < nearestVisibleDistance) then
+                        nearestVisible, nearestVisibleDistance = zombie, distance
+                    end
+                end
                 if nearestDistance == nil or distance < nearestDistance then
                     nearest, nearestDistance = zombieSquare, distance
                 end
             end
         end
     end
-    return count, nearest
+    return count, nearest, nearestVisible
 end
 
 function Controller.selectRoamCandidate(candidates, recentGoals, ticks)
@@ -4122,11 +5109,13 @@ function Controller:roamForeignBase(square)
         end
     end
     if self.companionOrder ~= nil then return nil end
-    if self.eventAssignment ~= nil then return nil end
-    if self.groupObjective ~= nil
-        and self.groupObjective.kind == "night_shelter" then
-        return nil
-    end
+    local duty=persistence.getSurvivorDuty(self.id)
+    local events=rawget(_G,"KnoxEvents")
+    local event=duty~=nil and duty.eventId~=nil and events~=nil and events.get(duty.eventId) or nil
+    if event~=nil and event.kind=="faction_raid" and event.phase=="objective"
+        and event.targetBaseId==base.id then return nil end
+    local shelter=rawget(_G,"KnoxNightShelter")
+    if shelter~=nil and shelter.canShelter(self.id,square) then return nil end
     return base
 end
 
@@ -4141,10 +5130,10 @@ local function findRoamTarget(self, ticks)
     local skippedForeign = 0
     -- Sample loaded squares every two tiles, rather than growing nested square
     -- scans. This reaches the next block without per-tick world searching.
-    for dx = -ROAM_MAX_RADIUS, ROAM_MAX_RADIUS, 2 do
-        for dy = -ROAM_MAX_RADIUS, ROAM_MAX_RADIUS, 2 do
+    for dx = -TUNE.ROAM_MAX_RADIUS, TUNE.ROAM_MAX_RADIUS, 2 do
+        for dy = -TUNE.ROAM_MAX_RADIUS, TUNE.ROAM_MAX_RADIUS, 2 do
                 local radius = math.max(math.abs(dx), math.abs(dy))
-                if radius >= ROAM_MIN_RADIUS then
+                if radius >= TUNE.ROAM_MIN_RADIUS then
                     local square = getCell():getGridSquare(
                         origin:getX() + dx,
                         origin:getY() + dy,
@@ -4190,10 +5179,10 @@ local function findRoamTarget(self, ticks)
     end
     local onward, onwardKey, onwardScore = nil, nil, -math.huge
     for _ = 1, 40 do
-        local radius = ROAM_MIN_RADIUS + ZombRand(ROAM_MAX_RADIUS - ROAM_MIN_RADIUS + 1)
+        local radius = TUNE.ROAM_MIN_RADIUS + ZombRand(TUNE.ROAM_MAX_RADIUS - TUNE.ROAM_MIN_RADIUS + 1)
         local dx = ZombRand(radius * 2 + 1) - radius
         local dy = ZombRand(radius * 2 + 1) - radius
-        if math.max(math.abs(dx), math.abs(dy)) >= ROAM_MIN_RADIUS then
+        if math.max(math.abs(dx), math.abs(dy)) >= TUNE.ROAM_MIN_RADIUS then
             local square = getCell():getGridSquare(
                 origin:getX() + dx,
                 origin:getY() + dy,
@@ -4279,6 +5268,8 @@ local function usableBed(self, object)
 end
 
 local function usableRestFurniture(self, object, sleeping)
+    local square = object ~= nil and object:getSquare() or nil
+    if square ~= nil and self:roamForeignBase(square) ~= nil then return false end
     if sleeping then
         return usableBed(self, object)
     end
@@ -4315,7 +5306,20 @@ local function assignedBedSpot(self, squareAllowed)
             matches = object ~= nil and object:getObjectIndex() == wanted
         end)
         if matches and usableBed(self, object) then
-            local approach = AdjacentFreeTileFinder.Find(
+            -- Vanilla sleeps from a square already tile-or-adjacent to the
+            -- bed and only walks when it is not (42.21 world context menu,
+            -- onConfirmSleep). Reusing that predicate stops the survivor
+            -- repeating a walk to a second approach square it cannot reach,
+            -- which is the standing-beside-the-bed stall.
+            -- The sleep owner may be absent in a minimal harness shell; the
+            -- assigned-bed path must still resolve rather than error.
+            local needs = rawget(_G, "KnoxSurvivorNeeds")
+            local approach = nil
+            if needs ~= nil and needs.bedAdjacent ~= nil
+                and needs.bedAdjacent(self.character, object) then
+                approach = self.character:getCurrentSquare()
+            end
+            approach = approach or AdjacentFreeTileFinder.Find(
                 square,
                 self.character,
                 nil
@@ -4342,18 +5346,79 @@ function Controller:assignedBedSpot(squareAllowed)
     return assignedBedSpot(self, squareAllowed)
 end
 
+-- DONOR BEDS (owner: this controller, reading the existing bed claims)
+-- A bed another resident holds is a loan, not a second claim: the borrower may
+-- use it only while that resident is not at the base to use it themselves. The
+-- claim record is never copied, so two residents can never own one bed.
+function Controller.donorBedClaims(self)
+    local persistence = rawget(_G, "KnoxPersistence")
+    local manager = rawget(_G, "KnoxBaseManager")
+    if persistence == nil or self.base == nil
+        or persistence.getBaseResidentIds == nil
+        or persistence.getSurvivorPolicies == nil then
+        return nil
+    end
+    local ok, ids = pcall(persistence.getBaseResidentIds, self.base.id)
+    if not ok or type(ids) ~= "table" then return nil end
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    local claims = {}
+    for _, otherId in ipairs(ids) do
+        if otherId ~= self.id then
+            local alive = persistence.isSurvivorAlive == nil
+                or persistence.isSurvivorAlive(otherId) ~= false
+            local policies = alive and persistence.getSurvivorPolicies(otherId) or nil
+            local bed = type(policies) == "table" and policies.assignedBed or nil
+            local x = type(bed) == "table" and tonumber(bed.x) or nil
+            local y = type(bed) == "table" and tonumber(bed.y) or nil
+            local z = type(bed) == "table" and tonumber(bed.z) or nil
+            local index = type(bed) == "table" and tonumber(bed.objectIndex) or nil
+            if x ~= nil and y ~= nil and z ~= nil and index ~= nil then
+                local character = runtime ~= nil and runtime.getCharacter ~= nil
+                    and runtime.getCharacter(otherId) or nil
+                local square = character ~= nil and character:getCurrentSquare() or nil
+                local present = square ~= nil
+                if present and manager ~= nil and manager.containsSquare ~= nil then
+                    local okHere, here = pcall(manager.containsSquare, self.base, square)
+                    present = okHere and here == true
+                end
+                claims[tostring(x) .. ":" .. tostring(y) .. ":" .. tostring(z)
+                    .. ":" .. tostring(index)] = present
+            end
+        end
+    end
+    return claims
+end
+
+function Controller.donorBedKey(object)
+    local ok, square, index = pcall(function()
+        return object:getSquare(), object:getObjectIndex()
+    end)
+    if not ok or square == nil then return nil end
+    local x = tonumber(square:getX())
+    local y = tonumber(square:getY())
+    local z = tonumber(square.getZ ~= nil and square:getZ() or 0) or 0
+    if x == nil or y == nil then return nil end
+    return tostring(x) .. ":" .. tostring(y) .. ":" .. tostring(z) .. ":"
+        .. tostring(index)
+end
+
 local function findBestRestSpot(self, sleeping, squareAllowed)
     local origin = self.character:getCurrentSquare()
     if origin == nil or getCell() == nil then
         return nil
     end
+    -- One read of the residents' claims per scan: a claim held by somebody who
+    -- is here right now is refused, a claim held by somebody away is a loan.
+    local donorClaims = sleeping and Controller.donorBedClaims(self) or nil
+    local donorBlocked = false
     -- An assigned bed wins over every generic option, including a closer or
     -- better one. Anything invalid falls through to the normal search below.
     if sleeping then
         local assigned = assignedBedSpot(self, squareAllowed)
-        if assigned ~= nil then return assigned end
+        if assigned ~= nil and self:roamForeignBase(assigned.approach) == nil then return assigned end
     end
-    local best = nil    for radius = 0, Controller.TUNING.RECOVERY_SEAT_SCAN_RADIUS do
+    local best = nil
+    for radius = 0, Controller.TUNING.RECOVERY_SEAT_SCAN_RADIUS do
         for dx = -radius, radius do
             for dy = -radius, radius do
                 if math.max(math.abs(dx), math.abs(dy)) == radius then
@@ -4362,11 +5427,18 @@ local function findBestRestSpot(self, sleeping, squareAllowed)
                         origin:getY() + dy,
                         origin:getZ()
                     )
-                    if square ~= nil and (squareAllowed == nil or squareAllowed(square)) then
+                    if square ~= nil and self:roamForeignBase(square) == nil
+                        and (squareAllowed == nil or squareAllowed(square)) then
                         local objects = square:getObjects()
                         for index = 0, objects:size() - 1 do
                             local object = objects:get(index)
-                            if usableRestFurniture(self, object, sleeping) then
+                            local claimKey = donorClaims ~= nil
+                                and Controller.donorBedKey(object) or nil
+                            local donorPresent = claimKey ~= nil
+                                and donorClaims[claimKey] == true
+                            if donorPresent then donorBlocked = true end
+                            if not donorPresent
+                                and usableRestFurniture(self, object, sleeping) then
                                 local approach = AdjacentFreeTileFinder.Find(
                                     square,
                                     self.character,
@@ -4401,6 +5473,11 @@ local function findBestRestSpot(self, sleeping, squareAllowed)
                 end
             end
         end
+    end
+    if best == nil and donorBlocked then
+        -- The only beds left belong to residents who are here to use them.
+        -- Refuse by name, once per cooldown, instead of silently taking one.
+        self:recordFailure("rest_spot:donor_bed_claimed", self.currentTicks or 0, 3600)
     end
     return best
 end
@@ -4505,7 +5582,7 @@ function Controller.forcedEntryRefusalFrom(intentAllowed, structureAllowed, weap
     if weaponKind == nil or weaponKind == "none" then return "no_melee_weapon" end
     if weaponKind == "broken" then return "melee_weapon_broken" end
     if weaponKind == "ranged" then return "ranged_weapon_not_a_melee_tool" end
-    if (tonumber(endurance) or 0) < LOCKED_DOOR_MIN_ENDURANCE then
+    if (tonumber(endurance) or 0) < TUNE.LOCKED_DOOR_MIN_ENDURANCE then
         return "too_tired_for_forced_entry"
     end
     return nil
@@ -4562,38 +5639,8 @@ local function findForcedEntryDoor(self, preferred)
         and not doorIsBarricaded(preferred) then
         return preferred
     end
-    local current = self.character ~= nil and self.character:getCurrentSquare() or nil
-    local cell = getCell ~= nil and getCell() or nil
-    if current == nil or cell == nil then return nil end
-    local function closedDoorOn(square)
-        if square == nil or square.getObjects == nil then return nil end
-        local objects = square:getObjects()
-        local closed = nil
-        for index = 0, objects:size() - 1 do
-            local object = objects:get(index)
-            if isDoorObject(object) and not doorIsOpen(object)
-                and not doorIsBarricaded(object) then
-                if doorIsLocked(object) then return object end
-                closed = closed or object
-            end
-        end
-        return closed
-    end
-    -- Cardinal neighbours first: the edge that just failed is next to the
-    -- current square, and a locked door there is not an incidental corner door.
-    local fallback = nil
-    for _, offset in ipairs(CARDINAL_OFFSETS) do
-        local candidate = closedDoorOn(cell:getGridSquare(
-            current:getX() + offset.x,
-            current:getY() + offset.y,
-            current:getZ()
-        ))
-        if candidate ~= nil then
-            if doorIsLocked(candidate) then return candidate end
-            fallback = fallback or candidate
-        end
-    end
-    return fallback
+    -- No incidental neighboring door is evidence of the failed route.
+    return nil
 end
 
 function Controller.findForcedEntryDoor(self, preferred)
@@ -4767,7 +5814,7 @@ function Controller:traversalMemoryClosedCountNear(targetSquare, radius)
             end)
             near = ok and dx <= limit and dy <= limit
         end
-        if fresh and near and entry.reason == "locked" and (entry.failures or 0) > 0 then
+        if fresh and near and entry.kind == "window" and entry.reason == "locked" and (entry.failures or 0) > 0 then
             count = count + 1
         end
     end
@@ -4799,7 +5846,7 @@ function Controller:traversalResumeRetryClear()
 end
 -- END TRAVERSAL MEMORY
 
-local function findAlternateEntry(self, supply, ticks)
+local function findAlternateEntry(self, supply, ticks, preferred)
     local targetSquare = supply ~= nil and supply.targetSquare or nil
     targetSquare = targetSquare or (supply ~= nil and supply.container ~= nil
         and supply.container:getSourceGrid() or nil)
@@ -4816,16 +5863,16 @@ local function findAlternateEntry(self, supply, ticks)
     local best = nil
     local bestScore = math.huge
     local bestDistance = math.huge
-    local allowForcedEntry = canForceEntry(self, targetSquare)
+    local allowForcedEntry = preferred == nil and canForceEntry(self, targetSquare)
     local allowOpening = canOpenClosedEntrances(self)
     local roomSquares = targetRoom:getSquares()
     local failedClosedWindows = self:traversalMemoryClosedCountNear(
-        targetSquare, ENTRY_SCAN_RADIUS)
+        targetSquare, TUNE.ENTRY_SCAN_RADIUS)
     for index = 0, roomSquares:size() - 1 do
         local inside = roomSquares:get(index)
         if inside ~= nil and inside:getZ() == origin:getZ()
-            and math.abs(inside:getX() - targetSquare:getX()) <= ENTRY_SCAN_RADIUS
-            and math.abs(inside:getY() - targetSquare:getY()) <= ENTRY_SCAN_RADIUS then
+            and math.abs(inside:getX() - targetSquare:getX()) <= TUNE.ENTRY_SCAN_RADIUS
+            and math.abs(inside:getY() - targetSquare:getY()) <= TUNE.ENTRY_SCAN_RADIUS then
             for _, offset in ipairs(CARDINAL_OFFSETS) do
                 local outside = getCell():getGridSquare(
                     inside:getX() + offset.x,
@@ -4848,7 +5895,8 @@ local function findAlternateEntry(self, supply, ticks)
                     local doorScore = door ~= nil
                         and Controller.doorEntryScore(door, allowForcedEntry) or nil
                     if not doorOpen and not allowOpening then doorScore = nil end
-                    if not isFailedEdge and doorScore ~= nil
+                    if doorScore ~= nil and (not isFailedEdge or doorScore == 4 or preferred ~= nil)
+                        and (preferred == nil or door == preferred)
                         and self:traversalMemoryGet(door, "door") == nil then
                         score = doorScore
                         candidate = {
@@ -4856,6 +5904,7 @@ local function findAlternateEntry(self, supply, ticks)
                             inside = inside,
                             object = door,
                             kind = "door",
+                            force = doorScore == 4,
                         }
                     end
 
@@ -4891,17 +5940,23 @@ local function findAlternateEntry(self, supply, ticks)
                         and failedClosedWindows < 2 then
                         windowScore = 3
                     end
-                    local forceWindow = allowForcedEntry
+                    local forceWindow = allowForcedEntry and failedClosedWindows >= 2
                         and self:traversalMemoryForceAllowed(window, "window")
                         and not windowOpen and not windowSmashed and windowScore ~= nil
-                    if self.allowClimbing == false or (not (windowOpen or windowSmashed) and not allowOpening) then
+                    -- A failed door can reach this scan too. Combat's window
+                    -- exclusion belongs at selection, not only at window errors.
+                    if self.combatTarget ~= nil or self.state == "COMBAT"
+                        or self.allowClimbing == false or (not (windowOpen or windowSmashed) and not allowOpening) then
                         windowScore, forceWindow = nil, false
                     end
                     if failedClosedWindows >= 2 and not windowOpen and not windowSmashed
                         and not forceWindow then windowScore = nil end
+                    if preferred ~= nil and not windowOpen and not windowSmashed
+                        and safeObjectBoolean(window, "isLocked", true) then windowScore = nil end
                     if windowScore ~= nil
-                        and ((not isFailedEdge
-                            and self:traversalMemoryGet(window, "window") == nil)
+                        and (preferred == nil or window == preferred)
+                        and ((not isFailedEdge or preferred ~= nil)
+                            and self:traversalMemoryGet(window, "window") == nil
                             or forceWindow) then
                         -- Prefer open or usable entrances; after two closed
                         -- handles, a safe forced window outranks another try.
@@ -4940,6 +5995,7 @@ end
 
 local function beginFormationWindowDetour(self, ticks)
     local target = self.groupLeader
+    if self.state == "GROUP_REGROUP" then target = self.regroupMember end
     if self.state == "COMPANION_FOLLOW" then target = self:resolvePlayerPartyAnchor(ticks) end
     local targetSquare = target ~= nil and target:getCurrentSquare() or nil
     if targetSquare == nil or getCell() == nil then return false end
@@ -4953,6 +6009,31 @@ local function beginFormationWindowDetour(self, ticks)
         return false
     end
     return true
+end
+
+-- A plain or named edge refusal in follow is the garage shape one room
+-- over: a blocked line, not a dead destination. Entry failures keep their
+-- window-detour and bounded door-retry handling; this only admits the
+-- obstacle kinds to the same door owner. Anything unreadable fails closed
+-- to false so an unknown failure keeps its existing path.
+function Controller.isFollowObstacleFailure(movement)
+    movement = tostring(movement or "")
+    if Controller.isEntryTraversalFailure(movement) then return false end
+    if string.find(movement, "FailedObstacle", 1, true) == nil then return false end
+    if string.find(movement, "FAILED_", 1, true) == nil then return true end
+    return string.find(movement, "FAILED_BLOCKED_DIAGONAL", 1, true) ~= nil
+        or string.find(movement, "FAILED_STATIC_BLOCKAGE", 1, true) ~= nil
+end
+
+-- A door edge refused for reach is an entry failure with the survivor still
+-- outside: the route named the door but the body was not adjacent to its
+-- square (diagonal approach, body/square drift, a two-tile edge). No Lua
+-- owner names FAILED_DOOR_OUT_OF_REACH, so it fell to cancel-and-retry
+-- everywhere except base idle. Admit it to the door owner without the
+-- window-detour priority: the fix is one more step, not another room.
+function Controller.isDoorReachFailure(movement)
+    movement = tostring(movement or "")
+    return string.find(movement, "FAILED_DOOR_OUT_OF_REACH", 1, true) ~= nil
 end
 
 function Controller.isEntryTraversalFailure(movement)
@@ -4988,7 +6069,7 @@ local function perceptionScanOffset(id)
     local value = 0
     local text = tostring(id or "")
     for index = 1, #text do
-        value = (value + string.byte(text, index)) % THREAT_SCAN_TICKS
+        value = (value + string.byte(text, index)) % TUNE.THREAT_SCAN_TICKS
     end
     return value
 end
@@ -5058,8 +6139,9 @@ function Controller.new(id, character, bridge, reservations, ticks)
     self.nextThink = ticks + 15 + ZombRand(30)
     -- Spread independent survivor scans across the interval so a group does not
     -- traverse the loaded zombie list on one shared tick.
-    self.nextThreatScan = ticks + perceptionScanOffset(id)
-    self.lastCombatRetarget = -COMBAT_RETARGET_COOLDOWN_TICKS
+    self.perceptionPhase = perceptionScanOffset(id)
+    self.nextThreatScan = ticks + self.perceptionPhase
+    self.lastCombatRetarget = -TUNE.COMBAT_RETARGET_COOLDOWN_TICKS
     self.nextWorldSearch = 0
     self.nextBaseSupplySearch = 0
     self.nextExplorationSearch = 0
@@ -5293,7 +6375,7 @@ function Controller:recordFailure(reason, ticks, cooldown)
     self.failureReasons[key] = (self.failureReasons[key] or 0) + 1
     self.nextThink = math.max(
         self.nextThink or 0,
-        (ticks or 0) + (cooldown or THINK_MIN_TICKS)
+        (ticks or 0) + (cooldown or TUNE.THINK_MIN_TICKS)
     )
     self:recordRecentFailure(key, ticks)
     local count = self.failureReasons[key]
@@ -5431,19 +6513,19 @@ function Controller:taskTravelStalled(ticks)
     local dx = sx - self.moveProgressX
     local dy = sy - self.moveProgressY
     local dz = ((sz or 0) - (self.moveProgressZ or 0)) * 2
-    if dx * dx + dy * dy + dz * dz >= TASK_TRAVEL_STALL_DISTANCE_SQUARED then
+    if dx * dx + dy * dy + dz * dz >= TUNE.TASK_TRAVEL_STALL_DISTANCE_SQUARED then
         self.moveProgressX, self.moveProgressY, self.moveProgressZ = sx, sy, sz
         self.moveProgressTick = ticks
         return false
     end
-    return ticks - (self.moveProgressTick or ticks) > TASK_TRAVEL_STALL_TICKS
+    return ticks - (self.moveProgressTick or ticks) > TUNE.TASK_TRAVEL_STALL_TICKS
 end
 
 function Controller:recordMovementFailure(scope, result, ticks, baseCooldown, maxCooldown)    self.movementFailureCount = (self.movementFailureCount or 0) + 1
     local exponent = math.min(self.movementFailureCount - 1, 3)
     local cooldown = math.min(
-        (baseCooldown or MOVEMENT_FAILURE_COOLDOWN_TICKS) * (2 ^ exponent),
-        maxCooldown or MOVEMENT_FAILURE_MAX_COOLDOWN_TICKS
+        (baseCooldown or TUNE.MOVEMENT_FAILURE_COOLDOWN_TICKS) * (2 ^ exponent),
+        maxCooldown or TUNE.MOVEMENT_FAILURE_MAX_COOLDOWN_TICKS
     )
     self:recordFailure(
         tostring(scope or "movement") .. ":" .. movementFailureKind(result),
@@ -5477,45 +6559,24 @@ end
 
 local FENCE_HOP_RETRY_TICKS = 300
 
-local function hoppableEdge(square)
-    if square == nil or square.has == nil then return false end
-    local ok, value = pcall(function()
-        return square:has(IsoFlagType.HoppableN) == true
-            or square:has(IsoFlagType.HoppableW) == true
-    end)
-    return ok and value == true
-end
-
--- The fence object itself, never the floor or a decorative sprite. Vanilla's
--- action asks whatever object it is handed whether the wall is tall
--- (`isTallHoppable`) and picks climbOverWall or climbOverFence from the answer,
--- so a guessed object is the wrong animation and, worse, a climb in a direction
--- the fence is not on.
-local function fenceObjectOn(square)
+-- Sprite properties identify the object on the selected edge. IsoObject's
+-- isTallHoppable method exists on ordinary objects too, so it is not a test.
+local function fenceObjectOn(square, flag, tallFlag)
     if square == nil or square.getObjects == nil then return nil end
     local ok, objects = pcall(function() return square:getObjects() end)
     if not ok or objects == nil then return nil end
     local count = 0
     pcall(function() count = objects:size() end)
-    for index = 0, math.max(0, count - 1) do
+    for index = 0, count - 1 do
         local got, object = pcall(function() return objects:get(index) end)
-        if got and object ~= nil and object.isTallHoppable ~= nil then
-            local read = pcall(function() return object:isTallHoppable() end)
-            if read then return object end
+        if got and object ~= nil then
+            local matches, hasFlag = pcall(function()
+                local sprite = object:getSprite()
+                return sprite ~= nil and (sprite:getProperties():has(flag) == true
+                    or (tallFlag ~= nil and sprite:getProperties():has(tallFlag) == true))
+            end)
+            if matches and hasFlag then return object end
         end
-    end
-    return firstObjectOn(square)
-end
-
-local function firstObjectOn(square)
-    if square == nil or square.getObjects == nil then return nil end
-    local ok, objects = pcall(function() return square:getObjects() end)
-    if not ok or objects == nil then return nil end
-    local count = 0
-    pcall(function() count = objects:size() end)
-    for index = 0, math.max(0, count - 1) do
-        local got, object = pcall(function() return objects:get(index) end)
-        if got and object ~= nil then return object end
     end
     return nil
 end
@@ -5606,7 +6667,7 @@ function Controller:holdAtWindow(ticks)
     return true
 end
 
-function Controller:hopNearestFence(ticks)
+function Controller:hopNearestFence(ticks, goal)
     if self.character == nil then return false end
     if nativeTraversalBusy(self.character) then return false end
     if self.fenceHopAt ~= nil and ticks - self.fenceHopAt < FENCE_HOP_RETRY_TICKS then
@@ -5620,66 +6681,177 @@ function Controller:hopNearestFence(ticks)
         local stats = self.character:getStats()
         fatigue = stats ~= nil and tonumber(stats:get(CharacterStat.FATIGUE)) or nil
     end)
-    local offsets = { {0, -1}, {0, 1}, {-1, 0}, {1, 0} }
-    for _, offset in ipairs(offsets) do
-        local square = getCell() ~= nil and getCell():getGridSquare(
-            origin:getX() + offset[1], origin:getY() + offset[2], origin:getZ()
-        ) or nil
-        if square ~= nil and hoppableEdge(square) then
-            local fence = fenceObjectOn(square)
-            if fence ~= nil then
-                local tall = false
-                pcall(function() tall = fence:isTallHoppable() == true end)
-                local refusal = self.allowClimbing == false and "climbing_closed"
-                    or Controller.fenceTraversalRefusal(health, fatigue, tall)
-                if refusal ~= nil then
-                    -- Say why, then let the ordinary recovery route around it
-                    -- instead of leaving them pressed against the rails.
-                    self:reactToTraversal(refusal, ticks)
-                    self:recordFailure("fence_traversal:" .. refusal, ticks,
-                        FENCE_HOP_RETRY_TICKS)
-                    return false
-                end
-                local hoppableNorth = false
-                pcall(function() hoppableNorth = square:has(IsoFlagType.HoppableN) == true end)
-                local direction = nil
-                pcall(function()
-                    direction = IsoDirections ~= nil
-                        and IsoDirections[Controller.fenceHopDirection(hoppableNorth,
-                            self.character:getX(), self.character:getY(),
-                            square:getX(), square:getY())] or nil
-                end)
-                local queued = pcall(function()
-                    luautils.walkAdjFence(self.character, square, fence)
-                    ISTimedActionQueue.add(
-                        ISClimbOverFence:new(self.character, fence, direction)
-                    )
-                end)
-                if queued then
-                    self.fenceHopAt = ticks
-                    self:reactToTraversal(tall and "climbing_wall" or "hopping_fence", ticks)
-                    return true
-                end
-            end
-        end
+    local gx, gy, gz = self.formationTargetX, self.formationTargetY, self.formationTargetZ
+    if goal ~= nil then
+        local goalOk, x, y, z = pcall(function() return goal:getX(), goal:getY(), goal:getZ() end)
+        if not goalOk then return false end
+        gx, gy, gz = x, y, z
+    end
+    local ox, oy, oz = origin:getX(), origin:getY(), origin:getZ()
+    if gx == nil or gy == nil or gz ~= oz then return false end
+    local dx, dy = gx - ox, gy - oy
+    if dx == 0 and dy == 0 then return false end
+    -- Only the edge directly ahead on the route's dominant axis is eligible.
+    local north = math.abs(dy) >= math.abs(dx)
+    local step = north and (dy < 0 and -1 or 1) or (dx < 0 and -1 or 1)
+    local square = origin
+    if step > 0 then
+        local cell = getCell()
+        square = cell ~= nil and cell:getGridSquare(ox + (north and 0 or 1),
+            oy + (north and 1 or 0), oz) or nil
+    end
+    if IsoFlagType == nil then return false end
+    local flag = north and IsoFlagType.HoppableN or IsoFlagType.HoppableW
+    local tallFlag = north and IsoFlagType.TallHoppableN or IsoFlagType.TallHoppableW
+    local fence = fenceObjectOn(square, flag, tallFlag)
+    if fence == nil then return false end
+    local tall = false
+    local tallOk = pcall(function() tall = fence:isTallHoppable() == true end)
+    if not tallOk then return false end
+    local refusal = self.allowClimbing == false and "climbing_closed"
+        or Controller.fenceTraversalRefusal(health, fatigue, tall)
+    if refusal ~= nil then
+        self:reactToTraversal(refusal, ticks)
+        self:recordFailure("fence_traversal:" .. refusal, ticks, FENCE_HOP_RETRY_TICKS)
+        return false
+    end
+    local directionName = north and (step < 0 and "N" or "S")
+        or (step < 0 and "W" or "E")
+    local direction = IsoDirections ~= nil and IsoDirections[directionName] or nil
+    if direction == nil then return false end
+    local adjacentOk, adjacent = pcall(luautils.walkAdjFence, self.character, square, fence)
+    local queued = adjacentOk and adjacent == true and pcall(function()
+        ISTimedActionQueue.add(ISClimbOverFence:new(self.character, fence, direction))
+    end)
+    if queued then
+        self.fenceHopAt = ticks
+        self:reactToTraversal(tall and "climbing_wall" or "hopping_fence", ticks)
+        return true
     end
     return false
 end
 
-function Controller:handleFormationMovementFailure(movement, ticks, companionFollow)
+-- A wall corner has no door to open: re-issuing the same corner-cutting
+-- route through the bounded door retries, cancelling it, and re-issuing it
+-- is the visible stick. A corner-signature failure (blocked diagonal /
+-- static blockage, never an entry or reach kind) with no door opened steps
+-- one tile orthogonally toward the goal instead, inside the same bounded
+-- budget, so the follow resumes from a better angle. Anything unavailable
+-- (combat, no bridge move, no readable cell, no standable free neighbor,
+-- an unstarted move) falls through to the existing path untouched.
+function Controller:wallCornerStepSquare(goal)
+    if self.combatTarget ~= nil or self.state == "COMBAT" then return nil end
+    if nativeTraversalBusy(self.character) or Controller.isNativeAttackBusy(self.character)
+        or Controller.isNativeRecoveryBusy(self.character) then return nil end
+    local current = self.character ~= nil and self.character:getCurrentSquare() or nil
+    local cell = getCell ~= nil and getCell() or nil
+    if current == nil or cell == nil or cell.getGridSquare == nil or goal == nil then return nil end
+    local currentX, currentY, currentZ = current:getX(), current:getY(), current:getZ()
+    if goal:getZ() ~= currentZ then return nil end
+    local best, bestDistance = nil, nil
+    for _, offset in ipairs({ { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } }) do
+        local candidate = cell:getGridSquare(currentX + offset[1], currentY + offset[2], currentZ)
+        if candidate ~= nil and candidate ~= current
+            and Controller.formationSquareAvailable(candidate, self.character)
+            and Controller.formationSharesInterior(current, candidate) then
+            -- Standable is not reachable: vanilla checks the connecting edge
+            -- separately. Require explicit clearance; never guess over glass,
+            -- a fence, stairs or a missing floor during a recovery sidestep.
+            local ok, clear = pcall(function()
+                return candidate.TreatAsSolidFloor ~= nil
+                    and current.HasStairs ~= nil and candidate.HasStairs ~= nil
+                    and current.isBlockedTo ~= nil and candidate.isBlockedTo ~= nil
+                    and current.isWindowTo ~= nil and candidate.isWindowTo ~= nil
+                    and current.isHoppableTo ~= nil and candidate.isHoppableTo ~= nil
+                    and candidate:TreatAsSolidFloor() == true
+                    and current:HasStairs() == false and candidate:HasStairs() == false
+                    and current:isBlockedTo(candidate) == false
+                    and candidate:isBlockedTo(current) == false
+                    and current:isWindowTo(candidate) == false
+                    and candidate:isWindowTo(current) == false
+                    and current:isHoppableTo(candidate) == false
+                    and candidate:isHoppableTo(current) == false
+            end)
+            local distance = navigationDistanceSquared(candidate, goal)
+            if ok and clear and (bestDistance == nil or distance < bestDistance) then
+                best, bestDistance = candidate, distance
+            end
+        end
+    end
+    return best
+end
+
+function Controller:stepAroundWallCorner(ticks, goal)
+    if self.bridge == nil or self.bridge.moveNpcWithPace == nil then return false end
+    -- tickNpc failures have no goal argument. Use the actual accepted route,
+    -- rather than ranking every neighbour at infinity and always choosing east.
+    if goal == nil and self.formationTargetX ~= nil and self.formationTargetY ~= nil
+        and self.formationTargetZ ~= nil then
+        local cell = getCell ~= nil and getCell() or nil
+        goal = cell ~= nil and cell:getGridSquare(self.formationTargetX,
+            self.formationTargetY, self.formationTargetZ) or nil
+    end
+    local best = self:wallCornerStepSquare(goal)
+    if not best then return false end
+    -- One tile: normal pace, no anchor read. Anything but a started move
+    -- keeps the existing handling.
+    local moveResult, pace = moveWithFormationPace(self.bridge, self.id, best, nil, self.character)
+    if string.find(tostring(moveResult), "MOVE_STARTED", 1, true) ~= 1 then return false end
+    self.formationTargetX = best:getX()
+    self.formationTargetY = best:getY()
+    self.formationTargetZ = best:getZ()
+    self.formationMovementPace = pace
+    if self.formationDoorRetry ~= nil then
+        self.formationDoorRetry.cornerGoal = goal
+        self.formationDoorRetry.cornerState = self.state
+    end
+    return true
+end
+
+function Controller:resumeFormationCornerMovement(ticks)
+    local retry = self.formationDoorRetry
+    if retry == nil or retry.cornerGoal == nil then return false end
+    local goal, state = retry.cornerGoal, retry.cornerState
+    retry.cornerGoal, retry.cornerState = nil, nil
+    if self.state ~= state then return false end
+    local cell = getCell ~= nil and getCell() or nil
+    local result = "FailedObstacle:FAILED_UNLOADED_NEXT_SQUARE"
+    if cell ~= nil and cell:getGridSquare(goal:getX(), goal:getY(), goal:getZ()) == goal then
+        local pace
+        result, pace = moveWithFormationPace(self.bridge, self.id, goal, nil, self.character)
+        if string.find(tostring(result), "MOVE_STARTED", 1, true) == 1 then
+            self.formationTargetX, self.formationTargetY, self.formationTargetZ =
+                goal:getX(), goal:getY(), goal:getZ()
+            self.formationMovementPace = pace
+            self.nextFormationRefresh = ticks + TUNE.THINK_MIN_TICKS
+            return true
+        end
+    end
+    self:handleFormationMovementFailure(result, ticks, state == "COMPANION_FOLLOW", goal)
+    return true
+end
+
+function Controller:handleFormationMovementFailure(movement, ticks, companionFollow, goal)
     -- Native climb/vault owns the body: never cancel, count, or replan while
     -- the native traversal action is active. Landing resolves on its own tick;
     -- treating it as failure is what produced the visible fast reset snap.
     if nativeTraversalBusy(self.character) then
-        self.nextThink = math.max(self.nextThink or 0, ticks + THINK_MIN_TICKS)
+        self.nextThink = math.max(self.nextThink or 0, ticks + TUNE.THINK_MIN_TICKS)
         self.nextFormationRefresh = math.max(self.nextFormationRefresh or 0,
-            ticks + THINK_MIN_TICKS)
-        return
+            ticks + TUNE.THINK_MIN_TICKS)
+        return true
     end
+    local retry = self.formationDoorRetry
+    if retry ~= nil and retry.cornerGoal ~= nil and retry.cornerState == self.state then
+        goal = retry.cornerGoal
+        retry.cornerGoal, retry.cornerState = nil, nil
+    end
+    self.formationRouteContinuity = nil
     -- A failed move beside a hoppable edge is the fence case: the survivor
     -- walked up to it and the path had no way through. Hop once, then let the
     -- existing recovery below run untouched if the hop is unavailable.
-    if Controller.isWindowTraversalFailure(movement) then
+    if Controller.isWindowTraversalFailure(movement)
+        and (self.combatTarget ~= nil or self.state == "COMBAT") then
         local decision = Controller.windowCombatPolicy({
             combat = self.combatTarget ~= nil or self.state == "COMBAT",
             sameSide = false,
@@ -5691,23 +6863,63 @@ function Controller:handleFormationMovementFailure(movement, ticks, companionFol
             self:recordFailure("window_wait:" .. movementFailureKind(movement), ticks,
                 WINDOW_HOLD_TICKS)
             self:holdAtWindow(ticks)
-            return
+            return true
         end
     end
-    if self:hopNearestFence(ticks) then
-        self.nextThink = math.max(self.nextThink or 0, ticks + THINK_MIN_TICKS)
-        return
+    if self:hopNearestFence(ticks, goal) then
+        self.nextThink = math.max(self.nextThink or 0, ticks + TUNE.THINK_MIN_TICKS)
+        return true
     end
     if Controller.isEntryTraversalFailure(movement)
-        and (self.state == "GROUP_FOLLOW" or self.state == "COMPANION_FOLLOW") then
-        if beginFormationWindowDetour(self, ticks) then return end
+        and (self.state == "GROUP_FOLLOW" or self.state == "GROUP_REGROUP"
+            or self.state == "COMPANION_FOLLOW") then
+        if beginFormationWindowDetour(self, ticks) then return true end
+    end
+    -- A follower held at a doorway is a tracked state with a reason and a
+    -- retry, never a quiet stall: the existing door owner opens the real
+    -- door and the formation refresh re-issues the route. A plain or named
+    -- edge refusal shares the owner (the garage shape one room over); with
+    -- no door nearby the attempt is a no-op and the same bounded path runs.
+    -- Only an entrance that stays shut through the bounded retries falls
+    -- through to the ordinary failure path, so a locked or barricaded door
+    -- still escalates.
+    if Controller.isEntryTraversalFailure(movement)
+        or Controller.isFollowObstacleFailure(movement)
+        or Controller.isDoorReachFailure(movement) then
+        self.formationDoorRetry = self.formationDoorRetry or { count = 0 }
+        -- Bounded retries: an entrance that stays shut escalates normally.
+        if (self.formationDoorRetry.count or 0) < 3 then
+            self.formationDoorRetry.count = (self.formationDoorRetry.count or 0) + 1
+            self.formationDoorRetry.reason = movementFailureKind(movement)
+            self.formationDoorRetry.at = ticks
+            self.formationDoorRetry.opened = self:openNearbyClosedDoor() == true
+            if self.formationDoorRetry.opened ~= true
+                and Controller.isFollowObstacleFailure(movement)
+                and self:stepAroundWallCorner(ticks, goal) then
+                self.nextFormationRefresh = ticks + 90
+                self.nextThink = math.max(self.nextThink or 0, ticks + TUNE.THINK_MIN_TICKS)
+                self:recordFailure(
+                    "formation_corner:" .. tostring(self.formationDoorRetry.reason),
+                    ticks, 90)
+                self:diag("movement", "formation_corner_step", self.formationDoorRetry)
+                return true
+            end
+            self.nextFormationRefresh = ticks + 90
+            self.nextThink = math.max(self.nextThink or 0, ticks + TUNE.THINK_MIN_TICKS)
+            self:recordFailure(
+                "formation_door:" .. tostring(self.formationDoorRetry.reason),
+                ticks, 90)
+            self:diag("movement", "formation_door_retry", self.formationDoorRetry)
+            return true
+        end
+        self.formationDoorRetry = nil
     end
     self.bridge:cancelNpcMove(self.id)
     if self.playerContactAnchor ~= nil then self.playerContactFailures = (self.playerContactFailures or 0) + 1 end
     self.formationFailureCount = (self.formationFailureCount or 0) + 1
     local cooldown = math.min(
         Controller.TUNING.FORMATION_FAILURE_COOLDOWN_TICKS * self.formationFailureCount,
-        FORMATION_FAILURE_MAX_COOLDOWN_TICKS
+        TUNE.FORMATION_FAILURE_MAX_COOLDOWN_TICKS
     )
     self:recordFailure(
         "formation_movement:" .. movementFailureKind(movement),
@@ -5727,7 +6939,7 @@ function Controller:handleFormationMovementFailure(movement, ticks, companionFol
     if self.baseId ~= nil and self.companionOrder == nil
         and self.companionDirective == nil and self.combatTarget == nil
         and self.baseTask == nil and self:beginBaseTask(ticks) then
-        return
+        return true
     end
     -- recordFailure owns the retry time. Do not let the ordinary grouped
     -- finishDecision fast path replace this with its five-tick refresh.
@@ -5736,9 +6948,9 @@ end
 
 function Controller:waitForFormationBottleneck(movement, ticks)
     if nativeTraversalBusy(self.character) then
-        self.nextThink = math.max(self.nextThink or 0, ticks + THINK_MIN_TICKS)
+        self.nextThink = math.max(self.nextThink or 0, ticks + TUNE.THINK_MIN_TICKS)
         self.nextFormationRefresh = math.max(self.nextFormationRefresh or 0,
-            ticks + THINK_MIN_TICKS)
+            ticks + TUNE.THINK_MIN_TICKS)
         return
     end
     self.bridge:cancelNpcMove(self.id)
@@ -5788,6 +7000,41 @@ function Controller:setGroupLeader(
     self.groupObjective = objective
     self:setGroupLeaderOrder(leaderOrder)
     if id ~= nil and not preserveLifeIntent then self:clearLifeIntent() end
+end
+
+-- Resolve the live character for an existing leader id without taking over
+-- group assignment.  The social coordinator owns the id and formation slot;
+-- a streamed-out or freshly spawned leader can briefly have no controller
+-- pointer, and that must not turn every follower into an independent idler.
+function Controller:resolveGroupLeader()
+    local id = self.groupLeaderId
+    if id == nil then return nil end
+    local current = self.groupLeader
+    if current ~= nil and type(current) == "table"
+        and type(current.getCurrentSquare) == "function"
+        and current:getCurrentSquare() ~= nil then
+        return current
+    end
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    if runtime ~= nil and runtime.getCharacter ~= nil then
+        local ok, live = pcall(runtime.getCharacter, id)
+        if ok and type(live) == "table"
+            and type(live.getCurrentSquare) == "function"
+            and live:getCurrentSquare() ~= nil then
+            self.groupLeader = live
+            return live
+        end
+    end
+    if self.bridge ~= nil and self.bridge.getNpcCharacter ~= nil then
+        local ok, live = pcall(self.bridge.getNpcCharacter, self.bridge, id)
+        if ok and type(live) == "table"
+            and type(live.getCurrentSquare) == "function"
+            and live:getCurrentSquare() ~= nil then
+            self.groupLeader = live
+            return live
+        end
+    end
+    return nil
 end
 
 function Controller:clearGroupLeader()
@@ -5853,7 +7100,11 @@ function Controller:setGroupLeaderOrder(order)
             previous.groupId ~= order.groupId or previous.leaderId ~= order.leaderId
             or previous.kind ~= order.kind or previous.revision ~= order.revision))
     self.groupLeaderOrder = order
-    if changed then self.groupLeaderOrderPending = true end
+    if changed then
+        self.groupLeaderOrderPending = true
+        self.groupEntryOrderChangedAt = self.currentTicks or 0
+        self.formationRouteContinuity = nil
+    end
 end
 
 -- Delivery is not permission to cancel a native action. Consume the changed
@@ -6039,6 +7290,7 @@ function Controller:isSettlementSupplyEntry()
 end
 
 function Controller:interruptForDirective(replaceOrder)
+    self:releaseSharedMeal(self.currentTicks)
     local windowEntry = self.entryDetour ~= nil and (self.state == "MOVING_TO_WINDOW_ENTRY"
         or self.state == "OPENING_ENTRY_WINDOW" or self.state == "CROSSING_WINDOW_ENTRY")
     -- Primary orders and targeted directives are projected separately. Both
@@ -6049,6 +7301,7 @@ function Controller:interruptForDirective(replaceOrder)
         return false
     end
     self.companionOrderInterruptPending = nil
+    self.formationRouteContinuity = nil
     self.securityRoute=nil
     self:releaseBaseCooking()
     local vehicles = rawget(_G, "KnoxCompanionVehicles")
@@ -6189,6 +7442,11 @@ function Controller:setCompanionOrder(
     self.companionPartySize = math.max(1, math.floor(
         tonumber(formationMemberCount) or 1
     ))
+    if normalized == "hold" and changed then
+        self:recordHoldPost()
+    elseif normalized ~= "hold" then
+        self.holdPost, self.holdReturnActive = nil, nil
+    end
     if changed then
         self:clearLifeIntent()
         -- Keep the new durable order, but let the native crossing finish before
@@ -6268,12 +7526,37 @@ function Controller:allowsCompanionThreat(target)
     end
     local square = self.character:getCurrentSquare()
     local targetSquare = target:getCurrentSquare()
+    -- Self-defense is never a policy decision: anything inside the scan's own
+    -- engagement radius is answered, whether or not it has acquired a target
+    -- yet. (Two tiles of warning was not enough to keep the party safe; the
+    -- scan already defines nearby danger, so the policy mirrors its radius -
+    -- base, targeting, and night-sweep terms - instead of second-guessing it.
+    -- An explicit passive order still holds, and flee still answers first on
+    -- its own scan. Distant unbothered zombies stay vetoed.)
+    if square ~= nil and targetSquare ~= nil then
+        local dd = distanceSquared(square, targetSquare)
+        local threatTarget = targetOf(target)
+        local settings = rawget(_G, "KnoxSettings")
+        local base = settings ~= nil and settings.zombieEngagementDistance ~= nil
+            and settings.zombieEngagementDistance() or 4
+        local radius = Controller.threatEngagementRadius(
+            base,
+            threatTarget == self.character,
+            threatTarget ~= self.character and targetsGroupMember(self, threatTarget),
+            targetsAnyPlayer(threatTarget, dd))
+        if (self.nightSweepUntil or 0) > (self.currentTicks or 0) then
+            radius = math.max(radius, Controller.TUNING.NIGHT_SWEEP_RADIUS)
+        end
+        if dd <= radius * radius then
+            return true
+        end
+    end
     -- Human shells do not expose the zombie getTarget contract reliably. A
     -- survivor already classified as hostile to this companion/player faction
     -- is enough for a defensive companion to protect its nearby owner and party.
     if square ~= nil and targetSquare ~= nil and hostileHuman(self, target)
         and distanceSquared(square, targetSquare)
-            <= THREAT_GROUP_ASSIST_RADIUS * THREAT_GROUP_ASSIST_RADIUS then
+            <= TUNE.THREAT_GROUP_ASSIST_RADIUS * TUNE.THREAT_GROUP_ASSIST_RADIUS then
         return true
     end
     -- getTarget is zombie-only and throws through pcall on human shells;
@@ -6282,7 +7565,7 @@ function Controller:allowsCompanionThreat(target)
         or not targetsGroupMember(self, targetOf(target)) then
         return false
     end
-    return distanceSquared(square, targetSquare) <= THREAT_GROUP_ASSIST_RADIUS * THREAT_GROUP_ASSIST_RADIUS
+    return distanceSquared(square, targetSquare) <= TUNE.THREAT_GROUP_ASSIST_RADIUS * TUNE.THREAT_GROUP_ASSIST_RADIUS
 end
 
 function Controller:setCompanionPolicy(allowClimbing)
@@ -6565,6 +7848,65 @@ function Controller:clearCompanionOrder()
     self.companionFormationForwardX = nil
     self.companionFormationForwardY = nil
     self.companionDirective = nil
+    self.holdPost, self.holdReturnActive = nil, nil
+end
+
+-- HOLD POST (pure readers + one bounded walk).
+-- A held post survives a fight the way a guard post does: the order-time
+-- square is the post, and a displaced survivor walks back instead of
+-- adopting the battlefield as the new hold. Old saves never recorded a
+-- post, and for them holding still means freezing in place.
+function Controller:recordHoldPost()
+    local square = self.character ~= nil and self.character:getCurrentSquare() or nil
+    local ok, x, y, z = pcall(function()
+        return square:getX(), square:getY(), square:getZ()
+    end)
+    if ok and tonumber(x) ~= nil and tonumber(y) ~= nil then
+        self.holdPost = { x = x, y = y, z = tonumber(z) or 0 }
+    else
+        self.holdPost = nil
+    end
+    self.holdReturnActive = nil
+end
+
+-- True when there is nowhere to walk back to (no post, unreachable body,
+-- already home, or a floor change nobody should chase). Clears the active
+-- flag so a stale walk can never pin the formation loop.
+function Controller:holdPostReached()
+    local post = self.holdPost
+    local here = self.character ~= nil and self.character:getCurrentSquare() or nil
+    if type(post) ~= "table" or here == nil then
+        self.holdReturnActive = nil
+        return true
+    end
+    if here:getZ() ~= (tonumber(post.z) or here:getZ()) then
+        self.holdReturnActive = nil
+        return true
+    end
+    local dx, dy = post.x - here:getX(), post.y - here:getY()
+    if dx * dx + dy * dy <= 2.25 then
+        self.holdReturnActive = nil
+        return true
+    end
+    return false
+end
+
+function Controller:returnToHoldPost(ticks)
+    if self.combatTarget ~= nil or self:holdPostReached() then return false end
+    if nativeTraversalBusy(self.character) or hasPendingTimedActions(self.character) then
+        return false
+    end
+    local post = self.holdPost
+    local cell = getCell ~= nil and getCell() or nil
+    local dest = cell ~= nil and cell:getGridSquare(post.x, post.y, post.z or 0) or nil
+    if dest == nil then return false end
+    local result = tostring(self.bridge:moveNpc(self.id, dest))
+    if string.find(result, "MOVE_STARTED", 1, true) ~= 1 then return false end
+    self.holdReturnActive = true
+    self.activeDecision = "hold_position"
+    self.state = "COMPANION_HOLD"
+    self.nextThink = ticks + 90
+    return true
 end
 
 function Controller:syncBaseSupplyOrder()
@@ -6709,6 +8051,30 @@ function Controller:canApplyDutyChange()
     return not nativeTraversalBusy(self.character) and not Controller.isNativeAttackBusy(self.character)
         and not Controller.isNativeRecoveryBusy(self.character)
         and not (entryAction and hasPendingTimedActions(self.character))
+end
+
+function Controller:onGroupHomeRevoked(baseId)
+    if self.baseId ~= baseId then return false end
+    self.groupHomeRevoked = baseId
+    self:releaseSupplyCollection()
+    self:releaseBaseTaskSupplyTransfer()
+    self:releaseInventoryCleanup()
+    local watch=self.baseTaskActionWatch
+    if watch ~= nil and watch.action ~= nil then self:releaseTransferActions({{action=watch.action}}) end
+    self.baseTaskActionWatch=nil
+    self.pendingDepositTrip=nil
+    self.pendingBaseSupplyDeposit=nil
+    self.baseSupplyOrder=nil
+    self.baseSupplyTrip=nil
+    self.baseSupplyKind=nil
+    -- Native work already in progress drains at its own boundary. Persisted
+    -- claims and all guarded stock actions have already lost permission.
+    self.baseTask=nil
+    self.baseTaskStartedAt=nil
+    self.base=nil
+    self.baseId=nil
+    self.nextThink=0
+    return true
 end
 
 function Controller:onDutyChanged()
@@ -6952,278 +8318,19 @@ function Controller:clearCampAssignment()
     self:interruptForDirective()
 end
 
-function Controller:setAwayTeam(teamId)
-    self.awayTeamId = type(teamId) == "string" and teamId ~= "" and teamId or nil
-    local team = self.awayTeamId ~= nil and KnoxPersistence.getAwayTeam(self.awayTeamId) or nil
-    local member = team ~= nil and team.collection ~= nil and team.collection.byMember ~= nil
-        and team.collection.byMember[self.id] or nil
-    self.awayCollected = type(member) == "table" and member.collected == true
-    self.awaySearchMisses = 0
-    self.awayTravelMisses = 0
-    if self.awayTeamId ~= nil then
-        self.activeDecision = "away_mission"
-        self.state = "IDLE"
-        self.nextThink = 0
-    end
-end
+-- Loaded mission travel/collection methods are installed from
+-- KS_SurvivorMissionController below; public controller methods are unchanged.
 
-function Controller:beginAwayReturn(ticks)
-    if self.awayTeamId == nil then return false end
-    local target = KnoxAwayTeamExecutor.returnDestination(self.awayTeamId)
-    if target == nil or getCell == nil or getCell() == nil then
-        self:recordFailure("away_return_target_unavailable", ticks, EXPLORATION_RETRY_TICKS)
-        return false
-    end
-    local square = getCell():getGridSquare(
-        math.floor(tonumber(target.x) or 0),
-        math.floor(tonumber(target.y) or 0),
-        math.floor(tonumber(target.z) or 0)
-    )
-    local canStand = square ~= nil
-    if canStand and square.canStand ~= nil then
-        local ok, value = pcall(square.canStand, square)
-        canStand = ok and value == true
-    end
-    if not canStand then
-        self:recordFailure("away_return_square_unloaded", ticks, EXPLORATION_RETRY_TICKS)
-        return false
-    end
-    local current = self.character:getCurrentSquare()
-    if current ~= nil and navigationDistanceSquared(current, square) <= 2.25 then
-        local result = KnoxPersistence.completeAwayTeamMember(
-            self.awayTeamId, self.id, true, "returned_to_owner", currentWorldAgeHours()
-        )
-        if result ~= nil then
-            self.awayTeamId = nil
-            self.awayCollected = false
-            self.activeDecision = nil
-            self.state = "IDLE"
-            self.nextThink = ticks + THINK_MIN_TICKS
-            return true
-        end
-    end
-    local movement = tostring(moveWithTravelPace(
-        self.bridge, self.id, self.character, square, "return_home"
-    ))
-    if string.find(movement, "MOVE_STARTED", 1, true) ~= 1 then
-        self:recordMovementFailure("away_return", movement, ticks, EXPLORATION_RETRY_TICKS)
-        return false
-    end
-    self.activeDecision = "away_return"
-    self.state = "AWAY_RETURN"
-    return true
-end
-
--- A finished team keeps no claim over a loaded member. Clearing this local
--- mission state lets the same member resume ordinary base/companion work in
--- this decision pass instead of waiting for an external reassignment.
-function Controller:clearFinishedAwayTeam(ticks, team)
-    if self.awayTeamId == nil then return false end
-    if team ~= nil and team.state ~= "complete" and team.state ~= "blocked" then
-        return false
-    end
-    local decision = tostring(self.activeDecision or "")
-    self.awayTeamId = nil
-    self.awayCollected = false
-    self.awaySearchMisses = 0
-    self.awayTravelMisses = 0
-    if decision == "away_mission" or decision == "away_mission_travel"
-        or decision == "away_return" or decision == "away_return_pending"
-        or decision == "away_waiting_for_team" or decision == "away_collection_retry" then
-        self.activeDecision = nil
-        if self.state == "IDLE" or self.state == "GROUP_WAIT"
-            or self.state == "MOVING_TO_EXPLORE" then
-            self.state = "IDLE"
-            self.nextThink = math.min(self.nextThink or ticks, ticks)
-        end
-    end
-    return true
-end
-
--- A nearby member must visibly cover the distance to its mission area before
--- searching it.  Hibernation already owns the far case: when the population
--- lifecycle captures this body, the unloaded ledger keeps the durable
--- destination and the mission resolves there without any body on screen.
-function Controller:beginAwayTravel(ticks, team)
-    local destination = type(team.destination) == "table" and team.destination or nil
-    local x = destination ~= nil and tonumber(destination.x) or nil
-    local y = destination ~= nil and tonumber(destination.y) or nil
-    local cell = getCell ~= nil and getCell() or nil
-    local current = self.character ~= nil and self.character:getCurrentSquare() or nil
-    local square = cell ~= nil and x ~= nil and y ~= nil
-        and cell:getGridSquare(math.floor(x), math.floor(y), math.floor(tonumber(destination.z) or 0))
-        or nil
-    if square == nil or current == nil then
-        -- The destination is outside the loaded band, so no body can be walked
-        -- there. Search where this member actually stands and record the real
-        -- (possibly empty) result instead of inventing a destination haul.
-        self.awayTravelMisses = 0
-        return self:finishAwayCollection(ticks)
-    end
-    if navigationDistanceSquared(current, square) <= AWAY_TRAVEL_SEARCH_RADIUS_SQUARED then
-        self.awayTravelMisses = 0
-        return false
-    end
-    local movement = tostring(moveWithTravelPace(
-        self.bridge, self.id, self.character, square, "directed"
-    ))
-    if string.find(movement, "MOVE_STARTED", 1, true) == 1 then
-        self.activeDecision = "away_mission_travel"
-        self.state = "MOVING_TO_EXPLORE"
-        self.awayTravelMisses = 0
-        return true
-    end
-    self.awayTravelMisses = (self.awayTravelMisses or 0) + 1
-    if self.awayTravelMisses >= AWAY_TRAVEL_FAILURE_LIMIT then
-        self.awayTravelMisses = 0
-        return self:finishAwayCollection(ticks)
-    end
-    self:recordMovementFailure("away_travel", movement, ticks, EXPLORATION_RETRY_TICKS)
-    return true
-end
-
-function Controller:beginAwayMission(ticks)
-    if self.awayTeamId == nil then return false end
-    local team = KnoxPersistence.getAwayTeam(self.awayTeamId)
-    if team == nil then
-        self.awayTeamId = nil
-        return false
-    end
-    if team.state == "returning" then
-        return self:beginAwayReturn(ticks)
-    end
-    if team.state ~= "awaiting_collection" and team.state ~= "collecting" then
-        return false
-    end
-    if self.awayCollected then
-        -- The final acknowledgement may be an empty search or another member.
-        if KnoxAwayTeamExecutor.collectionReady(self.awayTeamId) then
-            local returning = KnoxAwayTeamExecutor.beginReturn(self.awayTeamId, currentWorldAgeHours())
-            if returning ~= nil then
-                self.awayCollected = false
-                self.state, self.activeDecision, self.nextThink = "IDLE", "away_return_pending", ticks
-                return true
-            end
-        end
-        self.activeDecision = "away_waiting_for_team"
-        self.state = "GROUP_WAIT"
-        self.nextThink = ticks + 120
-        return true
-    end
-    local _, beginResult = KnoxAwayTeamExecutor.beginCollection(
-        self.awayTeamId, currentWorldAgeHours()
-    )
-    if beginResult == "not_collectible" then return false end
-    if self:beginAwayTravel(ticks, team) then return true end
-    local directive = KnoxAwayTeamExecutor.destinationDirective(team)
-    if directive == nil then
-        self:recordFailure("away_destination_unavailable", ticks, EXPLORATION_RETRY_TICKS)
-        return true
-    end
-    if ticks < (self.nextExplorationSearch or 0) then
-        self.nextThink = self.nextExplorationSearch
-        return true
-    end
-    if self:beginExploration(ticks, directive) then
-        self.awaySearchMisses = 0
-        return true
-    end
-    self.awaySearchMisses = (self.awaySearchMisses or 0) + 1
-    if self.awaySearchMisses >= 3 then
-        return self:finishAwayCollection(ticks)
-    end
-    return true
-end
-
--- A loaded away member acknowledges a destination only after the ordinary
--- search/transfer action has finished.  This keeps mission results tied to
--- real inventory state and lets the persistence layer hold the group until
--- every member has completed the same boundary.
-function Controller:finishAwayCollection(ticks)
-    if self.awayTeamId == nil then return false end
-    local supply = self.pendingSupply
-    -- One container does not finish a supply run. Earlier this member
-    -- acknowledged its destination after the first real transfer, so a solo
-    -- team was immediately `collectionReady` and walked home with one item.
-    -- The member now keeps searching its own area until its pack is full or the
-    -- bounded chain budget is spent, and each container's transfer is recorded
-    -- as it happens so the result still counts everything carried home. The
-    -- planner refusing every remaining container ends the run through the
-    -- existing miss budget, and the needs/combat owners cannot interrupt this
-    -- because the away-team duty already outranks them.
-    self.awaySearches = (self.awaySearches or 0) + 1
-    local continues = KnoxAwayTeamExecutor.runContinues({
-        searches = self.awaySearches,
-        maxSearches = KnoxAwayTeamExecutor.RUN_SEARCH_LIMIT,
-        packFull = KnoxAwayTeamExecutor.packFull(self.character),
-    })
-    local recorded, detail = KnoxAwayTeamExecutor.recordCollection(
-        self.awayTeamId,
-        self.id,
-        supply,
-        self.character,
-        currentWorldAgeHours(),
-        not continues
-    )
-    if recorded ~= nil then self:markAwayCargoDelivery(supply) end
-    -- Remember the container that was just worked, so the next search moves on
-    -- to the next real container instead of reopening the same crate.
-    if supply ~= nil and supply.container ~= nil then
-        self.inspectedContainers[supply.container] = ticks + EXPLORATION_RETRY_TICKS
-    end
-    self:releaseSupply()
-    if recorded == nil then
-        self:recordFailure(
-            "away_collection_record:" .. tostring(detail),
-            ticks,
-            EXPLORATION_RETRY_TICKS
-        )
-        self.state = "IDLE"
-        self.activeDecision = "away_collection_retry"
-        self.nextThink = ticks + EXPLORATION_RETRY_TICKS
-        return true
-    end
-    if continues then
-        self.awayCollected = false
-        self.awaySearchMisses = 0
-        self.activeDecision = "away_continue_search"
-        self.state = "IDLE"
-        self.nextThink = ticks + THINK_MIN_TICKS
-        return true
-    end
-    self.awaySearches = nil
-    self.awayCollected = true
-    self.awaySearchMisses = 0
-    if KnoxAwayTeamExecutor.collectionReady(self.awayTeamId) then
-        local _, returnResult = KnoxAwayTeamExecutor.beginReturn(
-            self.awayTeamId,
-            currentWorldAgeHours()
-        )
-        if returnResult == "returning" then
-            self.awayCollected = false
-            self.activeDecision = "away_return_pending"
-            self.state = "IDLE"
-            self.nextThink = ticks
-            return true
-        end
-        self:recordFailure(
-            "away_return_begin:" .. tostring(returnResult),
-            ticks,
-            EXPLORATION_RETRY_TICKS
-        )
-    end
-    self.activeDecision = "away_waiting_for_team"
-    self.state = "GROUP_WAIT"
-    self.nextThink = ticks + 120
-    return true
-end
-
-function Controller:setFactionBaseCandidate(factionId, candidate)
-    self.factionId = factionId
+function Controller:setFactionBaseCandidate(factionId, candidate, ownerKind)
+    self.baseCandidateOwnerKind = ownerKind or "faction"
+    self.baseCandidateOwnerId = factionId
+    self.factionId = self.baseCandidateOwnerKind == "faction" and factionId or nil
     self.factionBaseCandidate = candidate
 end
 
 function Controller:clearFactionBaseCandidate()
+    self.baseCandidateOwnerKind = nil
+    self.baseCandidateOwnerId = nil
     self.factionId = nil
     self.factionBaseCandidate = nil
 end
@@ -7233,7 +8340,7 @@ function Controller:rejectFactionBaseCandidate(ticks, reason)
     local worldAge = getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
     if candidate ~= nil then
         KnoxPersistence.rejectFactionBaseCandidate(
-            self.factionId,
+            self.baseCandidateOwnerId or self.factionId,
             candidate.buildingId,
             worldAge
         )
@@ -7275,10 +8382,34 @@ local function needCalloutIsCurrent(character, decision)
         and needs.isNeedCurrent(character, decision) == true
 end
 
+-- A resident speaking in front of the people they live with is the same
+-- audience as a companion or a travel group: their own base, with another
+-- resident in it. Admitted only while nothing else owns the body or the moment,
+-- so ordinary need calls and their existing callers are untouched.
+function Controller:speaksToBaseResidents()
+    if self.base == nil or self.baseId == nil or self.character == nil then return false end
+    local manager = rawget(_G, "KnoxBaseManager")
+    local store = rawget(_G, "KnoxPersistence")
+    if manager == nil or manager.containsSquare == nil
+        or store == nil or store.getBaseResidentIds == nil then return false end
+    local square = self.character:getCurrentSquare()
+    if square == nil or not manager.containsSquare(self.base, square) then return false end
+    if self.combatTarget ~= nil or self.pendingThreatAwareness ~= nil then return false end
+    if self.activeDecision == "rest" or self.activeDecision == "sleep" then return false end
+    if hasPendingTimedActions(self.character) then return false end
+    local ids = store.getBaseResidentIds(self.baseId)
+    if type(ids) ~= "table" then return false end
+    for _, id in ipairs(ids) do
+        if id ~= self.id then return true end
+    end
+    return false
+end
+
 function Controller:sayNeedIfGrouped(decision, ticks)
     local grouped = self.companionTarget ~= nil
         or self.groupLeader ~= nil
         or #(self.groupMembers or {}) > 1
+        or self:speaksToBaseResidents()
     if not grouped or ticks < self.nextNeedCallout
         or not needCalloutIsCurrent(self.character, decision) then
         return
@@ -7299,6 +8430,19 @@ function Controller:sayNeedIfGrouped(decision, ticks)
         KnoxActivityFeed.speak(self.character, line)
         self.nextNeedCallout = ticks + 1800
     end
+end
+
+-- Orders the survivor cannot physically carry out are reported by that
+-- survivor in one line, through the same speech owner as every other callout;
+-- only blockers that name a missing thing keep the feed notice.
+function Controller:reportBlockedJob(reason, ticks)
+    local kind, line = KnoxBaseTaskBoard.blockedOrderFeedback(reason)
+    if kind == "speak" and line ~= nil then
+        return self:sayAction({ line }, ticks, 2400)
+    end
+    KnoxActivityFeed.event("Base job blocked: "
+        .. (line or "Supplies unavailable") .. ".")
+    return false
 end
 
 function Controller:sayAction(lines, ticks, cooldown)
@@ -7340,8 +8484,9 @@ local function conversationDistance(character, player, current, target)
     return dx * dx + dy * dy
 end
 
-function Controller:beginPlayerConversation(player)
+function Controller:beginPlayerConversation(player, options)
     local ticks = self.currentTicks or 0
+    local managePack = type(options) == "table" and options.managePack == true
     local currentConversation = self.playerConversation
     local continuing = currentConversation ~= nil and currentConversation.player == player
         and self.state == "PLAYER_CONVERSATION"
@@ -7367,6 +8512,17 @@ function Controller:beginPlayerConversation(player)
         local heard, clear = pcall(function() return self.bridge:canHearOrder(player, self.character) end)
         if not heard or clear ~= true then return false, "not_visible" end
     end
+    -- Gear management renews without re-admission. The pack is a loot pane: the
+    -- player is in a UI, so a threat inside the scan radius must not close it and
+    -- cancel the transfer in flight. The shared close rule still ends it on
+    -- distance, body replacement, death and hostility.
+    if continuing and (currentConversation.managePack == true or managePack) then
+        currentConversation.managePack = currentConversation.managePack == true or managePack
+        currentConversation.untilTick = ticks + 600
+        self.nextThreatScan = 0
+        safeMethod(self.character, "faceThisObject", nil, player)
+        return true, "talking"
+    end
     if fleeAssessment(self) or nearestThreat(self, ticks) ~= nil then return false, "danger" end
     if nativeTraversalBusy(self.character) or Controller.isNativeRecoveryBusy(self.character)
         or Controller.isNativeAttackBusy(self.character) then
@@ -7391,7 +8547,8 @@ function Controller:beginPlayerConversation(player)
     self.bridge:cancelNpcMove(self.id)
     self:releaseSupply()
     self:leaveRecoveryPosture()
-    self.playerConversation = { player = player, untilTick = ticks + 600 }
+    self.playerConversation = { player = player, untilTick = ticks + 600,
+        managePack = managePack or nil }
     self.state, self.activeDecision = "PLAYER_CONVERSATION", "talk_to_player"
     self.nextThreatScan = 0
     safeMethod(self.character, "faceThisObject", nil, player)
@@ -7424,8 +8581,10 @@ function Controller:updatePlayerConversation(ticks)
     if not ended and ticks >= (conversation.nextNeedsCheck or 0) then
         conversation.nextNeedsCheck = ticks + 60
         -- A survivor with no food/water/treatment needs to be able to ask for
-        -- help or receive a gift. Only executable self-care preempts attention.
-        ended = self:tradeNeedsSelfCare(ticks)
+        -- help or receive a gift. Only executable self-care preempts attention -
+        -- except while the player manages that survivor's pack: the open loot
+        -- pane owns the moment, and care resumes when it closes.
+        ended = conversation.managePack ~= true and self:tradeNeedsSelfCare(ticks) or false
     end
     if ended then self:endPlayerConversation(player) end
 end
@@ -7569,9 +8728,10 @@ function Controller:beginGreeting()
 end
 
 function Controller:resumeAfterGreeting(ticks)
+    if self.lifeIntent ~= nil and self.lifeIntent.kind == "seek_group" then self:clearLifeIntent() end
     self.activeDecision = nil
     self.state = "IDLE"
-    self.nextThink = ticks + THINK_MIN_TICKS
+    self.nextThink = ticks + TUNE.THINK_MIN_TICKS
 end
 
 function Controller:registerAllyDefenseThreat(hostileId, expiresAt)
@@ -7628,7 +8788,7 @@ function Controller:cancelRobbery(ticks, reason)
     end
     if self.state == "ROBBING" then
         self.state, self.activeDecision = "IDLE", nil
-        self.nextThink = math.max(self.nextThink or 0, (tonumber(ticks) or 0) + THINK_MIN_TICKS)
+        self.nextThink = math.max(self.nextThink or 0, (tonumber(ticks) or 0) + TUNE.THINK_MIN_TICKS)
     end
     if robbery.victimController ~= nil
         and robbery.victimController.releaseRobberyHold ~= nil then
@@ -7653,6 +8813,7 @@ function Controller:releaseTransferActions(transfers)
         if transfer.guard ~= nil then
             for _, action in ipairs(queue.queue) do
                 if action.knoxTransferGuard == transfer.guard
+                    or action.knoxGrabGuard == transfer.guard
                     or action.knoxAidGuard == transfer.guard
                     or action.knoxSearchGuard == transfer.guard
                     or action.knoxNeedGuard == transfer.guard then owned[action] = true end
@@ -7703,7 +8864,7 @@ function Controller:completeRobbery(ticks)
             received = #received, selected = #(robbery.transfers or {}),
         })
     else
-        self:recordFailure("robbery_no_transfer", ticks, SUPPLY_RETRY_TICKS)
+        self:recordFailure("robbery_no_transfer", ticks, TUNE.SUPPLY_RETRY_TICKS)
     end
     self:cancelRobbery(ticks, #received > 0 and "completed" or "no_transfer")
     self:finishDecision(ticks)
@@ -7761,7 +8922,7 @@ function Controller:beginRobbery(victim, ticks)
                 transfer.guard)
             if self.pendingRobbery ~= robbery then return false end
             if not queuedOk then
-                self:recordFailure("robbery_queue_error", ticks, SUPPLY_RETRY_TICKS)
+                self:recordFailure("robbery_queue_error", ticks, TUNE.SUPPLY_RETRY_TICKS)
                 self:cancelRobbery(ticks, "queue_error")
                 return false
             end
@@ -7789,17 +8950,131 @@ function Controller:beginRobbery(victim, ticks)
     return true
 end
 
+-- Keep a short accepted route vector across route completion. This governs only
+-- replacement requests, never the native path's steering or obstacle avoidance.
+function Controller.formationOrderKey(order)
+    if type(order) ~= "table" then return order end
+    return tostring(order.groupId) .. ":" .. tostring(order.leaderId) .. ":"
+        .. tostring(order.kind) .. ":" .. tostring(order.revision)
+end
+
+function Controller.formationReverseHeld(self, anchor, target, ticks, order)
+    local route = self.formationRouteContinuity
+    if route == nil then return false end
+    if ticks >= route.untilTick or route.anchor ~= anchor or route.order ~= Controller.formationOrderKey(order)
+        or self.character == nil or target == nil or anchor == nil
+        or safeMethod(self.character, "CanSee", false, anchor) ~= true then
+        self.formationRouteContinuity = nil
+        return false
+    end
+    local ok, x, y, z, tx, ty, tz = pcall(function()
+        local current = self.character:getCurrentSquare()
+        return current:getX(), current:getY(), current:getZ(),
+            target:getX(), target:getY(), target:getZ()
+    end)
+    if not ok or z ~= route.z or tz ~= z then
+        self.formationRouteContinuity = nil
+        return false
+    end
+    return (tx - x) * route.dx + (ty - y) * route.dy < 0
+end
+
+function Controller.rememberFormationRoute(self, anchor, target, ticks, order)
+    local ok, x, y, z, tx, ty, tz = pcall(function()
+        local current = self.character:getCurrentSquare()
+        return current:getX(), current:getY(), current:getZ(),
+            target:getX(), target:getY(), target:getZ()
+    end)
+    if not ok or z ~= tz or (x == tx and y == ty) then
+        self.formationRouteContinuity = nil
+        return
+    end
+    self.formationRouteContinuity = {anchor=anchor, order=Controller.formationOrderKey(order), dx=tx-x, dy=ty-y,
+        z=z, untilTick=ticks + Controller.TUNING.FORMATION_ROUTE_COMMIT_TICKS}
+end
+
+-- Record only an observed adjacent outside-to-inside crossing. This is
+-- ephemeral controller state, never a selected or requested route.
+function Controller:observeGroupEntry(ticks)
+    local actor = self.character
+    if actor == nil or actor.getCurrentSquare == nil then self.groupEntryObservedSquare = nil; return end
+    local ok, square = pcall(function() return actor:getCurrentSquare() end)
+    local previous = self.groupEntryObservedActor == actor and self.groupEntryObservedSquare or nil
+    self.groupEntryObservedActor = actor
+    if not ok or square == nil then self.groupEntryObservedSquare = nil; return end
+    self.groupEntryObservedSquare = square
+    if previous == nil or previous == square then return end
+    local valid, edge, kind, building = pcall(function()
+        if previous:getZ() ~= square:getZ()
+            or math.abs(previous:getX()-square:getX()) + math.abs(previous:getY()-square:getY()) ~= 1 then return nil end
+        local inside = square:getBuilding()
+        if inside == nil or previous:getBuilding() ~= nil then return nil end
+        local door = previous:getDoorTo(square) or square:getDoorTo(previous)
+        local window = previous:getWindowTo(square) or square:getWindowTo(previous)
+        if door ~= nil and window ~= nil then return false end
+        if door ~= nil then return door, "door", inside end
+        if window ~= nil then return window, "window", inside end
+    end)
+    if valid and edge == false then self.groupUsedEntry = nil; return end
+    if valid and edge ~= nil then
+        self.groupUsedEntry = { actor=actor, outside=previous, inside=square,
+            object=edge, kind=kind, building=building, tick=ticks }
+    end
+end
+
+function Controller:beginPreferredGroupEntry(ticks)
+    local leader = self.groupLeader
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    if leader == nil or runtime == nil or runtime.idForCharacter == nil or runtime.getController == nil
+        or self.pendingSupply ~= nil or self.entryDetour ~= nil then return false end
+    local leaderId = runtime.idForCharacter(leader)
+    local owner = leaderId ~= nil and runtime.getController(leaderId) or nil
+    local anchor = owner ~= nil and owner.groupUsedEntry or nil
+    if anchor == nil or owner.character ~= leader or anchor.actor ~= leader
+        or ticks < anchor.tick or ticks-anchor.tick > 900
+        or (self.groupEntryOrderChangedAt ~= nil and anchor.tick < self.groupEntryOrderChangedAt) then return false end
+    local ok, goal, here = pcall(function()
+        return leader:getCurrentSquare(), self.character:getCurrentSquare()
+    end)
+    if not ok or goal == nil or here == nil then return false end
+    local valid, usable = pcall(function()
+        return goal:getBuilding() == anchor.building and here:getBuilding() == nil
+            and goal:getZ() == here:getZ() and anchor.inside:getZ() == here:getZ()
+    end)
+    if not valid or not usable then return false end
+    local key = Controller.formationOrderKey(self.groupLeaderOrder)
+    local previous = self.groupEntryAttempt
+    if previous ~= nil and previous.anchor == anchor and previous.leader == leader
+        and previous.order == key then return false end
+    self.groupEntryAttempt = {anchor=anchor, leader=leader, order=key}
+    self.pendingSupply = {targetSquare=anchor.inside, approach=goal}
+    if not self:beginWindowDetour(ticks, "GROUP_FOLLOW", anchor.object) then
+        self.pendingSupply = nil
+        return false
+    end
+    self.activeDecision = "follow_group"
+    return true
+end
+
 function Controller:beginGroupFollow(ticks)
+    if self.formationDoorRetry ~= nil then
+        self.formationDoorRetry.cornerGoal, self.formationDoorRetry.cornerState = nil, nil
+    end
     if self.groupLeader == nil or self.groupLeader:getCurrentSquare() == nil then
         return false
     end
+    if self:beginPreferredGroupEntry(ticks) then return true end
     local approach = findFormationTarget(
         self.groupLeader,
         self.character,
         self.groupFormationSlot, self.id
     )
     if approach == nil then
-        self.nextThink = math.max(self.nextThink or 0, ticks + THINK_MIN_TICKS)
+        self.nextThink = math.max(self.nextThink or 0, ticks + TUNE.THINK_MIN_TICKS)
+        return false
+    end
+    if Controller.formationReverseHeld(self, self.groupLeader, approach, ticks, self.groupLeaderOrder) then
+        self.nextThink = math.max(self.nextThink or 0, self.formationRouteContinuity.untilTick)
         return false
     end
     local moveResult, pace = moveWithFormationPace(
@@ -7811,8 +9086,11 @@ function Controller:beginGroupFollow(ticks)
     )
     local result = tostring(moveResult)
     if string.find(result, "MOVE_STARTED", 1, true) ~= 1 then
-        self:handleFormationMovementFailure(result, ticks, false)
-        return false
+        if Controller.isEntryTraversalFailure(result) and not nativeTraversalBusy(self.character) then
+            self.state = "GROUP_FOLLOW"
+            self.activeDecision = "follow_group"
+        end
+        return self:handleFormationMovementFailure(result, ticks, false, approach) == true
     end
     self.activeDecision = "follow_group"
     self.state = "GROUP_FOLLOW"
@@ -7822,6 +9100,7 @@ function Controller:beginGroupFollow(ticks)
     self.formationTargetZ = approach:getZ()
     self.formationMovementPace = pace
     self.formationCommitUntil = ticks + Controller.TUNING.FORMATION_ROUTE_COMMIT_TICKS
+    Controller.rememberFormationRoute(self, self.groupLeader, approach, ticks, self.groupLeaderOrder)
     self.nextFormationRefresh = ticks + Controller.TUNING.FORMATION_REFRESH_TICKS
         + formationRefreshDelay(self.groupFormationSlot)
     return true
@@ -7842,6 +9121,9 @@ function Controller:resumeGroupFollowAfterSuccess(ticks)
 end
 
 function Controller:beginGroupRegroup(member, ticks)
+    if self.formationDoorRetry ~= nil then
+        self.formationDoorRetry.cornerGoal, self.formationDoorRetry.cornerState = nil, nil
+    end
     local memberSquare = member ~= nil and member:getCurrentSquare() or nil
     if memberSquare == nil then
         return false
@@ -7859,12 +9141,17 @@ function Controller:beginGroupRegroup(member, ticks)
     )
     local result = tostring(moveResult)
     if string.find(result, "MOVE_STARTED", 1, true) ~= 1 then
-        self:handleFormationMovementFailure(result, ticks, false)
-        return false
+        if Controller.isEntryTraversalFailure(result) and not nativeTraversalBusy(self.character) then
+            self.state = "GROUP_REGROUP"
+            self.regroupMember = member
+            self.activeDecision = "retrieve_group_member"
+        end
+        return self:handleFormationMovementFailure(result, ticks, false, approach) == true
     end
     self:issueGroupLeaderOrder("follow", ticks)
     self:signalFollowers("comehere", ticks)
     self.regroupMember = member
+    self.formationTargetX, self.formationTargetY, self.formationTargetZ = approach:getX(), approach:getY(), approach:getZ()
     self.activeDecision = "retrieve_group_member"
     self.state = "GROUP_REGROUP"
     self.stateStartedAt = ticks
@@ -7904,6 +9191,33 @@ function Controller:resolvePlayerPartyAnchor(ticks)
             end
             self.playerContactAnchor = nil
             return player, square, nil
+        end
+    end
+    -- Leaders never need to be seen (owner direction 2026-11-12): a follower
+    -- reads the live square whenever it is readable, sight or not, so going
+    -- around a corner or through a door no longer freezes the breadcrumb
+    -- while the player keeps walking. The RequireCloseContact option still
+    -- gates order admission; it no longer blinds followers. The durable
+    -- breadcrumb below survives only for a genuinely unreadable square, a
+    -- dead player, mid-climb traversal or a fast vehicle.
+    if player ~= nil then
+        local liveOk, liveSquare = pcall(function()
+            return player:getCurrentSquare()
+        end)
+        local deadOk, dead = pcall(function() return player:isDead() end)
+        if liveOk and liveSquare ~= nil and not (deadOk and dead) then
+            if nativeTraversalBusy(player) then return nil, nil, "player_traversal" end
+            local vehicle
+            pcall(function() vehicle = player:getVehicle() end)
+            if vehicle ~= nil then
+                local speedOk, speed = pcall(function()
+                    return math.abs(vehicle:getCurrentSpeedKmHour())
+                end)
+                if speedOk and speed > 1 then return nil, nil, "player_vehicle_moving" end
+            end
+            self.playerContactAnchor = nil
+            self.playerContactFailures = 0
+            return player, liveSquare, nil
         end
     end
     local contact = self.playerLastContact
@@ -7958,26 +9272,29 @@ function Controller:abandonPartyFoodForFollow(ticks, reason)
     local pending = self.pendingSupply
     if pending == nil or pending.partySupport ~= true then return false end
     if pending.container ~= nil then
-        self.inspectedContainers[pending.container] = ticks + LOOT_TRAVEL_COOLDOWN_TICKS
+        self.inspectedContainers[pending.container] = ticks + TUNE.LOOT_TRAVEL_COOLDOWN_TICKS
     end
-    self.nextExplorationSearch = ticks + LOOT_TRAVEL_COOLDOWN_TICKS
+    self.nextExplorationSearch = ticks + TUNE.LOOT_TRAVEL_COOLDOWN_TICKS
     self.bridge:cancelNpcMove(self.id)
     self:recordFailure("party_support_" .. tostring(reason), ticks,
-        LOOT_TRAVEL_COOLDOWN_TICKS)
+        TUNE.LOOT_TRAVEL_COOLDOWN_TICKS)
     self:releaseSupply()
     self:finishDecision(ticks)
-    self.nextThink = ticks + THINK_MIN_TICKS
+    self.nextThink = ticks + TUNE.THINK_MIN_TICKS
     return true
 end
 
 function Controller:beginCompanionFollow(ticks)
+    if self.formationDoorRetry ~= nil then
+        self.formationDoorRetry.cornerGoal, self.formationDoorRetry.cornerState = nil, nil
+    end
     if self.companionOrder ~= "follow" then
         return false
     end
     -- Do not issue a fresh route while the native climb/vault action owns the
     -- body; the follow refresh retries once the landing tick settles.
     if nativeTraversalBusy(self.character) then
-        self.nextThink = math.max(self.nextThink or 0, ticks + THINK_MIN_TICKS)
+        self.nextThink = math.max(self.nextThink or 0, ticks + TUNE.THINK_MIN_TICKS)
         return false
     end
     local anchor, anchorSquare, anchorReason = self:resolvePlayerPartyAnchor(ticks)
@@ -7989,8 +9306,16 @@ function Controller:beginCompanionFollow(ticks)
         return false
     end
     self.companionAnchorWaitReason = anchorReason
-    if anchor.knownContact and (navigationDistanceSquared(self.character:getCurrentSquare(), anchorSquare)
-        <= Controller.TUNING.FORMATION_ARRIVAL_TOLERANCE_SQUARED or (self.playerContactFailures or 0) >= 3) then
+    -- A frozen last-contact point is a breadcrumb, not the player: only wait
+    -- on it once actually standing on it. Mere proximity (the wrong side of
+    -- a shut door) must route to the point so the existing door recovery can
+    -- engage instead of parking the follower.
+    local followSquare = self.character:getCurrentSquare()
+    local onContactSquare = followSquare ~= nil and anchorSquare ~= nil
+        and followSquare:getX() == anchorSquare:getX()
+        and followSquare:getY() == anchorSquare:getY()
+        and followSquare:getZ() == anchorSquare:getZ()
+    if anchor.knownContact and (onContactSquare or (self.playerContactFailures or 0) >= 3) then
         self.activeDecision = (self.playerContactFailures or 0) >= 3 and "regroup_route_blocked" or "awaiting_player_contact"
         self.state = "COMPANION_WAIT"
         self.nextThink = ticks + Controller.TUNING.FORMATION_BOTTLENECK_WAIT_TICKS
@@ -8005,6 +9330,10 @@ function Controller:beginCompanionFollow(ticks)
             ticks + Controller.TUNING.FORMATION_BOTTLENECK_WAIT_TICKS)
         return false
     end
+    if Controller.formationReverseHeld(self, anchor, approach, ticks, self.companionOrder) then
+        self.nextThink = math.max(self.nextThink or 0, self.formationRouteContinuity.untilTick)
+        return false
+    end
     local moveResult, pace = moveWithFormationPace(
         self.bridge,
         self.id,
@@ -8014,8 +9343,11 @@ function Controller:beginCompanionFollow(ticks)
     )
     local result = tostring(moveResult)
     if string.find(result, "MOVE_STARTED", 1, true) ~= 1 then
-        self:handleFormationMovementFailure(result, ticks, true)
-        return false
+        if Controller.isEntryTraversalFailure(result) and not nativeTraversalBusy(self.character) then
+            self.state = "COMPANION_FOLLOW"
+            self.activeDecision = "follow_player"
+        end
+        return self:handleFormationMovementFailure(result, ticks, true, approach) == true
     end
     local distance = navigationDistanceSquared(
         self.character:getCurrentSquare(), anchorSquare
@@ -8035,6 +9367,7 @@ function Controller:beginCompanionFollow(ticks)
     self.formationTargetZ = approach:getZ()
     self.formationMovementPace = pace
     self.formationCommitUntil = ticks + Controller.TUNING.FORMATION_ROUTE_COMMIT_TICKS
+    Controller.rememberFormationRoute(self, anchor, approach, ticks, self.companionOrder)
     self.nextFormationRefresh = ticks + Controller.TUNING.FORMATION_REFRESH_TICKS
     return true
 end
@@ -8080,7 +9413,7 @@ function Controller:refreshFormationFollow(ticks)
                 state = tostring(self.state),
             })
         end
-        self.nextFormationRefresh = ticks + THINK_MIN_TICKS
+        self.nextFormationRefresh = ticks + TUNE.THINK_MIN_TICKS
         return false
     end
     if self.formationTraversalBusy then
@@ -8099,6 +9432,13 @@ function Controller:refreshFormationFollow(ticks)
     local groupFollow = self.state == "GROUP_FOLLOW"
     local slot = groupFollow and self.groupFormationSlot or self.companionFormationSlot
     if not groupFollow and self.companionOrder ~= "follow" then
+        if self.companionOrder == "hold" and not self:holdPostReached() then
+            -- A return walk is due or underway: let it finish instead of
+            -- cancelling it back into a displaced hold.
+            self.nextThink = ticks + Controller.TUNING.FORMATION_REFRESH_TICKS
+                + formationRefreshDelay(slot)
+            return true
+        end
         self.bridge:cancelNpcMove(self.id)
         self.formationMovementPace = nil
         self.activeDecision = self.companionOrder == "hold"
@@ -8108,6 +9448,10 @@ function Controller:refreshFormationFollow(ticks)
         self.nextThink = ticks + Controller.TUNING.FORMATION_REFRESH_TICKS
             + formationRefreshDelay(slot)
         return true
+    end
+    if self.formationDoorRetry ~= nil and self.formationDoorRetry.cornerGoal ~= nil
+        and self.formationDoorRetry.cornerState == self.state then
+        return false
     end
     local anchor = groupFollow and self.groupLeader or self.companionTarget
     local partyAnchorSquare = nil
@@ -8125,6 +9469,7 @@ function Controller:refreshFormationFollow(ticks)
         end
         anchor, partyAnchorSquare = resolvedAnchor, resolvedSquare
     end
+    if groupFollow and self:beginPreferredGroupEntry(ticks) then return true end
     local target, compressed
     if groupFollow then
         -- The autonomous NPC group formation path is intentionally unchanged.
@@ -8161,7 +9506,15 @@ function Controller:refreshFormationFollow(ticks)
             self.activeDecision = "follow_player"
         end
     end
-    if not groupFollow and anchor.knownContact and navigationDistanceSquared(current, target)
+    -- Same breadcrumb rule as the follow start below: proximity across a
+    -- shut door is not arrival. Only a follower standing on the frozen
+    -- point waits for contact; anything else keeps routing to it.
+    local onRegroupSquare = current ~= nil and target ~= nil
+        and current:getX() == target:getX()
+        and current:getY() == target:getY()
+        and current:getZ() == target:getZ()
+    if not groupFollow and anchor.knownContact and onRegroupSquare
+        and navigationDistanceSquared(current, target)
         <= Controller.TUNING.FORMATION_ARRIVAL_TOLERANCE_SQUARED then
         self.bridge:cancelNpcMove(self.id)
         self:releasePlayerFormationTarget()
@@ -8170,13 +9523,16 @@ function Controller:refreshFormationFollow(ticks)
         return true
     end
     self:updateFormationMovementPace(anchor)
+    local routeOrder = self.companionOrder
+    if groupFollow then routeOrder = self.groupLeaderOrder end
+    if Controller.formationReverseHeld(self, anchor, target, ticks, routeOrder) then return false end
     if navigationDistanceSquared(current, target)
         <= Controller.TUNING.FORMATION_ARRIVAL_TOLERANCE_SQUARED then
         -- Same-zone arrival only: if the anchor is across a wall/doorway
         -- (one of us inside a room, the other outside or in another
         -- building), keep moving into their space instead of parking on the
         -- wrong side until the player moves. Adjacent rooms in one building
-        -- (kitchen/living open arches) count as arrived. Bounded by the
+        -- count as arrived only across a clear edge. Bounded by the
         -- normal route-commit window so this cannot spam moves.
         local crossZone = false
         do
@@ -8207,15 +9563,25 @@ function Controller:refreshFormationFollow(ticks)
                 end
             end
         end
+        if not onRegroupSquare then
+            local ok, clear = pcall(function()
+                return current:isBlockedTo(target) == false
+                    and target:isBlockedTo(current) == false
+            end)
+            if not ok or not clear then crossZone = true end
+        end
         if crossZone then
             if ticks >= (self.formationCommitUntil or 0) then
+                local previousState = self.state
                 local moved = false
                 if groupFollow then moved = self:beginGroupFollow(ticks)
                 else moved = self:beginCompanionFollow(ticks) end
-                if moved then return true end
+                -- A refused start may cancel the route and enter recovery.
+                if moved or self.state ~= previousState then return true end
             end
-            self.nextThink = math.max(self.nextThink or 0, ticks + THINK_MIN_TICKS)
-            return true
+            self.nextThink = math.max(self.nextThink or 0, ticks + TUNE.THINK_MIN_TICKS)
+            -- Keep ticking the current route if no replacement was accepted.
+            return false
         end
         self.bridge:cancelNpcMove(self.id)
         self:resetMovementRecovery()
@@ -8251,7 +9617,7 @@ function Controller:refreshFormationFollow(ticks)
     end
     if not restarted then
         self.state = groupFollow and "GROUP_WAIT" or "COMPANION_WAIT"
-        self.nextThink = math.max(self.nextThink or 0, ticks + THINK_MIN_TICKS)
+        self.nextThink = math.max(self.nextThink or 0, ticks + TUNE.THINK_MIN_TICKS)
     end
     return true
 end
@@ -8364,14 +9730,14 @@ function Controller:findBaseMovementTarget(returning, ticks)
             -- Reuse perceived danger; no extra world/zombie scan per idle tile.
             for threat,memory in pairs(self.perceivedThreats or {}) do
                 local threatSquare=safeMethod(threat,"getCurrentSquare",nil)
-                if ticks-(memory.lastSeen or 0)<=THREAT_MEMORY_TICKS
+                if ticks-(memory.lastSeen or 0)<=TUNE.THREAT_MEMORY_TICKS
                     and not safeMethod(threat,"isDead",true)
                     and navigationDistanceSquared(square,threatSquare)<=36 then suitable=false;break end
             end
         end
         if suitable then
             local score=(outside==preferOutside and 100 or 0)+(outside==currentOutside and 20 or 0)
-                - math.abs(distance-16)
+ - math.abs(distance-16)
             if score>bestScore then best,bestScore=square,score end
         end
     end
@@ -8439,12 +9805,14 @@ function Controller:beginBaseMovement(ticks, returning)
         self.lastAmbientOrigin=self.character:getCurrentSquare()
         self.lastAmbientOriginUntil=ticks+7200
     end
+    self.ambientMovementSquare = target
     self.activeDecision = returning and "return_to_base" or "patrol_base"
     self.state = returning and "BASE_RETURN" or "BASE_PATROL"
     return true
 end
 
 function Controller:releaseAmbientMovement()
+    self.ambientMovementSquare = nil
     if self.ambientMovementTarget ~= nil then
         self.reservations = self.reservations or {}
         self.reservations.ambientSpots = self.reservations.ambientSpots or {}
@@ -8465,7 +9833,7 @@ function Controller:handleBaseMovementFailure(movement, ticks)
     self:recordMovementFailure("base_movement", movement, ticks)
     self.activeDecision = "base_idle"
     self.state = "BASE_IDLE"
-    self.nextThink = math.max(self.nextThink or 0, (ticks or 0) + THINK_MIN_TICKS)
+    self.nextThink = math.max(self.nextThink or 0, (ticks or 0) + TUNE.THINK_MIN_TICKS)
     return true
 end
 
@@ -8482,13 +9850,76 @@ function Controller:handleRestMovementFailure(movement, ticks)
     return true
 end
 
--- A native route can fail after the target was valid and loaded: a door can
--- change state, a streamed square can disappear, or the pathfinder can leave
--- the survivor on a bad side of an opening. Give a claimed physical task one
--- fresh target/route before blocking it. This is deliberately bounded; retrying
--- a corpse while it is attached would make the survivor drag forever, so the
--- drop phase remains fail-closed and releases the body through the existing
--- action failure path.
+-- Keep the existing job claim and pickup lease through one local sidestep.
+-- Its arrival is a waypoint, never permission to work or transfer at a distance.
+function Controller:recoverBaseTaskObstacle(movement, ticks)
+    if (self.state ~= "BASE_TASK_MOVE" and self.state ~= "BASE_TASK_SUPPLY_MOVE")
+        or self.baseTask == nil or self.baseTaskMoveRetryIssued == true
+        or (self.baseTask.type == "haul_corpse" and self.baseTaskCorpsePhase == "drop")
+        or nativeTraversalBusy(self.character) or not self:baseTaskStillOurs() then return false end
+    if not Controller.isFollowObstacleFailure(movement)
+        and not Controller.isDoorReachFailure(movement) then return false end
+    -- Ordinary work travel had no door recovery. Use the same entrance owner
+    -- as job-supply travel before attempting any geometric correction.
+    if self:recoverMovementThroughDoor(ticks) then
+        self.baseTaskMoveRetryIssued = true
+        return true
+    end
+    if not Controller.isFollowObstacleFailure(movement)
+        or self.bridge == nil or self.bridge.moveNpc == nil then return false end
+    local transfer = self.state == "BASE_TASK_SUPPLY_MOVE" and self.baseTaskSupplyTransfer or nil
+    local goal = transfer ~= nil and transfer.approach or self.baseTaskMoveSquare
+    if self.state == "BASE_TASK_SUPPLY_MOVE" and transfer == nil then return false end
+    local step = self:wallCornerStepSquare(goal)
+    if step == nil then return false end
+    -- Consume the existing retry even if native admission fails.
+    self.baseTaskMoveRetryIssued = true
+    local result = tostring(self.bridge:moveNpc(self.id, step))
+    if string.find(result, "MOVE_STARTED", 1, true) ~= 1 then return false end
+    self.baseTaskCornerMove = { state = self.state, task = self.baseTask, transfer = transfer }
+    self:noteTaskTravelStart(ticks)
+    self:recordFailure("base_task_corner:" .. movementFailureKind(movement), ticks, 30)
+    return true
+end
+
+function Controller:resumeBaseTaskCornerMovement(ticks)
+    local corner = self.baseTaskCornerMove
+    if corner == nil then return false end
+    self.baseTaskCornerMove = nil
+    if self.state ~= corner.state then return false end
+    if self.baseTask ~= corner.task then
+        -- A new assignment did not inherit arrival at the old waypoint.
+        self:finishDecision(ticks)
+        return true
+    end
+    if not self:baseTaskStillOurs() then
+        self:dropStaleBaseTask()
+        self:finishDecision(ticks)
+        return true
+    end
+    if corner.state == "BASE_TASK_SUPPLY_MOVE" then
+        local transfer = self.baseTaskSupplyTransfer
+        local goal = transfer ~= nil and transfer.approach or nil
+        local cell = getCell ~= nil and getCell() or nil
+        if transfer == nil or transfer ~= corner.transfer or transfer.retired == true or goal == nil
+            or cell == nil or cell:getGridSquare(goal:getX(), goal:getY(), goal:getZ()) ~= goal then
+            self:failBaseTaskAction(ticks, "corner_supply_target_changed")
+            return true
+        end
+        local result = tostring(self.bridge:moveNpc(self.id, goal))
+        if string.find(result, "MOVE_STARTED", 1, true) ~= 1 then
+            self:failBaseTaskAction(ticks, "corner_supply_resume_failed:" .. result)
+        else
+            self:noteTaskTravelStart(ticks)
+        end
+    elseif not self:beginBaseTaskWorkMove(ticks) then
+        self:finishDecision(ticks)
+    end
+    return true
+end
+
+-- A failed native route gets one fresh target/route before blocking the job.
+-- Attached corpse drops keep their existing fail-closed release path.
 function Controller:retryBaseTaskMovement(ticks, movement)
     local task = self.baseTask
     if task == nil or self.baseTaskMoveRetryIssued == true then
@@ -8525,12 +9956,18 @@ end
 
 function Controller:clearBaseTaskRuntimeState()
     self:releaseBaseTaskSupplyTransfer()
+    self.baseTaskCornerMove = nil
+    self.baseTaskMoveSquare = nil
     self.baseTask = nil
     self.baseTaskStartedAt = nil
     self.baseTaskSupplyTransfer = nil
     self.baseResupplyAttempts = 0
     self.baseTaskActionQueued = false
     self.baseTaskActionWatch = nil
+    self.baseTaskBedPlan = nil
+    self.baseTaskBedApproach = nil
+    self.baseTaskBedSurface = nil
+    self.baseTaskBedReturn = nil
     self.baseTaskActionQueueTicks = nil
     self.baseTaskMoveRetryIssued = false
     self.baseTaskBarricadeTarget = nil
@@ -8707,6 +10144,8 @@ function Controller:baseTaskStillOurs()
 end
 
 function Controller:dropStaleBaseTask()
+    self.baseTaskCornerMove = nil
+    self.baseTaskMoveSquare = nil
     if self.bridge ~= nil and self.bridge.cancelNpcMove ~= nil then
         self.bridge:cancelNpcMove(self.id)
     end
@@ -8774,6 +10213,24 @@ local function residentForename(id)
     return "A resident"
 end
 
+-- Normal action completion and threat suspension read the same physical
+-- receipt. Intermediate retrieval/unpack never completes the placement task.
+function Controller:bedTaskReceipt()
+    if self.baseTask ~= nil and self.baseTask.type == "craft_bed" then
+        local actions = rawget(_G, "KnoxInventoryActions")
+        local output = actions ~= nil and actions.craftedOutput ~= nil
+            and actions.craftedOutput(self.baseTaskActionWatch ~= nil and self.baseTaskActionWatch.action,
+                "Base.SleepingBag_Hide_Packed") or nil
+        return output ~= nil, output ~= nil and "sleeping_bag_crafted" or "bed_craft_no_output"
+    end
+    local manager = rawget(_G, "KnoxBaseManager")
+    local complete = self.baseTask ~= nil and self.baseTask.type == "prepare_bed"
+        and self.baseTaskBedPlan ~= nil and self.baseTaskBedPlan.phase == "place"
+        and manager ~= nil and manager.bedPlacementComplete ~= nil
+        and manager.bedPlacementComplete(self.base, self.baseTaskBedPlan) == true
+    return complete == true, complete and "sleeping_bag_placed" or "bed_preparation_no_result"
+end
+
 function Controller:finishBaseTask(succeeded, reason)
     self.securityRoute=nil
     self:releaseBaseCooking()
@@ -8811,7 +10268,7 @@ function Controller:finishBaseTask(succeeded, reason)
         print("[KnoxSurvivors][BaseJobs] finish-failed id=" .. tostring(self.id)
             .. " task=" .. tostring(task.id) .. " result=" .. tostring(result))
         self:recordFailure("base_task_finish_rejected:" .. tostring(result or "unknown"),
-            tonumber(self.currentTicks) or 0, BASE_TASK_ACTION_FAILURE_TICKS)
+            tonumber(self.currentTicks) or 0, TUNE.BASE_TASK_ACTION_FAILURE_TICKS)
     else
         snapshot.ok = succeeded == true
         self:diag("jobs", succeeded == true and "task_finished_ok" or "task_finished_fail", snapshot)
@@ -8869,7 +10326,7 @@ function Controller:failBaseTaskAction(ticks, reason)
     -- before finish clears its pointer and releases supplies.
     self:abandonBaseTask(reason)
     self:recordFailure("base_task_action:" .. tostring(reason), ticks,
-        BASE_TASK_ACTION_FAILURE_TICKS)
+        TUNE.BASE_TASK_ACTION_FAILURE_TICKS)
     self:finishDecision(ticks)
 end
 
@@ -8898,6 +10355,8 @@ end
 -- unloads or dies. Explicit cancellation, invalid targets, and real action
 -- failures continue through abandonBaseTask/finishBaseTask as before.
 function Controller:suspendBaseTaskForThreat(reason)
+    self.baseTaskCornerMove = nil
+    self.baseTaskMoveSquare = nil
     local preserveBaseSupplyRun = self.baseId ~= nil
         and (self.baseSupplyTrip == true
             or self.baseSupplyOrder ~= nil
@@ -8920,7 +10379,9 @@ function Controller:suspendBaseTaskForThreat(reason)
     -- to credit only an already observed result, rather than consuming it again.
     if self.state == "BASE_TASK_ACTION" and self.baseTaskActionQueued == true then
         local ok, received, receiptReason = false, false, nil
-        if self.baseTask.type == "repair" and self.baseTaskRepairTarget ~= nil
+        if self.baseTask.type == "craft_bed" or self.baseTask.type == "prepare_bed" then
+            ok, received, receiptReason = pcall(self.bedTaskReceipt, self)
+        elseif self.baseTask.type == "repair" and self.baseTaskRepairTarget ~= nil
             and self.baseTaskRepairBefore ~= nil and KnoxBaseRepairs ~= nil then
             ok, received = pcall(KnoxBaseRepairs.isComplete,
                 self.baseTaskRepairTarget, self.baseTaskRepairBefore)
@@ -8971,6 +10432,8 @@ function Controller:suspendBaseTaskForThreat(reason)
     self.baseTaskRepairTarget = nil
     self.baseTaskRepairBefore = nil
     if self.baseTask ~= nil then
+        self.baseTaskBedPlan = nil
+        self.baseTaskBedApproach, self.baseTaskBedSurface, self.baseTaskBedReturn = nil, nil, nil
         self.baseTask.interruptedReason = tostring(reason or "threat")
     end
     return true
@@ -9049,6 +10512,7 @@ function Controller:pauseWorkForInteraction(reason)
 end
 
 function Controller:updateBaseSecurityDuty(ticks)
+    if self.pendingAid ~= nil then return end
     local task = self.baseTask
     if task == nil or (task.type ~= "guard" and task.type ~= "patrol") then return end
     if ticks < (self.nextSecurityCheck or 0) then return end
@@ -9137,6 +10601,8 @@ function Controller:beginBaseTaskWorkMove(ticks)
                 target, targetReason = KnoxBaseBarricades.approachResolved(target, self.character)
             end
         end
+    elseif task ~= nil and task.type == "craft_bed" and self.baseTaskBedApproach ~= nil then
+        target = self.baseTaskBedApproach
     elseif task ~= nil then
         target = KnoxBaseJobs.resolveTaskSquare(task, self.character)
         if target == nil and task.type == "barricade" and KnoxBaseBarricades ~= nil
@@ -9159,6 +10625,7 @@ function Controller:beginBaseTaskWorkMove(ticks)
     end
     local moveResult = tostring(self.bridge:moveNpc(self.id, target))
     if string.find(moveResult, "MOVE_STARTED", 1, true) ~= 1 then
+        if self:refuseUnreachableBedCraft(ticks) then return false end
         local snapshot = self:diagTaskSnapshot(task)
         snapshot.reason = tostring(moveResult)
         self:diag("jobs", "task_move_start_failed", snapshot)
@@ -9169,6 +10636,7 @@ function Controller:beginBaseTaskWorkMove(ticks)
     self.baseTaskStartedAt = nil
     self:noteTaskTravelStart(ticks)
     self.activeDecision = "base_task_" .. tostring(task.type)
+    self.baseTaskMoveSquare = target
     self.state = "BASE_TASK_MOVE"
     print("[KnoxSurvivors][BaseJobs] id=" .. tostring(self.id)
         .. " task=" .. tostring(task.id) .. " type=" .. tostring(task.type)
@@ -9252,9 +10720,60 @@ function Controller:validateBaseTaskTarget(ticks)
         return false
     end
     self:finishBaseTask(false, kind .. "_target_stale:" .. tostring(reason))
-    self:recordFailure("base_task_stale:" .. kind, ticks, BASE_TASK_ACTION_FAILURE_TICKS)
+    self:recordFailure("base_task_stale:" .. kind, ticks, TUNE.BASE_TASK_ACTION_FAILURE_TICKS)
     self:finishDecision(ticks)
     return false
+end
+
+-- A native-selected stored input the settlement will not release is a named
+-- refusal, never a substitution: release the pending plan, say why, and let
+-- the existing task writer record the failure.
+function Controller:refuseBedCraftInput(ticks, plan)
+    self.baseTaskBedPlan, self.baseTaskBedApproach = nil, nil
+    self.baseTaskBedSurface, self.baseTaskBedReturn = nil, nil
+    self.baseTaskActionQueued, self.baseTaskActionWatch = false, nil
+    local reason = plan ~= nil and tostring(plan.reason or "recipe_input_forbidden")
+        or "recipe_input_forbidden"
+    if ticks >= (self.nextBedRecipeBlockedSpeech or 0) then
+        KnoxActivityFeed.speak(self.character, reason == "recipe_input_unreachable"
+            and "I can't get to the part of our storage that recipe needs."
+            or "That recipe needs something I'm not allowed to take from our storage.")
+        self.nextBedRecipeBlockedSpeech = ticks + 3600
+    end
+    local itemType = plan ~= nil and tostring(plan.itemType or "unknown") or "unknown"
+    self:failBaseTaskAction(ticks, reason .. ":" .. itemType)
+    return false
+end
+
+-- A cross-floor ingredient trip can be planned and still be unreachable: the
+-- installed movement owner then reports a failed route instead of arriving.
+-- That is a named refusal, never a partial transfer or an endless walk.
+function Controller:refuseUnreachableBedCraft(ticks)
+    local plan = self.baseTaskBedPlan
+    if self.baseTask == nil or self.baseTask.type ~= "craft_bed"
+        or plan == nil or plan.crossFloor ~= true then return false end
+    self.bridge:cancelNpcMove(self.id)
+    self:refuseBedCraftInput(ticks, { reason = "recipe_input_unreachable",
+        itemType = plan.itemType })
+    return true
+end
+
+-- One planner for the bed craft's ingredient phase: native selection first,
+-- then the return leg to the surface that plan was made at. A distant trip is
+-- authorized only after native selection named the exact stored item.
+function Controller:planBedCraft()
+    local plan = KnoxBaseManager.bedCraftPlan(self.base, self.character)
+    if plan ~= nil then
+        self.baseTaskBedReturn = false
+        return plan
+    end
+    if self.baseTaskBedReturn ~= true or self.baseTaskBedSurface == nil
+        or KnoxInventoryActions == nil or KnoxInventoryActions.craftSurfaceApproach == nil
+        or not KnoxBaseManager.needsBedCraft(self.base) then return nil end
+    local approach = KnoxInventoryActions.craftSurfaceApproach(
+        self.baseTaskBedSurface, self.character, self.base)
+    if approach == nil then return nil end
+    return { phase = "craft_return", approach = approach, surface = self.baseTaskBedSurface }
 end
 
 -- A resident first gathers one required item at a time from assigned, currently
@@ -9264,6 +10783,34 @@ end
 -- into the worker's pockets, and the native timed actions still validate,
 -- animate, and consume them normally.
 function Controller:beginBaseTaskSupplyOrWork(ticks)
+    if self.baseTask ~= nil and self.baseTask.type == "prepare_bed" then
+        if KnoxBaseManager.bedPreparationPlan(self.base, self.character) == nil then
+            self:finishBaseTask(false, "bed_preparation_unavailable"); return false
+        end
+        self.state, self.activeDecision = "BASE_TASK_ACTION", "base_task_prepare_bed"
+        self.baseTaskStartedAt, self.baseTaskActionQueued = ticks, false
+        return true
+    end
+    if self.baseTask ~= nil and self.baseTask.type == "craft_bed" then
+        local plan = self:planBedCraft()
+        if plan == nil then
+            self:finishBaseTask(false, "bed_recipe_unavailable")
+            return false
+        end
+        if plan.phase == "craft_blocked" then
+            self:refuseBedCraftInput(ticks, plan)
+            return false
+        end
+        if plan.phase == "craft_supply_move" or plan.phase == "craft_return" then
+            self.baseTaskBedPlan = plan
+            self.baseTaskBedApproach = plan.approach
+            self.baseTaskBedSurface = plan.surface or self.baseTaskBedSurface
+            return self:beginBaseTaskWorkMove(ticks)
+        end
+        self.state, self.activeDecision = "BASE_TASK_ACTION", "base_task_craft_bed"
+        self.baseTaskStartedAt, self.baseTaskActionQueued = ticks, false
+        return true
+    end
     local settings = rawget(_G, "KnoxSettings")
     local ignore = settings ~= nil and settings.ignoreJobResourceRequirements ~= nil
         and settings.ignoreJobResourceRequirements() == true
@@ -9271,7 +10818,7 @@ function Controller:beginBaseTaskSupplyOrWork(ticks)
         if self:beginBaseCooking(ticks,self.baseTask.target,false) then return true end
         self:finishBaseTask(false,"cooking_start_unavailable")
         self:recordFailure("base_task_action:cook:cooking_start_unavailable", ticks,
-            BASE_TASK_ACTION_FAILURE_TICKS)
+            TUNE.BASE_TASK_ACTION_FAILURE_TICKS)
         return false
     end
     if not self:validateBaseTaskTarget(ticks) then return true end
@@ -9286,8 +10833,8 @@ function Controller:beginBaseTaskSupplyOrWork(ticks)
         if not ok or supplyResult ~= "topped_up" then
             local reason = "free_job_supplies:" .. tostring(ok and supplyResult or added)
             self:finishBaseTask(false, reason)
-            self:recordFailure(reason, ticks, BASE_TASK_ACTION_FAILURE_TICKS)
-            KnoxActivityFeed.event("Base job blocked: " .. KnoxBaseTaskBoard.blockerText(reason) .. ".")
+            self:recordFailure(reason, ticks, TUNE.BASE_TASK_ACTION_FAILURE_TICKS)
+            self:reportBlockedJob(reason, ticks)
             self:finishDecision(ticks)
             return true
         end
@@ -9304,8 +10851,8 @@ function Controller:beginBaseTaskSupplyOrWork(ticks)
         if not self:allowsBaseTaskSupplyRun() then
             self:finishBaseTask(false, "stay_home_missing_supplies:" .. tostring(result))
             self:recordFailure("base_task_supply:stay_home_missing_supplies", ticks, 300)
-            KnoxActivityFeed.event("Base job blocked: " .. KnoxBaseTaskBoard.blockerText(
-                "stay_home_missing_supplies:" .. tostring(result)) .. ".")
+            self:reportBlockedJob(
+                "stay_home_missing_supplies:" .. tostring(result), ticks)
             return false
         end
         if (self.baseResupplyAttempts or 0) < 3 then
@@ -9315,7 +10862,7 @@ function Controller:beginBaseTaskSupplyOrWork(ticks)
                 KnoxActivityFeed.speak(self.character,
                     "We're missing supplies for that job.")
             end
-            self.baseTaskRetryAt = ticks + SUPPLY_RETRY_TICKS
+            self.baseTaskRetryAt = ticks + TUNE.SUPPLY_RETRY_TICKS
             self.activeDecision = "base_task_supply_wait"
             self.state = "BASE_TASK_SUPPLY_WAIT"
             self.nextThink = self.baseTaskRetryAt
@@ -9323,8 +10870,7 @@ function Controller:beginBaseTaskSupplyOrWork(ticks)
         end
         self:finishBaseTask(false, tostring(result))
         KnoxActivityFeed.speak(self.character, "We're missing supplies for that job.")
-        KnoxActivityFeed.event("Base job blocked: " .. (KnoxBaseTaskBoard.blockerText(result)
-            or "Supplies unavailable") .. ".")
+        self:reportBlockedJob(result, ticks)
         self:recordFailure("base_task_supply:" .. tostring(result), ticks, 300)
         return false
     end
@@ -9425,7 +10971,7 @@ function Controller:beginBaseResourceRun(ticks, reason)
                         container = candidate.container, approach = candidate.approach,
                         targetSquare = sourceSquare, taskSupplyEntry = true,
                     }
-                    self.nextWorldSearch = ticks + SUPPLY_RETRY_TICKS
+                    self.nextWorldSearch = ticks + TUNE.SUPPLY_RETRY_TICKS
                     self:noteTaskTravelStart(ticks)
                     self.activeDecision = "base_task_collect_supplies"
                     self.state = "BASE_TASK_SUPPLY_MOVE"
@@ -9438,11 +10984,11 @@ function Controller:beginBaseResourceRun(ticks, reason)
             end
         end
         self:releaseBaseTaskSupplyTransfer()
-        self.nextWorldSearch = ticks + SUPPLY_RETRY_TICKS
+        self.nextWorldSearch = ticks + TUNE.SUPPLY_RETRY_TICKS
     elseif missingType ~= nil then
-        self.nextWorldSearch = math.max(self.nextWorldSearch or 0, ticks + THINK_MIN_TICKS)
+        self.nextWorldSearch = math.max(self.nextWorldSearch or 0, ticks + TUNE.THINK_MIN_TICKS)
     end
-    self.baseTaskRetryAt = ticks + SUPPLY_RETRY_TICKS
+    self.baseTaskRetryAt = ticks + TUNE.SUPPLY_RETRY_TICKS
     self.activeDecision = "base_task_supply_wait"
     self.state = "BASE_TASK_SUPPLY_WAIT"
     self.nextThink = self.baseTaskRetryAt
@@ -9706,6 +11252,8 @@ function Controller:baseSupplyNeed(ticks)
         or ticks < (self.nextBaseSupplySearch or 0) then
         return nil
     end
+    local jobs = rawget(_G, "KnoxBaseJobs")
+    if jobs ~= nil and jobs.isRestWindow ~= nil and jobs.isRestWindow(self.id) then return nil end
     local groupScavenge = rawget(_G, "KnoxGroupScavenge")
     if groupScavenge ~= nil and groupScavenge.hasSupplyParty ~= nil
         and groupScavenge.hasSupplyParty(self.baseId) then
@@ -9724,7 +11272,7 @@ function Controller:baseSupplyNeed(ticks)
         return KnoxBaseStorage.summarize(self.base)
     end)
     if not success or type(summary) ~= "table" then
-        self.nextBaseSupplySearch = ticks + SUPPLY_RETRY_TICKS
+        self.nextBaseSupplySearch = ticks + TUNE.SUPPLY_RETRY_TICKS
         return nil
     end
     if KnoxBaseSupplyPlanner == nil
@@ -9732,7 +11280,7 @@ function Controller:baseSupplyNeed(ticks)
         or not KnoxBaseSupplyPlanner.hasKnownStorageSnapshot(summary) then
         -- Missing/unloaded containers do not prove the base is short, and no
         -- assigned destination is available to receive a real supply delivery.
-        self.nextBaseSupplySearch = ticks + SUPPLY_RETRY_TICKS
+        self.nextBaseSupplySearch = ticks + TUNE.SUPPLY_RETRY_TICKS
         return nil
     end
     local totals = summary.totals or {}
@@ -9798,10 +11346,25 @@ function Controller:baseSupplyNeed(ticks)
         end
     end
     local goal = nil
-    local jobs = rawget(_G, "KnoxBaseJobs")
     local waterSource = jobs ~= nil and jobs.waterSourceState ~= nil
         and jobs.waterSourceState() or "unknown"
-    if KnoxBaseSupplyPlanner.chooseAvailableShortage ~= nil then
+    local materialGoals = {}
+    if jobs ~= nil and jobs.prepareWorkforce ~= nil then
+        local _, prepared = jobs.prepareWorkforce(self.base, self.character, nowHours)
+        materialGoals = prepared or {}
+    end
+    local materialClaim = claims.find_materials
+    local otherClaim = false
+    for kind, claim in pairs(claims) do
+        if kind ~= "find_materials" and type(claim) == "table" and claim.survivorId == self.id then
+            otherClaim = true
+            break
+        end
+    end
+    if not otherClaim and #materialGoals > 0
+        and (materialClaim == nil or materialClaim.survivorId == self.id) then
+        goal = "find_materials"
+    elseif KnoxBaseSupplyPlanner.chooseAvailableShortage ~= nil then
         goal = KnoxBaseSupplyPlanner.chooseAvailableShortage(
             totals, residents, claims, self.id,
             self.base ~= nil and self.base.reserveTargets or nil,
@@ -9868,7 +11431,8 @@ function Controller:baseSupplyNeed(ticks)
                     willing = duty ~= nil and (factionBaseId ~= ""
                         and factionResident
                         or factionBaseId == "" and duty.allowLootRuns == true),
-                    resting = duty ~= nil and duty.jobPreference == "rest",
+                    resting = (duty ~= nil and duty.jobPreference == "rest")
+                        or (jobs ~= nil and jobs.isRestWindow ~= nil and jobs.isRestWindow(residentId)),
                     hasTask = claimedTask ~= nil,
                     explicitOrder = duty ~= nil
                         and type(duty.baseSupplyOrder) == "table",
@@ -10046,7 +11610,7 @@ function Controller:recordExplicitBaseSupplyFailure(ticks)
     self.baseSupplyOrderAttempts = tonumber(attempts)
         or ((tonumber(self.baseSupplyOrderAttempts) or 0) + 1)
     if self.baseSupplyOrderAttempts < 3 then
-        self.nextThink = math.max(self.nextThink or 0, ticks + SUPPLY_RETRY_TICKS)
+        self.nextThink = math.max(self.nextThink or 0, ticks + TUNE.SUPPLY_RETRY_TICKS)
         return false
     end
     self:clearExplicitBaseSupplyOrder()
@@ -10077,11 +11641,39 @@ function Controller:collectionActionAllowed(pending, transfer, action, item)
     if transfer.action ~= nil and transfer.action ~= action then return false end
     transfer.action = action
     if action.character ~= self.character then return false end
-    local origin, target = self.character:getCurrentSquare(), transfer.source:getSourceGrid()
+    local origin = self.character:getCurrentSquare()
+    local target
+    if pending.assignedFood == true then
+        local storage = rawget(_G, "KnoxBaseStorage")
+        local ok, valid, square = pcall(function()
+            if self.base ~= pending.foodBase or self.baseId ~= pending.foodBaseId
+                or storage == nil then return false end
+            local resolved = storage.resolvePolicy(pending.foodPolicy)
+            if resolved == nil or resolved.container ~= pending.foodRoot
+                or resolved.square == nil or not resolved.container:isExistYet() then return false end
+            local selected = storage.findSurvivalSupply(self.base, self.character, "food", {
+                policy = pending.foodPolicy,
+                acceptItem = function(candidate, source)
+                    return candidate == item and source == transfer.source
+                end,
+            })
+            return selected ~= nil and selected.item == item and selected.source == transfer.source,
+                resolved.square
+        end)
+        if not ok or valid ~= true then return false end
+        target = square
+    else
+        target = transfer.source:getSourceGrid()
+        if not transfer.source:isExistYet() then return false end
+    end
+    if pending.vehicle ~= nil and (pending.vehiclePart == nil
+        or pending.vehiclePart:getItemContainer() ~= transfer.source
+        or not KnoxSurvivorLooting.vehicleStockAllowed(self.character, self.id,
+            pending.vehicle, pending.vehiclePart, true)) then return false end
+    if not KnoxSurvivorLooting.canLootSquare(self.id, target) then return false end
     if origin == nil or target == nil or origin:getZ() ~= target:getZ()
         or distanceSquared(origin, target) > 4 or self.character:isDead()
-        or self.character:getVehicle() ~= nil or nativeTraversalBusy(self.character)
-        or not transfer.source:isExistYet() then return false end
+        or self.character:getVehicle() ~= nil or nativeTraversalBusy(self.character) then return false end
     if transfer.search == true then
         return action.container == transfer.source
             and self.reservations.containers[transfer.source] == self.id
@@ -10089,7 +11681,8 @@ function Controller:collectionActionAllowed(pending, transfer, action, item)
     end
     return item == transfer.item and action.item == item
         and action.srcContainer == transfer.source and action.destContainer == transfer.destination
-        and transfer.destination == self.character:getInventory()
+        and (transfer.destination == self.character:getInventory()
+            or pending.awayMission == true and KnoxAwayTeamExecutor.ownsContainer(self.character,transfer.destination))
         and self.reservations.items[item] == self.id
         and (not transfer.containerLease or self.reservations.containers[transfer.source] == self.id)
         and item:getContainer() == transfer.source and transfer.source:contains(item)
@@ -10100,7 +11693,10 @@ function Controller:collectionItemReceived(pending, item)
     local ok, received = pcall(function()
         local inventory = self.character:getInventory()
         return inventory ~= nil and pending.container:contains(item) == false
-            and inventory:contains(item) == true and item:getContainer() == inventory
+            and ((inventory:contains(item) == true and item:getContainer() == inventory)
+                or pending.awayMission == true
+                    and KnoxAwayTeamExecutor.ownsContainer(self.character,item:getContainer())
+                    and item:getContainer():contains(item)==true)
     end)
     return ok and received == true
 end
@@ -10144,6 +11740,10 @@ function Controller:queueSupplyCollection(ticks)
         return queue == nil or (type(queue.queue) == "table" and #queue.queue == 0)
     end)
     if not readable or not idle then return false, "collection_busy" end
+    if pending.assignedFood == true then
+        local ok, full = pcall(function() return self.character:hasFullInventory() end)
+        if ok and full == true then return false, "inventory_full" end
+    end
     local collectionState = self.state
     pending.collectionActions = {}
     local selected = pending.items
@@ -10153,7 +11753,8 @@ function Controller:queueSupplyCollection(ticks)
     local admitted = false
     for _, candidate in ipairs(selected) do
         local transfer = {item = candidate.item, search = candidate.search == true,
-            source = pending.container, destination = self.character:getInventory(),
+            source = pending.container, destination = pending.awayMission == true
+                and candidate.destination or self.character:getInventory(),
             character = self.character, decision = self.activeDecision,
             directive = self.companionDirective,
             containerLease = self.reservations.containers ~= nil
@@ -10166,6 +11767,12 @@ function Controller:queueSupplyCollection(ticks)
         local ok, action, result = pcall(function()
             if transfer.search then
                 return KnoxInventoryActions.queueSearch(self.character, transfer.source, 90, allowed)
+            end
+            if pending.assignedFood == true then
+                return KnoxBaseStorage.queueTransfer(self.character, {
+                    item = transfer.item, source = {container = transfer.source},
+                    destination = {container = transfer.destination},
+                }, allowed)
             end
             return KnoxInventoryActions.queueTransfer(self.character, transfer.item,
                 transfer.source, transfer.destination, nil, allowed)
@@ -10206,8 +11813,27 @@ function Controller:queueSupplyCollection(ticks)
     return admitted, "collection_queued"
 end
 
+function Controller:finishSupplyCollectionRefusal(supply, result, ticks)
+    self:recordFailure("loot_action_queue:" .. tostring(result), ticks, 180)
+    self:releaseSupply()
+    self:finishDecision(ticks)
+    if supply ~= nil and supply.assignedFood == true and result == "inventory_full" then
+        self:recoverCapacityForNeed("eat", ticks)
+    end
+end
+
 function Controller:releaseSupply(preserveBaseSupplyRun)
     self:releaseSupplyCollection()
+    local pending=self.pendingSupply
+    if self.awayTeamId ~= nil and pending ~= nil and pending.awayMission == true
+        and pending.awayReceiptCommitted ~= true
+        and #KnoxAwayTeamExecutor.transferredItemTypes(pending,self.character)>0 then
+        -- Interrupted native actions may already have moved part of the haul.
+        -- Observe it once before dropping the transient plan, never replay it.
+        local receipt=KnoxAwayTeamExecutor.recordCollection(self.awayTeamId,self.id,
+            pending,self.character,currentWorldAgeHours(),false)
+        if receipt ~= nil then self:markAwayCargoDelivery(pending) end
+    end
     self:releaseBaseRecreation()
     -- A base-task pickup may be interrupted through the generic supply/need
     -- path before it reaches the timed transfer state. Release its exact
@@ -10316,13 +11942,13 @@ end
 function Controller:rejectUnreceivedGenericLoot(ticks, receivedCount, selectedCount)
     local container = self.pendingSupply ~= nil and self.pendingSupply.container or nil
     if container ~= nil then
-        self.inspectedContainers[container] = ticks + LOOT_TRAVEL_COOLDOWN_TICKS
+        self.inspectedContainers[container] = ticks + TUNE.LOOT_TRAVEL_COOLDOWN_TICKS
     end
     self:recordFailure(
         receivedCount > 0 and "loot_transfer_partial_receipt"
             or "loot_transfer_not_received",
         ticks,
-        LOOT_TRAVEL_COOLDOWN_TICKS
+        TUNE.LOOT_TRAVEL_COOLDOWN_TICKS
     )
     print(
         "[KnoxSurvivors][Autonomy] id=" .. self.id
@@ -10345,9 +11971,71 @@ function Controller:releaseGroupSupport()
         if self.state == "GROUP_SUPPORT" then
             self.state, self.activeDecision = "IDLE", nil
             self.nextThink = math.max(self.nextThink or 0,
-                (self.currentTicks or 0) + THINK_MIN_TICKS)
+                (self.currentTicks or 0) + TUNE.THINK_MIN_TICKS)
         end
     end
+end
+
+-- Resolve acceptance through the live group and recipient controller; no
+-- relationship or smoking state is copied into a separate registry.
+function Controller:canOfferSmoke(recipient, item, consuming)
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    if recipient == nil or item == nil or runtime == nil or runtime.idForCharacter == nil
+        or runtime.getController == nil or runtime.canInteract == nil
+        or self.combatTarget ~= nil or self.pendingThreatAwareness ~= nil then return false end
+    local sameGroup = recipient == self.groupLeader
+    for _, member in ipairs(self.groupMembers or {}) do
+        if member == recipient then sameGroup = true; break end
+    end
+    local id = runtime.idForCharacter(recipient)
+    local other = id ~= nil and runtime.getController(id) or nil
+    if not sameGroup or other == nil or other.character ~= recipient or not runtime.canInteract(id)
+        or hostileHuman(self, recipient, id) or hostileHuman(other, self.character, self.id)
+        or other.combatTarget ~= nil or other.pendingThreatAwareness ~= nil
+        or nativeTraversalBusy(self.character) or Controller.isNativeRecoveryBusy(self.character)
+        or Controller.isNativeAttackBusy(self.character)
+        or safeMethod(self.character, "isDead", true) or safeMethod(recipient, "isDead", true)
+        or safeMethod(recipient, "isAsleep", true) or nativeTraversalBusy(recipient)
+        or Controller.isNativeRecoveryBusy(recipient) or Controller.isNativeAttackBusy(recipient)
+        or not KnoxSurvivorNeeds.smokeMotive(recipient)
+        or not KnoxSurvivorNeeds.smokeIgnitionAvailable(recipient, item) then return false end
+    if not consuming then
+        if other.state ~= "IDLE" and other.state ~= "GROUP_WAIT" then return false end
+        if hasPendingTimedActions(recipient) or other.pendingSelfCare ~= nil then return false end
+        local need = KnoxSurvivorNeeds.decide(recipient, nil)
+        if need ~= nil and need.kind ~= "roam" then return false end
+    elseif other.pendingSelfCare == nil or (other.state ~= "TIMED_ACTION"
+        and not other.pendingSelfCare.admitting) then return false end
+    local a, b = self.character:getCurrentSquare(), recipient:getCurrentSquare()
+    return a ~= nil and b ~= nil and a:getZ() == b:getZ() and distanceSquared(a,b) <= 9
+end
+
+-- Once transferred, the recipient owns the cigarette and no longer depends on
+-- the donor's position or continued permission.
+function Controller:canStartOfferedSmoke(item)
+    local actor = self.character
+    if actor == nil or (self.state ~= "IDLE" and self.state ~= "GROUP_WAIT")
+        or self.pendingSelfCare ~= nil or self.combatTarget ~= nil or self.pendingThreatAwareness ~= nil
+        or safeMethod(actor, "isDead", true) or safeMethod(actor, "isAsleep", true)
+        or nativeTraversalBusy(actor) or Controller.isNativeRecoveryBusy(actor)
+        or Controller.isNativeAttackBusy(actor) or hasPendingTimedActions(actor)
+        or not KnoxSurvivorNeeds.smokeMotive(actor)
+        or not KnoxSurvivorNeeds.smokeIgnitionAvailable(actor, item) then return false end
+    local need = KnoxSurvivorNeeds.decide(actor, nil)
+    return need == nil or need.kind == "roam"
+end
+
+function Controller:canConsumeOfferedSmoke(item)
+    local actor = self.character
+    if actor == nil or self.pendingSelfCare == nil or self.combatTarget ~= nil
+        or self.pendingThreatAwareness ~= nil or safeMethod(actor, "isDead", true)
+        or safeMethod(actor, "isAsleep", true) or nativeTraversalBusy(actor)
+        or Controller.isNativeRecoveryBusy(actor) or Controller.isNativeAttackBusy(actor)
+        or (self.state ~= "TIMED_ACTION" and not self.pendingSelfCare.admitting)
+        or not KnoxSurvivorNeeds.smokeMotive(actor)
+        or not KnoxSurvivorNeeds.smokeIgnitionAvailable(actor, item) then return false end
+    local need = KnoxSurvivorNeeds.decide(actor, nil)
+    return need == nil or need.kind == "roam"
 end
 
 function Controller:beginGroupSupport(ticks)
@@ -10376,6 +12064,11 @@ function Controller:beginGroupSupport(ticks)
                 and not reservedByOther(self.reservations, "supportItems", item, self.id)
         end
     )
+    if plan == nil and KnoxGroupSupport.planSmoke ~= nil then
+        plan = KnoxGroupSupport.planSmoke(self.character, recipients,
+            self.reservations.supportRecipients, self.reservations.items,
+            function(recipient, item) return self:canOfferSmoke(recipient, item, false) end)
+    end
     if plan == nil
         or not reserve(self.reservations, "supportRecipients", plan.recipient, self.id)
         or not reserve(self.reservations, "supportItems", plan.item, self.id)
@@ -10411,7 +12104,7 @@ function Controller:beginGroupSupport(ticks)
     self.state = "GROUP_SUPPORT"
     self.stateStartedAt = ticks
     self.nextGroupSupportAt = ticks + Controller.TUNING.GROUP_SUPPORT_COOLDOWN_TICKS
-    sayDialogue(self.character, self.id, "share_supply", ticks, 1800)
+    if plan.kind == "smoke" then sayDialogue(self.character, self.id, "offer_cigarette", ticks, 1800) end
     return true
 end
 
@@ -10426,6 +12119,24 @@ function Controller:completeGroupSupport(ticks)
             or "group_support_receipt_unreadable", ticks,
             Controller.TUNING.GROUP_SUPPORT_RETRY_TICKS)
     else
+        -- The recipient must acquire the same item claim for its native action.
+        -- Transfer receipt has already proved ownership, so retire the donor
+        -- lease before admitting the recipient's self-care lease.
+        if plan.kind == "smoke" then self:releaseGroupSupport() end
+        if plan.kind == "smoke" then
+            local runtime = rawget(_G, "KnoxSurvivorRuntime")
+            local id = runtime ~= nil and runtime.idForCharacter ~= nil and runtime.idForCharacter(plan.recipient)
+            local other = id ~= nil and runtime.getController ~= nil and runtime.getController(id) or nil
+            local item = plan.item
+            if other ~= nil and other.character == plan.recipient and other:canStartOfferedSmoke(item) then
+                sayDialogue(plan.recipient, id, "accept_cigarette", ticks, 1800)
+                local permission = function() return other:canConsumeOfferedSmoke(item) end
+                local action = other:executeNeedAction({ kind="smoke", item=item,
+                    state=KnoxSurvivorNeeds.snapshot(plan.recipient), permission=permission }, ticks)
+                if action ~= nil then other.activeDecision = "group_smoke" end
+            end
+        end
+        sayDialogue(self.character, self.id, "share_supply", ticks, 1800)
         self:diag("social", "support_completed", {
             kind = plan ~= nil and tostring(plan.kind) or nil,
         })
@@ -10435,11 +12146,11 @@ function Controller:completeGroupSupport(ticks)
     return completed
 end
 
-function Controller:beginWindowDetour(ticks, resumeState)
+function Controller:beginWindowDetour(ticks, resumeState, preferred)
     if self.pendingSupply == nil or (self.pendingSupply.entryAttemptCount or 0) >= 8 then
         return false
     end
-    local entry = findAlternateEntry(self, self.pendingSupply, ticks)
+    local entry = findAlternateEntry(self, self.pendingSupply, ticks, preferred)
     if entry == nil then
         return false
     end
@@ -10465,6 +12176,7 @@ function Controller:beginWindowDetour(ticks, resumeState)
 end
 
 function Controller:beginLockedDoorBreak(ticks, resumeState, preserveBaseTaskSupply)
+    if self.combatTarget ~= nil or self.state == "COMBAT" then return false end
     if self.pendingSupply == nil or self.pendingSupply.doorBreakAttempted == true then
         return false
     end
@@ -10514,24 +12226,49 @@ function Controller:crossWindowDetour(ticks)
         return false
     end
     local entry = self.entryDetour
-    if entry.kind == "window" and self.allowClimbing == false then return false end
+    if entry.kind == "window" and (self.allowClimbing == false
+        or self.combatTarget ~= nil or self.state == "COMBAT") then return false end
     if entry.kind == "window" or entry.kind == "door" then
         local object = entry.object
         if not canOpenClosedEntrances(self)
             and not safeObjectBoolean(object, "IsOpen", false)
             and not (entry.kind == "window" and safeObjectBoolean(object, "isSmashed", false)) then return false end
     end
+    if entry.force and entry.kind == "door" then
+        -- The scan selected this exact goal-room edge; do not infer a door from
+        -- whichever adjacent object happens to be nearest after a detour.
+        if forcedEntryRefusal(self, entry.inside) ~= nil or self.combatTarget ~= nil then return false end
+        local traversal = rawget(_G, "KnoxSurvivorTraversal")
+        if traversal ~= nil and traversal.beginForceOpen(self.character, entry.object) then
+            self.entryDetour.force = false
+            self.state = "OPENING_ENTRY_WINDOW"
+            self.stateStartedAt = ticks
+            return true
+        end
+        if self.pendingSupply ~= nil and self.pendingSupply.taskEntry == true then
+            return self:beginBaseTaskLockedDoorBreak(ticks)
+        end
+        return self:beginLockedDoorBreak(ticks, entry.resumeState,
+            self.pendingSupply ~= nil and self.pendingSupply.taskSupplyEntry == true)
+    end
     if self.entryDetour.force then
         -- Revalidate protection and the real world object at the action boundary.
         local window = self.entryDetour.object
-        if not KnoxBaseManager.canDamageStructure(self.id, self.entryDetour.inside)
-            or KnoxSurvivorNeeds.snapshot(self.character).endurance < LOCKED_DOOR_MIN_ENDURANCE
+        if forcedEntryRefusal(self, self.entryDetour.inside) ~= nil
             or safeObjectBoolean(window, "isBarricaded", true) then return false end
         self.entryDetour.force = false
         self:traversalMemoryMarkForced(window, "window", ticks)
         if not safeObjectBoolean(window, "IsOpen", false)
             and not safeObjectBoolean(window, "isSmashed", false) then
             self.bridge:cancelNpcMove(self.id)
+            -- Build 42 pries before it smashes: a carried crowbar reaches the
+            -- vanilla forced-entry action, bare hands fall back to the window.
+            local traversal = rawget(_G, "KnoxSurvivorTraversal")
+            if traversal ~= nil and traversal.beginForceOpen(self.character, window) then
+                self.state = "OPENING_ENTRY_WINDOW"
+                self.stateStartedAt = ticks
+                return true
+            end
             ISTimedActionQueue.add(ISSmashWindow:new(self.character, window))
             self.state = "OPENING_ENTRY_WINDOW"
             self.stateStartedAt = ticks
@@ -10551,14 +12288,37 @@ end
 function Controller:retryWindowDetour(ticks, movement)
     local entry = self.entryDetour
     if entry == nil or self.pendingSupply == nil then return false end
-    if entry.kind == "window" and not entry.smashedAttempt
-        and string.find(tostring(movement), "FAILED_LOCKED_OR_UNUSABLE_WINDOW", 1, true)
+    if (entry.kind == "window" or entry.kind == "door") and not entry.smashedAttempt
+        and (string.find(tostring(movement), "FAILED_LOCKED_OR_UNUSABLE_WINDOW", 1, true)
+            or string.find(tostring(movement), "FAILED_LOCKED_DOOR", 1, true))
         and not safeObjectBoolean(entry.object, "IsOpen", false)
-        and not safeObjectBoolean(entry.object, "isSmashed", false) then
+        and (entry.kind ~= "window" or not safeObjectBoolean(entry.object, "isSmashed", false)) then
         self:traversalMemoryRecordFailure(entry.object, entry.kind, "locked",
             entry.inside, entry.outside, ticks)
     end
     return self:beginWindowDetour(ticks, entry.resumeState)
+end
+
+-- Ladders and sheet ropes: a survivor changes floor the way the player does,
+-- through the installed climb actions. Only from a settled state, only with a
+-- goal on another floor, and never mid-fight.
+function Controller:tryVerticalTraversal(ticks)
+    local traversal = rawget(_G, "KnoxSurvivorTraversal")
+    if traversal == nil or self.character == nil then return false end
+    if self.combatTarget ~= nil or self.state == "COMBAT" then return false end
+    if self.state ~= "IDLE" and self.travelFinalSquare == nil then return false end
+    local goal = self.travelFinalSquare
+        or (self.pendingSupply ~= nil and self.pendingSupply.approach or nil)
+    local current = self.character:getCurrentSquare()
+    if goal == nil or current == nil or goal:getZ() == current:getZ() then return false end
+    local climbed, kind = traversal.beginClimb(self.character, current, goal:getZ())
+    if not climbed then return false end
+    self.nextThink = math.max(self.nextThink or 0, (tonumber(ticks) or 0) + 120)
+    print(
+        "[KnoxSurvivors][Autonomy] id=" .. self.id
+            .. " vertical-traversal=" .. tostring(kind)
+    )
+    return true
 end
 
 function Controller:updateEntryWindow(ticks)
@@ -10579,13 +12339,35 @@ function Controller:resumeAfterWindowDetour(ticks)
     end
     local resumeState = self.entryDetour.resumeState
     local resumedEdge = self.entryDetour.object
+    local entry = self.entryDetour
+    if self.character ~= nil and entry.outside ~= nil and entry.inside ~= nil
+        and entry.object ~= nil and (entry.kind == "door" or entry.kind == "window") then
+        local ok, building = pcall(function()
+            if self.character:getCurrentSquare() ~= entry.inside
+                or entry.outside:getZ() ~= entry.inside:getZ()
+                or math.abs(entry.outside:getX()-entry.inside:getX())
+                    + math.abs(entry.outside:getY()-entry.inside:getY()) ~= 1
+                or entry.outside:getBuilding() ~= nil then return nil end
+            local insideBuilding = entry.inside:getBuilding()
+            local edge = entry.kind == "door"
+                and (entry.inside:getDoorTo(entry.outside) or entry.outside:getDoorTo(entry.inside))
+                or (entry.inside:getWindowTo(entry.outside) or entry.outside:getWindowTo(entry.inside))
+            if edge ~= entry.object then return nil end
+            return insideBuilding
+        end)
+        if ok and building ~= nil then
+            self.groupUsedEntry = { actor=self.character, outside=entry.outside, inside=entry.inside,
+                object=entry.object, kind=entry.kind, building=building, tick=ticks }
+            self.groupEntryObservedActor, self.groupEntryObservedSquare = self.character, entry.inside
+        end
+    end
     local result = tostring(self.bridge:moveNpc(self.id, self.pendingSupply.approach))
     if string.find(result, "MOVE_STARTED", 1, true) ~= 1 then
         -- The native vault animation can still own the body on the first tick
         -- after the crossing reports done. Hold the crossing state briefly and
         -- retry instead of abandoning into a seconds-long stand.
         if self:traversalResumeRetry(ticks) then
-            self.nextThink = ticks + THINK_MIN_TICKS
+            self.nextThink = ticks + TUNE.THINK_MIN_TICKS
             return true
         end
         return false
@@ -10594,7 +12376,8 @@ function Controller:resumeAfterWindowDetour(ticks)
     self:traversalMemoryForget(resumedEdge)
     self.entryDetour = nil
     if self.pendingSupply.taskEntry == true
-        or self.pendingSupply.taskSupplyEntry == true then
+        or self.pendingSupply.taskSupplyEntry == true
+        or self.pendingSupply.ambientEntry == true then
         self.pendingSupply = nil
     end
     self.state = resumeState
@@ -10602,7 +12385,8 @@ function Controller:resumeAfterWindowDetour(ticks)
     if resumeState == "BASE_TASK_SUPPLY_MOVE" then
         self:noteTaskTravelStart(ticks)
     end
-    if resumeState == "GROUP_FOLLOW" or resumeState == "COMPANION_FOLLOW" then
+    if resumeState == "GROUP_FOLLOW" or resumeState == "GROUP_REGROUP"
+        or resumeState == "COMPANION_FOLLOW" then
         self.pendingSupply = nil
     end
     print("[KnoxSurvivors][Autonomy] id=" .. self.id .. " alternate-entry=completed")
@@ -10673,7 +12457,7 @@ function Controller:abandonCurrentDecision(ticks, reason)    if self.pendingDepo
         self.selfCareRetryAt[kind] = ticks + Controller.TUNING.SELF_CARE_RETRY_TICKS
     end
     if self.pendingSupply ~= nil and self.pendingSupply.container ~= nil then
-        self.inspectedContainers[self.pendingSupply.container] = ticks + SUPPLY_RETRY_TICKS
+        self.inspectedContainers[self.pendingSupply.container] = ticks + TUNE.SUPPLY_RETRY_TICKS
     end
     if self.state == "ROAMING" then
         rememberRoamDestination(
@@ -10729,6 +12513,7 @@ function Controller:recoverFromControllerError(ticks, reason)
     cleanup("robbery", function() self:cancelRobbery(ticks, "controller_error") end)
     cleanup("group_support", function() self:releaseGroupSupport() end)
     cleanup("aid", function() self:releaseAid() end)
+    cleanup("shared_meal", function() self:releaseSharedMeal(ticks) end)
     cleanup("self_care", function() self:releaseSelfCare() end)
     cleanup("cancel_move", function()
         if self.bridge ~= nil and self.bridge.cancelNpcMove ~= nil then
@@ -10848,8 +12633,8 @@ function Controller:recoverFromControllerError(ticks, reason)
     self.ambientRest = nil
     self.activeDecision = nil
     self.state = "IDLE"
-    self.nextThink = ticks + THINK_MIN_TICKS
-    self.nextThreatScan = math.max(self.nextThreatScan or 0, ticks + THREAT_SCAN_TICKS)
+    self.nextThink = ticks + TUNE.THINK_MIN_TICKS
+    self.nextThreatScan = math.max(self.nextThreatScan or 0, ticks + TUNE.THREAT_SCAN_TICKS)
     self.stateStartedAt = ticks
     self.observedState = self.state
     self.counts = self.counts or {}
@@ -10922,17 +12707,17 @@ function Controller:beginExploration(ticks, directive, options)
     if target == nil then
         self.nextExplorationSearch = ticks + (options ~= nil
             and options.partySupport == true
-            and EMPTY_SEARCH_COOLDOWN_TICKS or EXPLORATION_RETRY_TICKS)
+            and TUNE.EMPTY_SEARCH_COOLDOWN_TICKS or TUNE.EXPLORATION_RETRY_TICKS)
         if options ~= nil and options.partySupport == true then
             self:recordFailure(
                 "party_support_food_unavailable",
                 ticks,
-                EMPTY_SEARCH_COOLDOWN_TICKS
+                TUNE.EMPTY_SEARCH_COOLDOWN_TICKS
             )
         end
         if directive ~= nil and directive.eventId ~= nil then
             KnoxEvents.recordEmptySearch(directive.eventId, self.id)
-        elseif directive ~= nil then
+        elseif directive ~= nil and directive.awayMission ~= true then
             self.directiveMisses = self.directiveMisses + 1
             if self.directiveMisses >= 3 then
                 KnoxPersistence.clearCompanionDirective(
@@ -10956,7 +12741,7 @@ function Controller:beginExploration(ticks, directive, options)
         return false
     end
     if not reserve(self.reservations, "containers", target.container, self.id) then
-        self.nextThink = math.max(self.nextThink or 0, ticks + THINK_MIN_TICKS)
+        self.nextThink = math.max(self.nextThink or 0, ticks + TUNE.THINK_MIN_TICKS)
         return false
     end
     local reservedItems = {}
@@ -10966,7 +12751,7 @@ function Controller:beginExploration(ticks, directive, options)
                 release(self.reservations, "items", reservedItem, self.id)
             end
             release(self.reservations, "containers", target.container, self.id)
-            self.nextThink = math.max(self.nextThink or 0, ticks + THINK_MIN_TICKS)
+            self.nextThink = math.max(self.nextThink or 0, ticks + TUNE.THINK_MIN_TICKS)
             return false
         end
         reservedItems[#reservedItems + 1] = candidate.item
@@ -10991,11 +12776,11 @@ function Controller:beginExploration(ticks, directive, options)
             release(self.reservations, "items", candidate.item, self.id)
         end
         release(self.reservations, "containers", target.container, self.id)
-        self.inspectedContainers[target.container] = ticks + EXPLORATION_RETRY_TICKS
+        self.inspectedContainers[target.container] = ticks + TUNE.EXPLORATION_RETRY_TICKS
         self:recordFailure(
             "exploration_move:" .. result,
             ticks,
-            EXPLORATION_RETRY_TICKS
+            TUNE.EXPLORATION_RETRY_TICKS
         )
         return false
     end
@@ -11064,7 +12849,7 @@ function Controller:nearestSightingContact(current, radius)
     if ownerId==nil and type(self.base)=="table" and self.base.ownerKind=="player" then
         ownerId=self.base.ownerId
     end
-    local nearest,nearestDistance,nearestContact=nil,nil,nil
+    local nearest,nearestDistance,nearestContact,nearestId,nearestKind=nil,nil,nil,nil,nil
     for _,id in ipairs(ids or {}) do
         if tostring(id)~=tostring(self.id) then
             local character=runtime.getCharacter(id)
@@ -11078,7 +12863,7 @@ function Controller:nearestSightingContact(current, radius)
                     local visible=false
                     local seenOk,seen=pcall(function() return self.character:CanSee(character) end)
                     if seenOk then visible=seen==true end
-                    if not dead and visible then
+                    if deadOk and deadResult==false and not dead and visible then
                         local affiliation=persistence.getSurvivorAffiliation~=nil
                             and persistence.getSurvivorAffiliation(id) or nil
                         local faction=persistence.getFactionForSurvivor~=nil
@@ -11093,33 +12878,149 @@ function Controller:nearestSightingContact(current, radius)
                                     ..tostring(identity.surname or "")):match("^%s*(.-)%s*$")
                             end
                         end
-                        local contact=patrol.contactWord(affiliation,
+                        local contact,kind=patrol.contactWord(affiliation,
                             faction~=nil and faction.name or nil,knownName)
                         if contact~=nil then
-                            nearest,nearestDistance,nearestContact=square,distance,contact
+                            nearest,nearestDistance,nearestContact,nearestId,nearestKind=square,distance,contact,id,kind
                         end
                     end
                 end
             end
         end
     end
-    return nearest,nearestContact
+    return nearest,nearestContact,nearestId,nearestKind
 end
 
 -- Say what the patrol actually sees at a stop. The count is the same real
 -- pressure read roaming uses, not a new threat record. A quiet stop still spends
 -- the scan gap, so a long route does not inspect the cell at every corner.
+-- A loaded witness can name a death only from its owner's prior knowledge.
+-- A single outcome cue belongs to the selected, actually dead zombie in the
+-- existing encounter; no personal kill credit is inferred from this voice.
+function Controller:reportZombieOutcome(zombie)
+    if zombie == nil or self.combatOutcomeSpoken or self.state ~= "COMBAT"
+        or self.combatTarget ~= zombie or self.character == nil then return false end
+    local ticks = self.currentTicks
+    if type(ticks) ~= "number" or ticks ~= ticks or ticks < 0 or ticks >= math.huge then return false end
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    local persistence = rawget(_G, "KnoxPersistence")
+    local relationships = rawget(_G, "KnoxSurvivorRelationships")
+    local dialogue = rawget(_G, "KnoxSurvivorDialogue")
+    if runtime == nil or runtime.getController == nil or runtime.getController(self.id) ~= self
+        or persistence == nil or persistence.isSurvivorAlive == nil
+        or relationships == nil or relationships.canPerceiveHuman == nil
+        or dialogue == nil or dialogue.say == nil then return false end
+    local ok, eligible = pcall(function()
+        return zombie:isZombie() == true and zombie:isDead() == true
+            and self.character:isDead() == false and persistence.isSurvivorAlive(self.id) == true
+            and relationships.canPerceiveHuman(self.character, zombie) == true
+    end)
+    if not ok or not eligible then return false end
+    local spoke = dialogue.say(self.character, self.id, "combat_zombie_done", ticks, 900)
+    if spoke == true then self.combatOutcomeSpoken = true; return true end
+    return false
+end
+
+function Controller:reportKnownCorpse(target)
+    local victimId = target and target.survivorId
+    local body = target and target.body
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    local persistence = rawget(_G, "KnoxPersistence")
+    local relationships = rawget(_G, "KnoxSurvivorRelationships")
+    local dialogue = rawget(_G, "KnoxSurvivorDialogue")
+    local handling = rawget(_G, "KnoxBaseCorpseHandling")
+    local ticks = self.currentTicks
+    if type(victimId) ~= "string" or victimId == self.id or body == nil or self.character == nil
+        or type(ticks) ~= "number" or ticks ~= ticks or ticks < 0 or ticks >= math.huge
+        or runtime == nil or runtime.getController == nil or runtime.getController(self.id) ~= self
+        or persistence == nil or relationships == nil or dialogue == nil or handling == nil then return false end
+    local ok, eligible = pcall(function()
+        return handling.readTaggedSurvivorId(body) == victimId and self.character:isDead() == false
+            and persistence.isSurvivorAlive(self.id) == true and persistence.isSurvivorAlive(victimId) == false
+            and relationships.canPerceiveHuman(self.character, body) == true
+    end)
+    if not ok or not eligible then return false end
+    local ownerId = self.companionOwnerId
+    if ownerId == nil and type(self.base) == "table" and self.base.ownerKind == "player" then ownerId = self.base.ownerId end
+    if ownerId == nil or persistence.getObserverKnowledge(ownerId, victimId) == nil then return false end
+    local identity = persistence.getSurvivorIdentity(victimId)
+    if type(identity) ~= "table" then return false end
+    local name = (tostring(identity.forename or "") .. " " .. tostring(identity.surname or "")):match("^%s*(.-)%s*$")
+    if name == nil or name == "" then return false end
+    return dialogue.sayRecognition(self.character, self.id, victimId, ticks, nil, "known_corpse", name) == true
+end
+
+function Controller:reportWitnessedDeath(victimId, victim)
+    if victimId == nil or tostring(victimId) == tostring(self.id)
+        or self.character == nil or victim == nil then return false end
+    local ticks = self.currentTicks
+    if type(ticks) ~= "number" or ticks ~= ticks or ticks < 0 or ticks >= math.huge then return false end
+    local persistence = rawget(_G, "KnoxPersistence")
+    local relationships = rawget(_G, "KnoxSurvivorRelationships")
+    local dialogue = rawget(_G, "KnoxSurvivorDialogue")
+    if persistence == nil or persistence.isSurvivorAlive == nil
+        or relationships == nil or relationships.canPerceiveHuman == nil
+        or dialogue == nil or dialogue.sayRecognition == nil then return false end
+    local ok, eligible = pcall(function()
+        return victim:isDead() == true and self.character:isDead() == false
+            and persistence.isSurvivorAlive(victimId) == false
+            and persistence.isSurvivorAlive(self.id) == true
+            and relationships.canPerceiveHuman(self.character, victim) == true
+    end)
+    if not ok or not eligible then return false end
+    local ownerId = self.companionOwnerId
+    if ownerId == nil and type(self.base) == "table" and self.base.ownerKind == "player" then
+        ownerId = self.base.ownerId
+    end
+    if ownerId == nil or persistence.getObserverKnowledge == nil
+        or persistence.getSurvivorIdentity == nil
+        or persistence.getObserverKnowledge(ownerId,victimId) == nil then return false end
+    local identity = persistence.getSurvivorIdentity(victimId)
+    if type(identity) ~= "table" then return false end
+    local name = (tostring(identity.forename or "") .. " " .. tostring(identity.surname or ""))
+        :match("^%s*(.-)%s*$")
+    if name == nil or name == "" then return false end
+    return dialogue.sayRecognition(self.character,self.id,victimId,ticks,nil,"known_death",name) == true
+end
+
 function Controller:reportPatrolSighting(ticks,base)
     local patrol=rawget(_G,"KnoxCompanionPatrol")
     if self.character==nil or patrol==nil or patrol.sightingWord==nil
         or patrol.sightingDue==nil then return false end
     local cooldown=Controller.TUNING.PATROL_SIGHTING_COOLDOWN_TICKS
     if not patrol.sightingDue(self.nextPatrolSightingAt,ticks,cooldown) then return false end
-    self.nextPatrolSightingAt=ticks+cooldown
+    self.nextPatrolSightingAt=ticks
     local current=self.character:getCurrentSquare()
     local radius=Controller.TUNING.PATROL_SIGHTING_RADIUS
-    local pressure,nearestZombie=zombiePressureAt(current,radius)
-    local nearestContact,contact=self:nearestSightingContact(current,radius)
+    local pressure,nearestZombie,visibleZombie=zombiePressureAt(current,radius,self.character)
+    local nearestContact,contact,contactId,contactKind=self:nearestSightingContact(current,radius)
+    local personRecognition=(contactKind=="stranger" or contactKind=="known") and contactId~=nil
+    local undeadRecognition=nearestContact==nil and visibleZombie~=nil
+    if personRecognition or undeadRecognition then
+        local dialogue=rawget(_G,"KnoxSurvivorDialogue")
+        if dialogue==nil or dialogue.sayRecognition==nil then return false end
+        local feed=rawget(_G,"KnoxActivityFeed")
+        local attemptedDelivery=false
+        local function deliver(character,line)
+            attemptedDelivery=true
+            if feed==nil or feed.speak==nil then return false end
+            if feed.speak(character,line)==true then return true end
+            local speechOn=KnoxSettings==nil or KnoxSettings.showSurvivorSpeech==nil
+                or KnoxSettings.showSurvivorSpeech()==true
+            if base and speechOn and feed.event~=nil and patrol.feedLine~=nil then
+                local report=patrol.feedLine(line)
+                if report~=nil then
+                    local result=feed.event(report)
+                    return result~=nil and result~=false
+                end
+            end
+            return false
+        end
+        local event=undeadRecognition and "recognition_undead" or (contactKind=="known" and "npc_known" or nil)
+        local subject=undeadRecognition and visibleZombie or contactId
+        local recognized=dialogue.sayRecognition(self.character,self.id,subject,ticks,deliver,event,contact)==true
+        if recognized or attemptedDelivery then return recognized end
+    end
     local target=nearestContact or nearestZombie
     local direction=nil
     if current~=nil and target~=nil then
@@ -11198,6 +13099,7 @@ function Controller:beginSecurityRoute(ticks,duty,base)
     end
     local result=KnoxCompanionPatrol.move(self.bridge,self.id,square,area)
     if result:find("MOVE_STARTED",1,true)~=1 then return self:deferSecurityRoute(ticks,result,base) end
+    if base then self.baseTaskMoveSquare = square end
     self.state=base and "BASE_TASK_MOVE" or (patrol and "MOVING_TO_COMPANION_PATROL" or "MOVING_TO_COMPANION_POINT")
     self.activeDecision=base and ("base_task_"..duty.type) or (patrol and "patrol_area" or "guard_location")
     self.baseTaskStartedAt=nil
@@ -11294,7 +13196,7 @@ function Controller:beginCompanionPointDirective(ticks, directive)
     end
     local destination = cell:getGridSquare(x, y, z)
     if destination == nil then
-        self:recordFailure("companion_point_unloaded", ticks, EXPLORATION_RETRY_TICKS)
+        self:recordFailure("companion_point_unloaded", ticks, TUNE.EXPLORATION_RETRY_TICKS)
         return false
     end
     local target = destination
@@ -11332,7 +13234,7 @@ function Controller:beginCompanionPointDirective(ticks, directive)
     )))
     if string.find(result, "MOVE_STARTED", 1, true) ~= 1 then
         self:recordMovementFailure(
-            "companion_point_move", result, ticks, EXPLORATION_RETRY_TICKS
+            "companion_point_move", result, ticks, TUNE.EXPLORATION_RETRY_TICKS
         )
         return false
     end
@@ -11346,8 +13248,71 @@ function Controller:beginCompanionPatrolDirective(ticks,directive)
 end
 
 function Controller:releaseCombat()
+    self.combatOutcomeSpoken = nil
+    self.combatBarrier = nil
     releaseThreat(self.reservations, self.combatTarget, self.id)
     self.combatTarget = nil
+end
+
+-- A failed native approach is not a lost fight. Native pursuit gives up after
+-- three refreshes that produced no distance, which left the survivor standing
+-- at range staring at a target it had locked. Close the gap through the
+-- ordinary movement owner and let the next scan re-engage from closer.
+function Controller:beginCombatPursuit(target, ticks, reason)
+    if target == nil or self.character == nil or self.bridge == nil then return false end
+    if safeMethod(target, "isDead", false) == true then return false end
+    local current = self.character:getCurrentSquare()
+    local targetSquare = target.getCurrentSquare ~= nil and target:getCurrentSquare() or nil
+    if current == nil or targetSquare == nil then return false end
+    if current:getZ() ~= targetSquare:getZ() then return false end
+    local distance = distanceSquared(current, targetSquare)
+    if (tonumber(distance) or math.huge) > TUNE.THREAT_MAX_DISTANCE_SQUARED then return false end
+    local approach = combatApproachSquare(self.character, target)
+    if approach == nil or approach == current then return false end
+    -- A bare wall between the fighters has no approach square worth walking:
+    -- doors, windows and fences already have owners, and re-issuing the same
+    -- blocked line is the wall-grind the owner reported. Keep the failure
+    -- cooldown the caller installed so the scan backs off instead of looping.
+    local positioning = rawget(_G, "KnoxCombatPositioning")
+    if positioning ~= nil and positioning.wallBlockedLine ~= nil
+        and positioning.wallBlockedLine(current, targetSquare) then
+        return false
+    end
+    -- An identical pursuit is already walking: re-issuing it restarts the
+    -- route and its progress. Let it walk; the window bounds the staleness.
+    if self.combatPursuitTarget == target
+        and (tonumber(ticks) or 0) < (tonumber(self.combatPursuitUntil) or 0)
+        and tonumber(self.combatPursuitX) == approach:getX()
+        and tonumber(self.combatPursuitY) == approach:getY()
+        and tonumber(self.combatPursuitZ) == approach:getZ() then
+        return false
+    end
+    local result = tostring(self.bridge:moveNpc(self.id, approach))
+    if string.find(result, "MOVE_STARTED", 1, true) ~= 1 then
+        if self.diag ~= nil then
+            self:diag("combat", "combat_pursuit_refused", {
+                reason = tostring(reason),
+                result = result,
+            })
+        end
+        return false
+    end
+    -- The target is still a valid encounter: clear the cooldown the failed
+    -- attempt installed so the next scan may re-engage immediately.
+    self.failedThreats = self.failedThreats or {}
+    self.failedThreats[target] = nil
+    self.combatDisengageUntil = nil
+    self.combatPursuitTarget = target
+    self.combatPursuitUntil = (tonumber(ticks) or 0) + 180
+    self.combatPursuitX = approach:getX()
+    self.combatPursuitY = approach:getY()
+    self.combatPursuitZ = approach:getZ()
+    self.activeDecision = "combat_pursuit"
+    self.state = "IDLE"
+    if self.diag ~= nil then
+        self:diag("combat", "combat_pursuit", { reason = tostring(reason) })
+    end
+    return true
 end
 
 -- Terminal firearm-encounter cleanup. Native reload/attack actions are owned
@@ -11450,7 +13415,7 @@ function Controller:startRecoveryPosture(ticks, useFurniture, ambient)
         if bed == nil then
             self:releaseRestSpot()
         end
-        local sleeping, result = KnoxSurvivorNeeds.startSleep(
+        local sleeping, result, hours = KnoxSurvivorNeeds.startSleep(
             self.character,
             bed,
             bedType
@@ -11460,6 +13425,16 @@ function Controller:startRecoveryPosture(ticks, useFurniture, ambient)
             self.recoveryStarted = ticks
             self.recoveryPostureStarted = ticks
             self.nextThink = ticks + Controller.TUNING.RECOVERY_RECHECK_TICKS
+            -- The native player path stores its own wake hour; the controller
+            -- stores the same plan from the hour this sleep actually chose,
+            -- so the night always ends even when the engine's player clock
+            -- never runs for a resident.
+            self.sleepPlannedHours = tonumber(hours)
+            self.sleepStartedHours = nil
+            pcall(function()
+                self.sleepStartedHours =
+                    GameTime.getInstance():getTimeOfDay()
+            end)
             self.selfCareIntent = self.selfCareIntent or {
                 kind = "sleep",
                 before = KnoxSurvivorNeeds.snapshot(self.character),
@@ -11474,8 +13449,18 @@ function Controller:startRecoveryPosture(ticks, useFurniture, ambient)
         self.selfCareRetryAt.sleep = ticks + Controller.TUNING.SELF_CARE_RETRY_TICKS
         self:recordFailure("needs_action:sleep:" .. tostring(result), ticks,
             Controller.TUNING.SELF_CARE_RETRY_TICKS)
-        self:finishDecision(ticks)
-        return false
+        if result == "sleep_not_safe" then
+            -- A zombie nearby belongs to the danger owner; standing alert is
+            -- the honest posture until that resolves.
+            self:finishDecision(ticks)
+            return false
+        end
+        -- Vanilla refuses sleep for pain, panic or an unreadable body and
+        -- simply stops. An NPC that stops here stands beside the assigned bed
+        -- until the next think, which is the reported stall. Keep the body
+        -- resting through the existing posture path below and let the
+        -- recovery timeout re-decide; standing is never a rest state.
+        self.sleepRefusedReason = tostring(result)
     end
     local action = nil
     local posture = "ground"
@@ -11491,7 +13476,6 @@ function Controller:startRecoveryPosture(ticks, useFurniture, ambient)
         self:releaseRestSpot()
         action = ISSitOnGround:new(self.character, nil)
     end
-    ISTimedActionQueue.add(action)
     self.state = ambient == true
         and (self.activeDecision == "camp_ambient_rest" and "CAMP_AMBIENT_REST"
             or (self.activeDecision == "companion_relax" and "COMPANION_RELAX"
@@ -11506,6 +13490,9 @@ function Controller:startRecoveryPosture(ticks, useFurniture, ambient)
             .. " recovery-posture=" .. posture
             .. " endurance=" .. tostring(KnoxSurvivorNeeds.snapshot(self.character).endurance)
     )
+    self:trackSharedMealSeat(action)
+    ISTimedActionQueue.add(action)
+    return action
 end
 
 function Controller:releaseBaseCooking()
@@ -11640,7 +13627,7 @@ function Controller:updateBaseRecreation(ticks)
         if need~=nil and need.kind~="roam" then
             self:releaseBaseRecreation()
             self:finishDecision(ticks)
-            self.nextThink=math.max(self.nextThink or 0,ticks+THINK_MIN_TICKS)
+            self.nextThink=math.max(self.nextThink or 0,ticks+TUNE.THINK_MIN_TICKS)
             return
         end
     end
@@ -11664,7 +13651,9 @@ function Controller:releaseBaseOrganize()
     if plan == nil then return end
     if KnoxBaseOrganize ~= nil and KnoxBaseOrganize.cancelAction ~= nil then
         KnoxBaseOrganize.cancelAction(self.character, plan, function(transfers)
-            return self:releaseTransferActions(transfers)
+            local draining=self:releaseTransferActions(transfers)
+            if draining then self.transferActionDrainPending=true end
+            return draining
         end)
     end
     if plan.item ~= nil then
@@ -11680,15 +13669,36 @@ end
 -- demoted item to its best shelf through the shared reservation and
 -- transfer machinery. Honors hauling=Never, work windows only (never
 -- sleep/recreation), threats and needs preempt like any idle round.
-function Controller:beginBaseOrganize(ticks)
+function Controller:floorHaulAllowed()
+    if self.character==nil or self.base==nil or self.baseTask~=nil
+        or self.companionOrder~=nil or self.companionDirective~=nil or self.combatTarget~=nil
+        or safeMethod(self.character,"isDead",true)~=false then return false end
+    if self.base.settings and self.base.settings.automaticJobs==false then return false end
+    local duty=KnoxPersistence.getSurvivorDuty(self.id) or {}
+    if duty.mode~="base" or duty.baseId~=self.base.id then return false end
+    if KnoxPersistence.getWorkPreference(self.id,"hauling")=="disabled" then return false end
+    local profile=KnoxPersistence.getSurvivorCapabilities(self.id) or {}
+    local preference=KnoxBaseJobs.effectivePreference and KnoxBaseJobs.effectivePreference(duty,profile) or duty.jobPreference
+    if preference=="rest" then return false end
+    local assignment=KnoxBaseJobs.scheduleAssignment(self.id)
+    if assignment~="work" and assignment~="anything" then return false end
+    local need=KnoxSurvivorNeeds.decide(self.character,nil)
+    return need~=nil and need.kind=="roam"
+end
+
+function Controller:beginBaseOrganize(ticks, floorOnly)
     if KnoxBaseOrganize == nil or self.base == nil or self.baseTask ~= nil
         or self.pendingOrganize ~= nil
         or not KnoxBaseManager.containsSquare(self.base, self.character:getCurrentSquare())
-        or ticks < (self.nextOrganizeAt or 0)
+        or ticks < ((floorOnly and (self.nextFloorHaulAt or 0) or self.nextOrganizeAt) or 0)
         or hasPendingTimedActions(self.character)
         or ISTimedActionQueue.getTimedActionQueue(self.character).current ~= nil then
         return false
     end
+    if floorOnly and not self:floorHaulAllowed() then return false end
+    self.reservations=self.reservations or {}
+    self.reservations.items=self.reservations.items or {}
+    self.reservations.containers=self.reservations.containers or {}
     local duty = KnoxPersistence.getSurvivorDuty ~= nil
         and KnoxPersistence.getSurvivorDuty(self.id) or nil
     local preference = KnoxPersistence.getWorkPreference ~= nil
@@ -11696,26 +13706,41 @@ function Controller:beginBaseOrganize(ticks)
     if preference == "disabled" then
         return false
     end
-    self.nextOrganizeAt = ticks + 1800
+    if floorOnly then self.nextFloorHaulAt=ticks+900 else self.nextOrganizeAt = ticks + 1800 end
     local recent = self.recentOrganized or {}
-    local plan, reason = KnoxBaseOrganize.find(self.base, self.character,
-        function(item) return (recent[item] or 0) <= ticks end,
-        function(item) return reservedByOther(self.reservations, "items", item, self.id) end,
-        function(policy) return reservedByOther(self.reservations, "containers", policy, self.id) end)
+    local available=function(item) return (recent[item] or 0)<=ticks end
+    local reserved=function(item) return reservedByOther(self.reservations,"items",item,self.id) end
+    local destinationReserved=function(policy) return reservedByOther(self.reservations,"containers",policy,self.id) end
+    local plan,reason
+    if floorOnly then
+        plan,self.floorHaulCursor,self.floorHaulScan=KnoxBaseOrganize.findFloor(self.base,self.character,
+            self.floorHaulCursor,available,reserved,destinationReserved)
+    else
+        plan,reason=KnoxBaseOrganize.find(self.base,self.character,available,reserved,destinationReserved)
+    end
     if plan == nil then
-        self.nextOrganizeAt = ticks + 3600
+        if floorOnly then self.nextFloorHaulAt=ticks+900 else self.nextOrganizeAt = ticks + 3600 end
         return false
     end
     if not reserve(self.reservations, "items", plan.item, self.id) then
         self.nextOrganizeAt = ticks + 900
         return false
     end
-    if not reserve(self.reservations, "containers", plan.destinationPolicy, self.id) then
+    if plan.destinationPolicy~=nil and not reserve(self.reservations, "containers", plan.destinationPolicy, self.id) then
         release(self.reservations, "items", plan.item, self.id)
         self.nextOrganizeAt = ticks + 900
         return false
     end
     self.pendingOrganize = plan
+    if floorOnly then
+        local actor,base=self.character,self.base
+        plan.permission=function()
+            return self.pendingOrganize==plan and self.character==actor and self.base==base
+                and self.state=="BASE_ORGANIZE" and self:floorHaulAllowed()
+                and self.reservations.items[plan.item]==self.id
+                and (plan.destinationPolicy==nil or self.reservations.containers[plan.destinationPolicy]==self.id)
+        end
+    end
     self.organizeStartedAt = ticks
     self.nextOrganizeNeedsCheck = ticks
     self.state, self.activeDecision = "BASE_ORGANIZE", "organizing"
@@ -11730,7 +13755,7 @@ function Controller:updateBaseOrganize(ticks)
         if need ~= nil and need.kind ~= "roam" then
             self:releaseBaseOrganize()
             self:finishDecision(ticks)
-            self.nextThink = math.max(self.nextThink or 0, ticks + THINK_MIN_TICKS)
+            self.nextThink = math.max(self.nextThink or 0, ticks + TUNE.THINK_MIN_TICKS)
             return
         end
     end
@@ -11752,6 +13777,7 @@ function Controller:updateBaseOrganize(ticks)
         end
         self:releaseBaseOrganize()
         self.nextOrganizeAt = ticks + (outcome == "done" and 900 or 1800)
+        if plan.floorHaul then self.nextFloorHaulAt=ticks+(outcome=="done" and 60 or 900) end
         if outcome == "failed" then
             self:recordFailure("organize:" .. tostring(reason), ticks, 1800)
         end
@@ -11793,6 +13819,23 @@ end
 -- No relationship model is touched (that belongs to the encounter system);
 -- the value is visible company plus a speech-cooldown-respecting chat.
 -- One shared cooldown per survivor so pairs do not chatter every think.
+function Controller:faceForAmbient(target)
+    local state = self.state
+    if state ~= "IDLE" and state ~= "BASE_IDLE" and state ~= "GROUP_WAIT"
+        and state ~= "COMPANION_WAIT" and state ~= "COMPANION_HOLD"
+        and state ~= "BASE_SECURITY_WAIT" then return false end
+    local character = self.character
+    if character == nil or target == nil or self.combatTarget ~= nil
+        or nativeTraversalBusy(character) or Controller.isNativeRecoveryBusy(character)
+        or Controller.isNativeAttackBusy(character) or hasPendingTimedActions(character)
+        or safeMethod(character,"isPlayerMoving",true)
+        or safeMethod(character,"isDead",true)
+        or safeMethod(character,"isAsleep",true)
+        or safeMethod(character,"getVehicle",nil) ~= nil then return false end
+    character:faceThisObject(target)
+    return true
+end
+
 function Controller:canAmbientSocial(ticks)
     if ticks < (self.nextSocialAt or 0) or self.character == nil or self.baseId == nil
         or (self.state ~= "IDLE" and self.state ~= "BASE_IDLE")
@@ -11829,6 +13872,25 @@ function Controller:acceptAmbientSocial(speaker, baseId, ticks)
 end
 
 function Controller:beginAmbientSocial(ticks)
+    -- The player is the person this resident actually knows. Greeting them used
+    -- to be impossible because the social owner only looked for other residents,
+    -- so a lone survivor never spoke and a full base never acknowledged the one
+    -- person running it.
+    local nearby = getSpecificPlayer ~= nil and getSpecificPlayer(0) or nil
+    local hereSquare = self.character ~= nil and self.character:getCurrentSquare() or nil
+    local playerSquare = nearby ~= nil and nearby:getCurrentSquare() or nil
+    if self.combatTarget == nil and hereSquare ~= nil and playerSquare ~= nil
+        and hereSquare:getZ() == playerSquare:getZ() then
+        local distance = (hereSquare:getX() - playerSquare:getX()) ^ 2
+            + (hereSquare:getY() - playerSquare:getY()) ^ 2
+        if Controller.greetDecision(distance, ticks, self.nextPlayerGreet) == "wave" then
+            pcall(function() self.character:faceThisObject(nearby) end)
+            pcall(sayDialogue, self.character, self.id, "base_greet", ticks, 3600)
+            self.nextPlayerGreet = (tonumber(ticks) or 0) + 3600
+            self.activeDecision = "base_greet_player"
+            return true
+        end
+    end
     if not self:canAmbientSocial(ticks) then return false end
     local runtime = rawget(_G, "KnoxSurvivorRuntime")
     if runtime == nil or runtime.acceptAmbientSocial == nil
@@ -11862,11 +13924,6 @@ function Controller:beginAmbientSocial(ticks)
     if partner == nil or partnerChar == nil then return false end
     pcall(function() self.character:faceThisObject(partnerChar) end)
     pcall(function() partnerChar:faceThisObject(self.character) end)
-    local signals = rawget(_G, "KnoxOrderSignals")
-    if signals ~= nil and signals.play ~= nil then
-        pcall(function() signals.play(self.character, "wavehi") end)
-        pcall(function() signals.play(partnerChar, "yes") end)
-    end
     sayDialogue(self.character, self.id, "base_social", ticks, 1800)
     sayDialogue(partnerChar, partner, "base_social", ticks, 1800)
     self.nextSocialAt = ticks + 1800
@@ -12148,12 +14205,12 @@ end
 
 -- Native rest remains the fallback when there is no suitable readable book.
 -- Use the best available chair or bed through the game's sit/rest actions.
-function Controller:beginAmbientBaseRest(ticks)
-    if self:beginBaseRecreation(ticks) then return true end
+function Controller:beginAmbientBaseRest(ticks, quiet)
+    if not quiet and self:beginBaseRecreation(ticks) then return true end
     -- Smoke break first for smokers and stressed survivors: the native eat
     -- action owns stress/unhappiness relief exactly like the player, then
     -- the next think settles them into their seat.
-    if ticks >= (self.nextSmokeAt or 0) and KnoxSurvivorNeeds.smokeMotive ~= nil
+    if not quiet and ticks >= (self.nextSmokeAt or 0) and KnoxSurvivorNeeds.smokeMotive ~= nil
         and KnoxSurvivorNeeds.smokeMotive(self.character) then
         local smoke = KnoxSurvivorNeeds.findSmokeItem ~= nil
             and KnoxSurvivorNeeds.findSmokeItem(self.character) or nil
@@ -12232,8 +14289,7 @@ function Controller:updateCompanionRelax(ticks)
     self.nextThink = ticks + Controller.TUNING.RECOVERY_RECHECK_TICKS
     local decision = KnoxSurvivorNeeds.decide(self.character, nil)
     local kind = decision.kind
-    if (kind == "eat" or kind == "drink" or kind == "bandage"
-        or kind == "improvise_medical" or kind == "sleep")
+    if (kind == "eat" or kind == "drink" or KnoxSurvivorNeeds.isMedicalCare(kind) or kind == "sleep")
         and Controller.selfCareReady(self.selfCareRetryAt, kind, ticks) then
         self:finishDecision(ticks)
         self.nextThink = ticks
@@ -12243,6 +14299,13 @@ function Controller:updateCompanionRelax(ticks)
 end
 
 function Controller:beginRecovery(decision, ticks)
+    local current = self.character ~= nil and self.character:getCurrentSquare() or nil
+    if current ~= nil and self:roamForeignBase(current) ~= nil then
+        -- An expired guest does not immediately choose the host's floor again.
+        -- Use the existing outward roaming route; no eviction teleport.
+        if not self:beginRoam(ticks) then self.nextThink = ticks + 120 end
+        return false
+    end
     self.activeDecision = decision
     self.recoveryStarted = ticks
     self.selfCareIntent = {
@@ -12294,6 +14357,23 @@ function Controller.scheduledSleepUsesBed(ownerKind, hasAssignedBed)
 end
 -- END SCHEDULED BED SLEEP
 
+-- SLEEP WAKE CLOCK (pure)
+-- The player path's wake hour is native (setForceWakeUpTime) and the engine
+-- runs it only for a real player, so a resident asleep at its planned hour
+-- would never wake and would stand frozen after the cycle. Pure so the
+-- round-the-clock arithmetic is proven offline.
+function Controller.sleepWakeDue(startedHours, plannedHours, nowHours)
+    local start = tonumber(startedHours)
+    local planned = tonumber(plannedHours)
+    local now = tonumber(nowHours)
+    if start == nil or planned == nil or now == nil or planned <= 0 then
+        return false
+    end
+    local elapsed = now - start
+    if elapsed < 0 then elapsed = elapsed + 24 end
+    return elapsed >= planned
+end
+-- END SLEEP WAKE CLOCK
 -- Faction residents use the shared duty schedule, and their beds are assigned
 -- automatically, so their scheduled sleep reaches the native sleep path. A
 -- player resident reaches the same path through the bed the player assigned;
@@ -12378,12 +14458,16 @@ function Controller:captureDecisionCheckpoint(ticks)
 end
 
 function Controller:finishDecision(ticks)
+    self.baseTaskCornerMove = nil
+    self.formationDoorRetry = nil
+    self:releaseSharedMeal(ticks)
     self.pendingFleeAttack = nil
     self:releaseSelfCare()
     self:closeOpenedDoors()
     self:releaseBaseCooking()
     self:releaseBaseRecreation()
     self:releaseBaseHygiene()
+    self:releaseBaseOrganize()
     self:releaseGroupSupport()
     self:releaseAid()
     self:releaseAmbientMovement()
@@ -12411,8 +14495,8 @@ function Controller:finishDecision(ticks)
     -- Grouped survivors re-decide quickly, but never faster than a full think
     -- interval, or success paths flap follow->combat->follow every few ticks.
     local proposedThink = stayingWithGroup
-        and (ticks + THINK_MIN_TICKS)
-        or (ticks + THINK_MIN_TICKS + ZombRand(Controller.TUNING.THINK_JITTER_TICKS))
+        and (ticks + TUNE.THINK_MIN_TICKS)
+        or (ticks + TUNE.THINK_MIN_TICKS + ZombRand(Controller.TUNING.THINK_JITTER_TICKS))
     -- A failure handler may already have installed a longer retry delay. Keep
     -- that delay so a group route cannot hammer the same cooled-down edge.
     self.nextThink = math.max(self.nextThink or 0, proposedThink)
@@ -12469,7 +14553,7 @@ function Controller:recoverFromDetached(ticks)
     self.regroupMember = nil
     self.formationMovementPace = nil
     self.state = "IDLE"
-    self.nextThink = math.max(self.nextThink or 0, ticks + THINK_MIN_TICKS)
+    self.nextThink = math.max(self.nextThink or 0, ticks + TUNE.THINK_MIN_TICKS)
     print("[KnoxSurvivors][Autonomy] id=" .. self.id
         .. " detached-recovered=true")
     return true
@@ -12548,7 +14632,7 @@ local function reloadThreatClose(character, target)
         if character:getZ() ~= target:getZ() then return false end
         local dx = character:getX() - target:getX()
         local dy = character:getY() - target:getY()
-        return dx * dx + dy * dy <= THREAT_IMMEDIATE_RADIUS * THREAT_IMMEDIATE_RADIUS
+        return dx * dx + dy * dy <= TUNE.THREAT_IMMEDIATE_RADIUS * TUNE.THREAT_IMMEDIATE_RADIUS
     end)
     return ok and close == true
 end
@@ -12692,7 +14776,7 @@ function Controller:forceMeleeFallback(ticks, target, reason)
     if target ~= nil then
         self.rangedFallbackUntil = self.rangedFallbackUntil
             or setmetatable({}, { __mode = "k" })
-        self.rangedFallbackUntil[target] = ticks + THREAT_FAILURE_COOLDOWN_TICKS
+        self.rangedFallbackUntil[target] = ticks + TUNE.THREAT_FAILURE_COOLDOWN_TICKS
     end
     print("[KnoxSurvivors][Autonomy] id=" .. self.id
         .. " reload-fallback reason=" .. tostring(reason)
@@ -12818,7 +14902,8 @@ function Controller:beginCombat(target)
         )
     else
         firearmState, firearmResult = KnoxFirearmSupport.prepareForThreat(
-            self.id, self.character, self.bridge, target, retainRanged
+            self.id, self.character, self.bridge, target, retainRanged,
+        self:combatGroupPresent()
         )
     end
     if firearmState == "reloading" then
@@ -12832,7 +14917,7 @@ function Controller:beginCombat(target)
             )
         else
             releaseThreat(self.reservations, target, self.id)
-            self.nextThreatScan = (self.nextThreatScan or 0) + COMBAT_RANGED_YIELD_DELAY_TICKS
+            self.nextThreatScan = (self.nextThreatScan or 0) + TUNE.COMBAT_RANGED_YIELD_DELAY_TICKS
             print(
                 "[KnoxSurvivors][Autonomy] id=" .. self.id
                     .. " firearm=" .. tostring(firearmState)
@@ -12847,9 +14932,9 @@ function Controller:beginCombat(target)
         if not armed and armResult ~= "unarmed_no_carried_melee" then
             releaseThreat(self.reservations, target, self.id)
             self.failedThreats[target] = (self.nextThreatScan or 0)
-                + THREAT_FAILURE_COOLDOWN_TICKS
+                + TUNE.THREAT_FAILURE_COOLDOWN_TICKS
             self:recordFailure("combat:" .. tostring(armResult),
-                self.nextThreatScan or 0, THREAT_FAILURE_COOLDOWN_TICKS)
+                self.nextThreatScan or 0, TUNE.THREAT_FAILURE_COOLDOWN_TICKS)
             return false
         end
         if not armed then
@@ -12919,9 +15004,9 @@ function Controller:beginCombat(target)
             self.unarmedCombatBlocked = true
             self.rejectedCombatItem = self.character:getPrimaryHandItem()
             self.unarmedRejectedTarget = target
-            self.unarmedRetryUntil = now + THREAT_FAILURE_COOLDOWN_TICKS
+            self.unarmedRetryUntil = now + TUNE.THREAT_FAILURE_COOLDOWN_TICKS
         end
-        local retry = THREAT_FAILURE_COOLDOWN_TICKS
+        local retry = TUNE.THREAT_FAILURE_COOLDOWN_TICKS
         self.failedThreats[target] = self.nextThreatScan + retry
         releaseThreat(self.reservations, target, self.id)
         self:diag("combat", "combat_start_failed", {
@@ -12945,6 +15030,11 @@ function Controller:beginCombat(target)
         return false
     end
     self.unarmedCombatBlocked = nil
+    self.combatPursuitTarget = nil
+    self.combatPursuitUntil = nil
+    self.combatPursuitX = nil
+    self.combatPursuitY = nil
+    self.combatPursuitZ = nil
     self:releaseSupply()
     self.combatTarget = target
     self:soundBaseAlarm(targetSquare)
@@ -12961,9 +15051,9 @@ function Controller:beginCombat(target)
     end
     self.activeDecision = "fight"
     self.state = "COMBAT"
+    self.combatOutcomeSpoken = false
     self:sampleCombatConfidence(false)
     self.reloadYieldStreak = 0
-    sayDialogue(self.character, self.id, "combat", self.nextThreatScan or 0, 900)
     awareness = awareness or {}
     print(
         "[KnoxSurvivors][Autonomy] id=" .. self.id .. " state=COMBAT " .. result
@@ -12982,6 +15072,13 @@ function Controller:beginCombat(target)
             targetKind = "zombie"
         end
     end)
+    local speechTicks = self.currentTicks
+    if targetKind == "zombie" and type(speechTicks) == "number" and speechTicks == speechTicks
+        and speechTicks >= 0 and speechTicks < math.huge then
+        sayDialogue(self.character, self.id, "combat_zombie", speechTicks, 900)
+    else
+        sayDialogue(self.character, self.id, "combat", self.nextThreatScan or 0, 900)
+    end
     self:diag("combat", "combat_started", {
         targetKind = targetKind,
         firearm = tostring(firearmState),
@@ -13000,10 +15097,22 @@ function Controller:beginWorldSearch(goal, ticks)
         self.lastWorldSearchOutcome = "cooldown"
         return false
     end
-    local supply = findSupply(self, goal, ticks)
+    local requirements = nil
+    local explicit = self.baseSupplyOrder
+    if explicit ~= nil and explicit.kind == goal and explicit.item ~= nil then
+        requirements = { items = { [explicit.item] = 1 } }
+    elseif self.baseSupplyTrip == true and goal == "find_materials" then
+        local jobs = rawget(_G, "KnoxBaseJobs")
+        local goals = jobs ~= nil and jobs.materialGoals ~= nil
+            and jobs.materialGoals(self.base) or {}
+        requirements = goals[1] ~= nil and goals[1].requirements or nil
+    end
+    local supply = findSupply(self, goal, ticks, requirements ~= nil and function(item)
+        return KnoxBaseSupplyPlanner.matchesRequirement(item, requirements)
+    end or nil)
     if supply == nil then
         self.lastWorldSearchOutcome = "no_candidate"
-        self.nextWorldSearch = ticks + SUPPLY_RETRY_TICKS
+        self.nextWorldSearch = ticks + TUNE.SUPPLY_RETRY_TICKS
         if goal == "find_water" then
             self.waterSearchMisses = (self.waterSearchMisses or 0) + 1
             if self.waterSearchMisses >= 3 then
@@ -13012,7 +15121,7 @@ function Controller:beginWorldSearch(goal, ticks)
                 if not self:sayAction({ line }, ticks, 1800) then
                     KnoxActivityFeed.speak(self.character, line)
                 end
-                self:recordFailure("water_source_unavailable", ticks, SUPPLY_RETRY_TICKS)
+                self:recordFailure("water_source_unavailable", ticks, TUNE.SUPPLY_RETRY_TICKS)
             end
         end
         return false
@@ -13022,7 +15131,7 @@ function Controller:beginWorldSearch(goal, ticks)
     local reservationTarget = supply.waterSource or supply.item
     if not reserve(self.reservations, reservationKind, reservationTarget, self.id) then
         self.lastWorldSearchOutcome = "reservation_taken"
-        self.nextThink = math.max(self.nextThink or 0, ticks + THINK_MIN_TICKS)
+        self.nextThink = math.max(self.nextThink or 0, ticks + TUNE.THINK_MIN_TICKS)
         return false
     end
     local result = tostring((moveWithTravelPace(
@@ -13030,12 +15139,16 @@ function Controller:beginWorldSearch(goal, ticks)
     )))
     if string.find(result, "MOVE_STARTED", 1, true) ~= 1 then
         release(self.reservations, reservationKind, reservationTarget, self.id)
-        if supply.container ~= nil then
-            self.inspectedContainers[supply.container] = ticks + SUPPLY_RETRY_TICKS
+        local source = supply.container or supply.waterSource
+        local alternate = source ~= nil and Controller.isOrdinaryNeedRoute(self, goal)
+        if supply.container ~= nil or (alternate and supply.waterSource ~= nil) then
+            self.inspectedContainers[source] = ticks + TUNE.SUPPLY_RETRY_TICKS
         end
-        self.nextWorldSearch = ticks + SUPPLY_RETRY_TICKS
+        local retry = alternate and Controller.TUNING.SELF_CARE_RETRY_TICKS or TUNE.SUPPLY_RETRY_TICKS
+        self.nextWorldSearch = ticks + retry
         self.lastWorldSearchOutcome = "movement_failed"
-        self:recordMovementFailure("supply_move", result, ticks, SUPPLY_RETRY_TICKS)
+        self:recordMovementFailure("supply_move", result, ticks, retry,
+            alternate and retry or nil)
         return false
     end
     self.pendingSupply = supply
@@ -13071,19 +15184,28 @@ function Controller:beginWorldWaterAction(ticks)
     local sourceSquare = source ~= nil and source:getSquare() or nil
     local approach = pending ~= nil and pending.approach or nil
     local currentSquare = self.character ~= nil and self.character:getCurrentSquare() or nil
+    -- A need order is the reason this source was chosen, so it cannot also be
+    -- the reason drinking is refused: a survivor sent to find water arrived
+    -- thirsty and used to walk away from the source he had just found. Base
+    -- supply, group and mission orders still block; those trips belong to
+    -- their own errand.
+    local needOrder = Controller.allowsNeedWaterSource(
+        self.companionDirective ~= nil and self.companionDirective.kind or nil
+    )
     if source == nil or sourceSquare == nil or approach == nil or currentSquare == nil
         or sourceSquare:getZ() ~= currentSquare:getZ()
         or approach:getZ() ~= currentSquare:getZ()
         or distanceSquared(approach, currentSquare) > 2
         or self.combatTarget ~= nil or self.pendingThreatAwareness ~= nil
         or self.baseSupplyTrip == true or self.baseSupplyOrder ~= nil
-        or self.companionOrder ~= nil or self.companionDirective ~= nil
+        or self.companionOrder ~= nil
+        or (self.companionDirective ~= nil and not needOrder)
         or self.groupLeaderId ~= nil or self.groupObjective ~= nil
         or nearestThreat(self, ticks) ~= nil
         or not Controller.waterSourceBoundaryContains(self, sourceSquare)
         or not self:allowNeedDetour(approach, ticks) then
         self:releaseSupply()
-        self.nextWorldSearch = ticks + SUPPLY_RETRY_TICKS
+        self.nextWorldSearch = ticks + TUNE.SUPPLY_RETRY_TICKS
         self:finishDecision(ticks)
         return false
     end
@@ -13109,6 +15231,8 @@ function Controller:beginWorldWaterAction(ticks)
         end
         self:releaseSupply()
         self:finishDecision(ticks)
+        if result == "native_water_action_refused_full_inventory"
+            and self:beginInventoryCleanup(ticks, true, "find_water") then return true end
         return false
     end
     self:sayNeedIfGrouped("drink", ticks)
@@ -13123,10 +15247,19 @@ end
 function Controller:releaseBaseHygiene()
     local plan = self.pendingHygiene
     if plan == nil then return end
-    if KnoxBaseHygiene ~= nil and KnoxBaseHygiene.cancel ~= nil then
+    if plan.kind=="surface" then
+        plan.cancelled=true
+        self:releaseTransferActions({plan})
+        release(self.reservations,"items",plan.tool,self.id)
+        release(self.reservations,"items",plan.cleaner,self.id)
+        if self.pendingHygiene==plan and self.activeDecision=="cleaning" then
+            self.activeDecision=nil
+            if self.state=="BASE_HYGIENE" then self.state="IDLE" end
+        end
+    elseif KnoxBaseHygiene ~= nil and KnoxBaseHygiene.cancel ~= nil then
         KnoxBaseHygiene.cancel(self.character, plan, self.bridge, self.id)
     end
-    self.pendingHygiene = nil
+    if self.pendingHygiene==plan then self.pendingHygiene = nil end
 end
 
 -- Field hygiene for followers: wash up at a nearby sink, tub or barrel
@@ -13155,6 +15288,48 @@ function Controller:beginFollowerHygiene(ticks)
     self.hygieneStartedAt = ticks
     self.nextHygieneNeedsCheck = ticks
     self.activeDecision, self.state = "washing", "BASE_HYGIENE"
+    return true
+end
+
+function Controller:beginBaseSurfaceCleaning(ticks)
+    if KnoxBaseHygiene==nil or KnoxBaseHygiene.findSurface==nil
+        or self.base==nil or self.baseTask~=nil or self.pendingHygiene~=nil
+        or ticks<(self.nextSurfaceCleanAt or 0) or self.combatTarget~=nil
+        or self.companionOrder~=nil or self.companionDirective~=nil
+        or hasPendingTimedActions(self.character) then return false end
+    if self.base.settings and self.base.settings.automaticJobs==false then return false end
+    local duty=KnoxPersistence.getSurvivorDuty(self.id) or {}
+    local profile=KnoxPersistence.getSurvivorCapabilities(self.id) or {}
+    local preference=KnoxBaseJobs.effectivePreference and KnoxBaseJobs.effectivePreference(duty,profile) or duty.jobPreference
+    if preference=="rest" then return false end
+    local assignment=KnoxBaseJobs.scheduleAssignment(self.id)
+    if assignment~="work" and assignment~="anything" then return false end
+    self.reservations=self.reservations or {};self.reservations.items=self.reservations.items or {}
+    local plan,cursor=KnoxBaseHygiene.findSurface(self.character,self.base,self.surfaceCleanCursor,
+        function(item) return self.reservations.items[item]==nil end)
+    self.surfaceCleanCursor=cursor
+    self.nextSurfaceCleanAt=ticks+3600
+    if plan==nil then return false end
+    local actor,base=self.character,self.base
+    plan.startedAt=ticks
+    self.pendingHygiene=plan
+    reserve(self.reservations,"items",plan.tool,self.id)
+    reserve(self.reservations,"items",plan.cleaner,self.id)
+    plan.permission=function()
+        return self.pendingHygiene==plan and self.character==actor and self.base==base
+            and self.state=="BASE_HYGIENE" and self.combatTarget==nil
+            and self.companionOrder==nil and self.companionDirective==nil
+            and self.reservations.items[plan.tool]==self.id and self.reservations.items[plan.cleaner]==self.id
+            and KnoxSurvivorNeeds.decide(actor,nil).kind=="roam"
+    end
+    self.hygieneStartedAt,self.nextHygieneNeedsCheck=ticks,ticks
+    self.activeDecision,self.state="cleaning","BASE_HYGIENE"
+    local ok,result=pcall(self.bridge.moveNpc,self.bridge,self.id,plan.approach)
+    if not ok or tostring(result):find("MOVE_STARTED",1,true)~=1 or plan.cancelled then
+        self:releaseBaseHygiene()
+        if self.activeDecision=="cleaning" then self.state,self.activeDecision="IDLE",nil end
+        return false
+    end
     return true
 end
 
@@ -13187,16 +15362,24 @@ function Controller:updateBaseHygiene(ticks)
         if need ~= nil and need.kind ~= "roam" then
             self:releaseBaseHygiene()
             self:finishDecision(ticks)
-            self.nextThink = math.max(self.nextThink or 0, ticks + THINK_MIN_TICKS)
+            self.nextThink = math.max(self.nextThink or 0, ticks + TUNE.THINK_MIN_TICKS)
             return
         end
     end
-    local outcome, reason = KnoxBaseHygiene.step(plan, self.character, self.bridge, self.id, ticks)
+    local step=plan.kind=="surface" and KnoxBaseHygiene.stepSurface or KnoxBaseHygiene.step
+    local ok,outcome,reason=pcall(step,plan,self.character,self.bridge,self.id,ticks)
+    if not ok then outcome,reason="failed","hygiene_action_error" end
+    if plan.kind=="surface" and (plan.cancelled or self.pendingHygiene~=plan) then
+        plan.cancelled=true
+        self:releaseTransferActions({plan})
+        return
+    end
     if outcome == "working" and self:ambientActionStalled(plan,ticks) then outcome,reason="failed","wash_action_stalled" end
     if outcome == "working" and ticks - (self.hygieneStartedAt or ticks) > 9000 then outcome, reason = "failed", "wash_session_timeout" end
     if outcome ~= "working" then
         self:releaseBaseHygiene()
-        self.nextHygieneAt = ticks + (outcome == "complete" and 10800 or 3600)
+        if plan.kind=="surface" then self.nextSurfaceCleanAt=ticks+3600
+        else self.nextHygieneAt = ticks + (outcome == "complete" and 10800 or 3600) end
         if outcome == "failed" then self:recordFailure("base_hygiene:" .. tostring(reason), ticks, 3600) end
         self:finishDecision(ticks)
     end
@@ -13289,7 +15472,6 @@ function Controller:fallbackTaskEntryToDoorBreak(ticks)
         end
         local resumeState = self.entryDetour ~= nil
             and self.entryDetour.resumeState or "BASE_TASK_SUPPLY_MOVE"
-        self.entryDetour = nil
         if self:beginLockedDoorBreak(ticks, resumeState, true) then
             return true
         end
@@ -13300,8 +15482,6 @@ function Controller:fallbackTaskEntryToDoorBreak(ticks)
     if self.pendingSupply == nil or self.pendingSupply.taskEntry ~= true then
         return false
     end
-    self.entryDetour = nil
-    self.pendingSupply = nil
     if self.baseTask == nil then return false end
     return self:beginBaseTaskLockedDoorBreak(ticks)
 end
@@ -13312,7 +15492,9 @@ end
 -- Structure ownership, melee weapon, endurance, and protected-safehouse gates
 -- remain authoritative through canForceEntry.
 function Controller:beginBaseTaskLockedDoorBreak(ticks)
-    if self.baseTask == nil or self.entryDetour ~= nil then return false end
+    if self.combatTarget ~= nil or self.state == "COMBAT" then return false end
+    if self.baseTask == nil or self.entryDetour == nil
+        or self.entryDetour.kind ~= "door" or self.entryDetour.force ~= true then return false end
     if self.baseTask.type == "haul_corpse"
         and self.baseTaskCorpsePhase == "drop" then
         return false
@@ -13326,6 +15508,7 @@ function Controller:beginBaseTaskLockedDoorBreak(ticks)
     if string.find(result, "COMBAT_STARTED", 1, true) ~= 1 then
         return false
     end
+    self.pendingSupply = nil
     self.entryDetour = {
         resumeState = "BASE_TASK_MOVE",
         baseTask = true,
@@ -13369,10 +15552,26 @@ function Controller:releaseSelfCare(plan)
     self:releaseTransferActions({plan})
 end
 
+-- Only a genuinely full pack justifies capacity recovery, and only for a
+-- retrieval that needs the item in the main inventory: eat/drink or a medical
+-- supply. An unreadable capacity reading is not a full pack, so it never
+-- invents room.
+function Controller:recoverCapacityForNeed(needKind, ticks)
+    local needs = rawget(_G, "KnoxSurvivorNeeds")
+    local medical = needs ~= nil and needs.isMedicalCare ~= nil
+        and needs.isMedicalCare(needKind) == true
+    if needKind ~= "eat" and needKind ~= "drink" and not medical then return false end
+    local ok, full = pcall(function() return self.character:hasFullInventory() end)
+    if not ok or full ~= true then return false end
+    local goal = needKind == "eat" and "find_food"
+        or needKind == "drink" and "find_water" or "find_medical"
+    return self:beginInventoryCleanup(ticks, true, goal)
+end
+
 function Controller:executeNeedAction(decision, ticks)
     if decision.kind ~= "eat" and decision.kind ~= "drink"
         and decision.kind ~= "smoke" and decision.kind ~= "drink_world"
-        and decision.kind ~= "bandage" and decision.kind ~= "improvise_medical" then
+        and not KnoxSurvivorNeeds.isMedicalCare(decision.kind) then
         return KnoxSurvivorNeeds.execute(self.character, decision)
     end
     if self.pendingSelfCare ~= nil or self:waitingForTransferActions()
@@ -13394,11 +15593,14 @@ function Controller:executeNeedAction(decision, ticks)
             selected.item = KnoxSurvivorNeeds.findBestWater(self.character, selected.state.thirst >= 0.90, available)
         elseif selected.kind == "smoke" then selected.item = KnoxSurvivorNeeds.findSmokeItem(self.character, available) end
     end
-    if selected.kind ~= "drink_world" and selected.item == nil then return nil, "self_care_supply_claimed" end
-    local claimKind = selected.kind == "drink_world" and "waterSources" or "items"
+    local itemlessRemoval = selected.kind == "remove_healed_bandage"
+    if selected.kind ~= "drink_world" and selected.item == nil and not itemlessRemoval then
+        return nil, "self_care_supply_claimed"
+    end
+    local claimKind = not itemlessRemoval and (selected.kind == "drink_world" and "waterSources" or "items") or nil
     local claimKey = selected.kind == "drink_world" and selected.source or selected.item
-    if claimKey == nil then return nil, "self_care_supply_missing" end
-    local previousClaim = self.reservations[claimKind][claimKey]
+    if claimKey == nil and not itemlessRemoval then return nil, "self_care_supply_missing" end
+    local previousClaim = claimKind ~= nil and self.reservations[claimKind][claimKey] or nil
     if previousClaim ~= nil and (claimKind == "items" or previousClaim ~= self.id) then
         return nil, "self_care_supply_claimed"
     end
@@ -13413,17 +15615,26 @@ function Controller:executeNeedAction(decision, ticks)
             and not nativeTraversalBusy(actor) and not actor:isDead()
             and actor:getCurrentSquare() ~= nil
             and intent.item == plan.item and intent.source == plan.source
+            and (selected.permission == nil or selected.permission() == true)
             and (worldSource == nil or intent.source == worldSource)
-            and self.reservations[claimKind][claimKey] == self.id
+            and (itemlessRemoval or self.reservations[claimKind][claimKey] == self.id)
     end
     self.pendingSelfCare = plan
-    if previousClaim == nil then reserve(self.reservations, claimKind, claimKey, self.id) end
+    if claimKind ~= nil and previousClaim == nil then reserve(self.reservations, claimKind, claimKey, self.id) end
     local ok, action, result, intent = pcall(KnoxSurvivorNeeds.execute, actor, selected, plan)
     plan.admitting = nil
     if not ok or action == nil or action == false or plan.cancelled
         or plan.action ~= action or plan.intent ~= intent
         or self.pendingSelfCare ~= plan then
         self:releaseSelfCare(plan)
+        -- A bagged meal or bottle that cannot come to hand because the pack is full
+        -- is the same capacity problem a world water source refuses on. Hand it to
+        -- the existing cleanup owner instead of retrying a transfer that can never
+        -- fit; no drop, no invented room, and only on a real full read.
+        if ok and result == "supply_transfer_rejected"
+            and self:recoverCapacityForNeed(selected.kind, ticks) then
+            return nil, result
+        end
         return nil, ok and (result or "self_care_cancelled") or "self_care_queue_failed"
     end
     self.selfCareIntent, self.state = intent, "TIMED_ACTION"
@@ -13437,8 +15648,7 @@ function Controller:beginImmediateNeedAction(kind, ticks)
     if decision == nil
         or (kind == "find_food" and decision.kind ~= "eat")
         or (kind == "find_water" and decision.kind ~= "drink")
-        or (kind == "find_medical" and decision.kind ~= "bandage"
-            and decision.kind ~= "improvise_medical") then
+        or (kind == "find_medical" and not KnoxSurvivorNeeds.isMedicalCare(decision.kind)) then
         return false
     end
     if not Controller.selfCareReady(self.selfCareRetryAt, decision.kind, ticks) then
@@ -13479,12 +15689,12 @@ function Controller:beginCompanionNeedDirective(ticks, directive)
     if kind == "clean_inventory" then
         if self.baseTask ~= nil or hasPendingTimedActions(self.character)
             or ticks < (self.nextCleanupAt or 0) then
-            self.nextThink = math.max(self.nextThink or 0, ticks + THINK_MIN_TICKS, self.nextCleanupAt or 0)
+            self.nextThink = math.max(self.nextThink or 0, ticks + TUNE.THINK_MIN_TICKS, self.nextCleanupAt or 0)
             return true
         end
         if self:beginInventoryCleanup(ticks) then return true end
         if not self:failCleanupDirectiveAttempt() then
-            self.nextThink = math.max(self.nextThink or 0, ticks + SUPPLY_RETRY_TICKS)
+            self.nextThink = math.max(self.nextThink or 0, ticks + TUNE.SUPPLY_RETRY_TICKS)
         end
         return true
     end
@@ -13518,7 +15728,7 @@ function Controller:beginCompanionNeedDirective(ticks, directive)
                                                 and "I couldn't find any ammunition."
                                                 or "I couldn't find a better weapon here."))))))))
         else
-            self.nextThink = math.max(self.nextThink or 0, ticks + SUPPLY_RETRY_TICKS)
+            self.nextThink = math.max(self.nextThink or 0, ticks + TUNE.SUPPLY_RETRY_TICKS)
         end
     end
     return true
@@ -13570,7 +15780,11 @@ function Controller.baseIdleChoice(ticks, id, residentCount, mode)
     if phase <= 6 then return "snack" end
     if phase == 7 then return "tidy" end
     if phase <= 9 then return "socialize" end
-    return "rest"
+    -- The tail of the rotation used to be reading, which is why a base full of
+    -- survivors looked like a library. Curiosity replaces it: walk a little and
+    -- think out loud. Rest is still reachable above; it is no longer the default.
+    if phase <= 11 then return "muse" end
+    return "move"
 end
 
 -- Execute the one base-idle choice through the existing native owners. A
@@ -13582,6 +15796,8 @@ function Controller:runBaseIdleChoice(ticks, choice)
     if choice == "move" then
         if self:beginBaseMovement(ticks, false) then return true end
     elseif choice == "snack" then
+        if self:beginSharedMeal(ticks) then return true end
+        if self.beginShareWithNeedy ~= nil and self:beginShareWithNeedy(ticks) then return true end
         if self:beginAmbientSnack(ticks) then return true end
     elseif choice == "socialize" then
         if self:beginAmbientSocial(ticks) then return true end
@@ -13589,6 +15805,8 @@ function Controller:runBaseIdleChoice(ticks, choice)
         if self:beginAmbientWatch(ticks) then return true end
     elseif choice == "tidy" then
         if self:beginBaseOrganize(ticks) then return true end
+    elseif choice == "muse" then
+        if self:beginAmbientMusing(ticks) then return true end
     end
     return self:beginAmbientBaseRest(ticks) == true
 end
@@ -13975,7 +16193,7 @@ function Controller:releaseAid()
         self:releaseTransferActions({plan})
         if self.state == "AID_MOVE" or self.state == "AID_ACTION" then
             self.state, self.activeDecision = "IDLE", nil
-            self.nextThink = math.max(self.nextThink or 0, (self.currentTicks or 0) + THINK_MIN_TICKS)
+            self.nextThink = math.max(self.nextThink or 0, (self.currentTicks or 0) + TUNE.THINK_MIN_TICKS)
         end
     end
 end
@@ -13996,22 +16214,63 @@ function Controller:aidNeedsSelfCare(ticks)
     return Controller.selfCareReady(self.selfCareRetryAt or {}, need.kind, ticks)
 end
 
-function Controller:aidPermission(plan)
+function Controller:aidPatientAllowed(patient)
+    local persistence = rawget(_G, "KnoxPersistence")
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    local count = getNumActivePlayers ~= nil and getNumActivePlayers() or 1
+    for playerNum = 0, math.max(0, count - 1) do
+        local player = getSpecificPlayer ~= nil and getSpecificPlayer(playerNum) or nil
+        if player ~= nil and player == patient then
+            if KnoxSettings ~= nil and KnoxSettings.allowSurvivorsTreatPlayer ~= nil
+                and not KnoxSettings.allowSurvivorsTreatPlayer() then return false end
+            local playerId = persistence ~= nil and persistence.ensurePlayerId ~= nil
+                and persistence.ensurePlayerId(player) or nil
+            if playerId ~= nil and persistence.isSurvivorHostileToPlayer ~= nil
+                and persistence.isSurvivorHostileToPlayer(self.id, playerId) then return false end
+            if playerId ~= nil and persistence.getPlayerSocialDisposition ~= nil
+                and persistence.getPlayerSocialDisposition(playerId, self.id) == "attack_on_sight" then return false end
+            return true
+        end
+    end
+    local id = runtime ~= nil and runtime.idForCharacter ~= nil and runtime.idForCharacter(patient) or nil
+    if id ~= nil and persistence ~= nil and persistence.areSurvivorsHostile ~= nil
+        and persistence.areSurvivorsHostile(self.id, id) then return false end
+    return true
+end
+
+function Controller:autoMedicalAllowed()
+    local persistence = rawget(_G, "KnoxPersistence")
+    local policy = persistence and persistence.getSurvivorPolicies and persistence.getSurvivorPolicies(self.id)
+    return policy == nil or policy.autoMedical ~= false
+end
+
+function Controller:aidPermission(plan, phase)
     if plan == nil or self.pendingAid ~= plan or plan.doctor ~= self.character
         or self.reservations.items[plan.item] ~= self.id
         or self.reservations.supportRecipients[plan.recipient] ~= self.id
         or self.character:getInventory() ~= plan.source
-        or self:aidNeedsSelfCare(self.currentTicks or 0) then return false end
-    return KnoxMedicalActions.aidAllowed(self.character, plan.recipient, plan.item, plan.part)
+        or self:aidNeedsSelfCare(self.currentTicks or 0)
+        or not self:aidPatientAllowed(plan.recipient)
+        or (plan.directRequest ~= true and not self:autoMedicalAllowed()) then return false end
+    return KnoxMedicalActions.aidAllowed(self.character, plan.recipient, plan.item, plan.part,
+        plan.kind, phase or (plan.kind == "replace_bandage" and "apply" or nil))
+
 end
 
 function Controller:queueBattlefieldAid(plan, ticks)
     if self.pendingAid ~= plan or hasPendingTimedActions(self.character) then return false end
     plan.guard = function(action, item)
         plan.action = action
-        return item == plan.item and self:aidPermission(plan)
+        -- Each half of a dressing replacement re-checks its own phase.
+        return item == plan.item
+            and self:aidPermission(plan, action ~= nil and action.aidPhase or nil)
     end
-    local ok, action, result = pcall(KnoxMedicalActions.queueAidBandage,
+    local queue = plan.kind == "disinfect" and KnoxMedicalActions.queueAidDisinfect
+        or plan.kind == "replace_bandage" and KnoxMedicalActions.queueAidReplacement
+        or plan.kind == "splint" and KnoxMedicalActions.queueAidSplint
+        or KnoxMedicalActions.queueAidBandage
+
+    local ok, action, result = pcall(queue,
         self.character, plan.recipient, plan.item, plan.part, plan.guard)
     if not ok or action == nil or self.pendingAid ~= plan then
         if self.pendingAid == plan then self:releaseAid()
@@ -14056,7 +16315,68 @@ local function bleedingPart(character)
     return alive and part or nil
 end
 
+local function deadPatient(character)
+    if character == nil or character.isDead == nil then
+        return false
+    end
+    local ok, dead = pcall(function() return character:isDead() == true end)
+    return ok and dead
+end
+
+-- Who a trained survivor treats first. The medical owner owns the reading;
+-- this only gathers the people the same aid scan already considers, and the
+-- briefing is rebuilt from their bodies instead of stored anywhere.
+function Controller:triageCasualties()
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    local persistence = rawget(_G, "KnoxPersistence")
+    local origin = self.character ~= nil and self.character:getCurrentSquare() or nil
+    if origin == nil then return {} end
+    local seen, casualties = {}, {}
+    local function consider(other)
+        if other == nil or other == self.character or seen[other] then return end
+        seen[other] = true
+        local square = other.getCurrentSquare ~= nil and other:getCurrentSquare() or nil
+        if square == nil or square.getX == nil then return end
+        local dx, dy = square:getX() - origin:getX(), square:getY() - origin:getY()
+        if square:getZ() ~= origin:getZ() or dx * dx + dy * dy > AID_RANGE_SQUARED then
+            return
+        end
+        casualties[#casualties + 1] = other
+    end
+    if self.baseId ~= nil and persistence ~= nil
+        and persistence.getBaseResidentIds ~= nil
+        and runtime ~= nil and runtime.getCharacter ~= nil then
+        for _, residentId in ipairs(persistence.getBaseResidentIds(self.baseId) or {}) do
+            if residentId ~= self.id then consider(runtime.getCharacter(residentId)) end
+        end
+    end
+    for _, member in ipairs(self.groupMembers or {}) do consider(member) end
+    if getNumActivePlayers ~= nil and getSpecificPlayer ~= nil then
+        for playerNum = 0, math.max(0, (getNumActivePlayers() or 1) - 1) do
+            consider(getSpecificPlayer(playerNum))
+        end
+    end
+    return casualties
+end
+
+function Controller:sayTriage(ticks)
+    local medical = rawget(_G, "KnoxMedicalActions")
+    local dialogue = rawget(_G, "KnoxSurvivorDialogue")
+    if medical == nil or medical.triageBriefing == nil or dialogue == nil
+        or dialogue.sayDiagnosis == nil or self.character == nil then
+        return false
+    end
+    local briefing = medical.triageBriefing(self.character, self:triageCasualties())
+    if briefing == nil then return false end
+    local name = nil
+    local ok, display = pcall(function() return briefing.patient:getDisplayName() end)
+    if ok and type(display) == "string" and display ~= "" then name = display end
+    return dialogue.sayDiagnosis(self.character, self.id, briefing.kind, name,
+        ticks, 3600) == true
+end
+
 function Controller:findAidPatient(ticks)
+
     local medical = rawget(_G, "KnoxMedicalActions")
     local runtime = rawget(_G, "KnoxSurvivorRuntime")
     local persistence = rawget(_G, "KnoxPersistence")
@@ -14064,19 +16384,35 @@ function Controller:findAidPatient(ticks)
         or self.character == nil then
         return nil
     end
+    -- The same scan that looks for the next patient is when a trained survivor
+    -- says what is worst and who is treated first.
+    self:sayTriage(ticks)
     local claims = self.reservations or {}
     local itemClaims, recipientClaims = claims.items or {}, claims.supportRecipients or {}
-    local bandage = medical.findBandageItem(self.character, function(item)
+    -- Supplies are resolved per patient, not up front: a survivor who can only
+    -- disinfect must still discover the exposed wound it may treat, while a
+    -- bleeding patient still needs the real bandage before anything is claimed.
+    local bandage, bandageChecked
+    local function usableAidItem(item)
         return itemClaims[item] == nil or itemClaims[item] == self.id
-    end)
-    if bandage == nil then
-        return nil
+    end
+    local function aidBandage()
+        if not bandageChecked then
+            bandageChecked = true
+            bandage = medical.findBandageItem(self.character, usableAidItem)
+        end
+        return bandage
     end
     local origin = self.character:getCurrentSquare()
     if origin == nil then
         return nil
     end
     local candidates = {}
+    local creator = persistence ~= nil and persistence.getSurvivorCreatorRecord ~= nil
+        and persistence.getSurvivorCreatorRecord(self.id) or nil
+    local doctor = creator ~= nil and creator.profile == "doctors"
+        or persistence ~= nil and persistence.getSurvivorServiceRole ~= nil
+            and persistence.getSurvivorServiceRole(self.id) == "medical"
     if self.baseId ~= nil and persistence ~= nil
         and persistence.getBaseResidentIds ~= nil
         and runtime ~= nil and runtime.getCharacter ~= nil then
@@ -14103,7 +16439,7 @@ function Controller:findAidPatient(ticks)
         or KnoxSettings.allowSurvivorsTreatPlayer == nil
         or KnoxSettings.allowSurvivorsTreatPlayer()
     local excludedPatients = {}
-    if ownerId ~= nil or not allowPlayerAid then
+    if ownerId ~= nil or doctor or not allowPlayerAid then
         local count = getNumActivePlayers ~= nil and getNumActivePlayers() or 1
         for playerNum = 0, math.max(0, count - 1) do
             local player = getSpecificPlayer ~= nil and getSpecificPlayer(playerNum) or nil
@@ -14114,7 +16450,7 @@ function Controller:findAidPatient(ticks)
                 -- The follow target may also arrive through a group/candidate
                 -- list. The sandbox permission applies to every player route.
                 excludedPatients[player] = true
-            elseif player ~= nil and playerId == ownerId then
+            elseif player ~= nil and (doctor or playerId == ownerId) then
                 candidates[#candidates + 1] = player
             end
         end
@@ -14145,7 +16481,7 @@ function Controller:findAidPatient(ticks)
         local myAffiliation = persistence.getSurvivorAffiliation ~= nil
             and persistence.getSurvivorAffiliation(self.id) or {}
         local myFaction = myAffiliation ~= nil and myAffiliation.factionId or nil
-        if myFaction ~= nil then
+        if myFaction ~= nil or doctor then
             local okIds, otherIds = pcall(function() return runtime.activeIds() end)
             if okIds and type(otherIds) == "table" then
                 for _, otherId in ipairs(otherIds) do
@@ -14159,8 +16495,8 @@ function Controller:findAidPatient(ticks)
                             if dx * dx + dy * dy <= AID_RANGE_SQUARED then
                                 local otherAffiliation = persistence.getSurvivorAffiliation ~= nil
                                     and persistence.getSurvivorAffiliation(otherId) or {}
-                                if otherAffiliation ~= nil
-                                    and otherAffiliation.factionId == myFaction then
+                                if doctor or (otherAffiliation ~= nil
+                                    and otherAffiliation.factionId == myFaction) then
                                     local hostile = persistence.areSurvivorsHostile ~= nil
                                         and persistence.areSurvivorsHostile(self.id, otherId)
                                         or false
@@ -14175,35 +16511,56 @@ function Controller:findAidPatient(ticks)
             end
         end
     end
-    local best, bestDistance = nil, nil
+    local best, bestDistance, bestOther, bestOtherDistance = nil, nil, nil, nil
     for _, ally in ipairs(candidates) do
         local square = ally.getCurrentSquare ~= nil and ally:getCurrentSquare() or nil
         if square ~= nil and (square:getZ() or 0) == (origin:getZ() or 0) then
             local distance = navigationDistanceSquared(origin, square)
-            if ally ~= self.character and not excludedPatients[ally] and distance <= AID_RANGE_SQUARED
-                and (recipientClaims[ally] == nil or recipientClaims[ally] == self.id)
-                and (bestDistance == nil or distance < bestDistance) then
+            if ally ~= self.character and not excludedPatients[ally] and self:aidPatientAllowed(ally)
+                and distance <= AID_RANGE_SQUARED
+                and (recipientClaims[ally] == nil or recipientClaims[ally] == self.id) then
                 local part = bleedingPart(ally)
+                local item, kind
                 if part ~= nil then
-                    best, bestDistance = { patient = ally, part = part }, distance
+                    item, kind = aidBandage(), "bandage"
+                elseif medical.maintenancePlan ~= nil and not deadPatient(ally) then
+                    -- The same maintenance owner a direct request uses decides
+                    -- whether an unbandaged wound has a real treatment here.
+                    local plan = medical.maintenancePlan(self.character, ally)
+                    if plan ~= nil and (plan.kind == "disinfect" or plan.kind == "replace_bandage"
+                        or plan.kind == "splint")
+                        and plan.item ~= nil and plan.bodyPart ~= nil
+                        and usableAidItem(plan.item) then
+                        part, item, kind = plan.bodyPart, plan.item, "disinfect"
+                    end
+                end
+                if part ~= nil and item ~= nil then
+                    -- Stopping a bleed outranks a wound that is merely open,
+                    -- however close that other ally happens to be.
+                    local found = { patient = ally, part = part, bandage = item, kind = kind }
+                    if kind == "bandage" then
+                        if best == nil or distance < bestDistance then
+                            best, bestDistance = found, distance
+                        end
+                    elseif bestOther == nil or distance < bestOtherDistance then
+                        bestOther, bestOtherDistance = found, distance
+                    end
                 end
             end
         end
     end
-    if best ~= nil then
-        best.bandage = bandage
-    end
-    return best
+    return best or bestOther
 end
 
-function Controller:beginBattlefieldAid(ticks)
+function Controller:beginBattlefieldAid(ticks, requested)
+    if requested == nil and not self:autoMedicalAllowed() then return false end
     if self.pendingAid ~= nil or ticks < (self.nextAidAt or 0) then
         return false
     end
     -- Aid never steals live work: claimed tasks, active cooks, deposits, and
     -- ordered supply runs all outrank patching someone up right now.
-    if self.baseTask ~= nil or self.pendingCooking ~= nil
-        or self.pendingDepositTrip ~= nil or self.baseSupplyOrder ~= nil then
+    if requested == nil and (self.baseTask ~= nil or self.pendingCooking ~= nil
+        or self.pendingDepositTrip ~= nil or self.baseSupplyOrder ~= nil) then
         return false
     end
     if self.character == nil or hasPendingTimedActions(self.character)
@@ -14214,7 +16571,7 @@ function Controller:beginBattlefieldAid(ticks)
     if medical == nil or medical.queueAidBandage == nil then
         return false
     end
-    local found = self:findAidPatient(ticks)
+    local found = requested or self:findAidPatient(ticks)
     if found == nil then
         return false
     end
@@ -14232,7 +16589,8 @@ function Controller:beginBattlefieldAid(ticks)
         return false
     end
     local plan = { doctor = self.character, recipient = found.patient, part = found.part,
-        item = found.bandage, source = self.character:getInventory() }
+        item = found.bandage, source = self.character:getInventory(), directRequest=found.directRequest == true,
+        kind=found.kind or "bandage" }
     self.pendingAid = plan
     self.pendingAidPatient, self.pendingAidPart, self.pendingAidBandage = plan.recipient, plan.part, plan.item
     if navigationDistanceSquared(current, patientSquare) <= 2 then
@@ -14256,6 +16614,71 @@ function Controller:beginBattlefieldAid(ticks)
     self.state = "AID_MOVE"
     self.stateStartedAt = ticks
     return true
+end
+
+-- Both a direct request and automatic help enter the existing aid owner.
+function Controller:requestMedicalAid(patient, ticks, automatic)
+    if automatic and not self:autoMedicalAllowed() then return false, "automatic_medical_off" end
+    if patient == nil or self.character == nil then return false, "patient_unavailable" end
+    if self.pendingAid then return self.pendingAid.recipient == patient, "medical_busy" end
+    if not self:aidPatientAllowed(patient) then return false, "treatment_not_allowed" end
+    if self.state == "COMBAT" or self.state == "FLEEING"
+        or nativeTraversalBusy(self.character) or Controller.isNativeAttackBusy(self.character)
+        or Controller.isNativeRecoveryBusy(self.character) then return false, "unsafe_to_treat" end
+    if self:aidNeedsSelfCare(ticks) then return false, "own_needs_first" end
+    local here, there = self.character:getCurrentSquare(), patient:getCurrentSquare()
+    if here == nil or there == nil or here:getZ() ~= there:getZ()
+        or navigationDistanceSquared(here, there) > AID_RANGE_SQUARED then return false, "medical_too_far" end
+    local part = bleedingPart(patient)
+    local medical = rawget(_G, "KnoxMedicalActions")
+    if medical == nil or medical.findBandageItem == nil then return false, "treatment_unavailable" end
+    local claims = self.reservations or {}
+    local bandage, treatmentKind
+    if part ~= nil then
+        bandage = medical.findBandageItem(self.character, function(item)
+            return not claims.items or not claims.items[item] or claims.items[item] == self.id
+        end)
+        if bandage == nil then return false, "no_bandage" end
+    else
+        local plan = medical.maintenancePlan and medical.maintenancePlan(self.character, patient)
+        if not plan or (plan.kind ~= "disinfect" and plan.kind ~= "replace_bandage"
+            and plan.kind ~= "splint") then
+            return false, "no_treatable_bleeding"
+        end
+
+        if claims.items and claims.items[plan.item] and claims.items[plan.item] ~= self.id then return false, "medical_busy" end
+        part, bandage, treatmentKind = plan.bodyPart, plan.item, plan.kind
+    end
+    if self:canPauseWorkForInteraction() then
+        if not self:pauseWorkForInteraction("medical_help") then return false, "work_step_finishing" end
+    elseif hasPendingTimedActions(self.character) or self:waitingForTransferActions() then
+        return false, "medical_busy"
+    else
+        self.bridge:cancelNpcMove(self.id)
+        self:releaseSupply(true)
+        self:leaveRecoveryPosture()
+    end
+    self.playerConversation = nil
+    self.nextAidAt = ticks
+    local accepted = self:beginBattlefieldAid(ticks, {patient=patient, part=part, bandage=bandage,
+        directRequest=not automatic, kind=treatmentKind})
+    return accepted == true, accepted and "medical_help_started" or "medical_route_blocked"
+end
+
+function Controller:tryAutomaticPlayerAid(ticks)
+    if ticks < (self.nextPlayerAidCheck or 0) then return false end
+    self.nextPlayerAidCheck = ticks + 90
+    if not self:autoMedicalAllowed() or self.pendingAid ~= nil then return false end
+    local owner = self.companionOwnerId or (self.base and self.base.ownerKind == "player" and self.base.ownerId)
+    if not owner or not KnoxPersistence or not KnoxPersistence.ensurePlayerId then return false end
+    local count = getNumActivePlayers and getNumActivePlayers() or 1
+    for playerNum=0, math.max(0, count - 1) do
+        local player = getSpecificPlayer and getSpecificPlayer(playerNum)
+        if player and KnoxPersistence.ensurePlayerId(player) == owner then
+            return self:requestMedicalAid(player, ticks, true)
+        end
+    end
+    return false
 end
 
 function Controller:beginNightShelter(ticks)
@@ -14315,7 +16738,9 @@ function Controller:beginNightShelter(ticks)
         and not groupShelter then
         return false
     end
-    if shelter.isSheltered(self.character) then
+    shelter.requestVisit(self, ticks)
+    if shelter.isSheltered(self.character)
+        and shelter.canShelter(self.id,self.character:getCurrentSquare()) then
         if self.state == "SLEEPING_RECOVERY" or self.state == "WAITING_TO_RECOVER"
             or self.state == "MOVING_TO_REST" then
             return true
@@ -14330,7 +16755,7 @@ function Controller:beginNightShelter(ticks)
     local refuge = shelter.findShelter(
         self.character,
         nil,
-        #(self.groupMembers or {}) > 1 and shelter.isUnclaimedTemporaryShelter or nil
+        function(square) return shelter.canShelter(self.id, square) end
     )
     if refuge == nil then
         self:diag("shelter", "no_refuge_found", nil)
@@ -14366,7 +16791,7 @@ function Controller:recoverFleeMovement(result, ticks)
     self:noteFleeFailure(ticks)
     if self.fleeTarget ~= nil then
         self.failedFleeTarget = { x = self.fleeTarget:getX(), y = self.fleeTarget:getY(),
-            z = self.fleeTarget:getZ(), untilTick = ticks + FLEE_PLAN_TICKS }
+            z = self.fleeTarget:getZ(), untilTick = ticks + TUNE.FLEE_PLAN_TICKS }
     end
     self.fleeTarget = nil
     self.fleeDirectionUntil = 0
@@ -14476,7 +16901,7 @@ function Controller:withdrawToRally(ticks, alarm)
             if topDx * topDx + topDy * topDy <= 4 then return false end
         end
     end
-    local threats = nearbyRetreatThreats(self, FLEE_SCAN_RADIUS + RALLY_LANE_STEPS)
+    local threats = nearbyRetreatThreats(self, TUNE.FLEE_SCAN_RADIUS + TUNE.RALLY_LANE_STEPS)
     local threatPoints = {}
     for _, threat in ipairs(threats) do
         local square = safeMethod(threat, "getCurrentSquare", nil)
@@ -14502,7 +16927,7 @@ function Controller:withdrawToRally(ticks, alarm)
                 { x = candidate.x, y = candidate.y },
                 function(fromX, fromY, toX, toY)
                     return cellStepOpen(cell, fromX, fromY, toX, toY, z)
-                end, { maxSteps = RALLY_LANE_STEPS })
+                end, { maxSteps = TUNE.RALLY_LANE_STEPS })
             if okReach and type(route) == "table" then
                 entry.laneClear = entry.standable
                 entry.steps = route.steps
@@ -14576,7 +17001,7 @@ function Controller:beginFlee(ticks, assessment)
     self.travelFinalContext = nil
     roadFinalById[self.id] = nil
     self:cancelTrade("danger")
-    self.combatDisengageUntil = ticks + FLEE_DISENGAGE_TICKS
+    self.combatDisengageUntil = ticks + TUNE.FLEE_DISENGAGE_TICKS
     local target, hadGroupPlan = groupFleeTarget(self, ticks)
     local emergency = false
     if target == nil then
@@ -14585,7 +17010,7 @@ function Controller:beginFlee(ticks, assessment)
         if target ~= nil and key ~= nil and (not hadGroupPlan or key == self.id) then
             fleePlans[key] = {
                 x = target:getX(), y = target:getY(), z = target:getZ(),
-                expiresAt = ticks + FLEE_PLAN_TICKS,
+                expiresAt = ticks + TUNE.FLEE_PLAN_TICKS,
             }
         end
     end
@@ -14602,11 +17027,11 @@ function Controller:beginFlee(ticks, assessment)
         end
     end
     if target == nil then
-        self.nextThink = ticks + FLEE_RECHECK_TICKS
+        self.nextThink = ticks + TUNE.FLEE_RECHECK_TICKS
         if self.state == "FLEEING" then self.fleeRecoveryUntil = self.nextThink end
         self.nextThreatScan = math.max(
             self.nextThreatScan or 0,
-            ticks + FLEE_RECHECK_TICKS
+            ticks + TUNE.FLEE_RECHECK_TICKS
         )
         -- If every escape lane is blocked, do not wait helplessly for a bite.
         -- Reuse native combat against an adjacent reachable threat only; this
@@ -14660,7 +17085,7 @@ function Controller:beginFlee(ticks, assessment)
         if length >= 0.01 then
             self.lastFleeDirectionX = dx / length
             self.lastFleeDirectionY = dy / length
-            self.fleeDirectionUntil = ticks + FLEE_PLAN_TICKS
+            self.fleeDirectionUntil = ticks + TUNE.FLEE_PLAN_TICKS
         end
     end
     self.fleeSafeScans = 0
@@ -14675,7 +17100,7 @@ function Controller:beginFlee(ticks, assessment)
     self.activeDecision = "flee"
     self.state = "FLEEING"
     self.stateStartedAt = ticks
-    self.nextThink = ticks + FLEE_RECHECK_TICKS
+    self.nextThink = ticks + TUNE.FLEE_RECHECK_TICKS
     sayDialogue(self.character, self.id, "flee", ticks, 900)
     print("[KnoxSurvivors][Autonomy] id=" .. self.id
         .. " state=FLEEING reason=" .. tostring(assessment and assessment.reason)
@@ -14722,7 +17147,7 @@ function Controller:updateCorpseDefenseRelease(ticks)
         -- Native grapple release may take more than one frame. Reassert it at
         -- the normal threat-scan cadence without starting a conflicting attack.
         if ticks >= (self.nextCorpseDefenseReleaseAttempt or 0) then
-            self.nextCorpseDefenseReleaseAttempt = ticks + THREAT_SCAN_TICKS
+            self.nextCorpseDefenseReleaseAttempt = ticks + TUNE.THREAT_SCAN_TICKS
             pcall(function() self.character:setDoGrappleLetGo() end)
         end
         return true
@@ -14735,7 +17160,7 @@ function Controller:updateCorpseDefenseRelease(ticks)
         self:recordFailure(
             "corpse_defense_release_timeout",
             ticks,
-            THREAT_FAILURE_COOLDOWN_TICKS
+            TUNE.THREAT_FAILURE_COOLDOWN_TICKS
         )
     end
     local target = self.pendingCorpseDefenseTarget
@@ -14905,10 +17330,11 @@ end
 -- is invented. If the yard moved or was removed during the walk, the item stays
 -- carried and the ordinary cleanup owner retries later.
 function Controller:completeDepotTrip(trip, ticks)
-    local base = self.base
+    local base,_,duty = cleanupContext(self)
     local here = self.character ~= nil and self.character:getCurrentSquare() or nil
     local inside = base ~= nil and base.id == trip.baseId and here ~= nil
-        and KnoxBaseStorage.depotZoneAt(base, here:getX(), here:getY(), here:getZ()) ~= nil
+        and self:canMakeDepositTrip(duty)
+        and KnoxBaseStorage.depotDropAllowed(base,trip.item,here,trip.depotZoneId)
     if not inside then
         self:deferDepositTrip(ticks)
         self:finishDecision(ticks)
@@ -14924,7 +17350,7 @@ function Controller:completeDepotTrip(trip, ticks)
     end
     local queued = self:queueInventoryCleanup({
         item = trip.item, source = source, reason = "depot",
-        dropSquare = here, baseId = base.id,
+        dropSquare = here, baseId = base.id, depotZoneId = trip.depotZoneId,
         baseSupply = trip.baseSupply == true,
     }, ticks)
     if queued then return true end
@@ -15246,10 +17672,38 @@ function Controller:reportSevereWound(ticks)
     return true
 end
 
+-- The capacity recovery keeps its goal on the transfer, so the water source and a
+-- bagged meal or bottle both ride the one cleanup owner. The goal kinds are the
+-- pairs decide returns: the goal itself, or the carried-item form it uses once the
+-- item is in the pack. A need that stops driving the recovery revokes it.
+function Controller.capacityNeedMatches(transfer, need)
+    if transfer == nil or transfer.waterCapacity ~= true or need == nil then return false end
+    local goal = transfer.capacityNeed or "find_water"
+    if goal == "find_food" then return need.kind == "find_food" or need.kind == "eat" end
+    if goal == "find_medical" then
+        local needs = rawget(_G, "KnoxSurvivorNeeds")
+        return need.kind == "find_medical"
+            or (needs ~= nil and needs.isMedicalCare ~= nil
+                and needs.isMedicalCare(need.kind) == true)
+    end
+    return need.kind == "find_water" or need.kind == "drink"
+end
+
 -- The current plan owns permission before native admission, including immediate
 -- completion. Re-resolve real utility/storage at transfer time rather than letting
 -- a changed filter, urgent reserve or newly protected item follow a stale plan.
 function Controller:cleanupTransferAllowed(transfer, item)
+    if transfer.waterCapacity == true then
+        local fullOk, full = pcall(function() return self.character:hasFullInventory() end)
+        local needs = rawget(_G, "KnoxSurvivorNeeds")
+        local needOk, need = pcall(function() return needs.decide(self.character, nil) end)
+        if not fullOk or full ~= true or not needOk or not Controller.capacityNeedMatches(transfer, need)
+            or self.combatTarget ~= nil or self.pendingThreatAwareness ~= nil
+            or self.baseTask ~= nil or self.baseSupplyOrder ~= nil or self.baseSupplyTrip == true
+            or self.companionOrder ~= nil or self.companionDirective ~= nil
+            or self.groupObjective ~= nil or self.groupLeaderId ~= nil
+            or transfer.destination == nil then return false end
+    end
     if self.pendingCleanup ~= transfer or transfer.character ~= self.character
         or item ~= transfer.item or self.reservations.items[item] ~= self.id
         or not transfer.source:contains(item) or item:getContainer() ~= transfer.source then return false end
@@ -15275,6 +17729,7 @@ function Controller:cleanupTransferAllowed(transfer, item)
     else
         local atBase = base ~= nil and KnoxBaseManager ~= nil
             and KnoxBaseManager.containsSquare(base, self.character:getCurrentSquare())
+        if transfer.waterCapacity == true and not atBase then return false end
         local eligible = false
         for _, candidate in ipairs(KnoxSurvivorLooting.cleanupPlan(
             self.character, requirements, self.cleanupInProgress, atBase)) do
@@ -15296,10 +17751,13 @@ function Controller:cleanupTransferAllowed(transfer, item)
         -- A stockpile tile is a place to set something down even when the
         -- cleanup policy would not allow dropping it in the open. Re-check the
         -- tile instead of trusting the plan that chose it.
-        local base, square = self.base, self.character:getCurrentSquare()
-        return square ~= nil and base ~= nil
-            and KnoxBaseStorage.depotZoneAt(base, square:getX(), square:getY(), square:getZ()) ~= nil
+        local square = self.character:getCurrentSquare()
+        local action = transfer.action
+        return square ~= nil and square==transfer.dropSquare and base ~= nil
+            and base.id==transfer.baseId and self:canMakeDepositTrip(duty)
+            and KnoxBaseStorage.depotDropAllowed(base,item,square,transfer.depotZoneId)
             and self.character:getVehicle() == nil
+            and action~=nil and action:getNotFullFloorSquare(item)==square
     end
     return self.character:getCurrentSquare() == transfer.dropSquare
         and self.character:getVehicle() == nil
@@ -15367,6 +17825,16 @@ function Controller:yieldInventoryCleanupForNeed(ticks)
     local need = needs.decide(self.character, nil)
     if need == nil or need.kind == "roam"
         or not Controller.selfCareReady(self.selfCareRetryAt or {}, need.kind, ticks) then return false end
+    local transfer = self.pendingCleanup
+    if transfer ~= nil and Controller.capacityNeedMatches(transfer, need)
+        and self.combatTarget == nil and self.pendingThreatAwareness == nil
+        and self.baseTask == nil and self.baseSupplyOrder == nil and self.baseSupplyTrip ~= true
+        and self.companionOrder == nil and self.companionDirective == nil
+        and self.groupObjective == nil and self.groupLeaderId == nil then
+        local okFull, full = pcall(function() return self.character:hasFullInventory() end)
+        local okReceipt, received = pcall(self.cleanupReceiptMatches, self, transfer)
+        if (okFull and full == true) or (okReceipt and received == true) then return false end
+    end
     -- Observe an already-received delivery before releasing only our transfer.
     -- The durable duty/order and unreceived settlement cargo remain in place.
     if self.state == "MOVING_TO_DEPOSIT" then self.bridge:cancelNpcMove(self.id) end
@@ -15377,7 +17845,7 @@ function Controller:yieldInventoryCleanupForNeed(ticks)
     return true
 end
 
-function Controller:beginInventoryCleanup(ticks)
+function Controller:beginInventoryCleanup(ticks, waterCapacity, capacityNeed)
     if rawget(_G, "KnoxSurvivorLooting") == nil or KnoxSurvivorLooting.cleanupPlan == nil then return false end
     if self.state ~= "IDLE" or ticks < (self.nextCleanupAt or 0) or self.baseTask ~= nil
         or hasPendingTimedActions(self.character) then return false end
@@ -15387,6 +17855,11 @@ function Controller:beginInventoryCleanup(ticks)
     local base, requirements, duty = cleanupContext(self)
     local atBase = base ~= nil and KnoxBaseManager ~= nil
         and KnoxBaseManager.containsSquare(base, self.character:getCurrentSquare())
+    if waterCapacity == true and (not atBase or base == nil or base.id ~= self.baseId
+        or self.combatTarget ~= nil or self.pendingThreatAwareness ~= nil
+        or self.baseSupplyOrder ~= nil or self.baseSupplyTrip == true
+        or self.companionOrder ~= nil or self.companionDirective ~= nil
+        or self.groupObjective ~= nil or self.groupLeaderId ~= nil) then return false end
     local plan, result = KnoxSurvivorLooting.cleanupPlan(self.character, requirements, self.cleanupInProgress, atBase)
     self.cleanupInProgress = result == "heavy_load"
     if #plan == 0 then return false end
@@ -15401,7 +17874,7 @@ function Controller:beginInventoryCleanup(ticks)
     end
     plan = available
     for _, entry in ipairs(plan) do
-        local preferred = self:canMakeDepositTrip(duty) and KnoxBaseStorage.findDepositTrip ~= nil
+        local preferred = waterCapacity ~= true and self:canMakeDepositTrip(duty) and KnoxBaseStorage.findDepositTrip ~= nil
             and KnoxBaseStorage.findDepositTrip(base, self.character, entry.item, self.depositRetryAt, ticks) or nil
         local storage = KnoxBaseStorage.findNearbyDeposit(base, self.character, entry.item,
             preferred ~= nil and preferred.policy.key or nil, self.depositRetryAt, ticks)
@@ -15415,6 +17888,7 @@ function Controller:beginInventoryCleanup(ticks)
             break
         end
     end
+    if candidate == nil and waterCapacity == true then return false end
     if candidate == nil and self:beginDepositTrip(base, plan, duty, ticks) then return true end
     if candidate == nil and atBase then return false end
     if candidate == nil then
@@ -15425,7 +17899,8 @@ function Controller:beginInventoryCleanup(ticks)
     if candidate == nil then return false end
     local queued = self:queueInventoryCleanup({ item = candidate.item, source = candidate.source,
         destination = destination, policyKey = destinationPolicyKey, reason = candidate.reason,
-        baseId = base ~= nil and base.id or nil }, ticks)
+        baseId = base ~= nil and base.id or nil, waterCapacity = waterCapacity == true,
+        capacityNeed = waterCapacity == true and (capacityNeed or "find_water") or nil }, ticks)
     if not queued then
         if destination ~= nil then self:deferDepositTrip(ticks, destinationPolicyKey) end
         self.nextCleanupAt = ticks + 600
@@ -15434,17 +17909,31 @@ function Controller:beginInventoryCleanup(ticks)
     return true
 end
 
+-- A drop is delivered only on its selected real yard square. Native transfer
+-- may otherwise choose an adjacent tile when the floor fills during the walk.
+function Controller:cleanupReceiptMatches(transfer)
+    if transfer==nil or transfer.source:contains(transfer.item) then return false end
+    if transfer.destination~=nil then return transfer.destination:contains(transfer.item) end
+    local world=transfer.item:getWorldItem()
+    if world==nil then return false end
+    if transfer.reason~="depot" then return true end
+    local base=self.base
+    local square=world:getSquare()
+    local zone=base~=nil and square~=nil
+        and KnoxBaseStorage.depotZoneAt(base,square:getX(),square:getY(),square:getZ()) or nil
+    return base~=nil and base.id==transfer.baseId and square==transfer.dropSquare
+        and zone~=nil and zone.id==transfer.depotZoneId
+end
+
 -- Retire observed delivery before an interruption drops the transfer pointer.
 -- This records existing world truth; it never moves goods or assumes queue success.
 function Controller:recordBaseSupplyDepositReceipt()
     local transfer = self.pendingCleanup
     if transfer == nil or transfer.baseSupply ~= true then return false end
     if transfer.receiptRecorded == true then return true end
-    if transfer.item == nil or transfer.source == nil or transfer.destination == nil then return false end
-    local ok, received = pcall(function()
-        return not transfer.source:contains(transfer.item)
-            and transfer.destination:contains(transfer.item)
-    end)
+    if transfer.item == nil or transfer.source == nil
+        or (transfer.destination == nil and transfer.reason ~= "depot") then return false end
+    local ok, received = pcall(function() return self:cleanupReceiptMatches(transfer) end)
     if not ok then return false, "receipt_unreadable" end
     if received ~= true then return false end
     if transfer.partyDelivery == true then
@@ -15499,9 +17988,7 @@ end
 function Controller:updateInventoryCleanup(ticks)
     if hasPendingTimedActions(self.character) then return end
     local transfer = self.pendingCleanup
-    local readable, completed = pcall(function() return transfer ~= nil and not transfer.source:contains(transfer.item)
-        and ((transfer.destination ~= nil and transfer.destination:contains(transfer.item))
-            or (transfer.destination == nil and transfer.item:getWorldItem() ~= nil)) end)
+    local readable, completed = pcall(function() return self:cleanupReceiptMatches(transfer) end)
     if not readable or not completed then
         if self.pendingDepositTrip ~= nil or (transfer ~= nil and transfer.policyKey ~= nil) then
             self:deferDepositTrip(ticks, transfer ~= nil and transfer.policyKey or nil)
@@ -15521,6 +18008,15 @@ function Controller:updateInventoryCleanup(ticks)
                 .. tostring(self.activeDecision) .. " reason=" .. tostring(transfer.reason))
         end
     end
+    if transfer ~= nil and transfer.waterCapacity == true and readable and completed then
+        local ok, full = pcall(function() return self.character:hasFullInventory() end)
+        if not ok or type(full) ~= "boolean" then
+            self:recordFailure("water_capacity_unreadable", ticks, Controller.TUNING.SELF_CARE_RETRY_TICKS)
+        elseif full then
+            self.nextCleanupAt = math.max(self.nextCleanupAt or 0,
+                ticks + Controller.TUNING.SELF_CARE_RETRY_TICKS)
+        end
+    end
     if readable and completed and self.companionDirective ~= nil
         and self.companionDirective.kind == "clean_inventory" then
         self.directiveMisses = 0
@@ -15536,673 +18032,6 @@ function Controller:updateInventoryCleanup(ticks)
         end
     end
     self:finishDecision(ticks)
-end
-
-function Controller:think(ticks)
-    -- The decision boundary agrees with the intervening threat scans: unseen-by-
-    -- zombies travel can continue quietly, but contact/active danger always wins.
-    local quiet = shouldRemainStealthy(self)
-    if not quiet then
-        local flee, assessment = fleeAssessment(self)
-        if flee and self:beginFlee(ticks, assessment) then return end
-    end
-    local threat = not quiet and nearestThreat(self, ticks) or nil
-    if not self:allowsCompanionThreat(threat) then
-        threat = nil
-    end
-    local decision = KnoxSurvivorNeeds.decide(self.character, threat)
-    local equipmentNeed = decision
-    -- Base residents stay on settlement duty. They may consume supplies they
-    -- already carry or retrieve them from assigned storage. An explicit
-    -- Survival Order can send them out, but a shortage alone must never turn
-    -- into an autonomous neighborhood search. findSupply() fails closed after
-    -- assigned storage for ordinary base residents.
-    if self.baseId ~= nil and self.baseSupplyOrder == nil
-        and (decision.kind == "find_food" or decision.kind == "find_water"
-            or decision.kind == "find_medical") then
-        if Controller.selfCareReady(self.selfCareRetryAt, decision.kind, ticks) then
-            if self.baseTask ~= nil and self.baseTask.type ~= "cook" then
-                self:suspendBaseTaskForThreat("needs_interrupt")
-            end
-            if self:beginWorldSearch(decision.kind, ticks) then return end
-            -- A missing safe meal is not a missing ingredient. Use the same
-            -- kitchen owner after storage retrieval fails, retaining the
-            -- resident's claim and the actual meal for native self-care.
-            if decision.kind == "find_food" then
-                if self.baseTask ~= nil and self.baseTask.type == "cook" then
-                    if self:beginBaseTask(ticks) then return end
-                elseif self:beginBaseCooking(ticks, nil, true) then return end
-            end
-        end
-        -- A hungry resident with no reachable supply must never convert the
-        -- need into roaming or patrol duty. Hold and retry on the normal
-        -- supply throttle instead of working to death.
-        self:clearLifeIntent()
-        self.state = "BASE_IDLE"
-        self.activeDecision = "waiting_for_" .. string.sub(decision.kind, 6)
-        self.nextThink = math.max(self.nextThink or 0,
-            (self.nextWorldSearch or ticks) + THINK_MIN_TICKS,
-            tonumber((self.selfCareRetryAt or {})[decision.kind]) or 0)
-        return
-    end
-    if decision.kind == "fight" then
-        if not self:beginCombat(decision.target) then
-            self.nextThink = math.max(self.nextThink or 0, ticks + THINK_MIN_TICKS)
-            self.nextThreatScan = math.max(self.nextThreatScan or 0, ticks + THREAT_SCAN_TICKS)
-        end
-        return
-    end
-    -- Ordinary rest yields to a direct player order, but actual sleep is a
-    -- survival need for every survivor, including owned companions. Recovery
-    -- keeps the durable order intact so it resumes after the native sleep
-    -- transition; only the lower-priority endurance-rest decision is deferred.
-    local hasDirectOrder = self.companionOrder ~= nil or self.companionDirective ~= nil
-    if hasDirectOrder and decision.kind == "rest"
-        and not Controller.isCriticalOrderedRecovery(decision) then
-        decision = { kind = "roam", state = decision.state }
-    end
-    if (decision.kind == "eat" or decision.kind == "drink"
-        or decision.kind == "bandage" or decision.kind == "improvise_medical"
-        or decision.kind == "rest" or decision.kind == "sleep"
-        or decision.kind == "find_food" or decision.kind == "find_water"
-        or decision.kind == "find_medical")
-        and not Controller.selfCareReady(
-            self.selfCareRetryAt,
-            decision.kind,
-            ticks
-        ) then
-        -- The need remains real, but a failed native action must not monopolize
-        -- every think cycle. Preserve the underlying Follow/Hold/roam activity
-        -- until this one bounded retry expires.
-        decision = { kind = "roam", state = decision.state }
-    end
-    if decision.kind == "eat" or decision.kind == "drink"
-        or decision.kind == "bandage" or decision.kind == "improvise_medical" then
-        local action, result, intent = self:executeNeedAction(decision, ticks)
-        if action ~= nil and action ~= false then
-            self:sayNeedIfGrouped(decision.kind, ticks)
-            self.activeDecision = decision.kind
-            self.selfCareIntent = intent
-            self.selfCareInterrupted = nil
-            self.state = "TIMED_ACTION"
-            print(
-                "[KnoxSurvivors][Autonomy] id=" .. self.id
-                    .. " state=TIMED_ACTION kind=" .. decision.kind
-            )
-        else
-            self.selfCareRetryAt[decision.kind] = ticks + Controller.TUNING.SELF_CARE_RETRY_TICKS
-            self:recordFailure(
-                "needs_action:" .. decision.kind .. ":" .. tostring(result),
-                ticks,
-                Controller.TUNING.SELF_CARE_RETRY_TICKS
-            )
-        end
-        return
-    end
-    if decision.kind == "find_food" and (self.baseTask == nil or self.baseTask.type ~= "cook")
-        and self:beginBaseCooking(ticks,nil,true) then return end
-    if decision.kind == "find_food" or decision.kind == "find_water"
-        or decision.kind == "find_medical" then
-        -- A live claim survives the search: suspend it cleanly so the route
-        -- is cancelled once and the task restarts from its work phase.
-        -- Cook claims feed the need themselves via the cooking update.
-        if self.baseTask ~= nil and self.baseTask.type ~= "cook" then
-            self:suspendBaseTaskForThreat("needs_interrupt")
-        end
-        self:sayNeedIfGrouped(decision.kind, ticks)
-        if self:hasNeedEscort() then
-            -- Only a short clear detour is automatic. If none is safe, retain
-            -- the real shortage and regroup instead of starting a roam search.
-            if self:beginWorldSearch(decision.kind, ticks) then return end
-            self.selfCareRetryAt[decision.kind] = ticks + Controller.TUNING.SELF_CARE_RETRY_TICKS
-            decision = { kind = "roam", state = decision.state }
-        else
-        if self.groupLeader ~= nil and self.groupLeader:getCurrentSquare() ~= nil
-            and Controller.shouldDelegateNeedToGroup(
-                decision.kind,
-                navigationDistanceSquared(
-                self.character:getCurrentSquare(),
-                self.groupLeader:getCurrentSquare()
-                )
-            ) then
-            -- The leader will either share a real spare or own one group search.
-            -- A nearby follower must not split off and create a competing route.
-            -- A live claim is suspended first so it resumes instead of orphaning.
-            if self.baseTask ~= nil and self.baseTask.type ~= "cook" then
-                self:suspendBaseTaskForThreat("needs_interrupt")
-            end
-            self.activeDecision = "await_group_" .. decision.kind
-            self.state = "GROUP_WAIT"
-            self.nextThink = ticks + 60
-            return
-        end
-        if not self:beginWorldSearch(decision.kind, ticks) then
-            self:beginRoam(ticks, decision.kind)
-        end
-        return
-        end
-    end
-    if decision.kind == "rest" or decision.kind == "sleep" then
-        if self.baseTask ~= nil and self.baseTask.type ~= "cook" then
-            self:suspendBaseTaskForThreat("needs_interrupt")
-        end
-        self:sayNeedIfGrouped(decision.kind, ticks)
-        self:beginRecovery(decision.kind, ticks)
-        return
-    end
-    if self.lifeIntent ~= nil
-        and (self.lifeIntent.kind == "find_food"
-            or self.lifeIntent.kind == "find_water"
-            or self.lifeIntent.kind == "find_medical") then
-        -- The real need evaluator no longer requests this resource. End the
-        -- durable purpose here instead of letting a satisfied survivor keep
-        -- searching because an older intent survived an interruption/reload.
-        self:clearLifeIntent()
-    end
-    -- Passive gear yields to the authoritative danger/needs choice. The
-    -- original need remains authoritative even during its retry cooldown.
-    if self.state == "IDLE" then
-        local equipped, equipmentReason = self:reconsiderEquipment(ticks, false, equipmentNeed)
-        -- A role-kit withdrawal owns the native inventory action until it
-        -- drains. Keep the decision loop parked rather than starting a job or
-        -- another pickup behind the same timed action.
-        if equipped and (equipmentReason == "role_kit_pickup"
-            or equipmentReason == "role_kit_move") then
-            self.nextThink = ticks + 60
-            return
-        end
-    end
-    if self:beginGroupSupport(ticks) then return end
-    if self.groupLeader == nil and #(self.groupMembers or {}) > 1 then
-        local groupNeed = KnoxGroupSupport.mostUrgentNeed(
-            self.character,
-            self.groupMembers
-        )
-        if groupNeed ~= nil then
-            if not self:beginWorldSearch(groupNeed.kind, ticks) then
-                self:beginRoam(ticks, groupNeed.kind)
-            end
-            return
-        end
-    end
-    if self:beginInventoryCleanup(ticks) then return end
-    if self:beginEventTravel(ticks) then return end
-    if self.awayTeamId ~= nil then
-        local awayTeam = KnoxPersistence.getAwayTeam(self.awayTeamId)
-        -- Completed or blocked: release the claim so this same pass can pick
-        -- ordinary work back up for a member standing in front of the player.
-        self:clearFinishedAwayTeam(ticks, awayTeam)
-        if self.awayTeamId ~= nil and awayTeam ~= nil
-            and (awayTeam.state == "awaiting_collection"
-                or awayTeam.state == "collecting" or awayTeam.state == "returning") then
-            if self:beginAwayMission(ticks) then
-                return
-            end
-            -- A mission-owned survivor must not fall through into roaming,
-            -- companion or base logic when its destination is temporarily
-            -- unavailable. Keep the durable away duty authoritative and retry
-            -- through this same bounded boundary.
-            self.nextThink = math.max(self.nextThink or 0,
-                ticks + EXPLORATION_RETRY_TICKS)
-            return
-        end
-    end
-    if self.companionOrder ~= nil then
-        if self.companionDirective ~= nil then
-            local kind = self.companionDirective.kind
-            if self.companionDirective.partyDestinationArrived == true then
-                self.activeDecision = "party_destination_regroup"
-                self.state = "COMPANION_WAIT"
-                self.nextThink = ticks + 90
-                return
-            end
-            if kind == "go_to" or kind == "guard" then
-                if self:beginCompanionPointDirective(ticks, self.companionDirective) then
-                    return
-                end
-                self.nextThink = math.max(self.nextThink or 0, ticks + EXPLORATION_RETRY_TICKS)
-                return
-            end
-            if kind == "patrol_area" then
-                if self:beginCompanionPatrolDirective(ticks, self.companionDirective) then
-                    return
-                end
-                self.nextThink = math.max(self.nextThink or 0,
-                    ticks + EXPLORATION_RETRY_TICKS)
-                return
-            end
-            if kind == "find_food" or kind == "find_water" or kind == "find_medical"
-                or kind == "find_weapon" or kind == "find_tools" or kind == "find_wood"
-                or kind == "find_materials" or kind == "find_clothing" or kind == "find_ammo" then
-                self:beginCompanionNeedDirective(ticks, self.companionDirective)
-                return
-            end
-            if self:beginExploration(ticks, self.companionDirective) then
-                return
-            end
-            if self.companionDirective ~= nil then
-                self.nextThink = ticks + EXPLORATION_RETRY_TICKS
-                return
-            end
-        end
-        if self.companionOrder == "hold" then
-            if self:beginFollowerHygiene(ticks) then return end
-            self:beginFollowerCompany(ticks, self.companionTarget, true)
-            self.activeDecision = "hold_position"
-            self.state = "COMPANION_HOLD"
-            self.nextThink = ticks + 90
-            return
-        end
-        if self.companionOrder == "relax" then
-            -- Real downtime: wash when filthy, hip-pocket snack when
-            -- peckish, rest after. The field context is stationary by
-            -- definition, same as base ambient.
-            if self:beginFollowerHygiene(ticks) then return end
-            if not self:beginAmbientSnack(ticks) then
-                self:beginCompanionRelax(ticks)
-            end
-            return
-        end
-        local anchor, anchorSquare, anchorReason = self:resolvePlayerPartyAnchor(ticks)
-        if anchor == nil or anchorSquare == nil then
-            self.companionAnchorWaitReason = anchorReason
-            self.activeDecision = "wait_for_party_anchor"
-            self.state = "COMPANION_WAIT"
-            self.nextThink = ticks + Controller.TUNING.FORMATION_BOTTLENECK_WAIT_TICKS
-            return
-        end
-        self.companionAnchorWaitReason = anchorReason
-        if anchor.knownContact then
-            self:beginCompanionFollow(ticks)
-            return
-        end
-        local formationTarget = self:findPlayerPartyFormationTarget(anchor, anchorSquare)
-        if formationTarget == nil then
-            self.activeDecision = "party_regrouping"
-            self.state = "COMPANION_WAIT"
-            self.nextThink = ticks + Controller.TUNING.FORMATION_BOTTLENECK_WAIT_TICKS
-            return
-        end
-        local distance = formationTarget ~= nil and navigationDistanceSquared(
-            self.character:getCurrentSquare(),
-            formationTarget
-        ) or math.huge
-        if distance > Controller.TUNING.FORMATION_ARRIVAL_TOLERANCE_SQUARED then
-            self:beginCompanionFollow(ticks)
-        else
-            -- A settled companion can use the same safe aid path as a camp
-            -- or base resident. Travel and explicit orders retain priority;
-            -- treating a nearby bleeding ally comes before optional looting.
-            if self:beginBattlefieldAid(ticks) then return end
-            -- Follow retains the destination. Explicit loot orders and urgent
-            -- self-care are admitted above; idle opportunities cannot replace it.
-            self:resetMovementRecovery()
-            self.formationMovementPace = nil
-            self:beginFollowerCompany(ticks, self.companionTarget, true)
-            self.activeDecision = "follow_player"
-            self.state = "COMPANION_WAIT"
-            -- Settled cadence: needs and orders still arrive through the
-            -- normal think, but a parked follower must not re-scan loot,
-            -- water and company every few seconds (visible rethink stutter).
-            self.nextThink = ticks + 90
-        end
-        return
-    end
-    if self.baseId ~= nil and self.base ~= nil then
-        self:syncBaseSupplyRun()
-        self:applyResidentStayHome(ticks)
-        if self:followScavengeParty(ticks) then
-            return
-        end
-        local atBase = KnoxBaseManager.containsSquare(
-            self.base,
-            self.character:getCurrentSquare()
-        )
-        if self.baseSupplyTrip == true and self.pendingBaseSupplyDeposit == nil
-            and self.baseSupplyKind ~= nil then
-            local resumedKind = self.baseSupplyKind
-            if self:beginWorldSearch(resumedKind, ticks) then
-                self:beginBaseSupplyRun(resumedKind)
-                return
-            end
-            self:finishBaseSupplyRun("unavailable")
-            if self.baseSupplyOrder ~= nil then
-                self:recordExplicitBaseSupplyFailure(ticks)
-            end
-            self:releaseSupply()
-            if not atBase then
-                self:beginBaseMovement(ticks, true)
-            else
-                self.activeDecision = "base_supply_retry"
-                self.state = "BASE_IDLE"
-                self.nextThink = ticks + SUPPLY_RETRY_TICKS
-            end
-            return
-        elseif not atBase then
-            if self:runScavengeSortie(ticks) then
-                return
-            end
-            if not self:resumeExternalBaseWork(ticks) then
-                self:beginBaseMovement(ticks, true)
-            end
-        elseif self.pendingBaseSupplyDeposit ~= nil then
-            if not self:beginBaseSupplyDeposit(ticks) then
-                self.activeDecision = "base_supply_delivery_wait"
-                self.state = "BASE_IDLE"
-                self.nextThink = math.max(self.nextThink or 0, ticks + 180)
-            end
-            return
-        elseif self.baseTask == nil then
-            -- A finished watch switches its set back off before the next
-            -- decision; an interrupted one keeps burning until this expiry.
-            -- Lit rooms follow the same rule through pendingLights.
-            if self.pendingWatch ~= nil
-                and ticks >= (self.pendingWatch.untilTick or 0) then
-                self:releaseWatch()
-            end
-            if self.pendingLights ~= nil
-                and ticks >= (self.pendingLights.untilTick or 0) then
-                self:releaseLights()
-            end
-            local explicit = self.baseSupplyOrder
-            local explicitKind = explicit ~= nil and tostring(explicit.kind or "") or nil
-            local explicitExpired = explicit ~= nil
-                and tonumber(explicit.expiresAtHours) ~= nil
-                and tonumber(explicit.expiresAtHours) <= currentWorldAgeHours()
-            if explicitExpired then
-                if KnoxPersistence.clearBaseSupplyOrder ~= nil then
-                    local duty = KnoxPersistence.getSurvivorDuty(self.id) or {}
-                    KnoxPersistence.clearBaseSupplyOrder(
-                        self.id, duty.ownerId, self.baseId, currentWorldAgeHours()
-                    )
-                end
-                self.baseSupplyOrder = nil
-                self.baseSupplyOrderAttempts = 0
-                explicit = nil
-                explicitKind = nil
-            end
-            if explicitKind ~= nil and explicitKind ~= "" then
-                self.baseSupplyTrip = true
-                self.baseSupplyKind = explicitKind
-                if self:beginWorldSearch(explicitKind, ticks) then
-                    self:beginBaseSupplyRun(explicitKind)
-                    return
-                end
-                self:recordExplicitBaseSupplyFailure(ticks)
-                self:releaseSupply()
-                self.nextThink = ticks + SUPPLY_RETRY_TICKS
-                return
-            end
-            if self.settlementArrivalPending == true then
-                self.settlementArrivalPending = nil
-                if self:beginBaseMovement(ticks, false) then
-                    return
-                end
-            end
-            -- Automatic settlement scavenging: an idle resident answers a real
-            -- storage shortage (food/water/medical/tools/weapons) with a
-            -- bounded neighborhood fetch before accepting ordinary work. The
-            -- election, one-claimant lease, and rotation live in
-            -- baseSupplyNeed; claimed native tasks are never interrupted.
-            -- Missing player preference means Stay Home; only explicit permission
-            -- permits automatic runs. A faction resident may answer only its
-            -- own faction base's shortage.
-            -- Existing group-sortie leases remain separate and are not stolen.
-            local need = self:baseSupplyNeed(ticks)
-            if need ~= nil and self.baseSupplyTrip == true and self.baseSupplyKind ~= nil then
-                local supplyKind = self.baseSupplyKind
-                if self:beginWorldSearch(supplyKind, ticks) then
-                    self:beginBaseSupplyRun(self.baseSupplyKind)
-                    return
-                end
-                if self.lastWorldSearchOutcome == "no_candidate" then
-                    self:reportBaseSupplySearchMiss(supplyKind, ticks)
-                    self:recordFailure(
-                        "base_supply_no_nearby:" .. tostring(supplyKind),
-                        ticks,
-                        SUPPLY_RETRY_TICKS
-                    )
-                end
-                self:finishBaseSupplyRun("unavailable")
-                self:releaseSupply()
-                self.nextThink = ticks + SUPPLY_RETRY_TICKS
-                return
-            end
-            -- A resident without an already-claimed native task should answer
-            -- a real settlement shortage before accepting ordinary work. This
-            -- keeps food/water/medical recovery aligned with the existing
-            -- priority model without interrupting a job already in progress.
-            -- A drafted pair leader leaves on sortie instead of idling.
-            if self:runScavengeSortie(ticks) then
-                return
-            end
-            -- Existing claims and explicit player orders keep their normal
-            -- priority over optional leisure. Use the same task owner, but
-            -- do not elect fresh automatic work that would consume the break.
-            if self.leisureBreakDue == true and self:beginBaseTask(ticks, true) then
-                return
-            end
-            -- Earned leisure break: one ambient round instead of another
-            -- automatic claim. Shortages and sorties above already ran, so
-            -- genuine need still preempts; sleep/recreation windows already
-            -- idle and simply clear the debt.
-            local forceLeisure = false
-            if self.leisureBreakDue == true then
-                self.leisureBreakDue = false
-                self.consecutiveAutoTasks = 0
-                local breakAssignment = self.lastScheduleAssignment
-                if breakAssignment == nil and KnoxBaseJobs.scheduleAssignment ~= nil then
-                    breakAssignment = KnoxBaseJobs.scheduleAssignment(self.id)
-                end
-                if breakAssignment == "anything" or breakAssignment == "work" then
-                    forceLeisure = true
-                end
-            end
-            if forceLeisure ~= true then
-                if self:beginBaseTask(ticks) then
-                    return
-                end
-            end
-            if self:beginBaseHygiene(ticks) then
-                return
-            end
-            local residentIds = KnoxPersistence.getBaseResidentIds ~= nil
-                and KnoxPersistence.getBaseResidentIds(self.baseId) or {}
-            -- Scheduled sleep rests through the night; scheduled recreation
-            -- stays inside the ambient set (rest/snack/socialize/stroll) and
-            -- never flat-stands through the window.
-            local idleAssignment = self.lastScheduleAssignment
-            if idleAssignment == nil and KnoxBaseJobs.scheduleAssignment ~= nil then
-                idleAssignment = KnoxBaseJobs.scheduleAssignment(self.id)
-            end
-            if idleAssignment == "sleep" then
-                self:beginScheduledBaseSleep(ticks)
-                return
-            end
-            -- Company time keeps the lights on: flip a nearby dark room's
-            -- switch while settling into leisure, never while working.
-            if idleAssignment == "recreation" or forceLeisure
-                or idleAssignment == "anything" then
-                self:maintainBaseLights(ticks)
-            end
-            self:offerBaseAdvice(ticks)
-            local choice = Controller.baseIdleChoice(
-                ticks,
-                self.id,
-                type(residentIds) == "table" and #residentIds or 1,
-                (idleAssignment == "recreation" or forceLeisure) and "recreation" or nil
-            )
-            if self:answerBaseAlarm(ticks) then
-                return
-            end
-            if self:beginBattlefieldAid(ticks) then
-                return
-            end
-            self:runBaseIdleChoice(ticks, choice)
-        elseif self:beginBaseTask(ticks) then
-            return
-        end
-        return
-    end
-    if self.factionBaseCandidate ~= nil then
-        if not self:beginFactionBaseScout(ticks) then
-            self.nextThink = ticks + THINK_MIN_TICKS
-        end
-        return
-    end
-    if self.campId ~= nil and self.camp ~= nil then
-        if self:followScavengeParty(ticks) then
-            return
-        end
-        local atCamp = KnoxFactionCamps.contains(
-            self.camp,
-            self.character:getCurrentSquare()
-        )
-        if not atCamp then
-            if self:runScavengeSortie(ticks) then
-                return
-            end
-            if self.campExcursion and not self.campExcursionExplored then
-                self.campExcursionExplored = true
-                if self:beginExploration(ticks) then
-                    return
-                end
-            end
-            if not self:beginCampMovement(ticks, true) then
-                self.nextThink = math.max(
-                    self.nextThink or 0,
-                    ticks + Controller.TUNING.CAMP_POSITION_FAILURE_TICKS
-                )
-            end
-            return
-        end
-        if self.campExcursion then
-            self.campExcursion = false
-            self.campExcursionExplored = false
-        end
-        if self:runScavengeSortie(ticks) then
-            return
-        end
-        if self.campPosition == nil then
-            if not self:beginCampMovement(ticks, false) then
-                self.nextThink = math.max(
-                    self.nextThink or 0,
-                    ticks + Controller.TUNING.CAMP_POSITION_FAILURE_TICKS
-                )
-            end
-            return
-        end
-        local choice = Controller.campIdleChoice(
-            ticks,
-            self.campSlot,
-            ticks >= (self.nextCampExcursion or 0)
-        )
-        if self:answerBaseAlarm(ticks) then
-            return
-        end
-        if self:beginBattlefieldAid(ticks) then
-            return
-        end
-        if choice == "rest" then
-            self:beginCampAmbientRest(ticks)
-        elseif choice == "reposition" then
-            self.campPositionCycle = (self.campPositionCycle or 0) + 1
-            self:beginCampMovement(ticks, false)
-        elseif choice == "excursion" then
-            self:beginCampExcursion(ticks)
-        else
-            self.activeDecision = "camp_idle"
-            self.state = "CAMP_IDLE"
-            self.nextThink = ticks + Controller.TUNING.CAMP_DECISION_TICKS
-        end
-        return
-    end
-    if self.groupLeader ~= nil and self.groupLeader:getCurrentSquare() ~= nil then
-        self:applyGroupLeaderOrder(ticks)
-        if self.groupLeaderOrder ~= nil and self.groupLeaderOrder.kind == "hold" then
-            -- This explicit leader directive is below threat/need/combat scans
-            -- (which run before think) and does not own a native action. A
-            -- later follow/cancel/expiry simply returns the follower to the
-            -- existing formation branch below.
-            self.activeDecision = "leader_hold"
-            self.state = "GROUP_WAIT"
-            self.nextThink = ticks + 60
-            return
-        end
-        if self.groupObjective ~= nil and self.groupObjective.kind == "night_shelter"
-            and self:beginNightShelter(ticks) then
-            return
-        end
-        local formationTarget = findFormationTarget(
-            self.groupLeader,
-            self.character,
-            self.groupFormationSlot, self.id
-        )
-        local distance = formationTarget ~= nil and navigationDistanceSquared(
-            self.character:getCurrentSquare(),
-            formationTarget
-        ) or math.huge
-        if distance > Controller.TUNING.FORMATION_ARRIVAL_TOLERANCE_SQUARED then
-            self:beginGroupFollow(ticks)
-        else
-            self:resetMovementRecovery()
-            self.formationMovementPace = nil
-            if self.groupObjectiveChanged then
-                self.groupObjectiveChanged = false
-                self.nextGroupObjectiveAssist = math.max(
-                    self.nextGroupObjectiveAssist or 0,
-                    ticks + self.groupFormationSlot * 45
-                )
-            elseif ticks >= (self.nextGroupObjectiveAssist or 0)
-                and Controller.shouldAssistGroupObjective(
-                    self.groupObjective,
-                    navigationDistanceSquared(
-                        self.character:getCurrentSquare(),
-                        self.groupLeader:getCurrentSquare()
-                    )
-                ) then
-                self.nextGroupObjectiveAssist = ticks
-                    + Controller.TUNING.GROUP_OBJECTIVE_ASSIST_COOLDOWN_TICKS
-                    + self.groupFormationSlot * 120
-                if self:beginExploration(ticks) then
-                    return
-                end
-                self.nextGroupObjectiveAssist = ticks
-                    + Controller.TUNING.GROUP_OBJECTIVE_ASSIST_RETRY_TICKS
-                    + self.groupFormationSlot * 30
-            end
-            if self:beginBattlefieldAid(ticks) then
-                return
-            end
-            if self:beginFollowerHygiene(ticks) then return end
-            self:beginFollowerCompany(ticks, self.groupLeader, false)
-            self.state = "GROUP_WAIT"
-            self.nextThink = ticks + 60
-        end
-        return
-    end
-    local distantMember, distantDistance = self:findDistantGroupMember()
-    if distantMember ~= nil then
-        if distantDistance > Controller.TUNING.GROUP_RETRIEVE_LEASH_SQUARED
-            and self:beginGroupRegroup(distantMember, ticks) then
-            return
-        end
-        self.state = "GROUP_WAIT"
-        self.nextThink = math.max(self.nextThink or 0, ticks + 90)
-        return
-    end
-    if self.forceTravel then
-        if not self:beginRoam(ticks) then
-            self.nextThink = math.max(self.nextThink or 0, ticks + THINK_MIN_TICKS)
-        end
-        return
-    end
-    if self:beginNightShelter(ticks) then
-        return
-    end
-    if not self:beginExploration(ticks) then
-        self:beginRoam(ticks)
-    end
 end
 
 -- Runtime observation of the existing native action, never a second work
@@ -16312,2755 +18141,66 @@ function Controller:baseTaskActionTimedOut(ticks, stateAge)
     return ticks - watch.lastProgressAt > Controller.TUNING.ACTION_TIMEOUT_TICKS
 end
 
-function Controller:updateBaseTaskAction(ticks)
-    if self.state == "BASE_TASK_ACTION" then
-        if self.baseTask == nil
-            or (self.baseTask.type ~= "barricade"
-                and self.baseTask.type ~= "farm_water"
-                and self.baseTask.type ~= "farm_harvest"
-                and self.baseTask.type ~= "farm_plow"
-                and self.baseTask.type ~= "farm_seed"
-                and self.baseTask.type ~= "chop_tree"
-                and self.baseTask.type ~= "saw_logs"
-                and self.baseTask.type ~= "haul_corpse"
-                and self.baseTask.type ~= "burn_corpse"
-                and self.baseTask.type ~= "repair") then
-            self:finishBaseTask(false, "unsupported_base_action")
-            self:finishDecision(ticks)
-            return true
-        end
-        if hasPendingTimedActions(self.character) then return end
-        if self.baseTask.type == "barricade" then
-            if not self.baseTaskActionQueued then
-                local target = self.baseTaskBarricadeTarget
-                if target == nil or not KnoxBaseBarricades.isTargetValid(
-                    target,
-                    self.character
-                ) then
-                    local targetReason
-                    target, targetReason = KnoxBaseBarricades.resolveTarget(
-                        self.base,
-                        self.baseTask.target,
-                        self.character
-                    )
-                    self.baseTaskBarricadeTarget = target
-                    if target == nil then
-                        target = self:retargetBarricadeTask()
-                        self.baseTaskBarricadeTarget = target
-                    end
-                    if target == nil then
-                        if KnoxBaseBarricades.isTargetComplete ~= nil
-                            and KnoxBaseBarricades.isTargetComplete(self.base, self.baseTask.target, self.character) then
-                            self:finishBaseTask(true, "barricade_already_secured")
-                            self:finishDecision(ticks)
-                            return true
-                        end
-                        self:failBaseTaskAction(
-                            ticks,
-                            "barricade_target_invalid:" .. tostring(targetReason)
-                        )
-                        return true
-                    end
-                end
-                local queueBefore = nil
-                pcall(function()
-                    local queues = ISTimedActionQueue ~= nil and ISTimedActionQueue.queues or nil
-                    local queue = queues ~= nil and queues[self.character] or nil
-                    if queue ~= nil and type(queue.queue) == "table" then queueBefore = #queue.queue end
-                end)
-                local action, actionResult = KnoxBaseBarricades.queueAction(
-                    self.character,
-                    target,
-                    self.base
-                )
-                if action == nil then
-                    local pos = self:diagPos()
-                    local tsquare = target ~= nil and target.square or nil
-                    local tpos = diagSquare(tsquare)
-                    local dist2 = nil
-                    if pos ~= nil and tpos ~= nil then
-                        dist2 = (pos.x - tpos.x) ^ 2 + (pos.y - tpos.y) ^ 2
-                    end
-                    self:diag("barricade", "queue_failed", {
-                        reason = tostring(actionResult),
-                        queueBefore = queueBefore,
-                        dist2 = dist2,
-                        before = self.baseTaskBarricadeBefore,
-                    })
-                    self:failBaseTaskAction(ticks, "barricade_queue:" .. tostring(actionResult))
-                    return true
-                end
-                self.baseTaskActionQueued = true
-                self.baseTaskStartedAt = ticks
-                self.baseTaskActionQueueTicks = ticks
-                self:watchBaseTaskAction(action, ticks, target)
-                self:diagOnce("barricade", "action_queued", {
-                    queueBefore = queueBefore,
-                    before = self.baseTaskBarricadeBefore,
-                })
-                return true
-            end
-            if not self.character:getCharacterActions():isEmpty() then
-                return true
-            end
-            local target = self.baseTaskBarricadeTarget
-            local complete = KnoxBaseBarricades.isComplete(
-                target,
-                self.character,
-                self.baseTaskBarricadeBefore
-            )
-            local after = KnoxBaseBarricades.plankCount(target, self.character)
-            local stillValid = false
-            pcall(function()
-                stillValid = KnoxBaseBarricades.isTargetValid(target, self.character) == true
-            end)
-            local queueDepth = nil
-            pcall(function()
-                local queues = ISTimedActionQueue ~= nil and ISTimedActionQueue.queues or nil
-                local queue = queues ~= nil and queues[self.character] or nil
-                if queue ~= nil and type(queue.queue) == "table" then queueDepth = #queue.queue end
-            end)
-            local pos = self:diagPos()
-            local tsquare = target ~= nil and target.square or nil
-            local tpos = diagSquare(tsquare)
-            local dist2 = nil
-            if pos ~= nil and tpos ~= nil then
-                dist2 = (pos.x - tpos.x) ^ 2 + (pos.y - tpos.y) ^ 2
-            end
-            self:diag("barricade", complete and "completed" or "not_completed", {
-                before = self.baseTaskBarricadeBefore, after = after,
-                queueDepth = queueDepth, stillValid = stillValid,
-                dist2 = dist2, waitTicks = ticks - (self.baseTaskActionQueueTicks or ticks),
-            })
-            -- A finished action that changed nothing is a loop, not progress:
-            -- the window will not take another board. Name it so the board
-            -- stops the work instead of re-queuing the same trip.
-            local changed = complete
-                or (tonumber(after) or 0) > (tonumber(self.baseTaskBarricadeBefore) or 0)
-            local plankReason = complete and "barricade_plank_added"
-                or (changed and "barricade_not_completed" or "barricade_no_progress")
-            local accepted = self:finishBaseTask(complete, plankReason)
-            if complete and accepted then
-                KnoxActivityFeed.speak(self.character, "One more layer on the windows.")
-            end
-            self:finishDecision(ticks)
-            return true
-        end
-        if self.baseTask.type == "haul_corpse" then
-            -- Drop-destination cooldown: after a failed drop at these coords,
-            -- do not touch the body again until it expires. This converts a
-            -- grab→carry→release→regrab loop (e.g. fence-separated disposal)
-            -- into one bounded attempt per cooldown window.
-            do
-                local cd = self.corpseDropCooldown
-                local tgt = self.baseTask ~= nil and self.baseTask.target or nil
-                if cd ~= nil and tgt ~= nil and ticks < (cd.untilTick or 0)
-                    and tostring(tgt.dropX) == tostring(cd.x)
-                    and tostring(tgt.dropY) == tostring(cd.y)
-                    and tostring(tgt.dropZ) == tostring(cd.z) then
-                    self.baseTaskCorpseTarget = nil
-                    self:failBaseTaskAction(ticks, "corpse_drop_cooldown")
-                    return true
-                end
-            end
-            if not self.baseTaskActionQueued then
-                local target = self.baseTaskCorpseTarget
-                if target == nil then
-                    target = KnoxBaseCorpseHandling.resolveTarget(
-                        self.base,
-                        self.baseTask.target,
-                        self.character
-                    )
-                    self.baseTaskCorpseTarget = target
-                end
-                if target == nil then
-                    self:failBaseTaskAction(ticks, "corpse_target_invalid")
-                    return true
-                end
-                local action, actionResult
-                if self.baseTaskCorpsePhase == "drop" then
-                    action, actionResult = KnoxBaseCorpseHandling.queueDrop(
-                        self.character,
-                        target
-                    )
-                else
-                    -- The native grab settles asynchronously: never stack a
-                    -- second grab while a body is already attached.
-                    local dragging = false
-                    if KnoxBaseCorpseHandling ~= nil
-                        and KnoxBaseCorpseHandling.isDragging ~= nil then
-                        local ok, value = pcall(function()
-                            return KnoxBaseCorpseHandling.isDragging(self.character)
-                        end)
-                        dragging = ok and value == true
-                    end
-                    if dragging then
-                        self.nextThink = math.max(self.nextThink or 0,
-                            ticks + THINK_MIN_TICKS)
-                        return true
-                    end
-                    self.baseTaskCorpsePhase = "grab"
-                    action, actionResult = KnoxBaseCorpseHandling.queueGrab(
-                        self.character,
-                        target
-                    )
-                end
-                if action == nil then
-                    self:failBaseTaskAction(ticks, "corpse_queue:" .. tostring(actionResult))
-                    return true
-                end
-                self.baseTaskActionQueued = true
-                self.baseTaskStartedAt = ticks
-                return true
-            end
-            if not self.character:getCharacterActions():isEmpty() then
-                return true
-            end
-            if self.baseTaskCorpsePhase == "grab" then
-                local step, transition, verifyUntil =
-                    KnoxBaseCorpseHandling.nextGrabStep(
-                        self.character,
-                        self.baseTaskCorpseGrabRetryIssued,
-                        self.baseTaskCorpseGrabVerifyUntil,
-                        ticks
-                    )
-                self.baseTaskCorpseGrabVerifyUntil = verifyUntil
-                if step == "wait" then
-                    return true
-                end
-                if step == "retry" then
-                    local requested, retryResult =
-                        KnoxBaseCorpseHandling.requestGrabRetry(
-                            self.character,
-                            self.baseTaskCorpseTarget
-                        )
-                    if not requested then
-                        self:failBaseTaskAction(ticks,
-                            "corpse_grab_retry:" .. tostring(retryResult))
-                        return true
-                    end
-                    self.baseTaskCorpseGrabRetryIssued = true
-                    print("[KnoxSurvivors][BaseJobs] id=" .. tostring(self.id)
-                        .. " corpse-grab-retry=" .. tostring(retryResult)
-                        .. " transition=" .. tostring(transition))
-                    return true
-                end
-                if step ~= "ready" then
-                    self:failBaseTaskAction(ticks,
-                        "corpse_grab_not_attached:" .. tostring(transition))
-                    return true
-                end
-                local target = self.baseTaskCorpseTarget
-                if target == nil or target.dropSquare == nil then
-                    pcall(function() self.character:setDoGrappleLetGo() end)
-                    self:failBaseTaskAction(ticks, "corpse_drop_square_unavailable")
-                    return true
-                end
-                local moveResult = tostring(self.bridge:moveNpc(
-                    self.id,
-                    target.dropSquare
-                ))
-                if string.find(moveResult, "MOVE_STARTED", 1, true) ~= 1 then
-                    pcall(function() self.character:setDoGrappleLetGo() end)
-                    do
-                        local tgt = self.baseTask ~= nil and self.baseTask.target or nil
-                        self.corpseDropCooldown = {
-                            x = tgt ~= nil and tgt.dropX or nil,
-                            y = tgt ~= nil and tgt.dropY or nil,
-                            z = tgt ~= nil and tgt.dropZ or nil,
-                            untilTick = ticks + BLOCKED_AREA_COOLDOWN_TICKS,
-                        }
-                    end
-                    self:failBaseTaskAction(ticks, "corpse_drop_move:" .. moveResult)
-                    return true
-                end
-                self.baseTaskCorpsePhase = "drop"
-                self.baseTaskActionQueued = false
-                self.baseTaskCorpseDropVerifyUntil = nil
-                self.baseTaskCorpseDropRetryIssued = nil
-                self.baseTaskStartedAt = ticks
-                self:noteTaskTravelStart(ticks)
-                self.state = "BASE_TASK_MOVE"
-                return true
-            end
-            local step, transition, verifyUntil =
-                KnoxBaseCorpseHandling.nextDropStep(
-                    self.character,
-                    self.baseTaskCorpseDropRetryIssued,
-                    self.baseTaskCorpseDropVerifyUntil,
-                    ticks
-                )
-            self.baseTaskCorpseDropVerifyUntil = verifyUntil
-            if step == "wait" then
-                return true
-            end
-            if step == "retry" then
-                local requested, retryResult =
-                    KnoxBaseCorpseHandling.requestDropRetry(self.character)
-                if not requested then
-                    self:failBaseTaskAction(ticks,
-                        "corpse_drop_retry:" .. tostring(retryResult))
-                    return true
-                end
-                self.baseTaskCorpseDropRetryIssued = true
-                print("[KnoxSurvivors][BaseJobs] id=" .. tostring(self.id)
-                    .. " corpse-drop-retry=" .. tostring(retryResult)
-                    .. " transition=" .. tostring(transition))
-                return true
-            end
-            if step ~= "ready" then
-                pcall(function() self.character:setDoGrappleLetGo() end)
-                self:failBaseTaskAction(ticks,
-                    "corpse_drop_not_released:" .. tostring(transition))
-                return true
-            end
-            local accepted = self:finishBaseTask(true, "corpse_hauled")
-            if accepted then
-                KnoxActivityFeed.speak(self.character, "The body is out of the way.")
-            end
-            self:finishDecision(ticks)
-            return true
-        end
-        if self.baseTask.type == "burn_corpse" then
-            -- Burning is instant once on site with a lighter: delete piled
-            -- corpses via native removal. No grab/drag needed.
-            local zoneId = self.baseTask.target ~= nil and self.baseTask.target.zoneId or nil
-            local removed, result = KnoxBaseCorpseHandling.burnZoneCorpses(self.base, zoneId)
-            if removed ~= nil and removed > 0 then
-                local accepted = self:finishBaseTask(true, "corpses_burned:" .. tostring(removed))
-                if accepted then KnoxActivityFeed.speak(self.character, "Burned the pile.") end
-            else
-                self:failBaseTaskAction(ticks, tostring(result or "nothing_to_burn"))
-                return true
-            end
-            self:finishDecision(ticks)
-            return true
-        end
-        if self.baseTask.type == "repair" then
-            if not self.baseTaskActionQueued then
-                local target = self.baseTaskRepairTarget
-                if target == nil then
-                    target = KnoxBaseRepairs.resolveTarget(
-                        self.base,
-                        self.baseTask.target,
-                        self.character
-                    )
-                    self.baseTaskRepairTarget = target
-                    self.baseTaskRepairBefore = target ~= nil
-                        and KnoxBaseRepairs.snapshot(target) or nil
-                end
-                if target == nil then
-                    self:failBaseTaskAction(ticks, "repair_target_invalid")
-                    return true
-                end
-                if self.baseTaskRepairBefore == nil then
-                    self:failBaseTaskAction(ticks, "repair_health_unavailable")
-                    return true
-                end
-                local action, actionResult = KnoxBaseRepairs.queueAction(
-                    self.character,
-                    target
-                )
-                if action == nil then
-                    self:failBaseTaskAction(ticks,
-                        "repair_queue:" .. tostring(actionResult))
-                    return true
-                end
-                self.baseTaskActionQueued = true
-                self.baseTaskStartedAt = ticks
-                self:watchBaseTaskAction(action, ticks, target)
-                return true
-            end
-            if not self.character:getCharacterActions():isEmpty() then
-                return true
-            end
-            local complete = KnoxBaseRepairs.isComplete(
-                self.baseTaskRepairTarget,
-                self.baseTaskRepairBefore
-            )
-            local afterRepair = nil
-            pcall(function()
-                afterRepair = KnoxBaseRepairs.snapshot(self.baseTaskRepairTarget)
-            end)
-            self:diagActionVerdict("repair", complete,
-                self.baseTaskRepairBefore, afterRepair)
-            local accepted = self:finishBaseTask(
-                complete,
-                complete and "structure_repaired" or "repair_not_completed"
-            )
-            if complete and accepted then
-                KnoxActivityFeed.speak(self.character, "That should hold now.")
-            end
-            self:finishDecision(ticks)
-            return true
-        end
-        if self.baseTask.type == "chop_tree" or self.baseTask.type == "saw_logs" then
-            if not self.baseTaskActionQueued then
-                local target = self.baseTaskWoodcuttingTarget
-                if target == nil then
-                    target = KnoxBaseWoodcutting.resolveTarget(
-                        self.base,
-                        self.baseTask.target,
-                        self.character
-                    )
-                    self.baseTaskWoodcuttingTarget = target
-                end
-                if target == nil then
-                    self:failBaseTaskAction(ticks, "tree_target_invalid")
-                    return true
-                end
-                local action, actionResult = KnoxBaseWoodcutting.queueAction(
-                    self.character,
-                    target
-                )
-                if action == nil then
-                    self:failBaseTaskAction(ticks, "tree_queue:" .. tostring(actionResult))
-                    return true
-                end
-                if self.baseTask.type == "chop_tree" then
-                    self.baseTaskWoodcuttingBefore = target.tree:getObjectIndex()
-                end
-                self.baseTaskActionQueued = true
-                self.baseTaskStartedAt = ticks
-                self:watchBaseTaskAction(action, ticks, target)
-                return true
-            end
-            if not self.character:getCharacterActions():isEmpty() then
-                return true
-            end
-            local complete = KnoxBaseWoodcutting.isComplete(
-                self.baseTaskWoodcuttingTarget,
-                self.baseTaskWoodcuttingBefore
-            )
-            local afterTree = nil
-            pcall(function()
-                afterTree = self.baseTaskWoodcuttingTarget ~= nil
-                    and self.baseTaskWoodcuttingTarget.tree ~= nil
-                    and self.baseTaskWoodcuttingTarget.tree:getObjectIndex() or nil
-            end)
-            self:diagActionVerdict(self.baseTask.type, complete,
-                self.baseTaskWoodcuttingBefore, afterTree)
-            local taskType = self.baseTask.type
-            local finishReason = complete
-                and (taskType == "saw_logs" and "logs_sawn" or "tree_chopped")
-                or (taskType == "saw_logs" and "logs_not_sawn" or "tree_not_chopped")
-            local accepted = self:finishBaseTask(
-                complete,
-                finishReason
-            )
-            if complete and accepted then
-                KnoxActivityFeed.speak(self.character,
-                    taskType == "saw_logs"
-                        and "The logs are ready." or "That tree is down."
-                )
-            end
-            self:finishDecision(ticks)
-            return true
-        end
-        if self.baseTask.type == "farm_water"
-            or self.baseTask.type == "farm_harvest"
-            or self.baseTask.type == "farm_plow"
-            or self.baseTask.type == "farm_seed" then
-            if not self.baseTaskActionQueued then
-                local target = self.baseTaskFarmingTarget
-                if target == nil then
-                    target = KnoxBaseFarming.resolveTarget(
-                        self.base,
-                        self.baseTask.target,
-                        self.character
-                    )
-                    self.baseTaskFarmingTarget = target
-                end
-                if target == nil then
-                    self:failBaseTaskAction(ticks, "farming_target_invalid")
-                    return true
-                end
-                local water = nil
-                if self.baseTask.type == "farm_water" then
-                    local item, uses = KnoxBaseFarming.findWaterItem(
-                        self.character,
-                        self.baseTask.target.waterItemType
-                    )
-                    if item ~= nil then
-                        water = {
-                            item = item,
-                            uses = math.min(
-                                tonumber(uses) or 0,
-                                tonumber(self.baseTask.target.waterUses) or 0
-                            ),
-                        }
-                    end
-                end
-                local action, actionResult = KnoxBaseFarming.queueAction(
-                    self.character,
-                    target,
-                    water,
-                    {survivorId = self.id, taskId = self.baseTask.id, baseId = self.baseId}
-                )
-                if action == nil then
-                    self:failBaseTaskAction(ticks, "farming_queue:" .. tostring(actionResult))
-                    return true
-                end
-                self.baseTaskActionQueued = true
-                self.baseTaskStartedAt = ticks
-                self:watchBaseTaskAction(action, ticks, target)
-                return true
-            end
-            if not self.character:getCharacterActions():isEmpty() then
-                return true
-            end
-            local complete = KnoxBaseFarming.isComplete(
-                self.baseTaskFarmingTarget,
-                self.baseTaskFarmingBefore
-            )
-            local afterFarm = nil
-            pcall(function()
-                afterFarm = KnoxBaseFarming.snapshot(self.baseTaskFarmingTarget)
-            end)
-            self:diagActionVerdict(self.baseTask.type, complete,
-                self.baseTaskFarmingBefore, afterFarm)
-            local taskType = self.baseTask.type
-            local accepted = self:finishBaseTask(
-                complete,
-                complete and "farming_action_complete" or "farming_action_not_completed"
-            )
-                if complete and accepted then
-                    KnoxActivityFeed.speak(self.character,
-                        taskType == "farm_harvest" and "Harvest is in."
-                        or taskType == "farm_water" and "Crops are watered."
-                        or taskType == "farm_seed" and "Seeds are in."
-                        or "The furrow is ready."
-                    )
-            end
-            self:finishDecision(ticks)
-            return true
-        end
-    end
-
-    return false
-end
-
-function Controller:tick(ticks)
-    self.currentTicks = ticks
-    -- Stale-animation recovery cannot act until the native graph has been idle
-    -- for 180 ticks, so probing two state names, three animation flags and the
-    -- traversal state on every frame for every survivor buys nothing. Sample
-    -- it; the grace window still decides whether a flag is stale.
-    if ticks >= (self.nextIdleLatchCheck or 0) then
-        self.nextIdleLatchCheck = ticks + 15
-        self:recoverIdleAnimationLatch(ticks)
-    end
-    -- A pending order must not starve a native opening's real completion receipt.
-    -- This observes only the shared Java native action; it does not tick movement.
-    if self.character ~= nil and nativeTraversalBusy(self.character)
-        and self.bridge ~= nil and self.bridge.observeNpcNativeAction ~= nil then
-        self.bridge:observeNpcNativeAction(self.id)
-    end
-    if self.pendingFleeAttack ~= nil then
-        if self.state == "FLEEING" and self.character ~= nil
-            and self.character:getCurrentSquare() ~= nil then
-            if Controller.isNativeRecoveryBusy(self.character) then
-                if self.bridge ~= nil and self.bridge.observeNpcNativeRecovery ~= nil then
-                    self.bridge:observeNpcNativeRecovery(self.id)
-                end
-                return
-            end
-            if Controller.isNativeAttackBusy(self.character) or nativeTraversalBusy(self.character) then return end
-            local assessment = self.pendingFleeAttack
-            self.pendingFleeAttack = nil
-            -- Replan from the actual released position. Latest durable orders
-            -- stay authoritative; no captured Follow/Hold is restored here.
-            if not self:beginFlee(ticks, assessment) then
-                if self:waitingForTransferActions() then
-                    self.pendingFleeAttack = assessment
-                elseif self.state == "FLEEING" then
-                    -- No escape can legitimately hand off to cornered defense.
-                    -- Preserve that new combat owner rather than overwriting it.
-                    self:recoverFleeMovement("native_attack_released", ticks)
-                end
-            end
-            return
-        end
-        self.pendingFleeAttack = nil
-    end
-    if not self:applyPendingCombatPolicy() then return end
-    if self.state ~= "PLAYER_CONVERSATION" then self.playerConversation = nil end
-    local vehicles = rawget(_G, "KnoxCompanionVehicles")
-    if self.character ~= nil and vehicles ~= nil and vehicles.isBusy ~= nil then
-        -- Native passenger actions own their route and inputs until completion.
-        local busy, result = vehicles.isBusy(self.character)
-        if busy then
-            -- A boarding lease must not hold the survivor deaf: retreat-worthy
-            -- danger or a critical need releases the lease through the existing
-            -- owner, and the normal arbitration below runs on the next tick
-            -- with fresh scans. Fightable danger can wait out the short
-            -- boarding window; fleeing cannot. Either check failing safe
-            -- preserves today's behavior instead of erroring the tick.
-            local flee = false
-            if fleeAssessment ~= nil then
-                local assessed, verdict = pcall(fleeAssessment, self)
-                flee = assessed and verdict == true
-            end
-            local need = nil
-            if KnoxSurvivorNeeds ~= nil and KnoxSurvivorNeeds.decide ~= nil then
-                local decided, decision = pcall(KnoxSurvivorNeeds.decide, self.character, nil)
-                if decided then need = decision end
-            end
-            if flee or (need ~= nil and need.kind ~= nil and need.kind ~= "roam") then
-                vehicles.cancel(self.character)
-                self.nextThreatScan = 0
-                self.nextThink = 0
-                return
-            end
-            return
-        end
-        if result == "interrupted" then self.nextThreatScan = 0; self.nextThink = 0 end
-        if self.character.getVehicle ~= nil and self.character:getVehicle() ~= nil then return end
-    end
-    if self:tryBoardFollowVehicle(ticks) then return end
-    -- Disarm the one-shot rest-exit get-up pulse once the body is back on
-    -- its feet and not knocked down. Without this the latch survives until
-    -- the next knockdown and stands the survivor up instantly, unlike a
-    -- player whose flag is pulsed only by discrete input. Knockdown timing
-    -- itself is logged so parity stays visible instead of assumed.
-    if self.character ~= nil then
-        local sitting = safeMethod(self.character, "isSitOnGround", true)
-            or safeMethod(self.character, "isSittingOnFurniture", true)
-        local down = safeMethod(self.character, "isKnockedDown", true)
-            or safeMethod(self.character, "isOnFloor", true)
-        if self.forceGetUpLatched == true and not sitting and not down then
-            pcall(function() self.character:setVariable("forceGetUp", false) end)
-            self.forceGetUpLatched = nil
-        end
-        if down and self.knockedDownSince == nil then
-            self.knockedDownSince = ticks
-            self:diag("combat", "knocked_down", nil)
-        elseif not down and self.knockedDownSince ~= nil then
-            self:diag("combat", "stood_up", {
-                downTicks = (tonumber(ticks) or 0) - self.knockedDownSince,
-            })
-            self.knockedDownSince = nil
-        end
-    end
-    if self.tradeAction ~= nil and self.state ~= "TRADING" then self:cancelTrade("behavior_changed") end
-    if self.character == nil or self.character:getCurrentSquare() == nil then
-        self:cancelTrade("detached")
-        self:releaseSelfCare()
-        -- Freeze ownership on entry so a streamed-out shell cannot keep stale
-        -- move/combat leases while detached.
-        if self.bridge ~= nil then
-            if self.bridge.cancelNpcMove ~= nil then
-                pcall(function() self.bridge:cancelNpcMove(self.id) end)
-            end
-            if self.bridge.resetNpcCombat ~= nil then
-                pcall(function() self.bridge:resetNpcCombat(self.id) end)
-            end
-        end
-        -- The population owner, not the behavior controller, decides when an NPC is
-        -- actually stored. A streamed-out shell can temporarily lose its square before
-        -- the hibernation pass captures/removes it, so keep that state explicit.
-        self.state = "DETACHED"
-        self.knockedDownSince = nil
-        return
-    end
-
-    if self:recoverFromDetached(ticks) then
-        return
-    end
-
-    if (self.state == "COMBAT" or self.state == "BREAKING_LOCKED_DOOR")
-        and Controller.isNativeRecoveryBusy(self.character) then
-        -- Keep injury inputs clear even while duty/policy projection waits.
-        -- Observation must not consume a target/door's terminal combat receipt.
-        if self.bridge ~= nil and self.bridge.observeNpcNativeRecovery ~= nil then
-            self.bridge:observeNpcNativeRecovery(self.id)
-        end
-        return
-    end
-
-    -- Combat retargeting, reload yield and terminal cleanup also write native
-    -- inputs. Keep the whole combat decision paused until a live crossing ends.
-    if self.state == "COMBAT" and not safeMethod(self.character, "isDead", false)
-        and nativeTraversalBusy(self.character) then return end
-
-    if self.pendingDutyChange then
-        if not self:canApplyDutyChange() then return end
-        self:onDutyChanged()
-    end
-
-    if self.companionOrderInterruptPending then
-        if nativeTraversalBusy(self.character) then return end
-        self.companionOrderInterruptPending = nil
-        self:interruptForDirective(true)
-        -- Ordinary arbitration applies the latest order on the next update;
-        -- emergency states retain the same priority as an immediate handoff.
-        return
-    end
-
-    -- A dissolved pair may have issued recall only once during a vault.
-    -- Keep the native animation, then retire its old supply detour before
-    -- another entry or source route can start, even without a live pair lease.
-    if (self.baseSupplyPartyReturning == true or self.scavengeSortieReturning == true)
-        and self:isSettlementSupplyEntry() then
-        if not nativeTraversalBusy(self.character) then self:interruptForDirective() end
-        return
-    end
-
-    -- The existing retreat owner and safe-scan recovery apply to companions
-    -- too. Ownership of a durable order cannot revoke a survival action.
-
-    if self.observedState ~= self.state then
-        self.observedState = self.state
-        self.stateStartedAt = ticks
-    end
-
-    if self.state == "CORPSE_DEFENSE_RELEASE" then
-        self:updateCorpseDefenseRelease(ticks)
-        return
-    end
-
-    if self.state == "BASE_TASK_MOVE" and self.baseTask ~= nil
-        and (self.baseTask.type == "guard" or self.baseTask.type == "patrol")
-        and (self.baseTask.state ~= "claimed" or self.baseTask.claimedBy ~= self.id) then
-        self.nextSecurityCheck = ticks
-        self:updateBaseSecurityDuty(ticks)
-        return
-    end
-
-    -- Retire the previous drain before the next decision can queue fresh work.
-    -- Passive gear now runs inside think, after danger and survival needs.
-    if self.state == "IDLE" and not hasPendingTimedActions(self.character) then
-        self:waitingForTransferActions()
-    end
-
-    local stateAge = ticks - (self.stateStartedAt or ticks)
-    local movementState = self.state == "MOVING_TO_SUPPLY"
-        or self.state == "EVENT_TRAVEL"
-        or self.state == "MOVING_TO_DEPOSIT"
-        or self.state == "MOVING_TO_EXPLORE"
-        or self.state == "ROAMING"
-        or self.state == "GROUP_FOLLOW" or self.state == "GROUP_REGROUP"
-        or self.state == "COMPANION_FOLLOW"
-        or self.state == "MOVING_TO_COMPANION_POINT"
-        or self.state == "MOVING_TO_COMPANION_PATROL"
-        or self.state == "BASE_RETURN" or self.state == "BASE_PATROL"
-        or self.state == "BASE_DEFEND"
-        or self.state == "BASE_TASK_MOVE"
-        or self.state == "BASE_TASK_SUPPLY_MOVE"
-        or self.state == "ROLE_KIT_MOVE"
-        or self.state == "MEETING_APPROACH"
-        or self.state == "MOVING_TO_WINDOW_ENTRY"
-        or self.state == "CROSSING_WINDOW_ENTRY"
-        or self.state == "MOVING_TO_REST"
-        or self.state == "AID_MOVE"
-        or self.state == "MOVING_TO_BASE_CANDIDATE"
-        or self.state == "CAMP_RETURN" or self.state == "CAMP_REPOSITION"
-        or self.state == "AWAY_RETURN"
-        or self.state == "FLEEING"
-    local actionState = self.state == "LOOTING"
-        or self.state == "OPENING_ENTRY_WINDOW"
-        or self.state == "INVENTORY_CLEANUP"
-        or self.state == "SEARCHING"
-        or self.state == "TIMED_ACTION"
-        or self.state == "ROBBING"
-        or (self.state == "BASE_TASK_WORK"
-            and (self.baseTask == nil or self.baseTask.type ~= "guard"))
-        or self.state == "BASE_TASK_SUPPLY_TRANSFER"
-        or self.state == "AID_ACTION"
-        or self.state == "GROUP_SUPPORT"
-    local recoveryBusy = Controller.isNativeRecoveryBusy(self.character)
-    if recoveryBusy and (movementState or actionState or self.state == "BASE_TASK_ACTION") then
-        if self.state == "BASE_TASK_MOVE" or self.state == "BASE_TASK_SUPPLY_MOVE" then self:noteTaskTravelStart(ticks) end
-        return
-    end
-    if (movementState and stateAge > Controller.TUNING.MOVEMENT_TIMEOUT_TICKS)
-        or (actionState and stateAge > Controller.TUNING.ACTION_TIMEOUT_TICKS)
-        or (self.state == "BASE_TASK_ACTION" and self:baseTaskActionTimedOut(ticks, stateAge))
-        or (self.state == "BREAKING_LOCKED_DOOR"
-            and stateAge > Controller.TUNING.MOVEMENT_TIMEOUT_TICKS) then
-        if self.securityRoute~=nil and (self.state=="BASE_TASK_MOVE"
-            or self.state=="MOVING_TO_COMPANION_PATROL" or self.state=="MOVING_TO_COMPANION_POINT") then
-            self:deferSecurityRoute(ticks,"state_timeout",self.securityRoute.base)
-            return
-        end
-        if self.state == "FLEEING" then
-            self:recoverFleeMovement("state_timeout", ticks)
-            return
-        elseif self.state == "BASE_RETURN" or self.state == "BASE_PATROL" then
-            self:handleBaseMovementFailure("state_timeout", ticks)
-            return
-        elseif self.state == "MOVING_TO_REST" then
-            self:handleRestMovementFailure("state_timeout", ticks)
-            return
-        elseif self.state == "TIMED_ACTION" and self.pendingSelfCare ~= nil then
-            local intent = self.selfCareIntent or self.pendingSelfCare.intent
-            local kind = intent ~= nil and (intent.needKind or intent.kind) or self.activeDecision
-            self.selfCareRetryAt[kind] = ticks + Controller.TUNING.SELF_CARE_RETRY_TICKS
-            self:releaseSelfCare()
-            if kind == "drink_world" then self:releaseSupply() end
-            self:recordFailure("self_care_timeout:" .. tostring(kind), ticks,
-                Controller.TUNING.SELF_CARE_RETRY_TICKS)
-            self:finishDecision(ticks)
-            return
-        elseif self.state == "COMPANION_FOLLOW" or self.state == "AWAY_RETURN" then
-            self.bridge:cancelNpcMove(self.id)
-            self.activeDecision = nil
-            self.state = "IDLE"
-            self.nextThink = ticks + THINK_MIN_TICKS
-            return
-        elseif self.state == "MOVING_TO_BASE_CANDIDATE" then
-            self:rejectFactionBaseCandidate(ticks, "state_timeout")
-        elseif self.state == "ROLE_KIT_MOVE" then
-            self.bridge:cancelNpcMove(self.id)
-            self.nextRoleKitAt = ticks + 600
-        end
-        self:abandonCurrentDecision(ticks, "state_timeout_" .. tostring(self.state))
-        return
-    end
-
-    local traversalBusy = movementState and nativeTraversalBusy(self.character)
-    if traversalBusy and (self.state == "BASE_TASK_MOVE" or self.state == "BASE_TASK_SUPPLY_MOVE") then
-        -- Native opening/climbing is legitimate stationary work. Refresh the
-        -- existing progress anchor so landing does not inherit a spent stall
-        -- budget and immediately abandon an otherwise valid resident job.
-        self:noteTaskTravelStart(ticks)
-    end
-    -- Both danger evaluation and active-combat decisions consume this scheduled
-    -- observation. Advancing the deadline must not starve the combat branch.
-    local threatScanDue = ticks >= self.nextThreatScan and not traversalBusy and not recoveryBusy
-    if threatScanDue then
-        self.nextThreatScan = ticks + THREAT_SCAN_TICKS
-        local stealthCrowd = self.state ~= "COMBAT" and self.state ~= "FLEEING"
-            and shouldRemainStealthy(self)
-        if not stealthCrowd then
-            local flee, assessment = fleeAssessment(self)
-            if self.state ~= "FLEEING" and flee then
-                local admitted, reason = self:beginFlee(ticks, assessment)
-                -- Whether route acquisition succeeded or entered bounded recovery,
-                -- do not reacquire an attack in this same danger scan. When the
-                -- player explicitly disables retreat, keep ordinary combat
-                -- arbitration on this same scan instead of delaying it.
-                if admitted or reason ~= "retreat_disabled" then return end
-            end
-            if self:retryRetreatForDanger(ticks, flee, assessment) then return end
-            if self.state == "FLEEING" and retreatIsSafelyClear(self, flee, assessment, ticks) then
-                self.bridge:cancelNpcMove(self.id)
-                self:resetMovementRecovery()
-                self.fleeRecoveryUntil = nil
-                self.fleeTarget = nil
-                self.failedFleeTarget = nil
-                self.combatDisengageUntil = nil
-                self:finishDecision(ticks)
-                self.nextThink = ticks + 5
-                print(
-                    "[KnoxSurvivors][Autonomy] id=" .. self.id
-                        .. " retreat-complete safe_scans=" .. tostring(self.fleeSafeScans)
-                )
-                return
-            end
-            if self.state ~= "COMBAT" and self.state ~= "FLEEING" then
-                local threat = nearestThreat(self, ticks)
-                if not self:allowsCompanionThreat(threat) then
-                    threat = nil
-                end
-                -- A corpse carrier cannot safely attack while the native
-                -- grapple owns both hands. Release first, then hand off to
-                -- defense while retaining the task for later reconsideration.
-                local haulingCorpse = self.baseTask ~= nil
-                    and self.baseTask.type == "haul_corpse"
-                    and KnoxBaseCorpseHandling ~= nil
-                    and KnoxBaseCorpseHandling.isDragging ~= nil
-                    and KnoxBaseCorpseHandling.isDragging(self.character)
-                if threat ~= nil and haulingCorpse then
-                    local origin = self.character:getCurrentSquare()
-                    local threatSquare = threat:getCurrentSquare()
-                    if origin ~= nil and threatSquare ~= nil
-                        and distanceSquared(origin, threatSquare) <= 36 then
-                        self:interruptCorpseHaulForDefense(threat, ticks)
-                        return
-                    end
-                end
-                if threat ~= nil and self:beginCombat(threat) then
-                    return
-                end
-            end
-        end
-    end
-
-    if self:yieldBaseTaskForNeed(ticks) then return end
-    if self:yieldInventoryCleanupForNeed(ticks) then return end
-    if self:yieldAidForNeed(ticks) then return end
-    if self:yieldCollectionForNeed(ticks) then return end
-
-    -- A party-food detour may take a settled follower briefly away from
-    -- formation. Recheck its anchor and
-    -- needs before movement updates; native item actions may finish normally.
-    if self.state == "MOVING_TO_EXPLORE" and self.pendingSupply ~= nil
-        and self.pendingSupply.partySupport == true then
-        if self.allowAutoLoot == false then
-            self:abandonPartyFoodForFollow(ticks, "disabled")
-            return
-        end
-        local need = KnoxSurvivorNeeds.decide(self.character, nil)
-        if need ~= nil and need.kind ~= nil and need.kind ~= "roam"
-            and Controller.selfCareReady(self.selfCareRetryAt, need.kind, ticks) then
-            self:abandonPartyFoodForFollow(ticks, "urgent_need")
-            return
-        end
-        local _, anchorSquare, anchorReason = self:resolvePlayerPartyAnchor(ticks)
-        if anchorSquare == nil then
-            self:abandonPartyFoodForFollow(ticks, anchorReason or "anchor_unavailable")
-            return
-        end
-        if not Controller.partyFoodSupportAnchorWithinLeash(
-            self.pendingSupply, anchorSquare
-        ) then
-            self:abandonPartyFoodForFollow(ticks, "player_moved")
-            return
-        end
-    end
-
-    if self.state == "PLAYER_CONVERSATION" then
-        self:updatePlayerConversation(ticks)
-        return
-    end
-
-    if self.state == "TRADING" then
-        self.tradeTicksRemaining = (self.tradeTicksRemaining or 0) - 1
-        if self.tradeAction == nil then
-            self.state, self.activeDecision, self.nextThink = "IDLE", nil, 0
-        elseif not nativeTraversalBusy(self.character)
-            and self:tradeNeedsSelfCare(ticks) then
-            self:cancelTrade("survivor_needs_care")
-        elseif self.tradeTicksRemaining <= 0 or not self.tradeAction:isValid() then
-            self:cancelTrade("trade_interrupted_or_expired")
-        end
-        return
-    end
-
-    if self.state == "MEETING_WAIT" or self.state == "MEETING_READY"
-        or self.state == "GREETING" then
-        return
-    end
-
-    if self.state == "ROAMING" and ticks >= (self.nextRoamNeedsCheck or 0) then
-        self.nextRoamNeedsCheck = ticks + Controller.TUNING.ROAM_NEEDS_RECHECK_TICKS
-        local roamingNeed = KnoxSurvivorNeeds.decide(self.character, nil)
-        if Controller.shouldInterruptRoamingForNeed(roamingNeed.kind)
-            and Controller.selfCareReady(
-                self.selfCareRetryAt,
-                roamingNeed.kind,
-                ticks
-            ) then
-            self.bridge:cancelNpcMove(self.id)
-            self.roamGoalKey = nil
-            self.roamGoalKind = nil
-            self.activeDecision = nil
-            self.state = "IDLE"
-            self.nextThink = ticks
-            return
-        end
-    end
-
-    if self.state == "GROUP_WAIT" then
-        if self.pendingRobberyHold ~= nil
-            and ticks >= (tonumber(self.pendingRobberyHold.expiresAt) or 0) then
-            self:releaseRobberyHold(nil, ticks, "expired")
-            return
-        end
-        if self:applyGroupLeaderOrder(ticks) then return end
-        if ticks >= self.nextThink then
-            self.state = "IDLE"
-        end
-        return
-    end
-
-    if self.state == "COMPANION_HOLD" or self.state == "COMPANION_GUARD" then
-        -- Keep the persistent order. Ordinary fatigue is deferred, while a
-        -- critical body state re-enters think and takes the bounded recovery
-        -- exception without clearing the post or directive.
-        if ticks >= self.nextThink then
-            self.nextThink = ticks + 90
-            local need = KnoxSurvivorNeeds.decide(self.character, nil)
-            if need ~= nil and need.kind ~= "roam"
-                and ((need.kind ~= "rest" and need.kind ~= "sleep")
-                    or Controller.isCriticalOrderedRecovery(need)) then
-                self.state = "IDLE"
-                self.nextThink = ticks
-            elseif self.state == "COMPANION_GUARD" and self.companionDirective ~= nil then
-                -- Re-resolve the assigned post after a shove or displacement.
-                self:beginCompanionPointDirective(ticks, self.companionDirective)
-            end
-        end
-        return
-    end
-
-    if self.state == "COMPANION_DUTY_WAIT" or self.state == "BASE_SECURITY_WAIT" then
-        self:updateSecurityRouteWait(ticks,self.state=="BASE_SECURITY_WAIT")
-        return
-    end
-
-    if self.state == "COMPANION_WAIT" or self.state == "COMPANION_PATROL_WAIT" then
-        -- A settled follower can notice the player leaving without running the
-        -- full needs/order decision loop every few ticks. Keep the normal wait
-        -- for stationary players and only wake that loop for a real gap.
-        if self.state == "COMPANION_WAIT" and self.companionOrder == "follow"
-            and self.activeDecision == "follow_player"
-            and ticks >= (self.nextFollowProbe or 0) then
-            self.nextFollowProbe = ticks + 15
-            local player = self.companionTarget
-            local observed, visible = pcall(function()
-                return player ~= nil and self.character:CanSee(player) == true
-            end)
-            if observed and visible and not nativeTraversalBusy(player) then
-                local ok, anchorSquare = pcall(function() return player:getCurrentSquare() end)
-                local current = self.character:getCurrentSquare()
-                if ok and Controller.shouldWakeSettledFollower(
-                    current, anchorSquare,
-                    self.settledFollowAnchorX,
-                    self.settledFollowAnchorY,
-                    self.settledFollowAnchorZ) then
-                    self.state = "IDLE"
-                    self.nextThink = ticks
-                    return
-                end
-            end
-        end
-        if ticks >= self.nextThink then
-            self.state = "IDLE"
-        end
-        return
-    end
-
-    if self.state == "BASE_IDLE" or self.state == "EVENT_WAIT" then
-        if ticks >= self.nextThink then
-            self.activeDecision = nil
-            self.state = "IDLE"
-        end
-        return
-    end
-
-    if self.state == "CAMP_IDLE" then
-        if ticks >= self.nextThink then
-            self.activeDecision = nil
-            self.state = "IDLE"
-        end
-        return
-    end
-
-    if self.state == "BASE_RECREATION" then
-        self:updateBaseRecreation(ticks)
-        return
-    end
-
-    if self.state == "BASE_HYGIENE" then
-        self:updateBaseHygiene(ticks)
-        return
-    end
-
-    if self.state == "BASE_ORGANIZE" then
-        self:updateBaseOrganize(ticks)
-        return
-    end
-
-    if self.state == "BASE_AMBIENT_REST" then
-        if ticks >= self.nextThink then
-            self:finishDecision(ticks)
-        end
-        return
-    end
-
-    if self.state == "CAMP_AMBIENT_REST" then
-        if ticks >= self.nextThink then
-            self:finishDecision(ticks)
-        end
-        return
-    end
-
-    if self.state == "COMPANION_RELAX" then
-        self:updateCompanionRelax(ticks)
-        return
-    end
-
-    if self.state == "BASE_TASK_SUPPLY_WAIT" then
-        if self.baseTask == nil then
-            self:finishDecision(ticks)
-        elseif ticks >= (self.nextThink or 0) then
-            self:beginBaseTaskSupplyOrWork(ticks)
-        end
-        return
-    end
-
-    if self.state == "BASE_TASK_PATROL_WAIT" then
-        self:updateBaseSecurityDuty(ticks)
-        if self.state ~= "BASE_TASK_PATROL_WAIT" then return end
-        if self.baseTask == nil then
-            self:finishDecision(ticks)
-        elseif ticks >= (self.nextThink or 0) then
-            self:beginBaseTaskWorkMove(ticks)
-        end
-        return
-    end
-
-    if self.state == "BASE_TASK_WORK" then
-        if self.baseTask == nil then
-            self.state = "IDLE"
-            self.activeDecision = nil
-            self.nextThink = ticks + THINK_MIN_TICKS
-            return
-        end
-        if self.baseTask.type == "guard" then
-            self:updateBaseSecurityDuty(ticks)
-            return
-        end
-        local started = self.baseTaskStartedAt or ticks
-        if ticks - started >= KnoxBaseJobs.workDuration(self.baseTask) then
-            local taskType = self.baseTask.type
-            local accepted = self:finishBaseTask(true, "completed_" .. tostring(taskType))
-            local completionLines = {
-                guard = "All clear here.", patrol = "Patrol route is clear.",
-                barricade = "That opening is secured.",
-                repair = "That repair is finished.",
-                haul_corpse = "The body is out of the way.", farm_water = "The crops are watered.",
-                farm_harvest = "The harvest is gathered.", farm_plow = "The soil is ready.",
-                farm_seed = "The plot is planted.", chop_tree = "The tree is down.",
-                saw_logs = "The logs are cut.",
-            }
-            if accepted then
-                KnoxActivityFeed.speak(self.character,
-                    completionLines[taskType] or "That job is finished."
-                )
-            end
-            self:finishDecision(ticks)
-        end
-        return
-    end
-
-    if self.state == "BASE_COOKING" then
-        self:updateBaseCooking(ticks)
-        return
-    end
-
-    if self.state == "BASE_TASK_SUPPLY_TRANSFER" then
-        if self.baseTask == nil or self.baseTaskSupplyTransfer == nil then
-            self:releaseBaseTaskSupplyTransfer()
-            self.state = "IDLE"
-            self.activeDecision = nil
-            self.nextThink = ticks + THINK_MIN_TICKS
-            return
-        end
-        if hasPendingTimedActions(self.character) then
-            return
-        end
-        local transfer = self.baseTaskSupplyTransfer
-        local received = self:baseTaskSupplyReceived(transfer)
-        if not received then
-            -- An empty timed-action queue is not proof that native transfer
-            -- succeeded.  The action can be rejected after it was queued, or
-            -- the item can be placed somewhere other than the worker's
-            -- inventory when capacity/validity changes.  Do not send the
-            -- resident to a native job without the real tool/material.
-            self:failBaseTaskAction(ticks, "assigned_supply_transfer_not_completed")
-            return
-        end
-        self:releaseBaseTaskSupplyTransfer()
-        -- Lease retirement credits this verified receipt before resumption.
-        self:beginBaseTaskSupplyOrWork(ticks)
-        return
-    end
-
-    if self.state == "AID_ACTION" then
-        if hasPendingTimedActions(self.character) then
-            return
-        end
-        local helped = KnoxMedicalActions.verifyAid(self.pendingAid)
-        self:releaseAid()
-        self.nextAidAt = ticks + AID_RETRY_TICKS
-        self:diag("medical", helped and "aid_completed" or "aid_no_effect", nil)
-        if helped then
-            KnoxActivityFeed.speak(self.character, "That should hold for now.")
-        end
-        self:finishDecision(ticks)
-        return
-    end
-
-    if self:updateBaseTaskAction(ticks) then return end
-
-    if (self.state == "MOVING_TO_SUPPLY" or self.state == "MOVING_TO_REST") and self:hasNeedEscort()
-        and ticks >= (self.nextNeedEscortCheck or 0) then
-        self.nextNeedEscortCheck = ticks + 30
-        local destination = self.state == "MOVING_TO_SUPPLY" and self.pendingSupply or self.pendingRest
-        if destination ~= nil and not self:allowNeedDetour(destination.approach, ticks) then
-            self.bridge:cancelNpcMove(self.id)
-            if self.state == "MOVING_TO_SUPPLY" then self:releaseSupply()
-            else self:releaseRestSpot() end
-            self:finishDecision(ticks)
-            self.nextThink = ticks + 1
-            return
-        end
-    end
-    if self.state == "OPENING_ENTRY_WINDOW" then
-        self:updateEntryWindow(ticks)
-        return
-    end
-    if self.state == "COMBAT" then
-        -- Danger arbitration above may request retreat, but target cleanup,
-        -- retargeting and reload yield cannot cut native attack frames short.
-        if not safeMethod(self.character, "isDead", false)
-            and Controller.isNativeAttackBusy(self.character) then return end
-        if threatScanDue then
-            -- A dead/peaceful/unloaded target must release native firearm
-            -- ownership before reload or aim state is reconsidered. Otherwise
-            -- a completed target can keep a timed reload alive until its long
-            -- preparation timeout expires.
-            if shouldDropCombatTarget(self, ticks) then
-                if KnoxFirearmSupport.cancelPreparation ~= nil then
-                    KnoxFirearmSupport.cancelPreparation(self.character)
-                end
-                self.bridge:resetNpcCombat(self.id)
-                self:releaseCombat()
-                self:clearFirearmCombatState()
-                self.pendingThreatAwareness = nil
-                self:finishDecision(ticks)
-                print(
-                    "[KnoxSurvivors][Autonomy] id=" .. self.id
-                        .. " combat-disengaged reason=invalid_or_irrelevant"
-                )
-                return
-            end
-            local replacement = nearestThreat(self, ticks)
-            if not self:allowsCompanionThreat(replacement) then
-                replacement = nil
-            end
-            local replacementAwareness = self.pendingThreatAwareness
-            if shouldReplaceCombatTarget(self, replacement, replacementAwareness, ticks) then
-                local previous = self.combatTarget
-                self.lastCombatRetarget = ticks
-                -- An emergency human/zombie replacement owns the next native
-                -- combat action. Cancel only now, rather than cancelling a
-                -- valid reload on every ordinary combat refresh.
-                if KnoxFirearmSupport.cancelPreparation ~= nil then
-                    KnoxFirearmSupport.cancelPreparation(self.character)
-                end
-                self.bridge:resetNpcCombat(self.id)
-                self:releaseCombat()
-                self:clearFirearmCombatState()
-                self.state = "IDLE"
-                self.activeDecision = nil
-                if self:beginCombat(replacement) then
-                    print(
-                        "[KnoxSurvivors][Autonomy] id=" .. self.id
-                            .. " combat-retarget reason="
-                            .. tostring(replacementAwareness ~= nil
-                                and replacementAwareness.reason or "closer")
-                    )
-                    return
-                end
-                self.failedThreats[replacement] = math.max(
-                    self.failedThreats[replacement] or 0, ticks + THREAT_SCAN_TICKS)
-                if self:recoverFailedCombatRetarget(previous, ticks) then
-                    print("[KnoxSurvivors][Autonomy] id=" .. self.id
-                        .. " combat-retarget-recovered previous=" .. tostring(previous))
-                    return
-                end
-                -- A refused attack can already have admitted an unarmed retreat.
-                -- Preserve that survival mode and any native failure retry delay.
-                if self.state == "IDLE" then
-                    self.nextThink = math.max(self.nextThink or 0, ticks + THINK_MIN_TICKS)
-                end
-                print(
-                    "[KnoxSurvivors][Autonomy] id=" .. self.id
-                        .. " combat-retarget-failed previous=" .. tostring(previous)
-                )
-                return
-            end
-            local firearmState, firearmResult = KnoxFirearmSupport.currentCombatState(
-                self.character
-            )
-            self:speakDryFirearm(ticks, firearmState)
-            if firearmState == "needs_preparation" or firearmState == "reloading" then
-                local preparationTarget = self.combatTarget
-                local fallbackReason = self:reloadYieldDecision(
-                    ticks, preparationTarget, firearmState
-                )
-                self.bridge:resetNpcCombat(self.id)
-                self:releaseCombat()
-                if fallbackReason ~= nil then
-                    self:forceMeleeFallback(ticks, preparationTarget, fallbackReason)
-                    firearmState = "melee"
-                elseif firearmState == "needs_preparation" then
-                    firearmState, firearmResult = KnoxFirearmSupport.prepareForThreat(
-                        self.id,
-                        self.character,
-                        self.bridge,
-                        preparationTarget
-                    )
-                    if firearmState == "reloading" then
-                        fallbackReason = self:reloadYieldDecision(
-                            ticks, preparationTarget, firearmState
-                        )
-                        if fallbackReason ~= nil then
-                            self:forceMeleeFallback(ticks, preparationTarget, fallbackReason)
-                            firearmState = "melee"
-                        end
-                    end
-                end
-                self:finishDecision(ticks)
-                -- Give a queued rack/reload time to finish. Re-scanning in 15
-                -- ticks re-engages the same target and restarts native combat.
-                self.nextThreatScan = ticks + COMBAT_RANGED_YIELD_DELAY_TICKS
-                print(
-                    "[KnoxSurvivors][Autonomy] id=" .. self.id
-                        .. " ranged-combat-yield state=" .. tostring(firearmState)
-                        .. " result=" .. tostring(firearmResult)
-                )
-                return
-            end
-            self.pendingThreatAwareness = nil
-        end
-        local result = tostring(self.bridge:tickNpcCombat(self.id))
-        if string.find(result, "COMBAT_FIREARM_REQUEST", 1, true) == 1 then
-            -- A friendly in the corridor is a refusal, not a near miss. Stand
-            -- down for this request and let the next scan try again; never hand
-            -- the native hook a shot through a companion or the player.
-            if self:friendlyBlockingShot(self.combatTarget) ~= nil then
-                self:speakNoClearShot(ticks)
-                self.nextThreatScan = ticks + COMBAT_RANGED_YIELD_DELAY_TICKS
-                print("[KnoxSurvivors][Autonomy] id=" .. self.id
-                    .. " firearm-request-hold reason=friendly_in_line")
-                return
-            end
-            local fired, fireResult = KnoxFirearmSupport.fireNative(self.character)
-            if fired then
-                -- One native request was handed to the real Build 42 hook. Keep
-                -- the encounter committed to the gun and clear the bounded
-                -- ranged-failure streak so ordinary cadence continues.
-                self.rangedCombatFailureStreak = 0
-                self.rangedEncounterTarget = self.combatTarget
-            else
-                local preparationTarget = self.combatTarget
-                self.bridge:resetNpcCombat(self.id)
-                self:releaseCombat()
-                local preparation, preparationResult = KnoxFirearmSupport.prepareForThreat(
-                    self.id,
-                    self.character,
-                    self.bridge,
-                    preparationTarget
-                )
-                if preparation == "reloading" then
-                    local fallbackReason = self:reloadYieldDecision(
-                        ticks, preparationTarget, preparation
-                    )
-                    if fallbackReason ~= nil then
-                        self:forceMeleeFallback(ticks, preparationTarget, fallbackReason)
-                        preparation = "melee"
-                    end
-                else
-                    self.reloadYieldStreak = 0
-                end
-                self:finishDecision(ticks)
-                self.nextThreatScan = ticks + COMBAT_RANGED_YIELD_DELAY_TICKS
-                print(
-                    "[KnoxSurvivors][Autonomy] id=" .. self.id
-                        .. " firearm-request-yield result=" .. tostring(fireResult)
-                        .. " preparation=" .. tostring(preparation)
-                        .. " detail=" .. tostring(preparationResult)
-                )
-            end
-        elseif string.find(result, "COMBAT_FIREARM_FALLBACK", 1, true) == 1 then
-            if self.combatTarget ~= nil then
-                self.rangedFallbackUntil = self.rangedFallbackUntil
-                    or setmetatable({}, { __mode = "k" })
-                self.rangedFallbackUntil[self.combatTarget] = ticks
-                    + THREAT_FAILURE_COOLDOWN_TICKS
-            end
-            self.bridge:resetNpcCombat(self.id)
-            local fallbackResult = KnoxFirearmSupport.fallbackToMelee(
-                self.id,
-                self.bridge,
-                self.character
-            )
-            self:releaseCombat()
-            self:clearFirearmCombatState()
-            self:finishDecision(ticks)
-            self.nextThreatScan = ticks + COMBAT_RANGED_YIELD_DELAY_TICKS
-            print(
-                "[KnoxSurvivors][Autonomy] id=" .. self.id
-                    .. " firearm-close-fallback result=" .. tostring(result)
-                    .. " melee=" .. tostring(fallbackResult)
-            )
-        elseif string.find(result, "COMBAT_SUCCEEDED", 1, true) == 1 then
-            -- Native success includes observed damage, but can also represent
-            -- an obstacle. Only a genuinely dead enemy is a combat victory.
-            if self.combatTarget ~= nil
-                and safeMethod(self.combatTarget, "isDead", false) == true then
-                self:sampleCombatConfidence(true)
-                -- Its own kill, still at its feet: look at the body now, while
-                -- the corpse and its square are the ones this fight produced.
-                self:checkKilledBody(self.combatTarget, ticks)
-            end
-            self.counts.combat = self.counts.combat + 1
-            self.bridge:resetNpcCombat(self.id)
-            self:releaseCombat()
-            self:clearFirearmCombatState()
-            self:finishDecision(ticks)
-            self.nextThreatScan = math.max(self.nextThreatScan or 0, ticks + COMBAT_RANGED_YIELD_DELAY_TICKS)
-            -- Hold formation repath briefly so the follower walks instead of
-            -- sprinting to a slot that drifted mid-fight.
-            self.nextFormationRefresh = ticks + COMBAT_POST_KILL_FORMATION_DELAY_TICKS
-            self.formationCommitUntil = ticks + COMBAT_POST_KILL_FORMATION_DELAY_TICKS
-        elseif string.find(result, "COMBAT_FAILED", 1, true) == 1 then
-            self:diag("combat", "combat_failed", { reason = result })
-            self.bridge:resetNpcCombat(self.id)
-            self.counts.failures = self.counts.failures + 1
-            local fallbackTarget = self.combatTarget
-            local primary = nil
-            if self.character ~= nil then
-                pcall(function() primary = self.character:getPrimaryHandItem() end)
-            end
-            local rangedFallback = self:noteRangedCombatFailure(primary)
-            if fallbackTarget ~= nil then
-                self.failedThreats[fallbackTarget] = ticks
-                    + THREAT_FAILURE_COOLDOWN_TICKS
-            end
-            self:releaseCombat()
-            if rangedFallback and fallbackTarget ~= nil then
-                -- Bounded approach/pursuit retries are exhausted. Release firearm
-                -- ownership through the same melee-fallback owner the close-range
-                -- token uses. The target stays a valid encounter: its generic
-                -- failure cooldown is cleared so a melee attempt can re-engage
-                -- immediately instead of being cooled down as unreachable.
-                self:forceMeleeFallback(ticks, fallbackTarget, "ranged_combat_failed")
-                self.failedThreats[fallbackTarget] = nil
-            else
-                self:clearFirearmCombatState()
-            end
-            self:finishDecision(ticks)
-            self.nextThreatScan = math.max(self.nextThreatScan or 0, ticks + COMBAT_RANGED_YIELD_DELAY_TICKS)
-            self.nextFormationRefresh = ticks + COMBAT_POST_KILL_FORMATION_DELAY_TICKS
-        end
-        return
-    end
-
-
-    if self.state == "BREAKING_LOCKED_DOOR" then
-        -- Leash: never spend a siege on a locked door the player has walked
-        -- away from. A companion whose owner is streets away abandons the
-        -- break and rejoins instead of retrying indefinitely.
-        do
-            local anchor = self:resolvePlayerPartyAnchor(ticks)
-            if anchor ~= nil and self.companionDirective ~= nil then
-                local okA, aSq = pcall(function() return anchor:getCurrentSquare() end)
-                local okM, mSq = pcall(function()
-                    return self.character:getCurrentSquare()
-                end)
-                if okA and okM and aSq ~= nil and mSq ~= nil then
-                    local dd = navigationDistanceSquared(aSq, mSq)
-                    if (tonumber(dd) or 0) > 225 then
-                        self.bridge:resetNpcCombat(self.id)
-                        self:countDoorBreakDirectiveMiss(ticks)
-                        self:abandonCurrentDecision(ticks, "door_break_player_left")
-                        return
-                    end
-                end
-            end
-        end
-        local result = tostring(self.bridge:tickNpcCombat(self.id))
-        if string.find(result, "COMBAT_SUCCEEDED", 1, true) == 1 then
-            self.bridge:resetNpcCombat(self.id)
-            if self.entryDetour ~= nil and self.entryDetour.baseTask == true then
-                self:resumeAfterBaseTaskDoorBreak(ticks)
-            elseif not self:resumeAfterWindowDetour(ticks) then
-                self:abandonCurrentDecision(ticks, "door_break_resume_failed")
-            end
-        elseif string.find(result, "COMBAT_FAILED", 1, true) == 1 then
-            self.bridge:resetNpcCombat(self.id)
-            if self.entryDetour ~= nil and self.entryDetour.baseTask == true then
-                self.entryDetour = nil
-                self:failBaseTaskAction(ticks, "door_break_failed")
-            else
-                markPendingAreaBlocked(self, ticks, "door_break_failed")
-                self:countDoorBreakDirectiveMiss(ticks)
-                self:abandonCurrentDecision(ticks, "door_break_failed")
-            end
-        end
-        return
-    end
-
-    if self.state == "INVENTORY_CLEANUP" then
-        self:updateInventoryCleanup(ticks)
-        return
-    end
-
-    if self.state == "GROUP_SUPPORT" then
-        if not hasPendingTimedActions(self.character) then
-            self:completeGroupSupport(ticks)
-        end
-        return
-    end
-
-    if self.state == "TIMED_ACTION" then
-        if not hasPendingTimedActions(self.character) then
-            local completed, detail = KnoxSurvivorNeeds.verify(
-                self.character,
-                self.selfCareIntent
-            )
-            -- A meal or bottle in a bag requires a native transfer first.
-            -- Chain the real eat/drink action immediately after that transfer;
-            -- otherwise the survivor reports hunger forever while carrying the
-            -- food that the planner already fetched.
-            if completed and self.selfCareIntent ~= nil
-                and self.selfCareIntent.kind == "prepare_supply" then
-                local intent = self.selfCareIntent
-                self:releaseSelfCare()
-                local followup = {
-                    kind = intent.needKind,
-                    state = KnoxSurvivorNeeds.snapshot(self.character),
-                    item = intent.item,
-                }
-                local action, result, nextIntent = self:executeNeedAction(followup, ticks)
-                if action ~= nil and action ~= false then
-                    self.selfCareIntent = nextIntent
-                    self.activeDecision = intent.needKind
-                    print(
-                        "[KnoxSurvivors][Autonomy] id=" .. self.id
-                            .. " self-care-supply-ready kind=" .. tostring(intent.needKind)
-                    )
-                    return
-                end
-                completed = false
-                detail = "supply_ready_action=" .. tostring(result)
-            end
-            local kind = self.selfCareIntent ~= nil
-                and self.selfCareIntent.kind or tostring(self.activeDecision)
-            if kind == "drink_world" then
-                self:releaseSupply()
-            end
-            if completed then
-                self.counts.needs = self.counts.needs + 1
-                self.selfCareRetryAt[kind] = nil
-                print(
-                    "[KnoxSurvivors][Autonomy] id=" .. self.id
-                        .. " self-care-complete=" .. tostring(kind)
-                        .. " " .. tostring(detail)
-                )
-            else
-                self.selfCareRetryAt[kind] = ticks + Controller.TUNING.SELF_CARE_RETRY_TICKS
-                self:recordFailure(
-                    "needs_no_change:" .. tostring(kind) .. ":" .. tostring(detail),
-                    ticks,
-                    Controller.TUNING.SELF_CARE_RETRY_TICKS
-                )
-                if kind == "drink_world" then
-                    local line = "I couldn't use that water source."
-                    if not self:sayAction({ line }, ticks, 1800) then
-                        KnoxActivityFeed.speak(self.character, line)
-                    end
-                end
-            end
-            self:finishDecision(ticks)
-        end
-        return
-    end
-
-    if self.state == "ROBBING" then
-        if self.pendingRobbery ~= nil
-            and ticks >= (tonumber(self.pendingRobbery.expiresAt) or 0) then
-            self:completeRobbery(ticks)
-        elseif not hasPendingTimedActions(self.character) then self:completeRobbery(ticks) end
-        return
-    end
-
-    if self.state == "MOVING_TO_SUPPLY" or self.state == "MOVING_TO_EXPLORE"
-        or self.state == "EVENT_TRAVEL"
-        or self.state == "MOVING_TO_DEPOSIT"
-        or self.state == "ROAMING" or self.state == "GROUP_FOLLOW"
-        or self.state == "GROUP_REGROUP"
-        or self.state == "COMPANION_FOLLOW"
-        or self.state == "MOVING_TO_COMPANION_POINT"
-        or self.state == "MOVING_TO_COMPANION_PATROL"
-        or self.state == "BASE_RETURN" or self.state == "BASE_PATROL"
-        or self.state == "BASE_DEFEND"
-        or self.state == "BASE_TASK_MOVE"
-        or self.state == "BASE_TASK_SUPPLY_MOVE"
-        or self.state == "ROLE_KIT_MOVE"
-        or self.state == "MEETING_APPROACH"
-        or self.state == "MOVING_TO_WINDOW_ENTRY"
-        or self.state == "CROSSING_WINDOW_ENTRY"
-        or self.state == "MOVING_TO_REST"
-        or self.state == "NIGHT_SHELTER_MOVE"
-        or self.state == "AID_MOVE"
-        or self.state == "MOVING_TO_BASE_CANDIDATE"
-        or self.state == "CAMP_RETURN" or self.state == "CAMP_REPOSITION"
-        or self.state == "AWAY_RETURN"
-        or self.state == "FLEEING" then
-        if (self.state == "GROUP_FOLLOW" or self.state == "COMPANION_FOLLOW")
-            and self:refreshFormationFollow(ticks) then
-            return
-        end
-        local movement = tostring(self.bridge:tickNpc(self.id))
-        -- Hang watchdog for job travel (see noteTaskTravelStart): a route
-        -- that holds position with no climb/entry action running is failed
-        -- fast with a visible reason instead of timing out and retrying the
-        -- same unreachable approach forever.
-        if (self.state == "BASE_TASK_SUPPLY_MOVE" or self.state == "BASE_TASK_MOVE")
-            and ticks - (self.stateStartedAt or 0) > TASK_TRAVEL_STALL_TICKS
-            and not nativeTraversalBusy(self.character)
-            and self:taskTravelStalled(ticks) then
-            self.bridge:cancelNpcMove(self.id)
-            if self.baseTask ~= nil and self.baseTask.type == "haul_corpse"
-                and self.baseTaskCorpsePhase == "drop"
-                and KnoxBaseCorpseHandling.isDragging(self.character) then
-                pcall(function() self.character:setDoGrappleLetGo() end)
-            end
-            self:failBaseTaskAction(ticks,
-                self.state == "BASE_TASK_SUPPLY_MOVE"
-                    and "assigned_supply_no_progress" or "task_move_no_progress")
-            return
-        end
-        if movement == "Succeeded" then
-            self:resetMovementRecovery()
-            -- Road-biased intermediate arrival: continue to the stored final
-            -- destination instead of running arrival logic for a midpoint.
-            -- moveWithTravelPace stashes finals in roadFinalById, so check it
-            -- directly; self.travelFinalSquare is only set by explicit callers.
-            if roadFinalById[self.id] ~= nil and self:continueRoadTravel(ticks) then
-                return
-            end
-            if self.state == "EVENT_TRAVEL" then
-                self.eventMoveFailures = 0
-                self:finishDecision(ticks)
-                return
-            end
-            if self.state == "MOVING_TO_DEPOSIT" then
-                self:completeDepositTrip(ticks)
-                return
-            end
-            if self.state == "MOVING_TO_REST" then
-                self:startRecoveryPosture(ticks, true, self.ambientRest == true)
-                return
-            end
-            if self.state == "NIGHT_SHELTER_MOVE" then
-                -- Arrival just re-decides: still night and indoors means
-                -- sleep, dawn means roam. Never strand the move state.
-                self:finishDecision(ticks)
-                self.nextThink = ticks
-                return
-            end
-            if self.state == "BASE_DEFEND" then
-                -- Arrival just re-decides: the threat scan engages anything
-                -- still there, a live alarm re-issues, expiry resumes base
-                -- life. Never strand the move state.
-                self:finishDecision(ticks)
-                self.nextThink = ticks
-                return
-            end
-            if self.state == "AID_MOVE" then
-                if hasPendingTimedActions(self.character) then return end
-                local plan = self.pendingAid
-                if plan == nil or not self:aidPermission(plan) then
-                    self:releaseAid()
-                    self.nextAidAt = ticks + AID_RETRY_TICKS
-                    self:finishDecision(ticks)
-                    return
-                end
-                if not self:queueBattlefieldAid(plan, ticks) then
-                    self:finishDecision(ticks)
-                end
-                return
-            end
-            if self.state == "CAMP_RETURN" or self.state == "CAMP_REPOSITION" then
-                self.campExcursion = false
-                self.campExcursionExplored = false
-                self.activeDecision = "camp_idle"
-                self.state = "CAMP_IDLE"
-                self.nextThink = ticks + Controller.TUNING.CAMP_DECISION_TICKS
-                return
-            end
-            if self.state == "AWAY_RETURN" then
-                local completed, detail = KnoxPersistence.completeAwayTeamMember(
-                    self.awayTeamId,
-                    self.id,
-                    true,
-                    "returned_to_owner",
-                    currentWorldAgeHours()
-                )
-                if completed ~= nil then
-                    KnoxActivityFeed.speak(self.character, "Back home.")
-                    self.awayTeamId = nil
-                    self.awayCollected = false
-                    self.awaySearchMisses = 0
-                    self.activeDecision = nil
-                    self:finishDecision(ticks)
-                    self.nextThink = ticks
-                else
-                    self:recordFailure(
-                        "away_return_complete:" .. tostring(detail),
-                        ticks,
-                        EXPLORATION_RETRY_TICKS
-                    )
-                    self.state = "IDLE"
-                    self.nextThink = ticks + EXPLORATION_RETRY_TICKS
-                end
-                return
-            end
-            if self.state == "MOVING_TO_BASE_CANDIDATE" then
-                local candidate = self.factionBaseCandidate
-                local worldAge = getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
-                local arrivalVerified, result = KnoxFactionBaseScouting.validateArrival(
-                    self.character, candidate, self.factionId, worldAge)
-                local home = nil
-                if arrivalVerified then
-                    home, result = KnoxPersistence.confirmFactionHomeBase(
-                        self.factionId, candidate.buildingId, worldAge)
-                end
-                if home ~= nil then
-                    self.counts.baseScout = self.counts.baseScout + 1
-                    local _, safehouseResult = KnoxFactionSafehouse.ensure(
-                        KnoxPersistence.getFaction(self.factionId)
-                    )
-                    local base, baseResult = KnoxBaseManager.ensureFactionBase(
-                        KnoxPersistence.getFaction(self.factionId)
-                    )
-                    -- The persistence notification is authoritative for every
-                    -- resident. Adopt the new assignment immediately for this
-                    -- loaded scout so it cannot spend a decision cycle standing
-                    -- in its retired travel formation at the claimed building.
-                    if base ~= nil then
-                        self:setBaseAssignment(base.id, base)
-                    end
-                    if base ~= nil and safehouseResult == "protected" then
-                        KnoxActivityFeed.speak(self.character, "This place could work.")
-                        KnoxActivityFeed.event(
-                            "Home base established near " .. tostring(home.x)
-                                .. ", " .. tostring(home.y) .. ".")
-                    else
-                        KnoxActivityFeed.event("Shelter found. We're still getting settled.")
-                    end
-                    print(
-                        "[KnoxSurvivors][Autonomy] id=" .. self.id
-                            .. " faction-base-selected=" .. tostring(self.factionId)
-                            .. " building=" .. tostring(home.buildingId)
-                            .. " bounds=" .. tostring(home.minX) .. "," .. tostring(home.minY)
-                                .. "," .. tostring(home.width) .. "," .. tostring(home.height)
-                            .. " safehouse=" .. tostring(safehouseResult)
-                            .. " base=" .. tostring(base ~= nil and base.id or baseResult)
-                    )
-                else
-                    self.counts.failures = self.counts.failures + 1
-                    -- Confirmation can fail after the route itself succeeds
-                    -- (ownership conflict, stale building metadata, or a
-                    -- changed safehouse). Keep this candidate in the existing
-                    -- bounded rejection memory so the next scouting pass does
-                    -- not immediately select the same unusable shelter.
-                    if result == "safehouse_query_failed" and candidate ~= nil then
-                        -- Transient native query failure is not evidence against
-                        -- this building. Retain the lead with a bounded retry.
-                        candidate.retryAtHours = worldAge + 1/60
-                    else
-                        self:rejectFactionBaseCandidate(ticks, result)
-                    end
-                    print(
-                        "[KnoxSurvivors][Autonomy] id=" .. self.id
-                            .. " faction-base-selection-failed=" .. tostring(result)
-                    )
-                end
-                self:clearFactionBaseCandidate()
-                self:finishDecision(ticks)
-                return
-            end
-            if self.state == "CAMP_RETURN" or self.state == "CAMP_REPOSITION" then
-                self:releaseCampPosition()
-                self:finishDecision(ticks)
-                return
-            end
-            if self.state == "MOVING_TO_WINDOW_ENTRY" then
-                if not self:crossWindowDetour(ticks) then
-                    if not self:retryWindowDetour(ticks, "cross_start_failed")
-                        and not self:fallbackTaskEntryToDoorBreak(ticks) then
-                        self:abandonCurrentDecision(ticks, "window_cross_failed")
-                    end
-                end
-                return
-            end
-            if self.state == "CROSSING_WINDOW_ENTRY" then
-                if not self:resumeAfterWindowDetour(ticks) then
-                    if not self:fallbackTaskEntryToDoorBreak(ticks) then
-                        self:abandonCurrentDecision(ticks, "window_resume_failed")
-                    end
-                end
-                return
-            end
-            if self.state == "MEETING_APPROACH" then
-                self.state = "MEETING_READY"
-                return
-            end
-            if self.state == "GROUP_FOLLOW" then
-                self.counts.groupTravel = self.counts.groupTravel + 1
-                self:resumeGroupFollowAfterSuccess(ticks)
-                return
-            end
-            if self.state == "GROUP_REGROUP" then
-                self.counts.groupTravel = self.counts.groupTravel + 1
-                self:resetMovementRecovery()
-                self.formationMovementPace = nil
-                self:finishDecision(ticks)
-                return
-            end
-            if self.state == "COMPANION_FOLLOW" then
-                self:resetMovementRecovery()
-                self.formationMovementPace = nil
-                self.activeDecision = "follow_player"
-                self.state = "COMPANION_WAIT"
-                self.nextThink = ticks + Controller.TUNING.FORMATION_REFRESH_TICKS
-                return
-            end
-            if self.state == "FLEEING" then
-                self.fleeTarget = nil
-                self.fleeRecoveryUntil = nil
-                self.nextThreatScan = math.min(self.nextThreatScan or ticks, ticks)
-                return
-            end
-            if self.securityRoute~=nil and (self.state=="BASE_TASK_MOVE"
-                or self.state=="MOVING_TO_COMPANION_PATROL" or self.state=="MOVING_TO_COMPANION_POINT") then
-                if self:completeSecurityArrival(ticks,self.securityRoute.base) then return end
-            end
-            if self.state == "MOVING_TO_COMPANION_POINT" then
-                local directive = self.companionDirective
-                if directive == nil then
-                    self:finishDecision(ticks)
-                    return
-                end
-                if directive.partyDestination == true then
-                    local cell = getCell ~= nil and getCell() or nil
-                    local target = cell ~= nil and cell:getGridSquare(
-                        directive.minX, directive.minY, directive.z or 0
-                    ) or nil
-                    local current = self.character:getCurrentSquare()
-                    if target == nil or current == nil
-                        or navigationDistanceSquared(current, target) > 2.25 then
-                        -- A native route success is not itself arrival. Keep
-                        -- the shared order and let the ordinary order owner
-                        -- retry until the actor is physically in tolerance.
-                        self.partyDestinationFinalLeg = true
-                        self.state, self.nextThink = "IDLE", ticks
-                        return
-                    end
-                end
-                self.state = directive.kind == "guard" and "COMPANION_GUARD"
-                    or "COMPANION_WAIT"
-                self.nextThink = ticks + 90
-                if directive.kind == "go_to" then
-                    self:completeCompanionPointDirective(ticks, directive)
-                else
-                    KnoxActivityFeed.speak(self.character, "I'll keep watch.")
-                end
-                return
-            end
-            if self.state == "MOVING_TO_COMPANION_PATROL" then
-                self.activeDecision = "patrol_area"
-                self.state = "COMPANION_PATROL_WAIT"
-                self.nextThink = ticks + 120
-                return
-            end
-            if self.state == "AWAY_RETURN" then
-                self:recordMovementFailure("away_return", movement, ticks,
-                    EXPLORATION_RETRY_TICKS)
-                self.bridge:cancelNpcMove(self.id)
-                self.state = "IDLE"
-                self.activeDecision = "away_return_retry"
-                self.nextThink = ticks + EXPLORATION_RETRY_TICKS
-                return
-            end
-            if self.state == "BASE_RETURN" or self.state == "BASE_PATROL" then
-                self:finishDecision(ticks)
-                return
-            end
-            if self.state == "ROLE_KIT_MOVE" then
-                self:completeRoleKitMove(ticks)
-                return
-            end
-            if self.state == "BASE_TASK_SUPPLY_MOVE" then
-                local queued, actionResult = self:queueBaseTaskSupplyTransfer(ticks)
-                if not queued then
-                    self:failBaseTaskAction(ticks,
-                        "assigned_supply_transfer_queue:" .. tostring(actionResult))
-                    return
-                end
-                return
-            end
-            if self.state == "BASE_TASK_MOVE" then
-                if self.baseTask ~= nil and self.baseTask.type == "patrol" then
-                    local complete, _, stopCount = KnoxCompanionPatrol.recordTaskArrival(
-                        self.baseTask
-                    )
-                    if complete then
-                        self.baseTask.patrolLaps = (tonumber(self.baseTask.patrolLaps) or 0) + 1
-                    end
-                    self.activeDecision = "base_task_patrol"
-                    self.state = "BASE_TASK_PATROL_WAIT"
-                    self.nextThink = ticks + (complete and 180 or 90)
-                    print("[KnoxSurvivors][BaseJobs] id=" .. tostring(self.id)
-                        .. " patrol-stop=" .. tostring(self.baseTask.patrolStopsCompleted)
-                        .. "/" .. tostring(stopCount)
-                        .. " laps=" .. tostring(self.baseTask.patrolLaps or 0))
-                    return
-                end
-                if self.baseTask ~= nil and self.baseTask.type == "haul_corpse" then
-                    if self.baseTaskCorpsePhase == "drop" then
-                        local dropSquare = self.baseTaskCorpseTarget ~= nil
-                            and self.baseTaskCorpseTarget.dropSquare or nil
-                        if not KnoxBaseCorpseHandling.isAtDropSquare(
-                            self.character, dropSquare
-                        ) then
-                            -- A successful bridge tick can still end on a
-                            -- nearby fallback tile. Never start the native
-                            -- drop action from there: that leaves the grapple
-                            -- attached while the controller keeps walking in
-                            -- one direction. Release, cool down this
-                            -- destination, and retry from discovery.
-                            pcall(function() self.character:setDoGrappleLetGo() end)
-                            do
-                                local tgt = self.baseTask ~= nil and self.baseTask.target or nil
-                                self.corpseDropCooldown = {
-                                    x = tgt ~= nil and tgt.dropX or nil,
-                                    y = tgt ~= nil and tgt.dropY or nil,
-                                    z = tgt ~= nil and tgt.dropZ or nil,
-                                    untilTick = ticks + BLOCKED_AREA_COOLDOWN_TICKS,
-                                }
-                            end
-                            self.baseTaskCorpseTarget = nil
-                            self:failBaseTaskAction(ticks, "corpse_drop_arrival_mismatch")
-                            return
-                        end
-                        self.baseTaskStartedAt = ticks
-                        self.baseTaskActionQueued = false
-                        self.activeDecision = "base_task_haul_corpse_drop"
-                        self.state = "BASE_TASK_ACTION"
-                        return
-                    end
-                    self.baseTaskCorpseTarget = KnoxBaseCorpseHandling.resolveTarget(
-                        self.base,
-                        self.baseTask.target,
-                        self.character
-                    )
-                    if self.baseTaskCorpseTarget == nil then
-                        self:failBaseTaskAction(ticks, "corpse_target_invalid")
-                        return
-                    end
-                    self.baseTaskCorpsePhase = "grab"
-                    self.baseTaskCorpseGrabVerifyUntil = nil
-                    self.baseTaskCorpseGrabRetryIssued = nil
-                    self.baseTaskStartedAt = ticks
-                    self.baseTaskActionQueued = false
-                    self.activeDecision = "base_task_haul_corpse_grab"
-                    self.state = "BASE_TASK_ACTION"
-                    return
-                end
-                if self.baseTask ~= nil and self.baseTask.type == "barricade" then
-                    local target = self.baseTaskBarricadeTarget
-                    if target == nil or not KnoxBaseBarricades.isTargetValid(
-                        target,
-                        self.character
-                    ) then
-                        local targetReason
-                        target, targetReason = KnoxBaseBarricades.resolveTarget(
-                            self.base,
-                            self.baseTask.target,
-                            self.character
-                    )
-                    self.baseTaskBarricadeTarget = target
-                    if target == nil then
-                        target = self:retargetBarricadeTask()
-                        self.baseTaskBarricadeTarget = target
-                    end
-                    if target == nil then
-                        if KnoxBaseBarricades.isTargetComplete ~= nil
-                            and KnoxBaseBarricades.isTargetComplete(self.base, self.baseTask.target, self.character) then
-                            self:finishBaseTask(true, "barricade_already_secured")
-                            self:finishDecision(ticks)
-                            return
-                        end
-                        self:failBaseTaskAction(
-                            ticks,
-                            "barricade_target_invalid:" .. tostring(targetReason)
-                            )
-                            return
-                        end
-                    end
-                    self.baseTaskBarricadeBefore = KnoxBaseBarricades.plankCount(
-                        self.baseTaskBarricadeTarget,
-                        self.character
-                    )
-                    self.baseTaskStartedAt = ticks
-                    self.baseTaskActionQueued = false
-                    self.activeDecision = "base_task_barricade"
-                    self.state = "BASE_TASK_ACTION"
-                    return
-                end
-                if self.baseTask ~= nil
-                    and self.baseTask.type == "repair" then
-                    self.baseTaskRepairTarget = KnoxBaseRepairs.resolveTarget(
-                        self.base,
-                        self.baseTask.target,
-                        self.character
-                    )
-                    if self.baseTaskRepairTarget == nil then
-                        self:failBaseTaskAction(ticks, "repair_target_invalid")
-                        return
-                    end
-                    self.baseTaskRepairBefore = KnoxBaseRepairs.snapshot(
-                        self.baseTaskRepairTarget
-                    )
-                    self.baseTaskStartedAt = ticks
-                    self.baseTaskActionQueued = false
-                    self.activeDecision = "base_task_repair"
-                    self.state = "BASE_TASK_ACTION"
-                    return
-                end
-                if self.baseTask ~= nil
-                    and (self.baseTask.type == "farm_water"
-                        or self.baseTask.type == "farm_harvest"
-                        or self.baseTask.type == "farm_plow"
-                        or self.baseTask.type == "farm_seed") then
-                    self.baseTaskFarmingTarget = KnoxBaseFarming.resolveTarget(
-                        self.base,
-                        self.baseTask.target,
-                        self.character
-                    )
-                    if self.baseTaskFarmingTarget == nil then
-                        self:failBaseTaskAction(ticks, "farming_target_invalid")
-                        return
-                    end
-                    self.baseTaskFarmingBefore = KnoxBaseFarming.snapshot(
-                        self.baseTaskFarmingTarget
-                    )
-                    self.baseTaskStartedAt = ticks
-                    self.baseTaskActionQueued = false
-                    self.activeDecision = "base_task_" .. tostring(self.baseTask.type)
-                    self.state = "BASE_TASK_ACTION"
-                    return
-                end
-                if self.baseTask ~= nil
-                    and (self.baseTask.type == "chop_tree"
-                        or self.baseTask.type == "saw_logs") then
-                    self.baseTaskWoodcuttingTarget = KnoxBaseWoodcutting.resolveTarget(
-                        self.base,
-                        self.baseTask.target,
-                        self.character
-                    )
-                    if self.baseTaskWoodcuttingTarget == nil then
-                        self:failBaseTaskAction(ticks, "tree_target_invalid")
-                        return
-                    end
-                    if self.baseTask.type == "chop_tree" then
-                        self.baseTaskWoodcuttingBefore =
-                            self.baseTaskWoodcuttingTarget.tree:getObjectIndex()
-                    end
-                    self.baseTaskStartedAt = ticks
-                    self.baseTaskActionQueued = false
-                    self.activeDecision = "base_task_chop_tree"
-                    self.state = "BASE_TASK_ACTION"
-                    return
-                end
-                if self.baseTask ~= nil and self.baseTask.type == "sort_depot" then
-                    self:finishBaseTask(false, "central_cupboard_storage_retired")
-                    self:finishDecision(ticks)
-                    return
-                end
-                self.baseTaskStartedAt = ticks
-                self.activeDecision = "base_task_work"
-                self.state = "BASE_TASK_WORK"
-                KnoxActivityFeed.speak(self.character,
-                    self.baseTask ~= nil and self.baseTask.type == "guard"
-                        and "I'll keep watch here." or "I'll make a patrol."
-                )
-                return
-            end
-            if (self.state == "MOVING_TO_SUPPLY" or self.state == "MOVING_TO_EXPLORE")
-                and self.pendingSupply ~= nil then
-                local supply = self.pendingSupply
-                if supply.waterSource ~= nil then
-                    self:beginWorldWaterAction(ticks)
-                    return
-                end
-                local admitted, result = self:queueSupplyCollection(ticks)
-                if admitted then
-                    -- Refused admission did not inspect or loot this container.
-                    -- Keep it eligible for the existing bounded retry path.
-                    self.inspectedContainers[supply.container] = ticks
-                        + (supply.items ~= nil and #supply.items > 0
-                            and LOOT_TRAVEL_COOLDOWN_TICKS or EMPTY_SEARCH_COOLDOWN_TICKS)
-                    self.state = (supply.item ~= nil
-                        or (supply.items ~= nil and #supply.items > 0))
-                        and "LOOTING"
-                        or "SEARCHING"
-                    if self.state == "LOOTING" then
-                        self:sayAction({ "I'll take what we can use.",
-                            "Found something useful.", "I'll grab a few things." }, ticks, 1800)
-                    else
-                        self:sayAction({ "Let me check this.", "I'll have a quick look.",
-                            "Give me a second to search this." }, ticks, 1800)
-                    end
-                else
-                    self:recordFailure("loot_action_queue:" .. tostring(result), ticks, 180)
-                    self:releaseSupply()
-                    self:finishDecision(ticks)
-                end
-            else
-                if self.state == "ROAMING" then
-                    if self.lifeIntent ~= nil then
-                        self:setLifeIntent(
-                            self.lifeIntent.kind,
-                            "arrived",
-                            nil,
-                            self.roamGoalKey
-                        )
-                    end
-                    rememberRoamDestination(
-                        self,
-                        self.roamGoalKey,
-                        ticks,
-                        Controller.TUNING.ROAM_GOAL_COOLDOWN_TICKS
-                    )
-                    self.roamGoalKey = nil
-                    self.roamGoalKind = nil
-                end
-                self.counts.roam = self.counts.roam + 1
-                self:finishDecision(ticks)
-            end
-        elseif string.find(movement, "Failed", 1, true) == 1
-            or string.find(movement, "TICK_FAILED", 1, true) == 1 then
-            if self.state == "GROUP_FOLLOW"
-                or self.state == "GROUP_REGROUP"
-                or self.state == "COMPANION_FOLLOW" then
-                if (self.state == "GROUP_FOLLOW" or self.state == "GROUP_REGROUP")
-                    and Controller.isEntryTraversalFailure(movement) then
-                    self:waitForFormationBottleneck(movement, ticks)
-                    return
-                end
-                self:handleFormationMovementFailure(movement, ticks)
-                return
-            end
-            if self.state == "FLEEING" then
-                self:recoverFleeMovement(movement, ticks)
-                return
-            end
-            if (self.state=="BASE_TASK_MOVE" and self.baseTask~=nil
-                and (self.baseTask.type=="guard" or self.baseTask.type=="patrol"))
-                or self.state=="MOVING_TO_COMPANION_PATROL"
-                or (self.state=="MOVING_TO_COMPANION_POINT" and self.companionDirective~=nil
-                    and self.companionDirective.kind=="guard") then
-                if self.state == "BASE_TASK_MOVE"
-                    and string.find(movement, "FAILED_LOCKED_DOOR", 1, true)
-                    and self:beginBaseTaskLockedDoorBreak(ticks) then
-                    return
-                end
-                self:deferSecurityRoute(ticks,movement,self.state=="BASE_TASK_MOVE")
-                return
-            end
-            self:recordMovementFailure("movement", movement, ticks)
-            if self.state == "EVENT_TRAVEL" then
-                self.eventMoveFailures = (self.eventMoveFailures or 0) + 1
-                self.bridge:cancelNpcMove(self.id)
-                self:finishDecision(ticks)
-                return
-            end
-            if self.state == "MOVING_TO_DEPOSIT" then
-                self.bridge:cancelNpcMove(self.id)
-                self:deferDepositTrip(ticks)
-                self:finishDecision(ticks)
-                return
-            end
-            if self.state == "MOVING_TO_COMPANION_POINT"
-                or self.state == "MOVING_TO_COMPANION_PATROL" then
-                self.directiveMisses = self.directiveMisses + 1
-                if self.directiveMisses >= 3 then
-                    KnoxPersistence.clearCompanionDirective(
-                        self.id, self.companionOwnerId,
-                        getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
-                    )
-                    self.companionDirective = nil
-                    self.directiveMisses = 0
-                    KnoxActivityFeed.speak(self.character, "I can't get there from here.")
-                end
-                self:finishDecision(ticks)
-                return
-            end
-            if self.state == "MOVING_TO_REST" then
-                self:handleRestMovementFailure(movement, ticks)
-                return
-            end
-            if self.state == "MOVING_TO_BASE_CANDIDATE" then
-                self:rejectFactionBaseCandidate(ticks, movement)
-                self.counts.failures = self.counts.failures + 1
-                self:finishDecision(ticks)
-                return
-            end
-            if self.state == "BASE_RETURN" or self.state == "BASE_PATROL" then
-                -- Base residents may encounter a door that changed state after
-                -- target selection. Recover the entry locally before releasing
-                -- the ambient reservation and falling back to idle.
-                if not string.find(movement, "FAILED_LOCKED_DOOR", 1, true)
-                    and self:recoverMovementThroughDoor(ticks) then
-                    return
-                end
-                if string.find(movement, "FAILED_LOCKED_DOOR", 1, true) then
-                    self.pendingSupply = self.pendingSupply or {
-                        targetSquare = self.character:getCurrentSquare(),
-                    }
-                    if self:beginLockedDoorBreak(ticks, self.state) then
-                        return
-                    end
-                end
-                self:handleBaseMovementFailure(movement, ticks)
-                return
-            end
-            if self.state == "ROLE_KIT_MOVE" then
-                self:failRoleKitMove(ticks, movement)
-                return
-            end
-            if self.state == "BASE_TASK_SUPPLY_MOVE" then
-                if Controller.isEntryTraversalFailure(movement) then
-                    local lockedDoor = string.find(
-                        movement, "FAILED_LOCKED_DOOR", 1, true) ~= nil
-                    if not lockedDoor and self:recoverMovementThroughDoor(ticks) then
-                        return
-                    end
-                    if self:beginBaseTaskSupplyWindowDetour(ticks) then
-                        return
-                    end
-                    if lockedDoor and self:fallbackTaskEntryToDoorBreak(ticks) then
-                        return
-                    end
-                    if self.pendingSupply ~= nil
-                        and self.pendingSupply.taskSupplyEntry == true then
-                        self.pendingSupply = nil
-                    end
-                end
-                self:finishBaseTask(false, "assigned_supply_movement_failed:" .. movement)
-                self:recordMovementFailure("base_task_supply_move", movement, ticks)
-                self:finishDecision(ticks)
-                return
-            end
-            if self.state == "BASE_TASK_MOVE" then
-                if string.find(movement, "FAILED_LOCKED_DOOR", 1, true) then
-                    -- Quiet entry first: try a nearby window before smashing
-                    -- the door down. Break remains the fallback below and in
-                    -- the window-detour exhaustion path.
-                    if self:beginBaseTaskWindowDetour(ticks) then
-                        return
-                    end
-                    if self:beginBaseTaskLockedDoorBreak(ticks) then
-                        return
-                    end
-                end
-                if self.baseTask ~= nil and self.baseTask.type == "haul_corpse" then
-                    if self.baseTaskCorpsePhase == "drop"
-                        and KnoxBaseCorpseHandling.isDragging(self.character) then
-                        pcall(function() self.character:setDoGrappleLetGo() end)
-                        do
-                            local tgt = self.baseTask ~= nil and self.baseTask.target or nil
-                            self.corpseDropCooldown = {
-                                x = tgt ~= nil and tgt.dropX or nil,
-                                y = tgt ~= nil and tgt.dropY or nil,
-                                z = tgt ~= nil and tgt.dropZ or nil,
-                                untilTick = ticks + BLOCKED_AREA_COOLDOWN_TICKS,
-                            }
-                        end
-                        self:finishBaseTask(false, "corpse_movement_failed:" .. movement)
-                        self:recordMovementFailure("base_task_move_corpse", movement, ticks)
-                        self:finishDecision(ticks)
-                        return
-                    end
-                    if self:retryBaseTaskMovement(ticks, movement) then return end
-                    self:finishBaseTask(false, "corpse_movement_failed:" .. movement)
-                    self:recordMovementFailure("base_task_move_corpse", movement, ticks)
-                    self:finishDecision(ticks)
-                    return
-                end
-                if self:retryBaseTaskMovement(ticks, movement) then
-                    return
-                end
-                self:finishBaseTask(false, "movement_failed:" .. movement)
-                self:recordMovementFailure("base_task_move", movement, ticks)
-                self:finishDecision(ticks)
-                return
-            end
-            if self.state == "MOVING_TO_SUPPLY" and self.pendingSupply ~= nil
-                and self.pendingSupply.baseResupply == true then
-                self.inspectedContainers[self.pendingSupply.container] = ticks + SUPPLY_RETRY_TICKS
-                self:continueBaseResourceRun(ticks, false)
-                return
-            end
-            if (self.state == "MOVING_TO_WINDOW_ENTRY" or self.state == "CROSSING_WINDOW_ENTRY")
-                and self:retryWindowDetour(ticks, movement) then return end
-            if (self.state == "MOVING_TO_WINDOW_ENTRY" or self.state == "CROSSING_WINDOW_ENTRY")
-                and self:fallbackTaskEntryToDoorBreak(ticks) then return end
-            if Controller.isEntryTraversalFailure(movement)
-                and (self.state == "MOVING_TO_SUPPLY"
-                    or self.state == "MOVING_TO_EXPLORE") then
-                local resumeState = self.state
-                if string.find(movement, "OPENING_DISABLED", 1, true) then
-                    self:sayAction({
-                        "I can't open that without permission.",
-                        "The door is closed and opening is disabled.",
-                    }, ticks, 3600)
-                    markPendingAreaBlocked(self, ticks, "opening_permission_disabled")
-                    self:finishDecision(ticks)
-                    return
-                end
-                local lockedDoor = string.find(
-                    movement,
-                    "FAILED_LOCKED_DOOR",
-                    1,
-                    true
-                ) ~= nil
-                -- Closed unlocked doors are opened, not smashed: try ToggleDoor
-                -- before falling back to window detours or forced entry.
-                if not lockedDoor and self:recoverMovementThroughDoor(ticks) then
-                    return
-                end
-                if self:beginWindowDetour(ticks, resumeState)
-                    or (lockedDoor and self:beginLockedDoorBreak(ticks, resumeState)) then
-                    return
-                end
-                markPendingAreaBlocked(self, ticks, "alternate_entry_unavailable")
-            end
-            if self.pendingSupply ~= nil and self.pendingSupply.container ~= nil then
-                self.inspectedContainers[self.pendingSupply.container] = ticks + SUPPLY_RETRY_TICKS
-                local failedSquare = self.pendingSupply.container:getSourceGrid()
-                rememberRoamDestination(self, roamDestinationKey(failedSquare), ticks, Controller.TUNING.ROAM_FAILURE_COOLDOWN_TICKS)
-                markPendingAreaBlocked(self, ticks, "unreachable_supply")
-                print(
-                    "[KnoxSurvivors][Autonomy] id=" .. self.id
-                        .. " skipped-unreachable-container movement=" .. movement
-                )
-            end
-            if self.state == "ROAMING" then
-                rememberRoamDestination(
-                    self,
-                    self.roamGoalKey,
-                    ticks,
-                    Controller.TUNING.ROAM_FAILURE_COOLDOWN_TICKS
-                )
-                self.roamGoalKey = nil
-                self.roamGoalKind = nil
-                if self.lifeIntent ~= nil then
-                    self:setLifeIntent(self.lifeIntent.kind, "reassess", nil, nil)
-                end
-            end
-            if self.state == "AID_MOVE" then
-                self:releaseAid()
-                self.nextAidAt = ticks + AID_RETRY_TICKS
-            end
-            self:releaseSupply()
-            self:finishDecision(ticks)
-        end
-        return
-    end
-
-    if self.state == "LOOTING" then
-        if not hasPendingTimedActions(self.character) then
-            local retrievedNeedKind = (self.activeDecision == "find_food"
-                or self.activeDecision == "find_water"
-                or self.activeDecision == "find_medical") and self.activeDecision or nil
-            local retrievedNeedItem = self.pendingSupply ~= nil
-                and self.pendingSupply.item or nil
-            local retrievedNeedVerified = retrievedNeedKind == nil
-            if retrievedNeedKind ~= nil then
-                retrievedNeedVerified = self:collectionItemReceived(self.pendingSupply, retrievedNeedItem)
-                if not retrievedNeedVerified then
-                    self.selfCareRetryAt[retrievedNeedKind] = ticks + Controller.TUNING.SELF_CARE_RETRY_TICKS
-                    self:recordFailure(
-                        "need_supply_transfer_not_completed",
-                        ticks,
-                        Controller.TUNING.SELF_CARE_RETRY_TICKS
-                    )
-                    self:releaseSupply()
-                    self:finishDecision(ticks)
-                    return
-                end
-            end
-            local partyFoodItem = self.pendingSupply ~= nil
-                and self.pendingSupply.partySupport == true
-                and self.pendingSupply.items ~= nil
-                and self.pendingSupply.items[1] ~= nil
-                and self.pendingSupply.items[1].item or nil
-            if self.pendingSupply ~= nil
-                and self.pendingSupply.partySupport == true
-                and not self:collectionItemReceived(self.pendingSupply, partyFoodItem) then
-                local container = self.pendingSupply.container
-                if container ~= nil then
-                    self.inspectedContainers[container] = ticks + LOOT_TRAVEL_COOLDOWN_TICKS
-                end
-                self:recordFailure(
-                    "party_support_food_transfer_not_received",
-                    ticks,
-                    LOOT_TRAVEL_COOLDOWN_TICKS
-                )
-                self:releaseSupply()
-                self:finishDecision(ticks)
-                return
-            end
-            if retrievedNeedKind == nil
-                and self.pendingSupply ~= nil
-                and self.pendingSupply.partySupport ~= true
-                and self.pendingSupply.baseResupply ~= true
-                and self.awayTeamId == nil
-                and self.pendingSupply.items ~= nil
-                and #self.pendingSupply.items > 0 then
-                local received, receivedCount, selectedCount = self:verifyGenericLootReceipt()
-                if not received then
-                    self:rejectUnreceivedGenericLoot(ticks, receivedCount, selectedCount)
-                    return
-                end
-                -- The sweep announces only after this exact receipt succeeds,
-                -- so a planner guess can never become a false find line.
-                local house = rawget(_G, "KnoxHouseClearing")
-                if house ~= nil and house.onLootVerified ~= nil then
-                    pcall(house.onLootVerified, self, self.pendingSupply)
-                end
-            end
-            if self.pendingSupply ~= nil and self.pendingSupply.baseResupply == true then
-                self:continueBaseResourceRun(ticks, true)
-                return
-            end
-            if self.awayTeamId ~= nil then
-                self:finishAwayCollection(ticks)
-                return
-            end
-            self.counts.loot = self.counts.loot + 1
-            local settlementPickup = self.pendingSupply ~= nil
-                and self.pendingSupply.baseSupplyPartyBaseId ~= nil
-            local changed, equipment = false, nil
-            if not settlementPickup then
-                changed, equipment = self:reconsiderEquipment(ticks, true)
-            end
-            if changed then
-                -- The replaced weapon/garment stays carried until the existing
-                -- inventory-cleanup pass applies its own rules (typed base
-                -- storage deposit first, native tear-to-rags only when rags
-                -- are actually needed, drop last). Hastening that pass creates
-                -- no trips and never interrupts follow, hold, or orders.
-                local at = self.nextCleanupAt
-                if at == nil or at > ticks + 300 then
-                    self.nextCleanupAt = ticks + 300
-                end
-            end
-            print(
-                "[KnoxSurvivors][Autonomy] id=" .. self.id
-                    .. " loot-complete=" .. tostring(self.activeDecision)
-                    .. " equipmentChanged=" .. tostring(changed)
-                    .. " equipment=" .. tostring(equipment)
-            )
-            -- Bounded multi-container chaining: one container rarely covers a
-            -- need, so keep searching the same building/area while an explicit
-            -- loot directive stands (or a scavenge intent runs), capped at 3
-            -- chained containers so this always ends. Real transfers only;
-            -- combat, base-supply, and away-team duties never chain.
-            do
-                local directive = self.companionDirective
-                local kind = directive ~= nil and tostring(directive.kind or "") or ""
-                local lootDirective = kind == "loot_area" or kind == "loot_building"
-                    or kind == "loot_corpses"
-                local scavenging = self.lifeIntent ~= nil
-                    and self.lifeIntent.kind == "scavenge"
-                if (lootDirective or scavenging)
-                    and not (self.pendingSupply ~= nil
-                        and self.pendingSupply.partySupport == true)
-                    and self.combatTarget == nil
-                    and self.baseSupplyTrip ~= true
-                    and self.awayTeamId == nil
-                    and (self.scavengeChainCount or 0) < 3 then
-                    local used = self.pendingSupply ~= nil
-                        and self.pendingSupply.container or nil
-                    if used ~= nil then
-                        self.inspectedContainers[used] = ticks + EXPLORATION_RETRY_TICKS
-                    end
-                    local searchDirective = lootDirective and directive or nil
-                    local peek = findExploration(self, ticks, searchDirective)
-                    if peek ~= nil and peek.items ~= nil and #peek.items > 0 then
-                        self.scavengeChainCount = (self.scavengeChainCount or 0) + 1
-                        self:releaseSupply()
-                        -- Advisory hint only: room-derived, never claims an
-                        -- item exists before the transfer verifies it.
-                        local hint = nil
-                        do
-                            local roomName = nil
-                            local ok, name = pcall(function()
-                                local grid = peek.container ~= nil
-                                    and peek.container:getSourceGrid() or nil
-                                local room = grid ~= nil and grid:getRoom() or nil
-                                return room ~= nil and room:getName() or nil
-                            end)
-                            if ok and type(name) == "string" then
-                                roomName = string.lower(name)
-                            end
-                            local function has(sub)
-                                return roomName ~= nil
-                                    and string.find(roomName, sub, 1, true) ~= nil
-                            end
-                            if kind == "find_medical" or has("bath") or has("medic")
-                                or has("toilet") then
-                                hint = "Checking the bathroom for meds."
-                            elseif kind == "find_weapon" then
-                                hint = "Looking for a better weapon."
-                            elseif kind == "find_food" or has("kitchen") then
-                                hint = "Checking the kitchen for food."
-                            elseif kind == "find_water" then
-                                hint = "Looking for something to drink."
-                            elseif kind == "find_tools" or has("garage")
-                                or has("shed") or has("storage") or has("utility") then
-                                hint = "Checking for useful tools."
-                            elseif kind == "loot_corpses" then
-                                hint = "Checking these bodies while it's quiet."
-                            elseif has("bedroom") then
-                                hint = "Checking the bedroom for clothes and gear."
-                            else
-                                hint = "Moving on to the next room."
-                            end
-                        end
-                        if hint ~= nil then
-                            self:sayAction({ hint }, ticks, 1800)
-                        end
-                        if self:beginExploration(ticks, searchDirective) then
-                            return
-                        end
-                    end
-                    self.scavengeChainCount = 0
-                else
-                    self.scavengeChainCount = 0
-                end
-            end
-            self.nextExplorationSearch = ticks + LOOT_TRAVEL_COOLDOWN_TICKS
-            self.forceTravel = true
-            if self.lifeIntent ~= nil and self.lifeIntent.kind == "scavenge" then
-                self.scavengeBuildingId = self.pendingSupply ~= nil
-                    and self.pendingSupply.buildingId or self.scavengeBuildingId
-                self:setLifeIntent(
-                    "scavenge", "searching", nil, self.scavengeBuildingId
-                )
-            elseif self.lifeIntent ~= nil then
-                self:setLifeIntent(self.lifeIntent.kind, "reassess", nil, nil)
-            end
-            if self.companionDirective ~= nil
-                and (self.companionDirective.kind == "find_food"
-                    or self.companionDirective.kind == "find_water"
-                    or self.companionDirective.kind == "find_medical"
-                    or self.companionDirective.kind == "find_weapon"
-                    or self.companionDirective.kind == "find_tools"
-                    or self.companionDirective.kind == "find_wood"
-                    or self.companionDirective.kind == "find_materials"
-                    or self.companionDirective.kind == "find_clothing"
-                    or self.companionDirective.kind == "find_ammo") then
-                KnoxPersistence.clearCompanionDirective(
-                    self.id, self.companionOwnerId, currentWorldAgeHours()
-                )
-                self.companionDirective = nil
-                self.directiveMisses = 0
-            end
-            local returnToBase = self.baseSupplyTrip == true
-            local explicitBaseSupply = self.baseSupplyOrder ~= nil
-            local recoveredBaseItem = returnToBase
-                and self.pendingSupply ~= nil and self.pendingSupply.item or nil
-            if returnToBase then
-                if recoveredBaseItem == nil then
-                    self:finishBaseSupplyRun("empty")
-                else
-                    self:handoffBaseSupplyDelivery(recoveredBaseItem)
-                end
-            end
-            -- An explicit owner order repeats until expiry, failure budget,
-            -- or cancellation: after deposit the base loop starts the next
-            -- trip. Only empty searches count against the attempt budget.
-            if explicitBaseSupply and recoveredBaseItem == nil then
-                self:recordExplicitBaseSupplyFailure(ticks)
-            end
-            if not (returnToBase and recoveredBaseItem ~= nil) then
-                self:releaseSupply()
-            end
-            self:finishDecision(ticks)
-            if retrievedNeedVerified and retrievedNeedKind ~= nil
-                and self:beginImmediateNeedAction(retrievedNeedKind, ticks) then
-                return
-            end
-            if returnToBase then
-                -- The next normal decision sees the resident outside its
-                -- assigned territory and uses the existing native base-return
-                -- movement path. No second mission/order is created.
-                self.nextThink = ticks
-            end
-        end
-        return
-    end
-
-
-    if self.state == "SEARCHING" then
-        if not hasPendingTimedActions(self.character) then
-            if self.pendingSupply == nil or self.pendingSupply.searchAction == nil
-                or self.pendingSupply.searchAction.knoxSearchCompleted ~= true then
-                self:recordFailure("container_search_not_completed", ticks, SUPPLY_RETRY_TICKS)
-                self:releaseSupply()
-                self:finishDecision(ticks)
-                return
-            end
-            if self.pendingSupply ~= nil and self.pendingSupply.baseResupply == true then
-                self:continueBaseResourceRun(ticks, false)
-                return
-            end
-            if self.awayTeamId ~= nil then
-                self:finishAwayCollection(ticks)
-                return
-            end
-            if self.pendingSupply ~= nil and self.pendingSupply.eventId ~= nil then
-                KnoxEvents.recordEmptySearch(self.pendingSupply.eventId, self.id)
-            end
-            self.counts.search = self.counts.search + 1
-            print(
-                "[KnoxSurvivors][Autonomy] id=" .. self.id
-                    .. " search-complete=container_no_upgrade"
-            )
-            self.nextExplorationSearch = ticks + EMPTY_SEARCH_COOLDOWN_TICKS
-            self.forceTravel = true
-            if self.lifeIntent ~= nil and self.lifeIntent.kind == "scavenge" then
-                self.scavengeBuildingId = nil
-                self:clearLifeIntent()
-            end
-            if self.companionDirective ~= nil
-                and (self.companionDirective.kind == "find_food"
-                    or self.companionDirective.kind == "find_water"
-                    or self.companionDirective.kind == "find_medical"
-                    or self.companionDirective.kind == "find_weapon"
-                    or self.companionDirective.kind == "find_tools"
-                    or self.companionDirective.kind == "find_wood"
-                    or self.companionDirective.kind == "find_materials"
-                    or self.companionDirective.kind == "find_clothing"
-                    or self.companionDirective.kind == "find_ammo") then
-                KnoxPersistence.clearCompanionDirective(
-                    self.id, self.companionOwnerId, currentWorldAgeHours()
-                )
-                self.companionDirective = nil
-                self.directiveMisses = 0
-            end
-            local returnToBase = self.baseSupplyTrip == true
-            local explicitBaseSupply = self.baseSupplyOrder ~= nil
-            if returnToBase then
-                self:finishBaseSupplyRun("empty")
-            end
-            if explicitBaseSupply then
-                self:recordExplicitBaseSupplyFailure(ticks)
-            end
-            self:releaseSupply()
-            self:finishDecision(ticks)
-            if returnToBase then
-                self.nextThink = ticks
-            end
-        end
-        return
-    end
-
-    if self.state == "SLEEPING_RECOVERY" then
-        if self.character:isAsleep() then
-            if ticks - self.recoveryStarted < Controller.TUNING.SLEEP_RECOVERY_TIMEOUT_TICKS then
-                return
-            end
-            KnoxSurvivorNeeds.wakeForDanger(self.character)
-        end
-        local recovered, detail = KnoxSurvivorNeeds.verifyRecovery(
-            self.character,
-            self.selfCareIntent
-        )
-        if recovered then
-            self.counts.needs = self.counts.needs + 1
-            self.selfCareRetryAt.sleep = nil
-            print(
-                "[KnoxSurvivors][Autonomy] id=" .. self.id
-                    .. " self-care-complete=sleep " .. tostring(detail)
-            )
-        else
-            self.selfCareRetryAt.sleep = ticks + Controller.TUNING.SELF_CARE_RETRY_TICKS
-            self:recordFailure(
-                "needs_no_change:sleep:" .. tostring(detail),
-                ticks,
-                Controller.TUNING.SELF_CARE_RETRY_TICKS
-            )
-        end
-        self:finishDecision(ticks)
-        return
-    end
-
-    if self.state == "WAITING_TO_RECOVER" then
-        local sitting = self.character:isSitOnGround()
-            or self.character:isSittingOnFurniture()
-        if self.pendingRest ~= nil and not sitting
-            and ticks - self.recoveryPostureStarted >= Controller.TUNING.RECOVERY_POSTURE_TIMEOUT_TICKS then
-            self:startRecoveryPosture(ticks, false)
-            return
-        end
-        -- Vanilla IsoPlayer checks sitting before its isPlayerMoving flag when it
-        -- updates endurance. Entering a real sitting state therefore restores the
-        -- native recovery path without maintaining a second Knox stamina formula.
-        if ticks < self.nextThink then
-            return
-        end
-        local snapshot = KnoxSurvivorNeeds.snapshot(self.character)
-        local recovered = snapshot.endurance > KnoxSurvivorNeeds.thresholds.lowEndurance
-            and (self.activeDecision ~= "sleep"
-                or snapshot.fatigue < KnoxSurvivorNeeds.thresholds.fatigue)
-        print(
-            "[KnoxSurvivors][Autonomy] id=" .. self.id
-                .. " recovery-progress endurance=" .. tostring(snapshot.endurance)
-                .. " posture=" .. (self.character:isSittingOnFurniture()
-                    and "furniture" or (self.character:isSitOnGround() and "ground" or "standing"))
-        )
-        if recovered then
-            local changed, detail = KnoxSurvivorNeeds.verifyRecovery(
-                self.character,
-                self.selfCareIntent
-            )
-            if changed then
-                self.counts.needs = self.counts.needs + 1
-                self.selfCareRetryAt.rest = nil
-                print(
-                    "[KnoxSurvivors][Autonomy] id=" .. self.id
-                        .. " self-care-complete=rest " .. tostring(detail)
-                )
-            end
-            self:finishDecision(ticks)
-        elseif ticks - self.recoveryStarted >= Controller.TUNING.RECOVERY_TIMEOUT_TICKS then
-            local _, detail = KnoxSurvivorNeeds.verifyRecovery(
-                self.character,
-                self.selfCareIntent
-            )
-            self.selfCareRetryAt.rest = ticks + Controller.TUNING.SELF_CARE_RETRY_TICKS
-            self:recordFailure(
-                "needs_no_change:rest:" .. tostring(detail),
-                ticks,
-                Controller.TUNING.SELF_CARE_RETRY_TICKS
-            )
-            self:finishDecision(ticks)
-        else
-            self.nextThink = ticks + Controller.TUNING.RECOVERY_RECHECK_TICKS
-        end
-        return
-    end
-
-    if self.state == "IDLE" and ticks >= self.nextThink and not recoveryBusy then
-        if hasPendingTimedActions(self.character) then return end
-        -- Native movement can reject a route issued in the same update that
-        -- forceGetUp releases a chair or bed. Let the body finish standing
-        -- before an ordinary new job asks for movement. Danger was assessed
-        -- above and can still interrupt immediately.
-        if safeMethod(self.character, "isSitOnGround", false)
-            or safeMethod(self.character, "isSittingOnFurniture", false) then
-            self:leaveRecoveryPosture()
-            self.nextThink = ticks + THINK_MIN_TICKS
-            return
-        end
-        self:think(ticks)
-    end
-end
+-- Preserve the controller API and shared state; only the update implementations live separately.
+KnoxCombatPositioning.install(Controller, {
+    canOpen = canOpenClosedEntrances,
+    free = function(square, character) return not squareHasOtherBody(square, character) end,
+})
+require("KS_SurvivorMissionController").install(Controller, {
+    AWAY_TRAVEL_SEARCH_RADIUS_SQUARED = TUNE.AWAY_TRAVEL_SEARCH_RADIUS_SQUARED,
+    AWAY_TRAVEL_FAILURE_LIMIT = TUNE.AWAY_TRAVEL_FAILURE_LIMIT,
+    EXPLORATION_RETRY_TICKS = TUNE.EXPLORATION_RETRY_TICKS,
+    THINK_MIN_TICKS = TUNE.THINK_MIN_TICKS,
+    navigationDistanceSquared = navigationDistanceSquared,
+    moveWithTravelPace = moveWithTravelPace,
+    currentWorldAgeHours = currentWorldAgeHours,
+})
+require("KS_SurvivorSharedMeal").install(Controller, {
+    distanceSquared = distanceSquared,
+    safeMethod = safeMethod,
+    nativeTraversalBusy = nativeTraversalBusy,
+    nearestThreat = nearestThreat,
+    hasPendingTimedActions = hasPendingTimedActions,
+    findBestRestSpot = findBestRestSpot,
+    reserve = reserve,
+    sayDialogue = sayDialogue,
+})
+require("KS_SurvivorControllerUpdates").install(Controller, {
+    AID_RETRY_TICKS = AID_RETRY_TICKS,
+    BLOCKED_AREA_COOLDOWN_TICKS = TUNE.BLOCKED_AREA_COOLDOWN_TICKS,
+    COMBAT_POST_KILL_FORMATION_DELAY_TICKS = TUNE.COMBAT_POST_KILL_FORMATION_DELAY_TICKS,
+    COMBAT_RANGED_YIELD_DELAY_TICKS = TUNE.COMBAT_RANGED_YIELD_DELAY_TICKS,
+    EMPTY_SEARCH_COOLDOWN_TICKS = TUNE.EMPTY_SEARCH_COOLDOWN_TICKS,
+    EXPLORATION_RETRY_TICKS = TUNE.EXPLORATION_RETRY_TICKS,
+    LOOT_TRAVEL_COOLDOWN_TICKS = TUNE.LOOT_TRAVEL_COOLDOWN_TICKS,
+    SUPPLY_RETRY_TICKS = TUNE.SUPPLY_RETRY_TICKS,
+    TASK_TRAVEL_STALL_TICKS = TUNE.TASK_TRAVEL_STALL_TICKS,
+    THINK_MIN_TICKS = TUNE.THINK_MIN_TICKS,
+    THREAT_FAILURE_COOLDOWN_TICKS = TUNE.THREAT_FAILURE_COOLDOWN_TICKS,
+    THREAT_SCAN_TICKS = TUNE.THREAT_SCAN_TICKS,
+    currentWorldAgeHours = currentWorldAgeHours,
+    diagSquare = diagSquare,
+    distanceSquared = distanceSquared,
+    findExploration = findExploration,
+    findFormationTarget = findFormationTarget,
+    findSupply = findSupply,
+    fleeAssessment = fleeAssessment,
+    hasPendingTimedActions = hasPendingTimedActions,
+    markPendingAreaBlocked = markPendingAreaBlocked,
+    moveWithTravelPace = moveWithTravelPace,
+    nativeTraversalBusy = nativeTraversalBusy,
+    navigationDistanceSquared = navigationDistanceSquared,
+    nearestThreat = nearestThreat,
+    release = release,
+    rememberRoamDestination = rememberRoamDestination,
+    retreatIsSafelyClear = retreatIsSafelyClear,
+    roadFinalById = roadFinalById,
+    roamDestinationKey = roamDestinationKey,
+    safeMethod = safeMethod,
+    shouldDropCombatTarget = shouldDropCombatTarget,
+    shouldRemainStealthy = shouldRemainStealthy,
+    shouldReplaceCombatTarget = shouldReplaceCombatTarget,
+})
 
 local function statusPoint(value)
     if value == nil then return "none" end
@@ -19092,8 +18232,47 @@ local function statusDestination(self)
     return statusPoint(self.companionTarget)
 end
 
-function Controller:status()
-    return "id=" .. self.id
+do
+local function nativeEvidence(self)
+    local body = self.character
+    local function read(object, method)
+        local ok, value = pcall(function() return object[method](object) end)
+        if not ok then return false, nil end
+        return true, value
+    end
+    local result = " nativeHearing=raw_cache nativeControllerTick=" .. tostring(self.currentTicks)
+    local loaded, square = read(body, "getCurrentSquare")
+    if not loaded then return result .. " rawLastHeard=unavailable" end
+    if square == nil then return result .. " rawLastHeard=unloaded" end
+    local ok, location = read(body, "getLastHeardSound")
+    local heard = "unavailable"
+    if ok and location == nil then
+        heard = "none"
+    elseif ok then
+        local xok,x = read(location, "getX")
+        local yok,y = read(location, "getY")
+        local zok,z = read(location, "getZ")
+        if xok and yok and zok and type(x) == "number" and type(y) == "number" and type(z) == "number"
+            and x == x and y == y and z == z and math.abs(x) < math.huge
+            and math.abs(y) < math.huge and math.abs(z) < math.huge then
+            heard = tostring(x) .. "," .. tostring(y) .. "," .. tostring(z)
+        else
+            heard = "malformed"
+        end
+    end
+    result = result .. " rawLastHeard=" .. heard
+    if self.state == "COMBAT" then
+        for _, method in ipairs({ "getCurrentStateName", "getCurrentActionContextStateName",
+            "isAttackStarted", "isAttacking", "isPerformingAttackAnimation", "getAttackType", "isWeaponReady" }) do
+            local got, value = read(body, method)
+            result = result .. " " .. method .. "=" .. (got and value ~= nil and tostring(value) or "unavailable")
+        end
+    end
+    return result
+end
+
+function Controller:status(includeNativeEvidence)
+    local status = "id=" .. self.id
         .. " state=" .. tostring(self.state)
         .. " decision=" .. tostring(self.activeDecision or "none")
         .. " destination=" .. statusDestination(self)
@@ -19119,9 +18298,22 @@ function Controller:status()
         .. " formationFailures=" .. tostring(self.formationFailureCount or 0)
         .. " retryAt=" .. tostring(self.nextThink or 0)
         .. " " .. KnoxSurvivorNeeds.describe(KnoxSurvivorNeeds.snapshot(self.character))
+    if includeNativeEvidence == true then status = status .. nativeEvidence(self) end
+    return status
+end
 end
 
-function Controller:shutdown()
+function Controller:canHibernateForDistance()
+    local character = self.character
+    return character ~= nil and self.state ~= "COMBAT" and self.combatTarget == nil
+        and self.state ~= "PLAYER_CONVERSATION" and self.state ~= "TRADING"
+        and not nativeTraversalBusy(character) and not Controller.isNativeRecoveryBusy(character)
+        and not Controller.isNativeAttackBusy(character) and not hasPendingTimedActions(character)
+        and not safeMethod(character,"isDraggingCorpse",true)
+end
+
+function Controller:shutdown(preserveWork)
+    self:releaseSharedMeal(self.currentTicks)
     self.pendingCombatPolicy, self.pendingWeaponPolicy = nil, nil
     self.pendingFleeAttack = nil
     self:releaseSupplyCollection()
@@ -19139,7 +18331,11 @@ function Controller:shutdown()
     self:releaseGroupSupport()
     self:releaseAid()
     self.pendingDepositTrip = nil
-    self:abandonBaseTask("shutdown")
+    if preserveWork and self.baseTask ~= nil then
+        self:suspendBaseTaskForThreat("hibernate")
+    else
+        self:abandonBaseTask("shutdown")
+    end
     self:releaseCampPosition()
     if not self:waitingForTransferActions() and hasPendingTimedActions(self.character) then
         ISTimedActionQueue.clear(self.character)
@@ -19166,7 +18362,7 @@ function Controller:resumeAfterHibernateRollback(ticks, reason)
     self.currentTicks = ticks
     self.state = "IDLE"
     self.activeDecision = nil
-    self.nextThink = ticks + THINK_MIN_TICKS
+    self.nextThink = ticks + TUNE.THINK_MIN_TICKS
     self.nextThreatScan = math.min(self.nextThreatScan or ticks, ticks)
     if self.resetMovementRecovery ~= nil then
         pcall(function() self:resetMovementRecovery() end)

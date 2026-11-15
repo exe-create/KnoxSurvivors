@@ -267,12 +267,24 @@ end
 -- Native onKilled emits OnZombieDead before DoDeath. Only its actual player
 -- attacker and current nearby survivor target count; there is no radius-wide XP.
 function HumanCombat.onZombieDead(zombie)
-    if zombie == nil or creditedKills[zombie] or not KnoxSettings.enabled() then return end
+    if zombie == nil or not KnoxSettings.enabled() then return end
     local ok, attacker, target = pcall(function()
         if not zombie:isDead() then return nil, nil end
         return zombie:getAttackedBy(), zombie:getTarget()
     end)
-    if not ok or attacker == nil or target == nil then return end
+    if not ok or attacker == nil then return end
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    if runtime ~= nil and runtime.idForCharacter ~= nil and runtime.getController ~= nil then
+        local dispatched, err = pcall(function()
+            local id = runtime.idForCharacter(attacker)
+            local controller = id ~= nil and runtime.getController(id) or nil
+            if controller ~= nil and controller.character == attacker and controller.reportZombieOutcome ~= nil then
+                controller:reportZombieOutcome(zombie)
+            end
+        end)
+        if not dispatched then print("[KnoxSurvivors][Combat] zombie_outcome_error=" .. tostring(err)) end
+    end
+    if creditedKills[zombie] or target == nil then return end
     local playerId = localPlayerId(attacker)
     if playerId == nil then return end
     local survivorId = KnoxSurvivorRuntime.idForCharacter(target)

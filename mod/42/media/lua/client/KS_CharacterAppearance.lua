@@ -159,16 +159,27 @@ end
 -- engine's own HumanVisual models, so the body wears what the preview showed;
 -- clothing still goes through the one item-wear path above, and every level is
 -- written through the character's own experience owner.
+-- Initial authoring, before the body starts acting. Use the same native
+-- removal API as ISUnequipAction; removed items remain real inventory items.
+function KnoxCharacterAppearance.clearCreatorWear(character)
+    if not character or not character.getWornItems or not character.removeWornItem then return false end
+    local worn = character:getWornItems()
+    for index = worn:size() - 1, 0, -1 do character:removeWornItem(worn:getItemByIndex(index)) end
+    return true
+end
+
 function KnoxCharacterAppearance.applyCreator(bridge, id, character, record)
     if type(record) ~= "table" then return true, "no_record" end
     local faceEvidence = "face=none"
-    if type(record.hair) == "string" or type(record.beard) == "string" then
+    if type(record.hair) == "string" or type(record.beard) == "string" or record.skin ~= nil then
         local ok, result = pcall(function()
             if character == nil or character.getHumanVisual == nil then
                 return false
             end
             local visual = character:getHumanVisual()
             if visual == nil then return false end
+            local skin = KnoxCreator and KnoxCreator.skinIndex(record.skin)
+            if skin ~= nil then visual:setSkinTextureIndex(skin) end
             if type(record.hair) == "string" then
                 visual:setHairModel(record.hair ~= "" and record.hair or nil)
             end
@@ -191,6 +202,8 @@ function KnoxCharacterAppearance.applyCreator(bridge, id, character, record)
     end
     local clothesEvidence = "look=none"
     if record.look ~= nil and KnoxCreator ~= nil then
+        local cleared, result = pcall(KnoxCharacterAppearance.clearCreatorWear, character)
+        if not cleared or result ~= true then return false, "creator_wear_unavailable" end
         -- The preset with the person's per-slot choices swapped in. The model
         -- owns that merge, so the same list is what the card previewed.
         local lookOk, lookResult = KnoxCharacterAppearance.applyLook(
@@ -215,23 +228,7 @@ function KnoxCharacterAppearance.applyCreator(bridge, id, character, record)
         if not bagOk then return false, "bag=" .. tostring(bagResult) end
         bagEvidence = "bag=" .. bag
     end
-    local skillsEvidence = "skills=none"
-    if type(record.skills) == "string" and record.skills ~= ""
-        and character ~= nil and character.getXp ~= nil and Perks ~= nil
-        and KnoxCreator ~= nil then
-        local applied = 0
-        for perkId, level in pairs(KnoxCreator.decodeSkills(record.skills)) do
-            local ok = pcall(function()
-                local perk = Perks.FromString(perkId)
-                if perk ~= nil then
-                    character:getXp():setXPToLevel(perk, level)
-                    applied = applied + 1
-                end
-            end)
-            if not ok then return false, "skill_refused=" .. tostring(perkId) end
-        end
-        skillsEvidence = "skills=" .. tostring(applied)
-    end
+    local skillsEvidence = "skills=capabilities"
     return true, faceEvidence .. " " .. clothesEvidence .. " "
         .. bagEvidence .. " " .. skillsEvidence
 end

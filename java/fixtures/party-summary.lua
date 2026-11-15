@@ -67,15 +67,15 @@ assert(label(dead) == "Dead" and select(2, label(dead)) == "critical",
     "death stays critical")
 
 assert(M.partyHeadline({}) == "No one with you", "an empty party is quiet")
-assert(M.partyHeadline({ healthy, unknown }, false) == "2 · 1 unreported",
+assert(M.partyHeadline({ healthy, unknown }, false) == "2 - 1 unreported",
     "an unreported member is named instead of claiming all clear")
-assert(M.partyHeadline({ healthy, hurt }, false) == "2 · 1 needs you",
+assert(M.partyHeadline({ healthy, hurt }, false) == "2 - 1 needs you",
     "one trouble reads as one person needing you")
-assert(M.partyHeadline({ healthy, dry }, false) == "2 · 1 needs you",
+assert(M.partyHeadline({ healthy, dry }, false) == "2 - 1 needs you",
     "a dry fighter joins the same one-line problem count")
-assert(M.partyHeadline({ healthy, dead, bitten }, false) == "3 · 2 need you",
+assert(M.partyHeadline({ healthy, dead, bitten }, false) == "3 - 2 need you",
     "plural trouble reads as people, not a count of bars")
-assert(M.partyHeadline({ healthy, hurt }, true) == "2 with you · 1 problem",
+assert(M.partyHeadline({ healthy, hurt }, true) == "2 with you - 1 problem",
     "the compact row keeps its existing one-line summary")
 assert(M.partyTone({ healthy, unknown }) == "muted",
     "an unreported member keeps the header from claiming all clear")

@@ -336,14 +336,14 @@ end
 
 -- Transient action lease only. Identity, orders and inventory stay in their
 -- existing owners; a replacement/detached controller cannot inherit this lease.
-function Runtime.beginPlayerConversation(id, player)
+function Runtime.beginPlayerConversation(id, player, options)
     local accepted, reason = Runtime.canInteract(id)
     if not accepted then return false, reason end
     local entry = getEntry(id)
     if entry == nil or entry.controller.beginPlayerConversation == nil then
         return false, "survivor_unavailable"
     end
-    return entry.controller:beginPlayerConversation(player)
+    return entry.controller:beginPlayerConversation(player, options)
 end
 
 function Runtime.endPlayerConversation(id, player)

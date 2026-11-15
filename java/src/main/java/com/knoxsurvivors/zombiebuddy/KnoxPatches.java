@@ -27,6 +27,16 @@ public final class KnoxPatches {
         }
     }
 
+    @Patch(className = "zombie.characters.IsoGameCharacter", methodName = "processHitDamage")
+    public static final class SurvivorStrength {
+        @Patch.OnExit
+        public static void exit(@Patch.This Object victim, @Patch.Argument(0) Object weapon,
+                                @Patch.Argument(1) Object attacker,
+                                @Patch.Return(readOnly = false) float result) {
+            result = KnoxHooks.survivorStrength(victim, weapon, attacker, result);
+        }
+    }
+
     @Patch(className = "zombie.characters.IsoZombie", methodName = "isTargetVisible")
     public static final class TargetVisibility {
         @Patch.OnEnter(skipOn = true)

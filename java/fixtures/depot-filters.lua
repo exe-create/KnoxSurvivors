@@ -34,7 +34,9 @@ local foodItem = {
     getDisplayCategory = function() return "Food" end,
     IsFood = function() return true end,
 }
-assert(S.depotAccepts(zone, foodItem) == false, "food must not be dumped on a log yard")
+-- Superseded 2026-11-06: the yard is a drop point and takes any item; the
+-- filter set says what it is for, not what may be set down.
+assert(S.depotAccepts(zone, foodItem) == true, "a drop point takes any item")
 
 -- A player choice replaces the default set, and ensure must not undo it.
 local chosen = {id = "z2", type = "log_processing", enabled = true}
@@ -82,17 +84,20 @@ assert(S.depotZoneAt({zones = {z = {id = "z", type = "log_processing", enabled =
     "a square outside the yard must not find it")
 
 
--- A depot destination names a tile and a floor container, or refuses clearly.
+-- A depot destination names a real world tile, or refuses clearly.
 local noZone, noZoneReason = S.depotStore({zones = {}}, logItem)
 assert(noZone == nil and noZoneReason == "no_depot", "a base without a yard has no destination")
 local logBase = {zones = {z = {id = "z", type = "log_processing", enabled = true,
     x1 = 0, y1 = 0, x2 = 4, y2 = 4, z = 0}}}
-local refused, refusedReason = S.depotStore(logBase, foodItem)
-assert(refused == nil and refusedReason == "not_allowed", "food must never route to the log yard")
+-- Superseded 2026-11-06: the yard takes any item, so food is not refused by
+-- its filters. Without a loaded cell the yard still refuses for want of a tile.
+local stored, storedReason = S.depotStore(logBase, foodItem)
+assert(stored == nil and storedReason == "stock_unreadable",
+    "the yard takes food and stops at the world, got " .. tostring(storedReason))
 -- The harness has no loaded cell, so there is no free tile: the decision has to
 -- refuse rather than invent a destination.
 local noSpot, noSpotReason = S.depotStore(logBase, logItem)
-assert(noSpot == nil and (noSpotReason == "no_free_tile" or noSpotReason == "no_floor_container"),
+assert(noSpot == nil and noSpotReason == "stock_unreadable",
     "without a loaded cell a depot must refuse, got " .. tostring(noSpotReason))
 
 

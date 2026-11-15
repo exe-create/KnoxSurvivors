@@ -23,4 +23,22 @@ function Threats.isCorpseProxy(character)
     local ok, proxy = pcall(function() return character:isReanimatedForGrappleOnly() end)
     return ok and proxy == true
 end
+-- Read-only Bandits boundary. The owning mod supplies disposition; an identified
+-- body with unreadable ownership is not silently treated as an ordinary zombie.
+function Threats.banditDisposition(character)
+    if character == nil or character.getVariableBoolean == nil then return nil end
+    local marked, bandit = pcall(function() return character:getVariableBoolean("Bandit") end)
+    if not marked or bandit ~= true then return nil end
+    local api = rawget(_G, "Bandit")
+    if type(api) ~= "table" or type(api.IsHostile) ~= "function" then return "unknown" end
+    local ok, hostile = pcall(api.IsHostile,character)
+    if ok and hostile == true then return "hostile" end
+    if ok and hostile == false then return "neutral" end
+    return "unknown"
+end
+
+function Threats.ignoreForeignNpc(character)
+    local disposition=Threats.banditDisposition(character)
+    return disposition == "neutral" or disposition == "unknown"
+end
 return Threats

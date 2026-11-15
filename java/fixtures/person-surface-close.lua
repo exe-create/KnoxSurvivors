@@ -53,6 +53,8 @@ player.dead=false
 player.aiming=true
 ok,why=state({body=body})
 assert(not ok and why=="player_aiming","aiming closes a person surface")
+ok=state({body=body,checkAiming=false})
+assert(ok==true,"a loot surface keeps the pack open while the player holds aim")
 player.aiming=false
 player.vehicle={}
 ok,why=state({body=body})

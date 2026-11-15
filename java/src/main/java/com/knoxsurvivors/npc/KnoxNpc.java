@@ -6,11 +6,13 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.LongSupplier;
 
 /** Knox-owned identity paired with a temporary Project Zomboid IsoPlayer body. */
 public final class KnoxNpc {
     private final String id;
     private final Object body;
+    private final LongSupplier clockMillis;
     private final int spawnX;
     private final int spawnY;
     private final int spawnZ;
@@ -24,6 +26,7 @@ public final class KnoxNpc {
     private final Map<String, Long> traversalCooldowns = new LinkedHashMap<>();
     private Object traversalInteractionTarget;
     private String traversalInteractionStage = "NONE";
+    private int[] traversalClimbEdge;
     private boolean climbingAllowed = true;
     private boolean doorWindowOpeningAllowed = true;
     // Close-behind bookkeeping: the last door this NPC opened itself, with
@@ -44,8 +47,13 @@ public final class KnoxNpc {
     private int protectedMaxY;
 
     KnoxNpc(String id, Object body, int spawnX, int spawnY, int spawnZ) {
+        this(id, body, spawnX, spawnY, spawnZ, System::currentTimeMillis);
+    }
+
+    KnoxNpc(String id, Object body, int spawnX, int spawnY, int spawnZ, LongSupplier clockMillis) {
         this.id = id;
         this.body = body;
+        this.clockMillis = java.util.Objects.requireNonNull(clockMillis);
         this.spawnX = spawnX;
         this.spawnY = spawnY;
         this.spawnZ = spawnZ;
@@ -81,7 +89,7 @@ public final class KnoxNpc {
         if (until == null) {
             return false;
         }
-        if (System.currentTimeMillis() >= until) {
+        if (clockMillis.getAsLong() >= until) {
             traversalCooldowns.remove(key);
             return false;
         }
@@ -97,15 +105,18 @@ public final class KnoxNpc {
         int nextZ,
         String state
     ) {
-        if (state == null || state.isEmpty()) {
+        if (state == null || state.isEmpty() || "FAILED_EDGE_COOLDOWN".equals(state)) {
             return;
         }
-        long duration = state.contains("LOCKED") || state.contains("BARRICADED")
-            ? 5000L
-            : 1800L;
+        long duration = "FAILED_CLIMB_NO_PROGRESS".equals(state) ? 30000L
+            : state.contains("LOCKED") || state.contains("BARRICADED") ? 5000L : 1800L;
+        long now = clockMillis.getAsLong();
+        // A survivor may never revisit a failed edge. Retire old entries when
+        // recording a new failure so a long walk cannot retain every old door.
+        traversalCooldowns.values().removeIf(until -> until <= now);
         traversalCooldowns.put(
             traversalEdgeKey(currentX, currentY, currentZ, nextX, nextY, nextZ),
-            System.currentTimeMillis() + duration
+            now + duration
         );
     }
 
@@ -165,6 +176,12 @@ public final class KnoxNpc {
         return hasMovementRoute() ? movementRoute.get(movementRouteIndex) : null;
     }
 
+    /** The node after the current one, used to decide whether the current node is behind. */
+    float[] nextMovementNode() {
+        int next = movementRouteIndex + 1;
+        return next < movementRoute.size() ? movementRoute.get(next) : null;
+    }
+
     float movementNodeTolerance() {
         return combatActive && movementRouteIndex == movementRoute.size() - 1
             ? 0.04f : 0.35f;
@@ -181,7 +198,19 @@ public final class KnoxNpc {
         if (traversalInteractionTarget != target) {
             traversalInteractionTarget = target;
             traversalInteractionStage = "NONE";
+            traversalClimbEdge = null;
         }
+    }
+
+    void noteClimbEdge(int x, int y, int z, int nextX, int nextY, int nextZ) {
+        traversalClimbEdge = new int[] {x, y, z, nextX, nextY, nextZ};
+    }
+
+    void rememberFailedClimb(String terminalState) {
+        if (traversalClimbEdge == null || !"CLIMB_ATTEMPTED".equals(traversalInteractionStage)
+            || !(terminalState.startsWith("FailedStuck") || terminalState.startsWith("FailedTransitionStalled"))) return;
+        int[] edge = traversalClimbEdge;
+        rememberTraversalFailure(edge[0], edge[1], edge[2], edge[3], edge[4], edge[5], "FAILED_CLIMB_NO_PROGRESS");
     }
 
     Object getTraversalInteractionTarget() {
@@ -286,12 +315,7 @@ public final class KnoxNpc {
     private void clearTraversalInteraction() {
         traversalInteractionTarget = null;
         traversalInteractionStage = "NONE";
-    }
-
-    private static float distance(float firstX, float firstY, float secondX, float secondY) {
-        float dx = firstX - secondX;
-        float dy = firstY - secondY;
-        return (float) Math.sqrt(dx * dx + dy * dy);
+        traversalClimbEdge = null;
     }
 
     private static String traversalEdgeKey(

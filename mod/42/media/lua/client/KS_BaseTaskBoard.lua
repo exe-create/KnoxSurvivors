@@ -22,6 +22,8 @@ TaskBoard.TASK_TYPES = {
 
     repair = true,
     cook = true,
+    craft_bed = true,
+    prepare_bed = true,
 }
 
 local function worldAge()
@@ -30,6 +32,38 @@ end
 
 -- The notebook and activity feed describe the same work result. Keep exact
 -- executor codes on the task record, and explain the practical next step here.
+-- One blocker, two ways to say it. A route the survivor could not walk is
+-- spoken by that survivor, naming the player who can clear it; a stock or
+-- material problem keeps the readable notice the player acts on directly.
+-- Movement words are the reasons the autonomy path already records.
+local MOVEMENT_ROUTE_WORDS = { "unreachable", "no_progress" }
+local MOVEMENT_ROUTE_REASONS = {
+    assigned_supply_entry_unavailable = true,
+    storage_approach_unavailable = true,
+}
+local MOVEMENT_ENTRY_REASONS = {
+    alternate_entry_unavailable = true,
+    no_adjacent_door_for_forced_entry = true,
+}
+
+function TaskBoard.blockedOrderFeedback(value)
+    local reason = tostring(value or "")
+    if reason == "" then return "notice", nil end
+    if MOVEMENT_ENTRY_REASONS[reason] == true
+        or string.sub(reason, 1, 17) == "door_break_failed" then
+        return "speak", "You handle it, I couldn't figure it out."
+    end
+    if MOVEMENT_ROUTE_REASONS[reason] == true then
+        return "speak", "I can't get through, take a look."
+    end
+    for _, word in ipairs(MOVEMENT_ROUTE_WORDS) do
+        if string.find(reason, word, 1, true) ~= nil then
+            return "speak", "I can't get through, take a look."
+        end
+    end
+    return "notice", TaskBoard.blockerText(reason)
+end
+
 function TaskBoard.blockerText(value)
     local reason = tostring(value or "")
     if reason == "" then return nil end

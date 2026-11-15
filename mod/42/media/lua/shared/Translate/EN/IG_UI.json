@@ -1,3 +1,18 @@
 {
-    "UI_optionscreen_binding_KnoxSurvivorInteract": "Talk to Nearby Survivor"
+    "IGUI_Knox_VisitorGone": "Visitor is no longer in reach.",
+    "IGUI_Knox_GuestThanks": "Thank you. I'll leave in the morning.",
+    "IGUI_Knox_GuestAngry": "Get out of my way.",
+    "IGUI_Knox_GuestLeaves": "All right. I'll find somewhere else.",
+    "IGUI_Knox_GuestAccepted": "The visitor can stay until morning.",
+    "IGUI_Knox_GuestRefused": "The overnight request was refused.",
+    "IGUI_Knox_GuestRequest": "Could I spend the night here?",
+    "IGUI_Knox_AllowOvernight": "Allow overnight stay",
+    "IGUI_Knox_RefuseOvernight": "Refuse overnight stay",
+    "IGUI_Knox_UniformOffer": "I've got spare clothes for you.",
+    "IGUI_Knox_UniformMissing": "I've no spare uniform.",
+    "IGUI_Knox_OvernightUnavailable": "That overnight request is no longer available.",
+    "IGUI_KS_SawLogs": "Saw Logs",
+    "IGUI_KS_HaveSawLogs": "Have %1 saw logs",
+    "IGUI_KS_GiveToCompanion": "Give to Companion",
+    "IGUI_KS_CannotGive": "Cannot give items: stay close to one of your available survivors."
 }

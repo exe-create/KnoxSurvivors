@@ -109,6 +109,7 @@ local function recordHearsay(state, listenerId, otherId, outcome, atHours)
                     from = otherId,
                     heardKind = entry.kind,
                     heardOutcome = boundedText(entry.outcome, 48),
+                    heardDetail = boundedText(entry.detail, 160),
                     heardWith = entry.kind == "meet" and boundedText(entry.with, 96) or nil,
                     heardAtHours = tonumber(entry.t),
                     t = atHours,

@@ -146,3 +146,53 @@ assert(Creator.chooseFactionName("Rosewood Remnant", "", false) == "Rosewood Rem
 assert(Creator.requestedFactionName("Miller_s") == nil,
     "an internal-looking code is not a faction name")
 print("creator_roster: " .. tostring(#back) .. " people, group " .. group.name)
+
+-- one name, one record on read
+local dupText = "knox-creator 4" .. string.char(10) .. "group|Millers" .. string.char(10)
+    .. "groupfaction|household" .. string.char(10)
+    .. "p|Sam|casual|none|none|base:chef|0" .. string.char(10)
+    .. "p|sam|casual|none|none|base:chef|0" .. string.char(10)
+local dupBack, dupGroup, dupSkipped = Creator.decode(dupText)
+assert(#dupBack == 1 and dupBack[1].name == "Sam" and dupSkipped == 1,
+    "a duplicate name on read keeps the first person and counts one loss, got "
+    .. tostring(#dupBack) .. "/" .. tostring(dupSkipped))
+assert(dupGroup.readOnly ~= true, "a duplicate is dropped, not a corrupt file")
+
+-- the spawn-pool switch
+local pool = {}
+assert(Creator.add(pool, { name = "Innie" }), "a pool person is added")
+assert(Creator.add(pool, { name = "Outie" }), "a second pool person is added")
+assert(Creator.spawnIncluded(pool[1]) and Creator.spawnIncluded(pool[2]),
+    "everyone spawns unless ticked out")
+assert(Creator.spawnIncluded(nil) and Creator.spawnIncluded({}),
+    "an absent flag is an old record, which always spawned")
+local okSpawn, spawnMsg = Creator.toggleSpawn(pool, pool[2])
+assert(okSpawn and pool[2].excludeFromSpawn == true
+    and not Creator.spawnIncluded(pool[2]) and Creator.spawnIncluded(pool[1]),
+    "unticking Spawn drops one person from the pool, got " .. tostring(spawnMsg))
+local poolText = Creator.encode(pool, { name = "Pool", factionId = "household" })
+local poolBack = Creator.decode(poolText)
+assert(poolBack[2].excludeFromSpawn == true and poolBack[1].excludeFromSpawn ~= true,
+    "the tick survives the file round trip")
+local legacyPool = Creator.decode("knox-creator 2" .. string.char(10)
+    .. "group|Old" .. string.char(10) .. "groupfaction|household" .. string.char(10)
+    .. "p|Oldie|casual|none|none|base:chef|0" .. string.char(10))
+assert(#legacyPool == 1 and Creator.spawnIncluded(legacyPool[1]),
+    "a record from before the switch still spawns")
+okSpawn = Creator.toggleSpawn(pool, pool[2])
+assert(okSpawn and Creator.spawnIncluded(pool[2]), "re-ticking Spawn brings them back")
+pool[2].startCompanion = true
+okSpawn, spawnMsg = Creator.toggleSpawn(pool, pool[2])
+assert(okSpawn and pool[2].startCompanion == true,
+    "leaving the pool keeps the Companion mark, got " .. tostring(spawnMsg))
+local okStart, startMsg = Creator.toggleStart(pool, pool[2], "companion", 3)
+assert(okStart and pool[2].startCompanion ~= true,
+    "unmarking works while ticked out, got " .. tostring(startMsg))
+okStart, startMsg = Creator.toggleStart(pool, pool[2], "companion", 3)
+assert(okStart and pool[2].startCompanion == true,
+    "a ticked-out companion can still walk in with you, got " .. tostring(startMsg))
+-- a marked outsider survives the file round trip as both
+poolText = Creator.encode(pool, { name = "Pool", factionId = "household" })
+poolBack = Creator.decode(poolText)
+assert(poolBack[2].excludeFromSpawn == true and poolBack[2].startCompanion == true,
+    "a marked outsider keeps both the tick and the mark on read")

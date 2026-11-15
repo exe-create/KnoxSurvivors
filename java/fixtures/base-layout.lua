@@ -212,6 +212,27 @@ local noEntries, noEntriesReason = B.applyLayout(base.id, {}, "base-layout-playe
 assert(noEntries == nil and noEntriesReason == "no_entries",
     "an empty apply is refused rather than reported as success")
 
+local savedZones,savedStorage=base.zones,base.storage
+base.zones,base.storage={},{}
+local starter=assert(B.applyStarterLayout(base.id,building,0,"base-layout-player"))
+assert(starter.added==4 and starter.assigned==0,
+    "the starter applies work areas and files no storage for the player")
+local starterStorage=0
+for _ in pairs(base.storage or {}) do starterStorage=starterStorage+1 end
+assert(starterStorage==0,
+    "containers stay the player's to assign; no automatic policy is written")
+for _,zone in pairs(base.zones) do
+    assert(zone.type~="woodcutting" and zone.type~="log_processing","starter does not start destructive tree work")
+end
+local repeatStarter=B.applyStarterLayout(base.id,building,0,"base-layout-player")
+assert(repeatStarter.added==0 and repeatStarter.assigned==0,"starter cannot duplicate existing assignments")
+base.zones,base.storage={},{}
+local deniedStarter=B.applyStarterLayout(base.id,building,0,"someone-else")
+local deniedZones=0
+for _ in pairs(base.zones) do deniedZones=deniedZones+1 end
+assert(deniedStarter.reason=="not_your_base" and deniedZones==0,"starter retains ownership checks")
+base.zones,base.storage=savedZones,savedStorage
+
 _G.KnoxBaseStorage = previousStorage
 _G.KnoxToolCupboard = previousCupboard
 getCell = previousCell

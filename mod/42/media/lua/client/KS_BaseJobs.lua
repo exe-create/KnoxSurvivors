@@ -832,6 +832,45 @@ local function ensureRepairTask(base, now, character)
     return nil, result
 end
 
+local function ensureBedPreparationTask(base, now, character)
+    local manager = rawget(_G, "KnoxBaseManager")
+    if manager == nil or manager.bedPreparationPlan == nil
+        or manager.bedPreparationPlan(base, character) == nil then return nil end
+    local square = character:getCurrentSquare()
+    local target = { id = "bed-prepare:" .. tostring(base.id), x = square:getX(), y = square:getY(), z = square:getZ() }
+    local existing = taskForTargetId(base, target.id)
+    if existing ~= nil then
+        if existing.state == "queued" or existing.state == "claimed" then return existing end
+        existing = reopenWhenReady(existing, now)
+        if existing ~= nil then existing.target = target end
+        return existing
+    end
+    local task = KnoxBaseTaskBoard.queue(base.id, "prepare_bed", target, {}, 95)
+    if task ~= nil then task.baseId, task.auto, task.retryAtHours = base.id, true, now end
+    return task
+end
+
+local function ensureBedCraftTask(base, now, character)
+    local manager = rawget(_G, "KnoxBaseManager")
+    if character == nil or manager == nil or manager.bedCraftPlan == nil
+        or manager.bedCraftPlan(base, character) == nil then return nil end
+    local square = character:getCurrentSquare()
+    if square == nil or not manager.containsSquare(base, square) then return nil end
+    local target = { id = "bed-craft:" .. tostring(base.id), x = square:getX(),
+        y = square:getY(), z = square:getZ() }
+    local existing = taskForTargetId(base, target.id)
+    if existing ~= nil then
+        if existing.state == "queued" or existing.state == "claimed" then return existing end
+        existing = reopenWhenReady(existing, now)
+        if existing == nil then return nil end
+        existing.target = target
+        return existing
+    end
+    local task = KnoxBaseTaskBoard.queue(base.id, "craft_bed", target, {}, 92)
+    if task ~= nil then task.baseId, task.auto, task.retryAtHours = base.id, true, now end
+    return task
+end
+
 local function ensureCookingTask(base, now, character)
     local target,reason = KnoxBaseCooking.findTask(base,character)
     if target == nil then return nil,reason end
@@ -902,6 +941,11 @@ end
 -- any non-base duty, missing record, or player survivor without a schedule)
 -- preserves historical behavior exactly. NPC groups/factions receive the
 -- default clock once, lazily, on first read.
+function BaseJobs.isRestWindow(survivorId)
+    local assignment = BaseJobs.scheduleAssignment(survivorId)
+    return assignment == "sleep" or assignment == "recreation"
+end
+
 function BaseJobs.scheduleAssignment(survivorId)
     local persistence = KnoxPersistence
     if survivorId == nil or persistence == nil
@@ -911,6 +955,10 @@ function BaseJobs.scheduleAssignment(survivorId)
     local duty = persistence.getSurvivorDuty(survivorId)
     if type(duty) ~= "table" or duty.mode ~= "base" then
         return "anything"
+    end
+    if BaseJobs.ensureBalancedRota ~= nil then
+        BaseJobs.ensureBalancedRota(duty.baseId, worldAge())
+        duty = persistence.getSurvivorDuty(survivorId) or duty
     end
     -- A temporary block order outranks the saved rota, but is read through the
     -- persistence getter so expiry and ownership cannot be bypassed here.
@@ -1245,6 +1293,39 @@ end
 
 local workforcePreparation = setmetatable({}, { __mode = "k" })
 
+function BaseJobs.ensureBalancedRota(baseId, now)
+    local persistence = KnoxPersistence
+    local catalog = rawget(_G, "KnoxOrderCatalog")
+    if baseId == nil or catalog == nil or catalog.rotaFor == nil
+        or persistence.getBase == nil or persistence.getBaseResidentIds == nil
+        or persistence.getSurvivorAffiliation == nil then return false end
+    local base = persistence.getBase(baseId)
+    if base == nil then return false end
+    local roster, signature = {}, {}
+    for _, id in ipairs(persistence.getBaseResidentIds(baseId)) do
+        local duty = persistence.getSurvivorDuty(id)
+        local affiliation = persistence.getSurvivorAffiliation(id)
+        if duty ~= nil and affiliation ~= nil and affiliation.kind ~= "player"
+            and (persistence.isSurvivorAlive == nil or persistence.isSurvivorAlive(id))
+            and (duty.schedule == nil or duty.scheduleAuto == true) then
+            roster[#roster + 1] = { id = id, role = duty.jobPreference }
+            signature[#signature + 1] = id .. ":" .. tostring(duty.jobPreference or "auto")
+        end
+    end
+    table.sort(signature)
+    local key = table.concat(signature, "|")
+    local cached = workforcePreparation[base] or {}
+    if cached.rotaSignature == key then return false end
+    local schedules = catalog.rotaFor(roster, now)
+    for _, row in ipairs(roster) do
+        local windows = persistence.hoursToDutyWindows(schedules[row.id])
+        if not persistence.ensureAutoDutySchedule(row.id, now, windows) then return false end
+    end
+    cached.rotaSignature = key
+    workforcePreparation[base] = cached
+    return true
+end
+
 local function workforceSignature(base)
     local parts = {}
     for key, zone in pairs(base ~= nil and base.zones or {}) do
@@ -1272,6 +1353,19 @@ end
 -- decisions. Coalesce them for a short world-time window, invalidating the
 -- window automatically when zones/tasks change. Atomic claiming still happens
 -- below for each resident, so this cannot grant duplicate ownership.
+function BaseJobs.materialGoals(base)
+    local planner = rawget(_G, "KnoxBaseSupplyPlanner")
+    local storage = rawget(_G, "KnoxBaseStorage")
+    if base == nil or planner == nil or planner.taskItemGoals == nil
+        or storage == nil or storage.countAssignedItem == nil or storage.summarize == nil then
+        return {}
+    end
+    if not planner.hasKnownStorageSnapshot(storage.summarize(base)) then return {} end
+    return planner.taskItemGoals(base.tasks, function(fullType, requirements)
+        return storage.countAssignedItem(base, fullType, requirements)
+    end)
+end
+
 function BaseJobs.prepareWorkforce(base, character, now)
     if base == nil then return false end
     now = tonumber(now) or worldAge()
@@ -1321,6 +1415,8 @@ function BaseJobs.prepareWorkforce(base, character, now)
             jobTests.prepareDiscovery(base, character)
         end
         if KnoxBaseCooking ~= nil then ensureCookingTask(base, now, character) end
+        ensureBedCraftTask(base, now, character)
+        ensureBedPreparationTask(base, now, character)
         ensureFarmingTask(base, now, character)
         ensureWoodcuttingTask(base, now, character)
         ensureCorpseTask(base, now, character)
@@ -1358,8 +1454,9 @@ function BaseJobs.prepareWorkforce(base, character, now)
     workforcePreparation[base] = {
         signature = workforceSignature(base), atHours = recent and cached.atHours or now,
         discovery = discovery,
+        rotaSignature = cached ~= nil and cached.rotaSignature or nil,
     }
-    return true
+    return true, BaseJobs.materialGoals(base)
 end
 
 function BaseJobs.ensureAutomaticTask(base, character, survivorId, preference)
@@ -1373,7 +1470,10 @@ function BaseJobs.ensureAutomaticTask(base, character, survivorId, preference)
         and KnoxPersistence.getBaseResidentIds(base.id) or {}
     local summary = KnoxBaseStorage.summarize ~= nil
         and KnoxBaseStorage.summarize(base) or { totals = {}, misplacedItems = 0 }
-    KnoxBaseNeeds.apply(queued, summary, #residentIds)
+    local needsSummary = {}
+    for key, value in pairs(summary) do needsSummary[key] = value end
+    needsSummary.totals = KnoxBaseSupplyPlanner.stockTotals(summary)
+    KnoxBaseNeeds.apply(queued, needsSummary, #residentIds)
     -- A player preference is a strong first choice, not a hard lock. A resident
     -- still falls back to other eligible work if their preferred role has nothing
     -- useful to do, which prevents a healthy settlement from idling by accident.
@@ -1419,6 +1519,10 @@ function BaseJobs.resolveTaskSquare(task, character)
     -- controller's normalization boundary. Resolve against the same canonical
     -- vocabulary so an old alias cannot select the generic fallback square.
     local taskType = canonicalTaskType(task.type)
+    if taskType == "prepare_bed" then
+        local plan = KnoxBaseManager.bedPreparationPlan(KnoxPersistence.getBase(task.baseId), character)
+        return plan ~= nil and plan.phase == "move" and plan.approach or nil
+    end
     if taskType == "haul_corpse" or target.action == "haul_corpse" then
         local resolved = KnoxBaseCorpseHandling.resolveTarget(
             KnoxBaseManager.get(task.baseId),
@@ -1509,5 +1613,98 @@ end
 function BaseJobs.retryDelay(task)
     return task ~= nil and canonicalTaskType(task.type) == "guard" and 0.25 or 0.10
 end
+
+-- STREAM-IN DISCOVERY (pure)
+-- A settlement that streams back in must find a current work board without
+-- waiting for each resident's next think. This seeds the SAME discovery the
+-- loaded path uses (BaseJobs.prepareWorkforce); it completes nothing, claims
+-- nothing and consumes nothing. Marked pure so the fixture drives production
+-- code rather than a copy.
+function BaseJobs.streamInSeedDue(base, duty)
+    if type(base) ~= "table" or type(base.tasks) ~= "table" then
+        return false, "no_base_board"
+    end
+    if type(duty) ~= "table" or duty.mode ~= "base"
+        or duty.baseId == nil or tostring(duty.baseId) ~= tostring(base.id) then
+        return false, "not_base_resident"
+    end
+    return true, "base_resident"
+end
+
+function BaseJobs.streamInReport(base)
+    if type(base) ~= "table" or type(base.tasks) ~= "table" then return nil end
+    local queued, claimed, shifts = 0, 0, 0
+    for _, task in pairs(base.tasks) do
+        if type(task) == "table" then
+            if task.state == "queued" then queued = queued + 1 end
+            if task.state == "claimed" then claimed = claimed + 1 end
+            shifts = shifts + (tonumber(task.offscreenShiftsCompleted) or 0)
+        end
+    end
+    return { queued = queued, claimed = claimed, offscreenShifts = shifts }
+end
+
+function BaseJobs.streamInNoticeText(base, report)
+    if type(base) ~= "table" or type(report) ~= "table" then return nil end
+    local parts = {}
+    if (tonumber(report.queued) or 0) > 0 then
+        parts[#parts + 1] = tostring(report.queued) .. " queued"
+    end
+    if (tonumber(report.claimed) or 0) > 0 then
+        parts[#parts + 1] = tostring(report.claimed) .. " in hand"
+    end
+    if (tonumber(report.offscreenShifts) or 0) > 0 then
+        parts[#parts + 1] = tostring(report.offscreenShifts) .. " watches stood"
+    end
+    if #parts == 0 then return nil end
+    return tostring(base.name or "The settlement") .. " while you were away: "
+        .. table.concat(parts, ", ") .. "."
+end
+
+-- A group home staffs itself from its own roster when a member streams back
+-- in: the admission owner the loaded path already uses (ensureGroupBase) then
+-- admits every member whose real body is present at the home. Absent members
+-- stay travellers until they arrive; nothing is teleported, completed or made.
+function BaseJobs.staffStreamedHome(id)
+    local persistence = rawget(_G, "KnoxPersistence")
+    local manager = rawget(_G, "KnoxBaseManager")
+    if id == nil or persistence == nil or manager == nil
+        or type(manager.ensureGroupBase) ~= "function"
+        or type(persistence.getTravelGroupFor) ~= "function" then
+        return false, "unavailable"
+    end
+    local group = persistence.getTravelGroupFor(id)
+    if type(group) ~= "table" then return false, "no_group" end
+    if type(persistence.getBaseForOwner) ~= "function"
+        or persistence.getBaseForOwner("group", group.id) == nil then
+        return false, "no_home"
+    end
+    local ok, home = pcall(manager.ensureGroupBase, group)
+    if not ok or home == nil then return false, "not_ready" end
+    return true, "roster_staffed"
+end
+
+function BaseJobs.seedStreamedBase(id, character, now)
+    local persistence = rawget(_G, "KnoxPersistence")
+    if persistence == nil or id == nil then return false, "unavailable" end
+    -- Staff the home before seeding its board: the member that just streamed in
+    -- may not be a resident yet, and discovery belongs to residents.
+    BaseJobs.staffStreamedHome(id)
+    local duty = persistence.getSurvivorDuty ~= nil
+        and persistence.getSurvivorDuty(id) or nil
+    local base = duty ~= nil and duty.baseId ~= nil and persistence.getBase ~= nil
+        and persistence.getBase(duty.baseId) or nil
+    local due, reason = BaseJobs.streamInSeedDue(base, duty)
+    if not due then return false, reason end
+    local prepared, goals = BaseJobs.prepareWorkforce(base, character, tonumber(now) or worldAge())
+    local report = BaseJobs.streamInReport(base)
+    local text = BaseJobs.streamInNoticeText(base, report)
+    local feed = rawget(_G, "KnoxActivityFeed")
+    if text ~= nil and feed ~= nil and type(feed.event) == "function" then
+        pcall(feed.event, text)
+    end
+    return prepared == true, "streamed", report
+end
+-- END STREAM-IN DISCOVERY
 
 return BaseJobs

@@ -237,21 +237,32 @@ local function weaponName(character)
     return nameOk and weaponWord(name, broken, condition) or "Unarmed"
 end
 
+-- AMMO NAME (projection)
+local function ammoMethodAt(item, name)
+    return item[name]
+end
+
+local function ammoRead(item, name)
+    local found, method = pcall(ammoMethodAt, item, name)
+    if not found or type(method) ~= "function" then return false, nil end
+    return pcall(method, item)
+end
+
 local function ammoName(character)
     if character == nil then return nil end
     local success, item = pcall(function()
         return character:getPrimaryHandItem() or character:getSecondaryHandItem()
     end)
-    if not success or item == nil then return nil end
-    local ranged = false
-    pcall(function() ranged = item:isRanged() == true end)
-    if not ranged or item.getCurrentAmmoCount == nil then return nil end
-    local countOk, count = pcall(function() return item:getCurrentAmmoCount() end)
+    if not success or item == nil or not instanceof(item, "HandWeapon") then return nil end
+    local rangedOk, ranged = ammoRead(item, "isRanged")
+    if not rangedOk or ranged ~= true then return nil end
+    local countOk, count = ammoRead(item, "getCurrentAmmoCount")
     if not countOk then return nil end
-    local chambered = false
-    pcall(function() chambered = item:isRoundChambered() == true end)
-    return ammoWord(count, chambered)
+    local chamberOk, chambered = ammoRead(item, "isRoundChambered")
+    if not chamberOk then return nil end
+    return ammoWord(count, chambered == true)
 end
+-- END AMMO NAME
 
 local function roleFor(affiliation, duty)
     if affiliation.kind == "player" then
@@ -445,7 +456,7 @@ local function needSummary(state, available)
     if not available then return "Condition unavailable" end
     local labels = {}
     local thresholds = KnoxSurvivorNeeds.thresholds
-    -- A bite is‐the death sentence: surface it first, ahead of bleeding.
+    -- A bite is-the death sentence: surface it first, ahead of bleeding.
     -- No exclamation marks in player copy (UI.md law 8): a bite is already the
     -- first, critical entry in this list and reads in the red tone.
     if state.bitten == true then labels[#labels + 1] = "Bitten" end
@@ -936,7 +947,7 @@ function ViewModel.partyRefusal(willingness)
 end
 
 -- One short line for a hovered strip row: the fact the row itself has no
--- room for. It reads only what this file already projected for the snapshot —
+-- room for. It reads only what this file already projected for the snapshot -
 -- a need that crossed its threshold, or the last known place for someone out
 -- of contact. It is not a reason and never guesses why something happened.
 function ViewModel.partyDetail(snapshot)
@@ -989,13 +1000,13 @@ function ViewModel.partyHeadline(snapshots, compact)
     local problems = ViewModel.partyProblemCount(list)
     if compact == true then
         if problems > 0 then
-            return tostring(total) .. " with you · " .. tostring(problems)
+            return tostring(total) .. " with you - " .. tostring(problems)
                 .. (problems == 1 and " problem" or " problems")
         end
         return tostring(total) .. " with you"
     end
     if problems > 0 then
-        return tostring(total) .. " · " .. tostring(problems)
+        return tostring(total) .. " - " .. tostring(problems)
             .. (problems == 1 and " needs you" or " need you")
     end
     local unreported = 0
@@ -1005,9 +1016,9 @@ function ViewModel.partyHeadline(snapshots, compact)
         end
     end
     if unreported > 0 then
-        return tostring(total) .. " · " .. tostring(unreported) .. " unreported"
+        return tostring(total) .. " - " .. tostring(unreported) .. " unreported"
     end
-    return tostring(total) .. " · all clear"
+    return tostring(total) .. " - all clear"
 end
 
 -- The strongest condition in the party, used for the compact row's one accent

@@ -13,7 +13,7 @@ _G.KnoxBaseZoneSelector = BaseZoneSelector
 -- looks the same while it is being drawn and after it is placed. Alpha is the
 -- only difference: a draft is a suggestion, so it is softer than the finished
 -- fill.
-local DRAFT_ALPHA = 0.32
+local DRAFT_ALPHA = 0.16
 
 local Selection = {}
 Selection.__index = Selection
@@ -30,22 +30,7 @@ local function newSelectionCursor(selection)
     return cursor
 end
 
-local function pickMouseSquare(player)
-    if player == nil or getCell() == nil then return nil, nil, nil, nil end
-    local compat = rawget(_G, "KnoxViewpointCompatibility")
-    if compat ~= nil and require("KS_SurvivorUILayout").isPerspective() then
-        local sq = compat.targetSquare(player)
-        if sq ~= nil then return sq, sq:getX(), sq:getY(), sq:getZ() end
-        return nil, nil, nil, player:getZ()
-    end
-    local z = player:getZ()
-    local mx, my = getMouseX(), getMouseY()
-    local ok1, wx = pcall(function() return screenToIsoX(player:getPlayerNum(), mx, my, z) end)
-    local ok2, wy = pcall(function() return screenToIsoY(player:getPlayerNum(), mx, my, z) end)
-    if not ok1 or not ok2 then return nil, nil, nil, z end
-    local sq = getCell():getGridSquare(wx, wy, z)
-    return sq, wx, wy, z
-end
+
 
 -- Work areas describe jobs, not ownership. They may be outside the home
 -- territory or on another floor; native routing decides reachability.
@@ -90,16 +75,20 @@ local function draftTick()
         activeSelection:onSquareSelectedCancel()
         return
     end
-    if activeSelection.firstSquare == nil or activeSelection.pendingConfirm then return end
+    if activeSelection.firstSquare == nil then return end
     if player == nil then return end
     -- Right-click and opening a world context menu clear IsoCell's drag cursor
     -- directly. Build 42 does not call our selection callback in that path, so
     -- detect the cleared cursor and release the preview on the next tick.
-    if not activeSelection.perspective and getCell():getDrag(player:getPlayerNum()) ~= activeSelection.cursor then
+    if not activeSelection.pendingConfirm and not activeSelection.perspective
+        and getCell():getDrag(player:getPlayerNum()) ~= activeSelection.cursor then
         activeSelection:onSquareSelectedCancel()
         return
     end
-    local _, wx, wy, z = pickMouseSquare(player)
+    local second = activeSelection.pendingConfirm and activeSelection.pendingSecond or nil
+    local _, wx, wy, z
+    if second ~= nil then wx, wy, z = second:getX(), second:getY(), second:getZ()
+    else _, wx, wy, z = KnoxBaseHighlights.pickMouseSquare(player) end
     if wx == nil or wy == nil then return end
     local x1 = activeSelection.firstSquare:getX()
     local y1 = activeSelection.firstSquare:getY()
@@ -119,40 +108,11 @@ local function draftTick()
             col = KnoxBaseHighlights.INVALID_COLOUR
         end
     end
+    if z ~= activeSelection.firstSquare:getZ() then col = KnoxBaseHighlights.INVALID_COLOUR end
     pcall(function()
-        if addAreaHighlightForPlayer ~= nil then
-            addAreaHighlightForPlayer(player:getPlayerNum(), minX, minY, maxX + 1, maxY + 1, z, col.r, col.g, col.b, col.a)
-        elseif addAreaHighlight ~= nil then
-            addAreaHighlight(minX, minY, maxX + 1, maxY + 1, z, col.r, col.g, col.b, col.a)
-        end
-        -- Overlaps remain readable: draw intersect borders with thin contrasting outline
-        -- over the subdued existing fills, instead of blending into one block.
-        if base ~= nil and base.zones ~= nil then
-            local pn = player:getPlayerNum()
-            for _, zone in pairs(base.zones) do
-                if zone ~= nil and zone.x1 ~= nil and (zone.z or 0) == z then
-                    local zx1 = math.min(tonumber(zone.x1), tonumber(zone.x2))
-                    local zx2 = math.max(tonumber(zone.x1), tonumber(zone.x2))
-                    local zy1 = math.min(tonumber(zone.y1), tonumber(zone.y2))
-                    local zy2 = math.max(tonumber(zone.y1), tonumber(zone.y2))
-                    local ix1 = math.max(minX, zx1); local ix2 = math.min(maxX, zx2)
-                    local iy1 = math.max(minY, zy1); local iy2 = math.min(maxY, zy2)
-                    if ix1 <= ix2 and iy1 <= iy2 then
-                        -- Contrast edge over the overlap, then one thin conflict
-                        -- tint. Both come from the shared tokens, so the two
-                        -- selectors cannot drift apart.
-                        local edge = KnoxBaseHighlights.OVERLAP_COLOUR
-                        local conflict = KnoxBaseHighlights.CONFLICT_COLOUR
-                        if addAreaHighlightForPlayer ~= nil then
-                            addAreaHighlightForPlayer(pn, ix1, iy1, ix2 + 1, iy2 + 1, z,
-                                edge.r, edge.g, edge.b, edge.a)
-                            addAreaHighlightForPlayer(pn, ix1, iy1, ix2 + 1, iy2 + 1, z,
-                                conflict.r, conflict.g, conflict.b, conflict.a)
-                        end
-                    end
-                end
-            end
-        end
+        KnoxBaseHighlights.drawArea(player:getPlayerNum(), minX, minY, maxX, maxY, z, col)
+        KnoxBaseHighlights.drawArea(player:getPlayerNum(), wx, wy, wx, wy, z,
+            { r = col.r, g = col.g, b = col.b, a = 0.8 })
     end)
 end
 
@@ -160,7 +120,7 @@ local function hookTick(instance)
     activeSelection = instance
     KnoxBaseHighlights.setDraft(instance.player:getPlayerNum(), true, instance.zoneType)
     if not tickHooked then
-        Events.OnTick.Add(draftTick)
+        Events.OnPreUIDraw.Add(draftTick)
         tickHooked = true
     end
 end
@@ -172,7 +132,7 @@ local function unhookTick(instance)
         activeSelection = nil
     end
     if activeSelection == nil and tickHooked then
-        pcall(function() Events.OnTick.Remove(draftTick) end)
+        pcall(function() Events.OnPreUIDraw.Remove(draftTick) end)
         tickHooked = false
     end
     if instance ~= nil and instance.player ~= nil then
@@ -180,29 +140,8 @@ local function unhookTick(instance)
     end
 end
 
+-- Native area highlights expire per render frame; there is no removal API.
 local function clearDraftHighlight(instance)
-    if instance == nil or instance.firstSquare == nil then return end
-    pcall(function()
-        local x1 = instance.firstSquare:getX()
-        local y1 = instance.firstSquare:getY()
-        local _, wx, wy, z = pickMouseSquare(instance.player)
-        if wx ~= nil then
-            local minX = math.min(x1, wx)
-            local minY = math.min(y1, wy)
-            local maxX = math.max(x1, wx)
-            local maxY = math.max(y1, wy)
-            local pn = instance.player:getPlayerNum()
-            if removeAreaHighlightForPlayer ~= nil then
-                removeAreaHighlightForPlayer(pn, minX, minY, maxX + 1, maxY + 1, z)
-            elseif removeAreaHighlight ~= nil then
-                removeAreaHighlight(minX, minY, maxX + 1, maxY + 1, z)
-            end
-            if addAreaHighlightForPlayer ~= nil then
-                -- push a transparent update to overwrite stale preview
-                addAreaHighlightForPlayer(pn, minX, minY, maxX + 1, maxY + 1, z, 0, 0, 0, 0)
-            end
-        end
-    end)
 end
 
 function Selection:confirmCreate(secondSquare)
@@ -216,7 +155,7 @@ function Selection:confirmCreate(secondSquare)
     self.pendingSecond = secondSquare
     self.pendingConfirm = true
 
-    -- Keep highlight visible while modal is up — tick continues to draw.
+    -- Keep the exact proposed area visible while the confirmation is open.
     local prompt = "Create " .. tostring(self.label) .. "  " .. tostring(w) .. "x" .. tostring(h) .. " (" .. tostring(total) .. " tiles)?"
     local modal = ISModalDialog:new(0, 0, 360, 150, prompt, true, nil, function(_, button)
         if self.cancelled or self.firstSquare == nil then return end
@@ -232,7 +171,7 @@ function Selection:confirmCreate(secondSquare)
                 self.label
             )
             if zone ~= nil then
-                KnoxActivityFeed.event(tostring(self.label) .. " saved — " .. tostring(w) .. "x" .. tostring(h) .. " (" .. tostring(total) .. " tiles).")
+                KnoxActivityFeed.event(tostring(self.label) .. " saved - " .. tostring(w) .. "x" .. tostring(h) .. " (" .. tostring(total) .. " tiles).")
                 if KnoxBaseHighlights ~= nil and KnoxBaseHighlights.refresh ~= nil then
                     local pn = self.player ~= nil and self.player:getPlayerNum() or 0
                     KnoxBaseHighlights.refresh(pn)
@@ -241,7 +180,7 @@ function Selection:confirmCreate(secondSquare)
                 KnoxActivityFeed.event("Could not save work area: " .. tostring(result) .. ".")
             end
         else
-            KnoxActivityFeed.event(tostring(self.label) .. " not saved — cancelled at confirmation.")
+            KnoxActivityFeed.event(tostring(self.label) .. " not saved - cancelled at confirmation.")
         end
         self.cursor = nil
         self.firstSquare = nil
@@ -284,7 +223,7 @@ function Selection:onSquareSelected(square)
     end
     if self.firstSquare == nil then
         self.firstSquare = square
-        KnoxActivityFeed.event("First corner set for " .. tostring(self.label) .. " at " .. tostring(square:getX()) .. "," .. tostring(square:getY()) .. ". Now click the opposite corner — highlighted area is preview. Right-click cancels.")
+        KnoxActivityFeed.event("First corner set for " .. tostring(self.label) .. " at " .. tostring(square:getX()) .. "," .. tostring(square:getY()) .. ". Now click the opposite corner - highlighted area is preview. Right-click cancels.")
         hookTick(self)
         if not self.perspective then
             self.cursor = newSelectionCursor(self)
@@ -292,7 +231,15 @@ function Selection:onSquareSelected(square)
         end
         return
     end
-    -- Second corner — ask for confirmation (matches vanilla DesignationZone confirm).
+    if square:getZ() ~= self.firstSquare:getZ() then
+        KnoxActivityFeed.event("Choose the opposite corner on the same floor.")
+        if not self.perspective then
+            self.cursor = newSelectionCursor(self)
+            getCell():setDrag(self.cursor, self.player:getPlayerNum())
+        end
+        return
+    end
+    -- Second corner - ask for confirmation (matches vanilla DesignationZone confirm).
     self:confirmCreate(square)
 end
 

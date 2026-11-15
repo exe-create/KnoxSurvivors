@@ -43,9 +43,14 @@ function Names.companyName(company)
     if type(company) ~= "table" or type(company.leaderId) ~= "string"
         or company.leaderId == "" then return nil end
     -- "Who are you with" has no answer for the person being named: a leader is
-    -- not with themselves, so a surface that shows a leader uses the isLeader
-    -- fact instead of this sentence.
+    -- not with themselves. A leader's own surface reads `company.name` directly.
     if company.isLeader == true then return nil end
+    -- A household names itself. A mixed group still answers with its leader's
+    -- name because it has no household identity to borrow.
+    if type(company.name) == "string" then
+        local name = company.name:match("^%s*(.-)%s*$")
+        if name ~= "" then return name end
+    end
     local persistence = rawget(_G, "KnoxPersistence")
     if persistence == nil or persistence.getSurvivorIdentity == nil then return nil end
     local identity = persistence.getSurvivorIdentity(company.leaderId)

@@ -8,10 +8,13 @@ public final class KnoxMovementRequestVerifier {
     public static void main(String[] args) {
         verifyOwnershipMetadata();
         verifyZLevelGeometry();
+        verifyDoorwayPace();
         verifySparseRouteEdges();
         verifyRuntimeLifecycle();
         verifyPendingTransitionRecovery();
+        verifyFailedClimbCooldown();
         verifyRouteStartDoesNotReverse();
+        verifyShortRouteReplan();
         verifyDutyArea();
         System.out.println(
             "KnoxMovementRequestVerifier PASS duplicate=true replacement=true cleanup=true"
@@ -102,6 +105,51 @@ public final class KnoxMovementRequestVerifier {
         require(KnoxMovementGeometry.nodeReached(
             10.5f, 20.5f, 1, 10.5f, 20.5f, 1, 0.35f
         ), "floor transition releases the reached stair node");
+        // A running body crosses a tile centre between two controller ticks. The
+        // node behind it must count as reached, or the route turns the survivor
+        // around and back, which the owner reported as running back and forth.
+        require(KnoxMovementGeometry.nodeReached(
+            1.0f, 0.5f, 0, 1.5f, 0.5f, 0, 0.35f
+        ), "a tile already occupied releases its node even past the distance tolerance");
+        require(!KnoxMovementGeometry.nodeReached(
+            1.05f, 0.5f, 0, 2.5f, 0.5f, 0, 0.35f
+        ), "an untouched tile ahead is never claimed as reached");
+        require(!KnoxMovementGeometry.nodeBehind(1.6f, 1.5f, 0,
+            new float[] {1.5f, .5f, 0}, new float[] {2.5f, .5f, 0}, 1.5f),
+            "off-segment body must retain corner node");
+        require(!KnoxMovementGeometry.nodeReached(.9f, .9f, 0, 1.1f, .9f, 0, .35f),
+            "intermediate node across edge must remain pending");
+        require(!KnoxMovementGeometry.nodeReached(-.9f, -.9f, 0, -1.1f, -.9f, 0, .35f),
+            "negative coordinate edge must remain pending");
+        require(!KnoxMovementGeometry.nodeBehind(-1.4f, -1.5f, 0,
+            new float[] {-1.5f, -.5f, 0}, new float[] {-.5f, -.5f, 0}, 1.5f),
+            "negative coordinate off-segment body must retain corner node");
+        require(KnoxMovementGeometry.nodeBehind(11.2f, 20.5f, 0,
+            new float[] {10.5f, 20.5f, 0}, new float[] {11.5f, 20.5f, 0}, 1.5f),
+            "successor tile overshoot advances");
+        require(!KnoxMovementGeometry.nodeBehind(11.2f, 20.5f, 1,
+            new float[] {10.5f, 20.5f, 0}, new float[] {11.5f, 20.5f, 0}, 1.5f),
+            "overshoot on another floor retains node");
+        // A captured route often begins a fraction of a tile behind the body, or
+        // the body drifts across a tile corner while running. Walking back to a
+        // node already passed is the turn-around the owner still reports.
+        // The body has already drifted into the next tile, so the old "stands in
+        // the node's tile" clause cannot release this node; only the progress rule can.
+        require(KnoxMovementGeometry.startNodeBehind(
+            11.2f, 20.5f, 0, new float[] {10.5f, 20.5f, 0}, new float[] {11.5f, 20.5f, 0}
+        ), "a node the body has already passed is not walked backwards");
+        require(!KnoxMovementGeometry.startNodeBehind(
+            11.2f, 21.9f, 0, new float[] {10.5f, 20.5f, 0}, new float[] {11.5f, 20.5f, 0}
+        ), "a sideways body is not treated as past the node");
+        require(!KnoxMovementGeometry.startNodeBehind(
+            9.4f, 20.5f, 0, new float[] {10.5f, 20.5f, 0}, new float[] {11.5f, 20.5f, 0}
+        ), "a first node still ahead of the body is kept");
+        require(!KnoxMovementGeometry.startNodeBehind(
+            10.9f, 20.5f, 1, new float[] {10.5f, 20.5f, 0}, new float[] {11.5f, 20.5f, 0}
+        ), "a start node on another floor is never skipped");
+        require(!KnoxMovementGeometry.startNodeBehind(
+            10.9f, 20.5f, 0, new float[] {10.2f, 20.5f, 0}, new float[] {10.4f, 20.5f, 0}
+        ), "an in-tile goal keeps its node");
     }
 
     private static void verifyOwnershipMetadata() {
@@ -201,6 +249,32 @@ public final class KnoxMovementRequestVerifier {
             "interruption leaves no orphaned owner");
     }
 
+    private static void verifyFailedClimbCooldown() {
+        long[] now = {1000};
+        KnoxNpc npc = new KnoxNpc("failed-fence", new Object(), 0, 0, 0, () -> now[0]);
+        FakeMovementEngine engine = new FakeMovementEngine();
+        engine.x=.95f; engine.tickResult="Transition:ManualRoute";
+        KnoxNpcRuntime runtime = new KnoxNpcRuntime(npc,engine);
+        require(runtime.beginMove(new Target(1,0,0),false).startsWith("MOVE_STARTED"), "failed climb request starts");
+        npc.useTraversalInteractionTarget(new Object());
+        npc.setTraversalInteractionStage("CLIMB_ATTEMPTED");
+        npc.noteClimbEdge(0,0,0,1,0,0);
+        String outcome="";
+        for(int tick=0;tick<180;tick++) outcome=runtime.tickMovement();
+        require(outcome.startsWith("FailedTransitionStalled"), "uncompleted climb reaches normal watchdog");
+        require(npc.isTraversalCoolingDown(0,0,0,1,0,0), "failed climb edge survives route cleanup");
+        require(!npc.isTraversalCoolingDown(0,0,0,0,1,0), "another route remains available");
+        now[0]=3000;
+        npc.rememberTraversalFailure(0,0,0,1,0,0,"FAILED_EDGE_COOLDOWN");
+        require(npc.isTraversalCoolingDown(0,0,0,1,0,0), "blocked retries do not shorten the climb cooldown");
+        now[0]=31000;
+        require(!npc.isTraversalCoolingDown(0,0,0,1,0,0), "climb may be reconsidered after bounded rest/replan interval");
+        npc.useTraversalInteractionTarget(new Object());
+        npc.setTraversalInteractionStage("CLIMB_ATTEMPTED");npc.noteClimbEdge(0,0,0,1,0,0);
+        npc.rememberFailedClimb("Succeeded");
+        require(!npc.isTraversalCoolingDown(0,0,0,1,0,0), "successful crossing never becomes a failed edge");
+    }
+
     private static void verifyPendingTransitionRecovery() {
         for (String transition : java.util.List.of("Transition:TURNING_TO_WINDOW",
                 "Transition:STARTED_WINDOW_CLIMB", "Transition:ManualRoute")) {
@@ -243,6 +317,45 @@ public final class KnoxMovementRequestVerifier {
         System.out.println("Follow route start PASS no_artificial_reverse=true final_goal=true stairs=true actual_reverse=true");
     }
 
+    private static void verifyShortRouteReplan() {
+        KnoxNpc npc = new KnoxNpc("short-route", new Object(), 0, 0, 0);
+        FakeMovementEngine engine = new FakeMovementEngine();
+        engine.shortOnSucceed = true;
+        engine.tickResult = "Succeeded";
+        KnoxNpcRuntime runtime = new KnoxNpcRuntime(npc, engine);
+        require(runtime.beginMove(new Target(20, 20, 0), false).startsWith("MOVE_STARTED"),
+            "a short-route request starts");
+        int before = engine.starts;
+        require("Working".equals(runtime.tickMovement()),
+            "a route that ends short asks the engine for the next leg instead of failing");
+        require(engine.starts == before + 1, "the next leg is a real new native route");
+        boolean failed = false;
+        for (int tick = 0; tick < 8 && !failed; tick++) {
+            failed = runtime.tickMovement().startsWith("FailedWrongFloorOrPosition");
+        }
+        require(failed, "a destination the engine can never reach still fails after bounded replans");
+        System.out.println("Short route replan PASS replanned=true bounded=true");
+    }
+
+    private static void verifyDoorwayPace() {
+        KnoxLocomotionPolicy.Decision open = KnoxLocomotionPolicy.decide(
+            "run", 40f, 1f, 0f, 100f, true, false);
+        require(open.running() && !open.sprinting(),
+            "a long open leg still runs so travel is not slowed to a walk");
+        KnoxLocomotionPolicy.Decision doorway = KnoxLocomotionPolicy.decide(
+            "run", 40f, 1f, 0f, 100f, true, true);
+        require(!doorway.running() && !doorway.sprinting(),
+            "a doorway edge is walked, never run into the frame and wall beside it");
+        KnoxLocomotionPolicy.Decision urgentDoorway = KnoxLocomotionPolicy.decide(
+            "sprint", 40f, 1f, 0f, 100f, true, true);
+        require(!urgentDoorway.running() && !urgentDoorway.sprinting(),
+            "even an urgent order walks the single doorway edge");
+        KnoxLocomotionPolicy.Decision sprintOpen = KnoxLocomotionPolicy.decide(
+            "sprint", 40f, 1f, 0f, 100f, true, false);
+        require(sprintOpen.sprinting(), "the requested sprint resumes off the doorway edge");
+        System.out.println("Doorway pace PASS walk_edge=true run_resumes=true sprint_resumes=true");
+    }
+
     private static final class Target {
         private final int x;
         private final int y;
@@ -261,6 +374,7 @@ public final class KnoxMovementRequestVerifier {
         private boolean failTick;
         private String tickResult = "Working";
         private boolean completeOnWrongFloor;
+        private boolean shortOnSucceed;
         private float x = 0.5f;
         private float y = 0.5f;
         private int z;
@@ -308,7 +422,7 @@ public final class KnoxMovementRequestVerifier {
             if (failTick) {
                 throw new ReflectiveOperationException("synthetic tick failure");
             }
-            if ("Succeeded".equals(tickResult)) {
+            if ("Succeeded".equals(tickResult) && !shortOnSucceed) {
                 x = target.x + 0.5f;
                 y = target.y + 0.5f;
                 if (!completeOnWrongFloor) {

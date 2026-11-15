@@ -51,17 +51,11 @@ p.advanceAwayTeams(14, {
     memberLoaded = function() return false end,
 })
 local resolved = assert(p.getAwayTeam(watched.id))
-assert(resolved.state == "complete" and resolved.result.kind == "scouted",
-    "an abandoned reconnaissance resolves from the ledger")
-assert(p.getSurvivorDuty("live-a").mode == "base",
-    "the member's ordinary duty is restored on resolution")
-local notices = Executor.takePlayerNotices("live-owner", 14, 3)
-assert(#notices == 1 and string.find(notices[1], "Nora Vance", 1, true) ~= nil
-    and string.find(notices[1], "scouted", 1, true) ~= nil
-    and string.find(notices[1], "Corner store", 1, true) ~= nil,
-    "the resolved reconnaissance reports the real person, outcome and place")
-assert(#Executor.takePlayerNotices("live-owner", 14.1, 3) == 0,
-    "the resolved reconnaissance is reported once")
+assert(resolved.state=="awaiting_collection" and resolved.result.kind=="awaiting_live_scout",
+    "leaving the area cannot invent reconnaissance or release mission duty")
+assert(p.getSurvivorDuty("live-a").mode=="away","unobserved work remains assigned")
+assert(#Executor.takePlayerNotices("live-owner",14,3)==0,"waiting is never announced as success")
+assert(p.cancelAwayTeam(watched.id,"fixture_next_case",14))
 
 -- Nobody was watching when the trip arrived: the old immediate completion
 -- still applies, so an unwatched scout never waits for a live collection.
@@ -72,10 +66,10 @@ p.advanceAwayTeams(20.5, {
     memberLoaded = function() return false end,
 })
 local immediate = assert(p.getAwayTeam(unwatched.id))
-assert(immediate.state == "complete" and immediate.result.kind == "scouted",
-    "an unwatched scout completes at its arrival time")
-assert(p.getSurvivorDuty("live-a").mode == "base",
-    "the unwatched completion releases duty ownership")
+assert(immediate.state=="awaiting_collection" and immediate.result.kind=="awaiting_live_scout",
+    "an unwatched arrival also requires real-world evidence")
+assert(p.getSurvivorDuty("live-a").mode=="away","waiting retains the crew")
+assert(p.cancelAwayTeam(unwatched.id,"fixture_next_case",21))
 
 -- A resource mission keeps its own collection boundary: the scout grace must
 -- never retire work that is still waiting for real loot.
@@ -112,10 +106,10 @@ p.advanceAwayTeams(42.5, {
     memberLoaded = function() return false end,
 })
 local abandonedLive = assert(p.getAwayTeam(liveTeam.id))
-assert(abandonedLive.state == "complete" and abandonedLive.result.kind == "scouted",
-    "an abandoned live-dispatched mission resolves from the ledger")
-assert(p.getSurvivorDuty("live-b").mode == "base",
-    "the abandoned live member returns to base duty")
+assert(abandonedLive.state=="awaiting_collection" and abandonedLive.result.kind=="awaiting_live_scout",
+    "a live-dispatched scout cannot become a success just because its body unloaded")
+assert(p.getSurvivorDuty("live-b").mode=="away","unloaded scout keeps its mission duty")
+assert(p.cancelAwayTeam(liveTeam.id,"fixture_next_case",43))
 
 -- Setup failure before any native work: the roster and duty must roll back.
 local failedSetup = assert(p.createAwayTeam("player", "live-owner", { "live-b" },
@@ -133,4 +127,4 @@ assert(p.cancelAwayTeam(failedSetup.id, "again", 50) == nil,
     "a finished team cannot be cancelled twice")
 
 data["KnoxSurvivors_IsoPlayer"] = previousRoot
-print("Away scout live handoff PASS watched_live=true abandoned_resolved=true unwatched_immediate=true resources_untouched=true live_rollback=true")
+print("Away scout live handoff PASS watched_live=true abandoned_waits=true unwatched_waits=true resources_untouched=true live_rollback=true")

@@ -101,6 +101,16 @@ final class KnoxNpcRuntime {
     private float lastProgressY;
     private int lastProgressZ;
     private int noProgressTicks;
+    /**
+     * The square this request was opened for. A captured native route can end
+     * short of it (a partial path that stops at a stair square, for example),
+     * and the manual drive then reports "Succeeded" somewhere else. Keeping the
+     * requested square lets the runtime ask the engine for the next leg instead
+     * of failing the whole order.
+     */
+    private Object movementTargetSquare;
+    private int replanAttempts;
+    private static final int MAX_SHORT_ROUTE_REPLANS = 3;
     private KnoxSurvivorRecord lastRecord;
     private final KnoxCombatController combatController = new KnoxCombatController();
     private final KnoxCorpseRetirement corpseRetirement = new KnoxCorpseRetirement();
@@ -193,6 +203,8 @@ final class KnoxNpcRuntime {
                     }
                 }
                 npc.setMovementPace(pace);
+                movementTargetSquare = square;
+                replanAttempts = 0;
                 movementRequest.activate(targetX, targetY, targetZ, false);
                 movementControllerState = "Succeeded";
                 return "MOVE_STARTED already_at_target=true " + movementDescription();
@@ -219,6 +231,8 @@ final class KnoxNpcRuntime {
             movementEngine.start(npc, square, exactAdjacentCrossing);
             npc.movementArea = area;
             if (area != null) area.allowsPosition(movementStartX, movementStartY, movementEngine.bodyZ(npc));
+            movementTargetSquare = square;
+            replanAttempts = 0;
             movementRequest.activate(targetX, targetY, targetZ, exactAdjacentCrossing);
             movementControllerState = "Working";
             String result = (exactAdjacentCrossing ? "CROSS_STARTED " : "MOVE_STARTED ")
@@ -282,16 +296,49 @@ final class KnoxNpcRuntime {
                 currentX = movementEngine.bodyX(npc);
                 currentY = movementEngine.bodyY(npc);
                 currentZ = movementEngine.bodyZ(npc);
-            }
-            if ("Succeeded".equals(movementControllerState)
+            }            if ("Succeeded".equals(movementControllerState)
                 && !KnoxMovementGeometry.arrived(
                     currentX, currentY, currentZ,
-                    movementRequest.targetX(),
-                    movementRequest.targetY(),
-                    movementRequest.targetZ(),
+                    movementRequest.targetX(), movementRequest.targetY(), movementRequest.targetZ(),
                     ARRIVAL_DISTANCE
                 )) {
-                movementControllerState = "FailedWrongFloorOrPosition";
+                // The captured route ended short on the same floor: a partial
+                // native path can hand over only its first leg, and the manual
+                // drive then declares success before the destination is reached.
+                // Re-request the same square so the engine plans the next leg
+                // instead of failing the whole order.
+                //
+                // A completion on another floor keeps the existing rejection: a
+                // mismatch there is either an unmodelled floor transition or a
+                // stale route, and silently retrying it was explicitly ruled out
+                // by the runtime fixture ("engine XY completion on the wrong
+                // floor is rejected"). That path needs a stair owner, not a
+                // replan loop.
+                boolean replanned = false;
+                if (replanAttempts < MAX_SHORT_ROUTE_REPLANS && movementTargetSquare != null
+                    && currentZ == movementRequest.targetZ()) {
+                    try {
+                        movementEngine.start(npc, movementTargetSquare, false);
+                        replanAttempts++;
+                        noProgressTicks = 0;
+                        lastProgressX = currentX;
+                        lastProgressY = currentY;
+                        lastProgressZ = currentZ;
+                        movementControllerState = "Working";
+                        replanned = true;
+                        KnoxAgent.writeLog(
+                            "NPC probe movement replanned attempt="
+                                + replanAttempts
+                                + " "
+                                + movementDescription()
+                        );
+                    } catch (Throwable ignored) {
+                        replanned = false;
+                    }
+                }
+                if (!replanned) {
+                    movementControllerState = "FailedWrongFloorOrPosition";
+                }
             }
             boolean pendingTransition = isPendingTransition(movementControllerState);
             if ((isStuckState(movementControllerState) || pendingTransition) && !KnoxMovementGeometry.arrived(
@@ -310,7 +357,10 @@ final class KnoxNpcRuntime {
                     String result = (pendingTransition ? "FailedTransitionStalled" : "FailedStuck") + " displacement="
                         + distance(currentX, currentY, movementStartX, movementStartY)
                         + " targetDistance=" + remainingDistance
-                        + " state=" + movementControllerState;
+                        + " state=" + movementControllerState
+                        + " position=" + currentX + "," + currentY + "," + currentZ
+                        + " " + npc.describeMovementRoute()
+                        + " " + KnoxNpcFactory.movementObstacleContext(npc);
                     KnoxAgent.writeLog("NPC probe movement " + npc.describe() + " " + result);
                     return finishMovementRequest(result);
                 }
@@ -402,6 +452,8 @@ final class KnoxNpcRuntime {
 
     private void resetMovement() {
         movementRequest.release();
+        movementTargetSquare = null;
+        replanAttempts = 0;
         npc.movementArea = null;
         movementControllerState = "NotStarted";
         lastProgressX = 0.0f;
@@ -412,6 +464,9 @@ final class KnoxNpcRuntime {
     }
 
     private String finishMovementRequest(String terminalState) {
+        // Keep failed native climb evidence across route cleanup. Deliberate
+        // cancellation/replacement and successful crossings are not failures.
+        npc.rememberFailedClimb(terminalState);
         String cleanupFailure = releaseEngineMovement("MOVE_FINISH_CLEANUP_FAILED");
         resetMovement();
         return cleanupFailure == null ? terminalState : "FailedCleanup " + cleanupFailure;

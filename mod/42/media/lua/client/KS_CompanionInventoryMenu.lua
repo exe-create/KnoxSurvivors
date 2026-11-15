@@ -3,6 +3,7 @@ require "ISUI/ISInventoryPane"
 require "TimedActions/ISTimedActionQueue"
 require "TimedActions/ISInventoryTransferUtil"
 require "KS_CompanionService"
+require "KS_Text"
 require "KS_CompanionInventory"
 require "KS_SurvivorRuntime"
 require "KS_ActivityFeed"
@@ -43,7 +44,8 @@ end
 function InventoryMenu.give(_, player, target, survivorId, items)
     local playerNum = player ~= nil and player:getPlayerNum() or nil
     if playerNum == nil or not KnoxCompanionInventory.canManage(playerNum, survivorId, target) then
-        KnoxActivityFeed.event("Cannot give items: stay close to one of your available survivors.")
+        KnoxActivityFeed.event(KnoxText.get("IGUI_KS_CannotGive",
+            "Cannot give items: stay close to one of your available survivors."))
         return
     end
     if player == nil or target == nil or target:getCurrentSquare() == nil then return end
@@ -135,11 +137,12 @@ local function addSawLogsOptions(context, player, items, companions)
     end
     if #actors == 0 then return end
 
-    local root = context:addOption("Saw Logs", nil, nil)
+    local root = context:addOption(KnoxText.get("IGUI_KS_SawLogs", "Saw Logs"), nil, nil)
     local menu = ISContextMenu:getNew(context)
     context:addSubMenu(root, menu)
     for _, entry in ipairs(actors) do
-        menu:addOption("Have " .. displayName(entry.id) .. " saw logs",
+        menu:addOption(KnoxText.format("IGUI_KS_HaveSawLogs", "Have %1 saw logs",
+                displayName(entry.id)),
             InventoryMenu, InventoryMenu.sawLogs, entry.character, entry.id, player:getPlayerNum())
     end
 end
@@ -152,7 +155,7 @@ local function onFillInventoryObjectContextMenu(playerNum, context, items)
     end
     addSawLogsOptions(context, player, items, companions)
     if #companions == 0 then return end
-    local root = context:addOption("Give to Companion", nil, nil)
+    local root = context:addOption(KnoxText.get("IGUI_KS_GiveToCompanion", "Give to Companion"), nil, nil)
     local menu = ISContextMenu:getNew(context)
     context:addSubMenu(root, menu)
     for _, entry in ipairs(companions) do

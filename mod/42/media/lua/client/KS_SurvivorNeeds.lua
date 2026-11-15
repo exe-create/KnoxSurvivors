@@ -21,6 +21,12 @@ Needs.thresholds = {
     fatigue = 0.72,
 }
 
+function Needs.isMedicalCare(kind)
+    return kind == "bandage" or kind == "improvise_medical" or kind == "disinfect"
+        or kind == "antibiotic" or kind == "replace_bandage"
+        or kind == "remove_healed_bandage" or kind == "splint"
+end
+
 local NEED_CHANGE_EPSILON = 0.001
 
 -- Throttled self-care telemetry (1st + every 10th per survivor/kind):
@@ -159,12 +165,38 @@ function Needs.waterSourceState(source)
         available = hasFluid and amount > 0, tainted = tainted }
 end
 
+-- A square can hold a clean tap and a tainted barrel. Vanilla orders the
+-- drink menu by what is under the cursor, not by safety, so the first
+-- admissible source won and a desperate survivor drank from the barrel
+-- beside a working sink. Clean always outranks fuller.
+function Needs.betterWaterSource(best, candidate)
+    if candidate == nil or candidate.available ~= true then return best end
+    if best == nil then return candidate end
+    if best.tainted == true and candidate.tainted ~= true then return candidate end
+    if best.tainted ~= candidate.tainted then return best end
+    local bestAmount = tonumber(best.amount) or 0
+    local candidateAmount = tonumber(candidate.amount) or 0
+    return candidateAmount > bestAmount and candidate or best
+end
+
 local function isSmokeItem(item)
     local ok, supported = pcall(function()
         return item ~= nil and item:IsFood() and ItemTag ~= nil
             and ItemTag.SMOKABLE ~= nil and item:hasTag(ItemTag.SMOKABLE)
     end)
     return ok and supported == true
+end
+
+function Needs.isSmokeItem(item) return isSmokeItem(item) end
+
+-- Ask the native action for the same ignition sources it will use at start.
+function Needs.smokeIgnitionAvailable(character, item)
+    local ok, available = pcall(function()
+        if not isSmokeItem(item) then return false end
+        local action = ISEatFoodAction:new(character, item, 1.0)
+        return (action.carLighter or action.openFlame or action:getRequiredItem() ~= nil) and true or false
+    end)
+    return ok and available == true
 end
 
 -- Build 42 uses tagged Food cigarettes/cigars, not unopened drainable packs.
@@ -254,10 +286,9 @@ function Needs.snapshot(character)
         bleedingParts = bodyDamage:getNumPartsBleeding(),
         health = bodyDamage:getHealth(),
         pain = pain,
-        -- The card's Needs line and the party strip already read this field to
-        -- name a bite, but nothing produced it. The engine's own reading is the
-        -- only source; an unreadable body stays nil rather than reading clean.
-        bitten = Needs.infectionReading(character),
+        -- The card and party strip name an observed bite wound, not a diagnosis
+        -- inferred from systemic infection. Unreadable wounds stay unknown.
+        bitten = Needs.biteReading(character),
     }
 end
 
@@ -295,7 +326,9 @@ function Needs.heavyWorkRefusal(character, taskType)
     if not Needs.heavyWork[tostring(taskType)] then return nil end
     -- A bitten person knows what it means. The reason is separate from pain so
     -- the surface that speaks it can say which body fact refused the work.
-    if Needs.infectionBand(character) == "bitten" then return "infected" end
+    -- Keep the existing refusal code for callers; only a real bite may select
+    -- the dialogue that says "I got bit".
+    if Needs.biteReading(character) == true then return "infected" end
     local ok, snapshot = pcall(Needs.snapshot, character)
     if not ok or snapshot == nil then return nil end
     local band = Needs.painBand(snapshot)
@@ -356,14 +389,26 @@ function Needs.coreTemperature(character)
     return tonumber(value)
 end
 
+-- Use the engine's player-facing thermal severity, not invented Celsius bands.
+function Needs.thermalMoodle(character, kind)
+    if character == nil or (kind ~= "heat" and kind ~= "cold") then return nil end
+    local ok, level = pcall(function()
+        local moodle = kind == "heat" and MoodleType.HYPERTHERMIA or MoodleType.HYPOTHERMIA
+        return character:getMoodles():getMoodleLevel(moodle)
+    end)
+    return ok and tonumber(level) or nil
+end
+
 -- The reason a person steps out of the weather, or nil when there is none. Rain
 -- is answered first because it is the thing a person can see; a cold core is
 -- answered next. Anything unreadable is silence, not a guess.
 function Needs.shelterReason(character)
     local rain = Needs.rainIntensity()
     if rain ~= nil and rain >= Needs.rainShelter then return "rain" end
+    local hot, cold = Needs.thermalMoodle(character, "heat"), Needs.thermalMoodle(character, "cold")
+    if hot ~= nil and hot > 0 then return "heat" end
     local core = Needs.coreTemperature(character)
-    if core ~= nil and core <= Needs.coldCore then return "cold" end
+    if (cold ~= nil and cold > 0) or (core ~= nil and core <= Needs.coldCore) then return "cold" end
     -- Rain soaks a person and the soaking outlasts the rain. A body still wet
     -- through keeps them inside after the sky clears, until it dries.
     local wet = Needs.clothingWetness(character)
@@ -374,7 +419,7 @@ end
 -- The reason decides which words are spoken, in one place: a new reason cannot
 -- silently borrow another bank's line, and an unknown reason says nothing.
 Needs.shelterBanks = { rain = "weather_rain", cold = "weather_cold",
-    wet = "weather_wet" }
+    wet = "weather_wet", heat = "weather_heat" }
 
 function Needs.shelterBank(reason)
     if reason == nil then return nil end
@@ -389,7 +434,20 @@ function Needs.shelterAnnouncement(previous, current)
     return current
 end
 
+-- An outdoor job is refused while the body is already soaked or out of
+-- temperature. Rain on its own is not a refusal: the shelter walk already
+-- answers the sky, and a person in light rain still works. The planner reads
+-- this at its own gate, so a wet resident is deferred instead of claimed
+-- for a job they would walk away from. An unread body refuses nothing.
+function Needs.weatherWorkRefusal(character, outside)
+    if character == nil or outside ~= true then return nil end
+    local reason = Needs.shelterReason(character)
+    if reason == nil or reason == "rain" then return nil end
+    return reason
+end
+
 -- ILLNESS AND INFECTION
+
 -- The engine already models infection on the BodyDamage blob this mod persists
 -- whole, so this is a reader plus a decision, not a second simulation. An
 -- unreadable body is nil, never "healthy": a settlement must not act on a
@@ -417,8 +475,28 @@ function Needs.infectionReading(character)
 end
 
 -- One word for what the body says, or nil when it says nothing readable.
+-- Bite wounds are observable; infection and an unreadable body are not a
+-- clean medical examination. Use vanilla BodyPart:bitten(), not its name alone.
+function Needs.biteReading(character)
+    if character==nil then return nil end
+    local ok,result=pcall(function()
+        local parts=character:getBodyDamage():getBodyParts()
+        if parts==nil or parts:size()==0 then return nil end
+        for index=0,parts:size()-1 do
+            local bitten=parts:get(index):bitten()
+            if type(bitten)~="boolean" then return nil end
+            if bitten then return true end
+        end
+        return false
+    end)
+    if not ok then return nil end
+    return result
+end
+
 function Needs.infectionBand(character)
-    local reading = Needs.infectionReading(character)
+    -- Legacy name consumed by nameplates and Ask > Health. The visible word is
+    -- "bitten", so this band must describe wounds rather than hidden infection.
+    local reading = Needs.biteReading(character)
     if reading == nil then return nil end
     return reading and "bitten" or "clear"
 end
@@ -429,7 +507,7 @@ end
 -- the death line already has the attribution - so this answers why a person
 -- died when nobody was standing there to say.
 function Needs.deathCause(character, attributionKind)
-    if character ~= nil and Needs.infectionBand(character) == "bitten" then
+    if character ~= nil and Needs.infectionReading(character) == true then
         return "infection"
     end
     local ok, snapshot = pcall(Needs.snapshot, character)
@@ -552,6 +630,12 @@ function Needs.decide(character, threat)
     if state.fatigue >= Needs.thresholds.fatigue and Needs.sleepRequired() then
         return { kind = "sleep", state = state }
     end
+    local maintenance = KnoxMedicalActions.maintenancePlan ~= nil
+        and KnoxMedicalActions.maintenancePlan(character, character) or nil
+    if maintenance ~= nil then
+        maintenance.state = state
+        return maintenance
+    end
     return { kind = "roam", state = state }
 end
 
@@ -596,6 +680,15 @@ local function consumptionReceipt(character, intent)
             if finite(intent.smokeBefore[key]) and finite(current[key])
                 and current[key] < intent.smokeBefore[key] - NEED_CHANGE_EPSILON then return true end
         end
+    elseif intent.kind == "disinfect" then
+        local item = intent.item
+        local remaining = item:hasComponent(ComponentType.FluidContainer)
+            and item:getFluidContainer():getAmount() or item:getCurrentUsesFloat()
+        return intent.bodyPart:getAlcoholLevel() > intent.alcoholBefore
+            and (not carriedIn(character, item, nil) or remaining < intent.supplyBefore)
+    elseif intent.kind == "antibiotic" then
+        return not carriedIn(character, intent.item, nil)
+            and character:getReduceInfectionPower() > intent.drugBefore
     elseif intent.kind == "bandage" then
         return intent.bodyPart ~= nil and intent.bodyPart:bandaged()
             and not carriedIn(character, intent.item, nil)
@@ -634,7 +727,35 @@ local function bindNeedAction(character, action, intent, ownership)
                         or (carriedIn(character, item, source)
                             and KnoxMedicalSupplies.canImprovise(character, intent.supplyPlan) == true))
             end
+            if intent.kind == "remove_healed_bandage" then
+                return candidate.item == nil and candidate.doIt == false
+                    and candidate.bodyPart == intent.bodyPart and candidate.otherPlayer == character
+                    and intent.bodyPart:bandaged() and not intent.bodyPart:HasInjury()
+            end
+            if intent.kind == "replace_bandage" then
+                return candidate.item == nil and candidate.doIt == false
+                    and candidate.bodyPart == intent.bodyPart and candidate.otherPlayer == character
+                    and carriedIn(character, item, source)
+                    and KnoxMedicalActions.cleanBandageUsable(character, item)
+                    and intent.bodyPart:HasInjury() and intent.bodyPart:bandaged()
+                    and intent.bodyPart:getBandageLife() <= 0
+            end
+            if intent.kind == "splint" then
+                return candidate.item == nil and candidate.doIt == true
+                    and candidate.bodyPart == intent.bodyPart
+                    and candidate.otherPlayer == character
+                    and carriedIn(character, intent.item, intent.source)
+                    and KnoxMedicalActions.selfSplintAllowed(
+                        character, intent.item, intent.bodyPart)
+            end
             if candidate.item ~= intent.item or not carriedIn(character, intent.item, intent.source) then return false end
+            if intent.kind == "disinfect" or intent.kind == "antibiotic" then
+                local plan = KnoxMedicalActions.maintenancePlan(character, character,
+                    intent.replacementPart)
+                return plan ~= nil and plan.kind == intent.kind and plan.item == item
+                    and (intent.kind ~= "disinfect" or (candidate.alcohol == item
+                        and candidate.bodyPart == intent.bodyPart and plan.bodyPart == intent.bodyPart))
+            end
             if intent.kind == "bandage" then
                 return candidate.bodyPart == intent.bodyPart and candidate.otherPlayer == character
                     and intent.bodyPart:HasInjury() and not intent.bodyPart:bandaged()
@@ -666,6 +787,8 @@ local function bindNeedAction(character, action, intent, ownership)
             if not allowed(candidate) or (once and intent[completedKey]) then return false end
             if once then intent[completedKey] = true end
             local result = native(candidate, ...)
+            if (intent.kind == "replace_bandage" or intent.kind == "remove_healed_bandage") and result == true
+                and not intent.bodyPart:bandaged() then intent.removed = true end
             local ok, received = pcall(consumptionReceipt, character, intent)
             if ok and received then intent.receipt = true end
             return result
@@ -675,7 +798,7 @@ local function bindNeedAction(character, action, intent, ownership)
         wrapMutation("complete", true)
         -- Native stops/partial water updates can consume too. Revoked care
         -- must not eat/drink later while an unrelated current queue drains.
-        if intent.kind == "eat" or intent.kind == "smoke" then wrapMutation("eat")
+        if intent.kind == "eat" or intent.kind == "smoke" or intent.kind == "antibiotic" then wrapMutation("eat")
         elseif intent.kind == "drink" then wrapMutation("drink")
         elseif intent.kind == "drink_world" then wrapMutation("transferFluid")
         elseif intent.kind == "improvise_medical" then wrapMutation("performRecipe", true) end
@@ -686,7 +809,7 @@ local function registeredNeedAction(character, action, admitted, intent)
     local registered = ISTimedActionQueue.queues and ISTimedActionQueue.queues[character]
     if admitted == nil or admitted ~= registered or intent.cancelled then return false end
     for _, candidate in ipairs(admitted.queue or {}) do if candidate == action then return true end end
-    return intent.receipt == true
+    return intent.receipt == true or ((intent.kind == "replace_bandage" or intent.kind == "remove_healed_bandage") and intent.removed == true)
 end
 
 local function queueNeedAction(character, action, intent, ownership)
@@ -700,6 +823,52 @@ local function queueNeedAction(character, action, intent, ownership)
     end
     intent.admitted = true
     return action
+end
+
+local function prepareBaggedSupply(character, decision, ownership)
+    local inventory, source = character:getInventory(), nil
+    walkInventory(inventory, function(item, container)
+        if item == decision.item then source = container; return true end
+    end)
+    if source == nil then
+        diagNeed(character, "need_action_failed", {
+            kind = tostring(decision.kind), result = "supply_no_longer_carried",
+        })
+        return nil, "supply_no_longer_carried"
+    end
+    if source == inventory then return false end
+    local intent = { kind = "prepare_supply", needKind = decision.kind,
+        before = decision.state, item = decision.item, source = source, destination = inventory,
+        bodyPart = decision.bodyPart }
+    local guard
+    guard = function(candidate, item)
+        if intent.action == nil then
+            bindNeedAction(character, candidate, intent, ownership)
+            if ownership ~= nil then ownership.guard = guard end
+        end
+        return intent.guard(candidate) and item == intent.item
+            and candidate.srcContainer == source and candidate.destContainer == inventory
+    end
+    if ownership ~= nil then ownership.guard, ownership.intent = guard, intent end
+    local ok, action, reason = pcall(KnoxInventoryActions.queueTransfer,
+        character, decision.item, source, inventory, nil, guard)
+    if ok and action ~= nil then
+        if intent.action == nil then bindNeedAction(character, action, intent, ownership) end
+        if ownership ~= nil then ownership.guard = guard end
+        intent.receipt = not carriedIn(character, intent.item, source)
+            and carriedIn(character, intent.item, inventory)
+    end
+    local registered = ISTimedActionQueue.queues and ISTimedActionQueue.queues[character]
+    if not ok or action == nil or not registeredNeedAction(character, action, registered, intent)
+        or (ownership ~= nil and ownership.cancelled) then
+        intent.cancelled = true
+        diagNeed(character, "need_action_failed", {
+            kind = tostring(decision.kind), result = "supply_transfer_rejected",
+        })
+        return nil, "supply_transfer_rejected"
+    end
+    intent.admitted = true
+    return action, reason, intent
 end
 
 function Needs.execute(character, decision, ownership)
@@ -731,7 +900,96 @@ function Needs.execute(character, decision, ownership)
         })
         return action, result, intent
     end
+    if decision.kind == "splint" then
+        local plan = KnoxMedicalActions.maintenancePlan(character, character)
+        if plan == nil or plan.kind ~= "splint" or plan.item ~= decision.item
+            or plan.bodyPart ~= decision.bodyPart then
+            return report(nil, "self_splint_no_longer_needed")
+        end
+        local prepared, preparedResult, preparedIntent =
+            prepareBaggedSupply(character, decision, ownership)
+        if prepared ~= false then
+            if prepared == nil then return nil, preparedResult end
+            return report(prepared, preparedResult, preparedIntent)
+        end
+        local intent = { kind = "splint", before = decision.state,
+            item = decision.item, bodyPart = decision.bodyPart,
+            source = character:getInventory() }
+        local action = KnoxMedicalActions.queueSelfSplint(
+            character, decision.item, decision.bodyPart,
+            function(actor, candidate)
+                return queueNeedAction(actor, candidate, intent, ownership)
+            end)
+        return report(action, action ~= nil and "queued_self_splint"
+            or "self_splint_queue_refused", intent)
+    end
+    if decision.kind == "remove_healed_bandage" then
+        local plan = KnoxMedicalActions.maintenancePlan(character, character)
+        if plan == nil or plan.kind ~= decision.kind or plan.bodyPart ~= decision.bodyPart then
+            return report(nil, "removal_no_longer_needed")
+        end
+        local intent = { kind = decision.kind, before = decision.state, bodyPart = decision.bodyPart }
+        local action = KnoxMedicalActions.queueBandageRemoval(character, decision.bodyPart, function(actor, candidate)
+            return queueNeedAction(actor, candidate, intent, ownership)
+        end)
+        return report(action, action ~= nil and "queued_dressing_removal" or "removal_queue_refused", intent)
+    end
+    if decision.kind == "replace_bandage" then
+        local plan = KnoxMedicalActions.maintenancePlan(character, character)
+        if plan == nil or plan.kind ~= decision.kind or plan.item ~= decision.item
+            or plan.bodyPart ~= decision.bodyPart then return report(nil, "replacement_no_longer_needed") end
+        local intent = { kind = decision.kind, before = decision.state, item = decision.item,
+            bodyPart = decision.bodyPart, source = character:getInventory() }
+        local action = KnoxMedicalActions.queueBandageRemoval(character, decision.bodyPart, function(actor, candidate)
+            return queueNeedAction(actor, candidate, intent, ownership)
+        end)
+        return report(action, action ~= nil and "queued_dressing_removal" or "removal_queue_refused", intent)
+    end
+    if decision.kind == "disinfect" or decision.kind == "antibiotic" then
+        local plan = KnoxMedicalActions.maintenancePlan(character, character,
+            decision.replacementPart)
+        if plan == nil or plan.kind ~= decision.kind or plan.item ~= decision.item
+            or plan.bodyPart ~= decision.bodyPart then return report(nil, "maintenance_no_longer_needed") end
+        if decision.kind == "disinfect" then
+            local prepared, preparedResult, preparedIntent =
+                prepareBaggedSupply(character, decision, ownership)
+            if prepared ~= false then
+                if prepared == nil then return nil, preparedResult end
+                return report(prepared, preparedResult, preparedIntent)
+            end
+        end
+        local item = decision.item
+        local intent = { kind = decision.kind, before = decision.state, item = item,
+            bodyPart = decision.bodyPart, source = character:getInventory(),
+            replacementItem = decision.replacementItem, replacementPart = decision.replacementPart }
+        local action
+        if decision.kind == "disinfect" then
+            local ok, amount = pcall(function()
+                return item:hasComponent(ComponentType.FluidContainer)
+                    and item:getFluidContainer():getAmount() or item:getCurrentUsesFloat()
+            end)
+            if not ok or not finite(amount) then return report(nil, "disinfectant_unreadable") end
+            intent.supplyBefore, intent.alcoholBefore = amount, decision.bodyPart:getAlcoholLevel()
+            action = KnoxMedicalActions.queueDisinfect(character, item, decision.bodyPart, function(actor, candidate)
+                return queueNeedAction(actor, candidate, intent, ownership)
+            end)
+        else
+            intent.drugBefore = character:getReduceInfectionPower()
+            action = ISEatFoodAction:new(character, item, 1)
+            action = queueNeedAction(character, action, intent, ownership)
+        end
+        return report(action, action ~= nil and "queued_maintenance" or "maintenance_queue_refused", intent)
+    end
     if decision.kind == "bandage" then
+        -- A bandage chosen from a bag still has to come to hand. Use the same
+        -- prepare_supply transfer owner as a bagged meal; on a full pack the
+        -- controller hands the rejection to the existing cleanup owner.
+        local prepared, preparedResult, preparedIntent =
+            prepareBaggedSupply(character, decision, ownership)
+        if prepared ~= false then
+            if prepared == nil then return nil, preparedResult end
+            return report(prepared, preparedResult, preparedIntent)
+        end
         local intent = { kind = "bandage", before = decision.state,
             item = decision.item, bodyPart = decision.bodyPart }
         if ownership ~= nil then
@@ -758,50 +1016,11 @@ function Needs.execute(character, decision, ownership)
         if not isSmokeItem(decision.item) then return report(nil, "no_smoke_carried") end
     end
     if decision.kind == "drink" or decision.kind == "eat" or decision.kind == "smoke" then
-        local inventory, source = character:getInventory(), nil
-        walkInventory(inventory, function(item, container)
-            if item == decision.item then source = container; return true end
-        end)
-        if source == nil then
-            diagNeed(character, "need_action_failed", {
-                kind = tostring(decision.kind), result = "supply_no_longer_carried",
-            })
-            return nil, "supply_no_longer_carried"
-        end
-        if source ~= inventory then
-            -- Native eating validates main-inventory ownership. Retrieving a
-            -- bagged meal is a separate verified action, never consumption.
-            local intent = { kind = "prepare_supply", needKind = decision.kind,
-                before = decision.state, item = decision.item, source = source, destination = inventory }
-            local guard
-            guard = function(candidate, item)
-                if intent.action == nil then
-                    bindNeedAction(character, candidate, intent, ownership)
-                    if ownership ~= nil then ownership.guard = guard end
-                end
-                return intent.guard(candidate) and item == intent.item
-                    and candidate.srcContainer == source and candidate.destContainer == inventory
-            end
-            if ownership ~= nil then ownership.guard, ownership.intent = guard, intent end
-            local ok, action, reason = pcall(KnoxInventoryActions.queueTransfer,
-                character, decision.item, source, inventory, nil, guard)
-            if ok and action ~= nil then
-                if intent.action == nil then bindNeedAction(character, action, intent, ownership) end
-                if ownership ~= nil then ownership.guard = guard end
-                intent.receipt = not carriedIn(character, intent.item, source)
-                    and carriedIn(character, intent.item, inventory)
-            end
-            local registered = ISTimedActionQueue.queues and ISTimedActionQueue.queues[character]
-            if not ok or action == nil or not registeredNeedAction(character, action, registered, intent)
-                or (ownership ~= nil and ownership.cancelled) then
-                intent.cancelled = true
-                diagNeed(character, "need_action_failed", {
-                    kind = tostring(decision.kind), result = "supply_transfer_rejected",
-                })
-                return nil, "supply_transfer_rejected"
-            end
-            intent.admitted = true
-            return report(action, reason, intent)
+        local prepared, preparedResult, preparedIntent =
+            prepareBaggedSupply(character, decision, ownership)
+        if prepared ~= false then
+            if prepared == nil then return nil, preparedResult end
+            return report(prepared, preparedResult, preparedIntent)
         end
     end
     if decision.kind == "drink" then
@@ -919,6 +1138,34 @@ function Needs.execute(character, decision, ownership)
     return nil, "decision_requires_world_action=" .. tostring(decision.kind)
 end
 
+-- Removal is a handoff, not a completed treatment. Prefer disinfection only
+-- while bleeding is controlled, then the ordinary need planner can bandage.
+function Needs.replacementFollowup(character, intent)
+    local ok, decision = pcall(function()
+        if character == nil or intent == nil or intent.cancelled or intent.admitted ~= true then return nil end
+        local item, part
+        if intent.kind == "replace_bandage" and intent.removed == true then
+            item, part = intent.item, intent.bodyPart
+        elseif intent.kind == "disinfect" and intent.receipt == true then
+            item, part = intent.replacementItem, intent.replacementPart
+        end
+        if part == nil or part:bandaged() or not part:HasInjury()
+            or not KnoxMedicalActions.cleanBandageUsable(character, item) then return nil end
+        local state = Needs.snapshot(character)
+        if intent.kind == "replace_bandage" and state.bleedingParts < Needs.thresholds.bleeding then
+            local plan = KnoxMedicalActions.maintenancePlan(character, character, part)
+            if plan ~= nil and plan.kind == "disinfect" and plan.bodyPart == part then
+                plan.state = state
+                plan.replacementItem, plan.replacementPart = item, part
+                return plan
+            end
+        end
+        return { kind = "bandage", item = item, bodyPart = part, state = state }
+    end)
+    if ok then return decision end
+    return nil
+end
+
 -- An empty timed-action queue proves only that native ownership ended. These
 -- checks prove that the authoritative game state actually changed before the
 -- controller records self-care as successful.
@@ -926,8 +1173,15 @@ function Needs.verify(character, intent)
     if character == nil or intent == nil or intent.before == nil then
         return false, "missing_intent"
     end
+    if intent.kind == "replace_bandage" then return false, "replacement_not_yet_applied" end
+    if intent.kind == "remove_healed_bandage" then
+        local removed = not intent.cancelled and intent.admitted == true and intent.removed == true
+            and intent.bodyPart ~= nil and not intent.bodyPart:bandaged()
+        return removed, removed and "healed_dressing_removed" or "removal_unconfirmed"
+    end
     if intent.kind == "eat" or intent.kind == "drink" or intent.kind == "drink_world"
         or intent.kind == "smoke" or intent.kind == "prepare_supply"
+        or intent.kind == "disinfect" or intent.kind == "antibiotic"
         or ((intent.kind == "bandage" or intent.kind == "improvise_medical") and intent.action ~= nil) then
         if intent.cancelled or intent.action == nil or intent.admitted ~= true then
             return false, "need_action_unconfirmed"
@@ -935,6 +1189,9 @@ function Needs.verify(character, intent)
         if intent.kind ~= "prepare_supply" and intent.receipt ~= true then
             return false, "native_consumption_unconfirmed"
         end
+    end
+    if intent.kind == "disinfect" or intent.kind == "antibiotic" then
+        return intent.receipt == true, intent.receipt == true and "maintenance_received" or "maintenance_unconfirmed"
     end
     local after = Needs.snapshot(character)
     if intent.kind == "smoke" then
@@ -1039,6 +1296,65 @@ function Needs.sleepHours(character, fatigue, bedType)
     return math.max(3, math.min(16, hours))
 end
 
+-- SLEEP ADMISSION (pure)
+-- Install truth, 42.21: the whole sleep interaction keys off one furniture
+-- property. getBedQuality reads properties:get("BedType") and the sleep
+-- transition applies that same value to setBedType
+-- (pzHome/media/lua/client/ISUI/ISWorldObjectContextMenu.lua:1034-1090 and
+-- 2949-2951). A bed, and a couch that declares BedType, run the animation
+-- the player runs; a tent or shelter is vanilla's own CustomName special
+-- case. A vehicle is a different native path with a seat
+-- (ISVehicleMenu.onSleep), not a BedType object, so it is not a bed
+-- reference. One admissibility rule, read here by the assign surface and by
+-- the rest search.
+local function declaredBedType(object)
+    if object == nil or object.getProperties == nil then return nil end
+    local ok, properties = pcall(function() return object:getProperties() end)
+    if not ok or properties == nil or properties.get == nil then return nil end
+    local okType, value = pcall(function() return properties:get("BedType") end)
+    if not okType or value == nil then return nil end
+    local text = tostring(value)
+    if text == "" then return nil end
+    return text
+end
+
+local function declaredCustomName(object)
+    if object == nil or object.getProperties == nil then return "" end
+    local name = nil
+    pcall(function()
+        local properties = object:getProperties()
+        name = properties ~= nil and properties.get ~= nil
+            and properties:get("CustomName") or nil
+    end)
+    return name ~= nil and string.lower(tostring(name)) or ""
+end
+
+function Needs.sleepAdmissible(object)
+    if object == nil then return false, "no_object" end
+    local bedType = declaredBedType(object)
+    if bedType ~= nil then return true, bedType end
+    local name = declaredCustomName(object)
+    if name == "tent" or name == "shelter" then
+        return true, "averageBed"
+    end
+    return false, "not_a_bed"
+end
+
+-- Vanilla sleeps from a square that is tile-or-adjacent to the bed and only
+-- walks when it is not (onConfirmSleep). The same install predicate answers
+-- here, so the survivor takes the step the player would skip and never
+-- repeats a walk to a second approach square it cannot reach.
+function Needs.bedAdjacent(character, bed)
+    if character == nil or bed == nil or bed.getSquare == nil then return false end
+    local ok, adjacent = pcall(function()
+        local square = bed:getSquare()
+        local current = character:getCurrentSquare()
+        if square == nil or current == nil then return false end
+        return AdjacentFreeTileFinder.isTileOrAdjacent(current, square) == true
+    end)
+    return ok and adjacent == true
+end
+-- END SLEEP ADMISSION
 -- This is the same native sleep transition used by Build 42's world context
 -- menu, without touching local-player UI or time controls for the off-slot NPC.
 function Needs.startSleep(character, bed, bedType)
@@ -1102,7 +1418,214 @@ function Needs.startSleep(character, bed, bedType)
     diagSleep(character, "sleep_started", {
         hours = hours, bedType = tostring(sleepBedType), wakeAt = wakeAt,
     })
-    return true, "native_sleep hours=" .. tostring(hours)
+    return true, "native_sleep hours=" .. tostring(hours), hours
+end
+
+-- GIVING FOOD AWAY WITH A SELF RESERVE (2026-11-06)
+-- A hungry survivor is noticed from the same native hunger value every other
+-- need read uses; the giver's own reserve is the existing eat threshold, so
+-- food is only offered when it leaves the giver still fed. The native
+-- remaining-hunger value of one item is read once and never multiplied, and an
+-- unreadable hunger reading is never a need, a safe donation or a receipt.
+local function shareNumber(value)
+    return type(value) == "number" and value == value
+        and value ~= math.huge and value ~= -math.huge
+end
+
+local function hungerOf(character)
+    if character == nil or character.getStats == nil then return nil end
+    local ok, value = pcall(function()
+        return character:getStats():get(CharacterStat.HUNGER)
+    end)
+    if not ok then return nil end
+    value = tonumber(value)
+    if not shareNumber(value) then return nil end
+    return value
+end
+
+function Needs.shareFoodOffer(giver, target)
+    if giver == nil or target == nil or giver == target then
+        return nil, "missing_people"
+    end
+    local mine, theirs = hungerOf(giver), hungerOf(target)
+    if mine == nil or theirs == nil then return nil, "unreadable_need" end
+    if theirs < Needs.thresholds.hunger then return nil, "no_need" end
+    if mine >= Needs.thresholds.hunger then return nil, "keeping_own_reserve" end
+    local food = Needs.findBestFood(giver)
+    if food == nil then return nil, "no_safe_food" end
+    local okChange, change = pcall(function() return food:getHungerChange() end)
+    if not okChange then change = nil end
+    change = tonumber(change)
+    if not shareNumber(change) or change >= -0.01 then return nil, "unreadable_food" end
+    -- One item, one native value. A part-eaten portion is its own remaining
+    -- hunger; it is never a count multiplied into a larger meal.
+    local bite = math.abs(change)
+    if mine + bite > Needs.thresholds.hunger then return nil, "reserve_too_thin" end
+    return food, "share"
+end
+
+-- The one line that names why the offer is being made. Selection, cooldown and
+-- the speaker's own voice stay with the dialogue owner.
+Needs.shareLines = { "Here - you need this more than I do." }
+
+function Needs.queueFoodShare(giver, target, survivorId, ticks, duration)
+    local food, reason = Needs.shareFoodOffer(giver, target)
+    if food == nil then return nil, reason end
+    local actions = rawget(_G, "KnoxInventoryActions")
+    if actions == nil or actions.queueTransfer == nil then
+        return nil, "transfer_unavailable"
+    end
+    if giver.getInventory == nil or target.getInventory == nil then
+        return nil, "missing_people"
+    end
+    local ok, action = pcall(actions.queueTransfer, giver, food,
+        giver:getInventory(), target:getInventory(), duration or 60)
+    if not ok or action == nil then return nil, "transfer_refused" end
+    local dialogue = rawget(_G, "KnoxSurvivorDialogue")
+    if dialogue ~= nil and dialogue.sayLines ~= nil then
+        pcall(dialogue.sayLines, giver, survivorId or "survivor",
+            "share_food", Needs.shareLines, ticks or 0, 1800)
+    end
+    return action, "share"
+end
+
+-- WATER AND MEDICAL SHARING (2026-11-06)
+-- Water is measured from the container's actual fluid amount after the same
+-- safety checks drinking uses: an empty, non-water, unreadable or tainted
+-- container is never offered, and a nominal count is never a measurement. The
+-- giver keeps a bottle of their own. Medical supply is whatever the existing
+-- MedicalSupplies.plan already admits as a treatment; a plan that cannot name
+-- a safe treatment is never evidence that one exists.
+local function thirstOf(character)
+    if character == nil or character.getStats == nil then return nil end
+    local ok, value = pcall(function()
+        return character:getStats():get(CharacterStat.THIRST)
+    end)
+    if not ok then return nil end
+    value = tonumber(value)
+    if not shareNumber(value) then return nil end
+    return value
+end
+
+local function bleedingOf(character)
+    if character == nil or character.getBodyDamage == nil then return nil end
+    local ok, value = pcall(function()
+        return character:getBodyDamage():getNumPartsBleeding()
+    end)
+    if not ok then return nil end
+    value = tonumber(value)
+    if not shareNumber(value) or value < 0 then return nil end
+    return value
+end
+
+-- The item-side counterpart of Needs.waterSourceState: the actual amount in
+-- the bottle after the same taint/emptiness/readability checks vanilla drinking
+-- applies, never the item's stack count or a nominal capacity.
+local function potableState(item)
+    if item == nil or item.getFluidContainer == nil then return nil end
+    local ok, fluid = pcall(function() return item:getFluidContainer() end)
+    if not ok or fluid == nil then return nil end
+    local okRead, empty, waterSource, amount = pcall(function()
+        return fluid:isEmpty(), fluid:isWaterSource(), fluid:getAmount()
+    end)
+    amount = okRead and tonumber(amount) or nil
+    if not okRead or empty ~= false or waterSource ~= true
+        or not shareNumber(amount) or amount <= 0 then return nil end
+    local okTaint, tainted = pcall(function()
+        if Fluid == nil or Fluid.TaintedWater == nil then return nil end
+        return fluid:contains(Fluid.TaintedWater)
+    end)
+    if not okTaint or type(tainted) ~= "boolean" or tainted then return nil end
+    return { item = item, amount = amount }
+end
+
+function Needs.shareWaterOffer(giver, target)
+    if giver == nil or target == nil or giver == target then
+        return nil, "missing_people"
+    end
+    local mine, theirs = thirstOf(giver), thirstOf(target)
+    if mine == nil or theirs == nil then return nil, "unreadable_need" end
+    if theirs < Needs.thresholds.thirst then return nil, "no_need" end
+    if mine >= Needs.thresholds.thirst then return nil, "keeping_own_reserve" end
+    -- A pack that cannot be read is not an empty pack and not a safe offer:
+    -- the scan fails closed instead of propagating a native accessor error.
+    local okFind, water = pcall(Needs.findBestWater, giver, false)
+    if not okFind then return nil, "unreadable_water" end
+    if water == nil then return nil, "no_safe_water" end
+    local state = potableState(water)
+    if state == nil then return nil, "unreadable_water" end
+    local okSpare, spare = pcall(Needs.findBestWater, giver, false,
+        function(item) return item ~= water end)
+    if not okSpare then return nil, "unreadable_water" end
+    if spare == nil then return nil, "last_bottle" end
+    return water, "share"
+end
+
+Needs.shareWaterLines = { "You look parched - take my spare bottle." }
+
+function Needs.queueWaterShare(giver, target, survivorId, ticks, duration)
+    local water, reason = Needs.shareWaterOffer(giver, target)
+    if water == nil then return nil, reason end
+    local actions = rawget(_G, "KnoxInventoryActions")
+    if actions == nil or actions.queueTransfer == nil then
+        return nil, "transfer_unavailable"
+    end
+    if giver.getInventory == nil or target.getInventory == nil then
+        return nil, "missing_people"
+    end
+    local ok, action = pcall(actions.queueTransfer, giver, water,
+        giver:getInventory(), target:getInventory(), duration or 60)
+    if not ok or action == nil then return nil, "transfer_refused" end
+    local dialogue = rawget(_G, "KnoxSurvivorDialogue")
+    if dialogue ~= nil and dialogue.sayLines ~= nil then
+        pcall(dialogue.sayLines, giver, survivorId or "survivor",
+            "share_water", Needs.shareWaterLines, ticks or 0, 1800)
+    end
+    return action, "share"
+end
+
+function Needs.shareMedicalOffer(giver, target)
+    if giver == nil or target == nil or giver == target then
+        return nil, "missing_people"
+    end
+    local theirBleeding = bleedingOf(target)
+    if theirBleeding == nil then return nil, "unreadable_need" end
+    if theirBleeding < 1 then return nil, "no_need" end
+    local mine = bleedingOf(giver)
+    if mine == nil then return nil, "unreadable_need" end
+    if mine >= 1 then return nil, "keeping_own_reserve" end
+    local supplies = rawget(_G, "KnoxMedicalSupplies")
+    if supplies == nil or supplies.plan == nil then return nil, "supply_unreadable" end
+    local ok, plan = pcall(supplies.plan, giver, 8)
+    -- Only a named, safe treatment is a supply. Search, improvisation and an
+    -- unreadable plan are not evidence that medicine exists.
+    if not ok or plan == nil or plan.kind ~= "use_treatment" or plan.item == nil then
+        return nil, "no_safe_supply"
+    end
+    return plan.item, "share"
+end
+
+Needs.shareMedicalLines = { "Let me see that - take this." }
+
+function Needs.queueMedicalShare(giver, target, survivorId, ticks, duration)
+    local item, reason = Needs.shareMedicalOffer(giver, target)
+    if item == nil then return nil, reason end
+    local actions = rawget(_G, "KnoxInventoryActions")
+    if actions == nil or actions.queueTransfer == nil then
+        return nil, "transfer_unavailable"
+    end
+    if giver.getInventory == nil or target.getInventory == nil then
+        return nil, "missing_people"
+    end
+    local ok, action = pcall(actions.queueTransfer, giver, item,
+        giver:getInventory(), target:getInventory(), duration or 60)
+    if not ok or action == nil then return nil, "transfer_refused" end
+    local dialogue = rawget(_G, "KnoxSurvivorDialogue")
+    if dialogue ~= nil and dialogue.sayLines ~= nil then
+        pcall(dialogue.sayLines, giver, survivorId or "survivor",
+            "share_medical", Needs.shareMedicalLines, ticks or 0, 1800)
+    end
+    return action, "share"
 end
 
 function Needs.wakeForDanger(character)

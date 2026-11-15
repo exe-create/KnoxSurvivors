@@ -33,6 +33,7 @@ local RELATIONSHIP_INTERVAL_TICKS = 60
 local POPULATION_INTERVAL_TICKS = 300
 local ACTIVATION_RETRY_TICKS = POPULATION_INTERVAL_TICKS * 2
 local HIBERNATION_INTERVAL_TICKS = 30
+local HIBERNATIONS_PER_UPDATE = 2
 local DEFAULT_ACTIVATION_DISTANCE = 280
 local function activationDistance()
     return KnoxSettings.survivorEncounterDistance ~= nil
@@ -184,6 +185,25 @@ local function findSpawnSquare(origin)
     return nil
 end
 
+function Autonomy.applyCreatorCargo(character, record)
+    if record == nil then return true, "none" end
+    if KnoxCreator == nil or KnoxCreator.decodeCargo == nil then return false, "cargo_decoder_unavailable" end
+    local function expand(encoded)
+        local result = {}
+        for fullType, count in pairs(KnoxCreator.decodeCargo(encoded)) do
+            for _ = 1, count do result[#result + 1] = fullType end
+        end
+        return result
+    end
+    local bagItems = expand(record.bagCargo)
+    if #bagItems > 0 then
+        local bag = KnoxCreator.bagFromSlots(KnoxCreator.decodeSlots(record.slots))
+        local ok, reason = KnoxSurvivorStartingGear.applyBagItems(character, bag and bag.fullType, bagItems)
+        if not ok then return false, reason end
+    end
+    return KnoxSurvivorStartingGear.applyItems(character, expand(record.cargo))
+end
+
 local function createSurvivorAt(bridge, id, square, developerKit)
     if square == nil then
         return nil, "no_loaded_spawn_square", false
@@ -212,12 +232,11 @@ local function createSurvivorAt(bridge, id, square, developerKit)
         bridge:removeNpc(id)
         return nil, "capabilities_failed=" .. tostring(capabilityResult), true
     end
-    local appearanceOk, appearance = KnoxCharacterAppearance.randomizeNewSurvivor(
-        bridge,
-        id,
-        capabilities,
-        eventPolicy ~= nil and eventPolicy.appearanceItems or nil
-    )
+    local appearanceOk, appearance = true, "creator_authored"
+    if creatorRecord == nil or creatorRecord.look == nil then
+        appearanceOk, appearance = KnoxCharacterAppearance.randomizeNewSurvivor(
+            bridge, id, capabilities, eventPolicy ~= nil and eventPolicy.appearanceItems or nil)
+    end
     if not appearanceOk then
         bridge:removeNpc(id)
         return nil, "appearance_failed=" .. tostring(appearance), true
@@ -235,6 +254,10 @@ local function createSurvivorAt(bridge, id, square, developerKit)
     if developerKit then
         equipped = tostring(bridge:seedAndEquipNpc(id))
         equipmentOk = string.find(equipped, "EQUIPPED", 1, true) == 1
+    elseif creatorRecord ~= nil and creatorRecord.kit == "none" then
+        -- Explicit creator equipment is its own finite producer. Empty pockets
+        -- must not quietly add the random civilian starting inventory.
+        equipmentOk, equipped = true, "CREATOR_DEFINED"
     else
         equipmentOk, equipped = KnoxSurvivorStartingGear.initialize(
             id,
@@ -261,8 +284,9 @@ local function createSurvivorAt(bridge, id, square, developerKit)
         pcall(function()
             local descriptor = character:getDescriptor()
             if descriptor ~= nil then
-                descriptor:setForename(creatorRecord.name)
-                descriptor:setSurname("")
+                local forename, surname = creatorRecord.name:match("^(.-)%s+([^%s]+)$")
+                descriptor:setForename(forename or creatorRecord.name)
+                descriptor:setSurname(surname or "")
             end
         end)
     end
@@ -280,7 +304,8 @@ local function createSurvivorAt(bridge, id, square, developerKit)
         and KnoxCreator ~= nil and KnoxCreator.carriedFromSlots ~= nil then
         local _, secondary = KnoxCreator.carriedFromSlots(
             KnoxCreator.decodeSlots(creatorRecord.slots))
-        if type(secondary) == "string" and secondary ~= "" then
+        if type(secondary) == "string" and secondary ~= ""
+            and not KnoxCreator.isTwoHanded(creatorRecord.weapon) then
             local secondOk, secondResult = KnoxSurvivorStartingGear.applyItems(
                 character, { secondary })
             if not secondOk then
@@ -291,10 +316,17 @@ local function createSurvivorAt(bridge, id, square, developerKit)
     end
     if creatorRecord ~= nil and creatorRecord.pack ~= nil then
         local packOk, packResult = KnoxSurvivorStartingGear.applyItems(
-            character, KnoxCreator.packItems(creatorRecord.pack))
+            character, (KnoxCreator.packItemsForPlacement or KnoxCreator.packItems)(creatorRecord.pack))
         if not packOk then
             print("[KnoxSurvivors][Creator] pack refused for " .. tostring(id)
                 .. ": " .. tostring(packResult))
+        end
+    end
+    if creatorRecord ~= nil and (creatorRecord.cargo ~= nil or creatorRecord.bagCargo ~= nil) then
+        local cargoOk, cargoResult = Autonomy.applyCreatorCargo(character, creatorRecord)
+        if not cargoOk then
+            bridge:removeNpc(id)
+            return nil, "initialization_failed cargo=" .. tostring(cargoResult), true
         end
     end
     local saved, evidence = KnoxPersistence.captureActiveSurvivor(id)
@@ -371,6 +403,12 @@ local function checkRadioTowerArrivals(hours)
                     ZombRand(1000) / 1000
                 )
             end
+            -- The day belongs to the attempt, not only a successful outcome.
+            -- Existing records allow a nil ID: no person is invented by a miss
+            -- or a refused allocation, and neither can reroll every update.
+            if answered or planReason == "quiet" then
+                persistence.recordBaseRadioArrival(base.id, hours, nil)
+            end
             if answered then
                 -- The origin key must be unique per record, so a later call
                 -- from the same home steps a tile instead of colliding.
@@ -403,8 +441,12 @@ local function checkRadioTowerArrivals(hours)
                     and KnoxSettings.allowFactionRaids ~= nil
                     and KnoxSettings.allowFactionRaids() == true
                 local risk = persistence.getBaseRadioRisk(base.id) or {}
-                local heard = raidsAllowed
+                local riskDue = raidsAllowed
                     and baseManager.radioRiskDue(risk.lastRiskHours, hours)
+                if riskDue then
+                    persistence.recordBaseRadioRisk(base.id, hours, nil)
+                end
+                local heard = riskDue
                     and baseManager.radioRiskRoll(ZombRand(1000) / 1000,
                         baseManager.radioRiskChance(operatorLevel))
                     or false
@@ -641,6 +683,21 @@ local function getAnyLoadedPlayer()
     return nil
 end
 
+-- Dispatch only at the successful physical death transition, before the
+-- player-facing feed may add its own observation to the existing ledger.
+local function dispatchWitnessedDeath(id, character)
+    for _, witnessId in ipairs(activeIds) do
+        local witness = controllers[witnessId]
+        if witnessId ~= id and witness ~= nil and witness.reportWitnessedDeath ~= nil then
+            local ok, err = pcall(witness.reportWitnessedDeath, witness, id, character)
+            if not ok then
+                print(TAG .. " witnessed_death_error witness=" .. tostring(witnessId)
+                    .. " victim=" .. tostring(id) .. " error=" .. tostring(err))
+            end
+        end
+    end
+end
+
 local function retireDeadSurvivor(bridge, id, controller)
     -- Mark dead first so a later capture cannot overwrite the alive record
     -- with a corpse pose.
@@ -710,6 +767,7 @@ local function retireDeadSurvivor(bridge, id, controller)
             end
         end
         if KnoxPersistence.markSurvivorDead(id, now, "world_death", evidence) then
+            dispatchWitnessedDeath(id, controller.character)
             local feed = rawget(_G, "KnoxActivityFeed")
             if feed ~= nil and feed.survivorDied ~= nil then
                 pcall(feed.survivorDied, id, controller.character, attribution)
@@ -1038,7 +1096,8 @@ local function hibernateDistantWorldSurvivors(bridge, players)
     for _, id in ipairs(activeIds) do
         local controller = controllers[id]
         local duty = KnoxPersistence.getSurvivorDuty(id) or {}
-        if controller ~= nil and hibernateRollbackPending[id] == nil then
+        if controller ~= nil and hibernateRollbackPending[id] == nil
+            and ticks >= (controller.hibernateRetryAt or 0) then
             local character = controller.character
             -- Passenger shells are owned by the live vehicle. Treating their
             -- transient world square as a detached body would capture/remove a
@@ -1120,17 +1179,17 @@ local function hibernateDistantWorldSurvivors(bridge, players)
                 end
                 detachedGrace[id] = nil
                 KnoxSurvivorRuntime.setLifecycleState(id, "active")
-                -- Ordinary distance hibernation belongs only to production world
-                -- survivors. A missing square is different: any shell, including a
-                -- companion or developer scenario body, must leave DETACHED through
-                -- the transactional capture/remove path instead of remaining an
-                -- active engine object forever.
-                if KnoxSurvivorLifecyclePolicy.distanceEligible(
-                    world[id] == true,
-                    duty.mode,
-                    distanceSquared,
-                    hibernationDistanceSquared()
-                ) then
+                -- Authored/manual survivors have the same persistent lifecycle.
+                -- Visible bodies and native-owned actions stay in the scene.
+                if distanceSquared ~= nil and distanceSquared > hibernationDistanceSquared()
+                    and KnoxSurvivorLifecyclePolicy.distanceEligible(
+                        world[id] == true or KnoxPersistence.isSurvivorPresent(id),
+                        duty.mode,
+                        distanceSquared,
+                        hibernationDistanceSquared(),
+                        KnoxWorldPopulation.squareVisibleToPlayers(square, players)
+                    ) and controller.canHibernateForDistance ~= nil
+                    and controller:canHibernateForDistance() then
                     hibernate[#hibernate + 1] = {
                         id = id,
                         controller = controller,
@@ -1143,7 +1202,11 @@ local function hibernateDistantWorldSurvivors(bridge, players)
             end
         end
     end
+    local attempts = 0
     for _, entry in ipairs(hibernate) do
+        if attempts >= HIBERNATIONS_PER_UPDATE then break end
+        attempts = attempts + 1
+        entry.controller.hibernateRetryAt = ticks + HIBERNATION_INTERVAL_TICKS * 3
         local distance = entry.distanceSquared ~= nil and math.sqrt(entry.distanceSquared) or nil
         print(TAG .. " id=" .. entry.id .. " hibernate-attempt reason=" .. tostring(entry.reason) .. " square=" .. squareDescription(entry.square) .. " playerDistance=" .. tostring(distance) .. " threshold=" .. tostring(hibernationDistance()))
         -- While this resident and its assigned containers are still real loaded
@@ -1154,7 +1217,7 @@ local function hibernateDistantWorldSurvivors(bridge, players)
         -- shutdown() captures first. removeNpc() is intentionally not called unless
         -- persistence succeeds, so normal hibernation remains transactional.
         local success, saved, evidence = pcall(function()
-            return entry.controller:shutdown()
+            return entry.controller:shutdown(true)
         end)
         if success and saved then
             -- Commit stored ownership before removing the only native body.
@@ -1231,13 +1294,22 @@ local function hibernateDistantWorldSurvivors(bridge, players)
                 end
             end
         else
+            -- shutdown released native inputs before capture was refused.
+            -- Re-enter arbitration on the same shell instead of leaving its
+            -- old movement/action state waiting on a cancelled route.
+            local resumed = false
+            if entry.controller.resumeAfterHibernateRollback ~= nil then
+                local resumedOk,result = pcall(entry.controller.resumeAfterHibernateRollback,
+                    entry.controller,ticks,"capture_failed")
+                resumed = resumedOk and result == true
+            end
             KnoxSurvivorRuntime.setLifecycleState(entry.id,
                 entry.reason == "detached" and "detached_stale" or "active")
             print(TAG .. " id=" .. entry.id
                 .. " hibernate-save-failed reason=" .. tostring(entry.reason)
                 .. " square=" .. squareDescription(entry.square)
                 .. " playerDistance=" .. tostring(distance)
-                .. " evidence=" .. tostring(evidence))
+                .. " evidence=" .. tostring(evidence) .. " resumed=" .. tostring(resumed))
         end
     end
 end
@@ -1307,44 +1379,22 @@ local function activateWorldCandidate(bridge, candidate, options)
         local controller = controllers[candidate.id]
         if controller ~= nil and controller.setAwayTeam ~= nil then
             controller:setAwayTeam(nil)
+        end        print(TAG .. " id=" .. tostring(candidate.id)
+                .. " state=BLOCKED_DISPATCH_RECOVERED team="
+                .. tostring(candidate.blockedAwayTeamId))
+    end
+    if registered then
+        -- A resident that streams back in seeds the settlement's discovery once
+        -- with its real body, so the board it meets is current. Discovery only:
+        -- the same BaseJobs owner, no completion, claim or consumption here.
+        local jobs = rawget(_G, "KnoxBaseJobs")
+        if jobs ~= nil and jobs.seedStreamedBase ~= nil then
+            pcall(jobs.seedStreamedBase, candidate.id, character,
+                getGameTime ~= nil and getGameTime() ~= nil
+                    and getGameTime():getWorldAgeHours() or 0)
         end
-        print(TAG .. " id=" .. tostring(candidate.id)
-            .. " state=BLOCKED_DISPATCH_RECOVERED team="
-            .. tostring(candidate.blockedAwayTeamId))
     end
     return registered, registerResult, true
-end
-
--- A watched reconnaissance site is one a player can plausibly see right now:
--- the destination square is loaded and within ordinary visual range. These
--- questions are transient and never stored; the mission ledger only receives
--- their answer for one advance pass.
-local SCOUT_WATCHED_RADIUS_SQUARED = 40 * 40
-local function scoutSiteWatched(team)
-    local destination = type(team) == "table" and team.destination or nil
-    local x = destination ~= nil and tonumber(destination.x) or nil
-    local y = destination ~= nil and tonumber(destination.y) or nil
-    local cell = getCell ~= nil and getCell() or nil
-    if x == nil or y == nil or cell == nil then return false end
-    local square = cell:getGridSquare(
-        math.floor(x), math.floor(y), math.floor(tonumber(destination.z) or 0)
-    )
-    if square == nil then return false end
-    for _, player in ipairs(currentPlayers()) do
-        local playerSquare = player ~= nil and player:getCurrentSquare() or nil
-        if playerSquare ~= nil and playerSquare:getZ() == square:getZ()
-            and distanceSquared(playerSquare, square) <= SCOUT_WATCHED_RADIUS_SQUARED then
-            return true
-        end
-    end
-    return false
-end
-
-local function awayTeamMemberLoaded(team)
-    for _, id in ipairs(type(team) == "table" and team.memberIds or {}) do
-        if controllers[id] ~= nil then return true end
-    end
-    return false
 end
 
 -- A member with a live body is walking home under its own controller, so the
@@ -1384,11 +1434,16 @@ local function reconcileWorldPopulation(bridge)
     releaseMissingActiveBodies(bridge)
     local players = currentPlayers()
     for _, player in ipairs(players) do
-        if KnoxSpouseStart.update(player, function(id, square, record)
+        local function placeStartCast(id, square, record)
             return activateWorldCandidate(bridge, { id = id, square = square, record = record,
                 mode = record ~= nil and "restore" or "spawn" })
-        end) then
+        end
+        if KnoxSpouseStart.update(player, placeStartCast) then
             KnoxActivityFeed.event("Your spouse is here. They will follow you; use Orders to guide them.")
+        end
+        if KnoxSpouseStart.updateMarkedCompanions ~= nil
+            and KnoxSpouseStart.updateMarkedCompanions(player, placeStartCast) then
+            KnoxActivityFeed.event("Your companions are here. They will follow you; use Orders to guide them.")
         end
     end
     local now = getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
@@ -1402,11 +1457,11 @@ local function reconcileWorldPopulation(bridge)
     -- starting a second walk home from a stale position on the road.
     local awayChanged = KnoxPersistence.advanceAwayTeams ~= nil
         and KnoxPersistence.advanceAwayTeams(now, {
-            scoutSiteWatched = scoutSiteWatched,
-            memberLoaded = awayTeamMemberLoaded,
             returnMemberLoaded = awayReturnMemberLoaded,
         }) or 0
     KnoxWorldPopulation.endPopulationProfilePhase("away_team_transitions", phaseStarted)
+    -- maintain() clocks itself as "population_maintain"; an outer phase here
+    -- would count the same pass twice and inflate its own evidence.
     local summary = KnoxWorldPopulation.maintain(now, { players = players })
     phaseStarted = KnoxWorldPopulation.beginPopulationProfilePhase()
     KnoxFactionCamps.reconcile(controllers, activeIds, now)
@@ -1430,7 +1485,7 @@ local function reconcileWorldPopulation(bridge)
     local missionSeen = {}
     for _, candidate in ipairs(candidates) do missionSeen[candidate.id] = true end
     if #candidates < remaining and KnoxPersistence.getAwayTeams ~= nil then
-        for _, team in ipairs(KnoxPersistence.getAwayTeams() or {}) do
+        for _, team in pairs(KnoxPersistence.getAwayTeams() or {}) do
             local state = type(team) == "table" and team.state or nil
             if state == "awaiting_collection" or state == "collecting"
                 or state == "returning" or state == "blocked" then
@@ -1457,15 +1512,7 @@ local function reconcileWorldPopulation(bridge)
             if #candidates >= remaining then break end
         end
     end
-    table.sort(candidates, function(first, second)
-        local firstPriority = tonumber(first.activationPriority) or 4
-        local secondPriority = tonumber(second.activationPriority) or 4
-        if firstPriority ~= secondPriority then return firstPriority < secondPriority end
-        local firstDistance = tonumber(first.distanceSquared) or math.huge
-        local secondDistance = tonumber(second.distanceSquared) or math.huge
-        if firstDistance ~= secondDistance then return firstDistance < secondDistance end
-        return tostring(first.id) < tostring(second.id)
-    end)
+    table.sort(candidates, KnoxWorldPopulation.activationCandidateLess)
     local activated = 0
     for _, candidate in ipairs(candidates) do
         if activated >= remaining then break end
@@ -1747,7 +1794,7 @@ update = function()
         if controller == nil then
             KnoxSurvivorRuntime.unregister(id, nil)
             removeActiveId(id)
-        else
+        elseif hibernateRollbackPending[id] == nil then
             KnoxCompanionService.syncController(id, controller)
             if controller.state ~= "STOPPED" then
             -- A bound pcall is the same isolation as wrapping closure, without
@@ -1788,7 +1835,7 @@ update = function()
     if ticks % STATUS_INTERVAL_TICKS == 0 and KnoxSettings.showDeveloperDiagnostics() then
         print(TAG .. " render " .. tostring(bridge:getRenderDiagnostics()))
         for _, id in ipairs(activeIds) do
-            print(TAG .. " status " .. controllers[id]:status())
+            print(TAG .. " status " .. controllers[id]:status(true))
         end
     end
 end
@@ -2038,6 +2085,47 @@ function Autonomy.spawnDeveloperScenario(player, scenario, qaOwnership, options)
     return true, table.concat(ids, ",") .. " " .. tostring(configureResult), table.concat(ids, ",")
 end
 
+-- Spawn one authored creator person in game. The record is the same hand-over
+-- the world start uses, so the body arrives dressed, kitted and named; the id
+-- stays a developer id, so cleanup and QA ownership still apply.
+function Autonomy.spawnCreatorSurvivor(player, creatorRecord, square, qaOwnership)
+    if not KnoxSettings.developerToolsEnabled() then
+        return false, "developer_tools_disabled"
+    end
+    local bridge = rawget(_G, "KnoxJavaBridge")
+    if player == nil or bridge == nil then return false, "scenario_unavailable" end
+    if type(creatorRecord) ~= "table" or type(creatorRecord.name) ~= "string" then
+        return false, "invalid_creator_record"
+    end
+    if qaOwnership ~= nil and (type(qaOwnership) ~= "table"
+        or type(qaOwnership.runId) ~= "string" or qaOwnership.runId == ""
+        or type(qaOwnership.ownerToken) ~= "string" or qaOwnership.ownerToken == ""
+        or KnoxPersistence.tagDeveloperQaFixture == nil) then
+        return false, "invalid_qa_ownership"
+    end
+    local origin = square
+    if origin ~= nil then
+        local cell = getCell and getCell() or nil
+        if cell == nil or cell:getGridSquare(origin:getX(), origin:getY(), origin:getZ()) ~= origin
+            or not origin:canStand() then return false, "target_square_unavailable" end
+    end
+    local id = KnoxPersistence.allocateDeveloperSurvivorId()
+    if id == nil then return false, "allocation_failed" end
+    if qaOwnership ~= nil then
+        local tagged, tagResult = KnoxPersistence.tagDeveloperQaFixture(
+            id, qaOwnership.runId, qaOwnership.ownerToken, qaOwnership.scenarioId or "creator")
+        if not tagged then return false, "qa_fixture_tag_failed:" .. tostring(tagResult), id end
+    end
+    if KnoxPersistence.setSurvivorCreatorRecord ~= nil then
+        KnoxPersistence.setSurvivorCreatorRecord(id, creatorRecord)
+    end
+    local ready, result = ensurePopulation(bridge, player, { id }, origin)
+    if not ready then return false, result, id end
+    scenarioIds[#scenarioIds + 1] = id
+    KnoxCompanionService.syncController(id, controllers[id])
+    return true, id .. " " .. tostring(creatorRecord.name), id
+end
+
 -- Remove only survivors created through allocateDeveloperSurvivorId. Automated
 -- QA runs several real native fixtures in one save; without this ownership
 -- boundary an earlier faction can fight, claim a shelter, or occupy a doorway
@@ -2260,20 +2348,8 @@ end
 -- Prefer the building's real name so the departure and result lines describe a
 -- place the player recognizes; fall back to a neutral label, never an ID.
 local function scoutDestinationLabel(square)
-    local name = nil
-    pcall(function()
-        local building = square ~= nil and square.getBuilding ~= nil
-            and square:getBuilding() or nil
-        local definition = building ~= nil and building.getDef ~= nil
-            and building:getDef() or nil
-        name = definition ~= nil and definition.getName ~= nil
-            and definition:getName() or nil
-    end)
-    if type(name) == "string" then
-        name = name:gsub("^%s+", ""):gsub("%s+$", "")
-        if name ~= "" and string.lower(name) ~= "none" then return name end
-    end
-    return "the marked area"
+    return "Search area (" .. tostring(square:getX()) .. ", "
+        .. tostring(square:getY()) .. ")"
 end
 
 -- One cautious on-foot leg instead of a fixed two-hour slot: a building across
@@ -2362,15 +2438,8 @@ local function dispatchLiveAwayTeam(bridge, ownerKind, ownerId, selected, missio
     return true, team
 end
 
--- A single menu action must never empty a base, so the requested party is
--- capped. Larger groups stay available for later mission design; the base's
--- own decisions keep owning everyone else.
-local MAX_SCOUT_PARTY = 3
-
--- Ordered mission types the base menu may issue. Scouting is the only one that
--- can also resolve from the ledger, because it needs no cargo. A resource run
--- must really search containers, so it is only offered when a free resident
--- can be sent into the loaded world.
+-- The player chooses the entire crew. Real container access remains a separate
+-- executor boundary: remote travel does not establish a haul.
 local BASE_MISSION_TYPES = {
     scout = true, food = true, medicine = true, tools = true, weapons = true,
     building = true,
@@ -2382,21 +2451,22 @@ local BASE_MISSION_TYPES = {
 -- The resident list already means "on base duty here", so `residents` only has
 -- to separate "nobody is at this base" from "nobody is loaded".
 local function missionPartyCandidates(playerId, baseId, watchable)
-    local eligible, liveReady, residents = {}, {}, 0
+    local eligible, liveReady, residents, loaded = {}, {}, 0, 0
     for _, id in ipairs(KnoxPersistence.getBaseResidentIds(baseId)) do
         residents = residents + 1
         local duty = KnoxPersistence.getSurvivorDuty(id) or {}
         if duty.mode == "base" and duty.ownerId == playerId then
             local runtime = controllers[id]
-            if runtime ~= nil then
+            if runtime ~= nil then loaded=loaded+1 end
+            if runtime ~= nil and freeForLiveMission(runtime) then
                 eligible[#eligible + 1] = id
-                if watchable and freeForLiveMission(runtime) then
+                if watchable then
                     liveReady[#liveReady + 1] = id
                 end
             end
         end
     end
-    return eligible, liveReady, residents
+    return eligible, liveReady, residents, loaded
 end
 
 -- Order the existing eligible ids by saved role for this mission type. This
@@ -2434,8 +2504,7 @@ function Autonomy.missionCrewExclusions(player, baseId, missionType, destination
         if duty.mode ~= "base" then reason = "not_at_base"
         elseif duty.ownerId ~= playerId then reason = "not_your_survivor"
         elseif controllers[id] == nil then reason = "not_loaded"
-        elseif order ~= "scout" and watchable
-            and not freeForLiveMission(controllers[id]) then
+        elseif not freeForLiveMission(controllers[id]) then
             reason = "busy"
         end
         if reason ~= nil then excluded[#excluded + 1] = { id = id, reason = reason } end
@@ -2457,7 +2526,7 @@ function Autonomy.missionCrewIds(player, baseId, missionType, destinationSquare)
     local source = #liveReady > 0 and liveReady or eligible
     local ranked = Autonomy.rankMissionCandidates(source, tostring(missionType or "scout"))
     local crew = {}
-    for index = 1, math.min(#ranked, MAX_SCOUT_PARTY) do crew[index] = ranked[index] end
+    for index = 1, #ranked do crew[index] = ranked[index] end
     return crew
 end
 
@@ -2478,24 +2547,16 @@ function Autonomy.baseMissionAvailability(player, baseId, missionType, destinati
     end
     local watchable = destinationSquare ~= nil
         and canWatchMission(player, destinationSquare) or false
-    local eligible, liveReady, residents =
+    local eligible, liveReady, residents, loaded =
         missionPartyCandidates(playerId, baseId, watchable)
     if residents == 0 then return 0, "no_base_residents" end
-    if #eligible == 0 then return 0, "need_loaded_base_resident" end
-    if order ~= "scout" then
-        -- A supply run must really search containers, so it needs a body in the
-        -- world and a settled one; scouting can still resolve from the ledger.
-        if not watchable then return 0, "need_visible_destination" end
-        if #liveReady == 0 then return 0, "need_settled_resident" end
-        return math.min(MAX_SCOUT_PARTY, #liveReady), nil
-    end
+    if #eligible == 0 then return 0, loaded>0 and "need_settled_resident" or "need_loaded_base_resident" end
     local count = #liveReady > 0 and #liveReady or #eligible
-    return math.min(MAX_SCOUT_PARTY, count), nil
+    return count, nil
 end
 
--- Normal player-base scouting command. A party of one to MAX_SCOUT_PARTY
--- available, loaded residents is chosen here; anything unfilled is simply not
--- sent, and the departure line names the members that actually went.
+-- One transaction for the exact selected crew. If any name has become
+-- unavailable, refuse the whole order; never silently shrink or substitute it.
 function Autonomy.dispatchBaseScout(player, baseId, destinationSquare, partySize,
     missionType, radius, label, members)
     local bridge = rawget(_G, "KnoxJavaBridge")
@@ -2505,8 +2566,10 @@ function Autonomy.dispatchBaseScout(player, baseId, destinationSquare, partySize
     end
     local order = tostring(missionType or "scout")
     if not BASE_MISSION_TYPES[order] then return false, "invalid_mission" end
+    local available,reason=Autonomy.baseMissionAvailability(player,baseId,order,destinationSquare)
+    if available==0 then return false,reason end
     local count = math.floor(tonumber(partySize) or 1)
-    count = math.max(1, math.min(MAX_SCOUT_PARTY, count))
+    count = math.max(1, count)
     local watchable = canWatchMission(player, destinationSquare)
     local eligible, liveReady = missionPartyCandidates(playerId, baseId, watchable)
     -- A watched mission keeps every body in the world and an unwatched one
@@ -2516,16 +2579,18 @@ function Autonomy.dispatchBaseScout(player, baseId, destinationSquare, partySize
     local source = sourceIsLive and liveReady or eligible
     source = Autonomy.rankMissionCandidates(source, order)
     -- A player-chosen crew is honoured in the order it was picked, but only for
-    -- residents this order could send anyway: an ineligible name is dropped
-    -- rather than quietly swapped for someone else.
+    -- residents this order could send anyway: any ineligible name refuses the
+    -- whole order rather than silently changing the chosen crew.
     local chosen = type(members) == "table" and members or nil
     if chosen ~= nil and #chosen > 0 then
         local allowed = {}
         for _, id in ipairs(source) do allowed[id] = true end
         for _, id in ipairs(chosen) do
-            if allowed[id] and #selected < MAX_SCOUT_PARTY then
+            if allowed[id] then
                 selected[#selected + 1] = id
                 allowed[id] = nil
+            else
+                return false, "crew_changed"
             end
         end
         count = #selected
@@ -2540,18 +2605,12 @@ function Autonomy.dispatchBaseScout(player, baseId, destinationSquare, partySize
     if #selected == 0 then
         return false, "need_loaded_base_resident"
     end
-    if order ~= "scout" and not live then
-        -- A ledger-only resource mission would wait for loot that no body will
-        -- ever collect, so say why instead of dispatching a trip that cannot
-        -- end in a real haul.
-        return false, watchable and "need_settled_resident" or "need_visible_destination"
-    end
     -- An area order searches every building inside its radius instead of the one
     -- the click landed on, so the radius travels with the team and survives a
     -- reload; without one the order keeps its building label and default reach.
     local areaRadius = tonumber(radius)
     if areaRadius ~= nil then
-        areaRadius = math.max(4, math.min(40, math.floor(areaRadius)))
+        areaRadius = math.max(4, math.min(80, math.floor(areaRadius)))
     end
     local destination = {
         x = destinationSquare:getX(), y = destinationSquare:getY(),
@@ -2562,6 +2621,7 @@ function Autonomy.dispatchBaseScout(player, baseId, destinationSquare, partySize
                     .. tostring(destinationSquare:getY()))
                 or scoutDestinationLabel(destinationSquare)),
         radius = areaRadius,
+        fillPacks = order ~= "scout",
     }
     local now = getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
     local returnPoint = {

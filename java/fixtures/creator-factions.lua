@@ -11,23 +11,38 @@ local function indexOf(list, id)
     return nil
 end
 
--- Six defaults, unique ids, and every one names real catalogue entries.
-assert(#Creator.FACTIONS == 6, "six default factions: " .. tostring(#Creator.FACTIONS))
+-- The catalogue is *kinds*, not factions. It used to carry four named families
+-- (Barley/Voss/Turner/Mercer), which made a kind and an instance the same thing,
+-- so a second household could not exist and every new group became a household.
+assert(#Creator.FACTIONS == 10, "ten kinds including custom: " .. tostring(#Creator.FACTIONS))
 local seen = {}
 for _, faction in ipairs(Creator.FACTIONS) do
-    assert(not seen[faction.id], "faction id is unique: " .. faction.id)
+    assert(not seen[faction.id], "kind id is unique: " .. faction.id)
     seen[faction.id] = true
     assert(type(faction.label) == "string" and #faction.label >= 3,
-        "faction has a label: " .. tostring(faction.id))
+        "kind has a label: " .. tostring(faction.id))
+    assert(type(faction.note) == "string" and #faction.note >= 8,
+        "kind says what it does: " .. tostring(faction.id))
     assert(indexOf(Creator.LOOKS, Creator.resolveLook(faction.look)) ~= nil,
         "look exists: " .. faction.id)
     assert(indexOf(Creator.KITS, faction.kit) ~= nil, "kit exists: " .. faction.id)
     assert(indexOf(Creator.WEAPONS, faction.weapon) ~= nil, "weapon exists: " .. faction.id)
     assert(indexOf(Creator.PACKS, faction.pack) ~= nil, "pack exists: " .. faction.id)
 end
-assert(seen["fire_service"], "fire service is a default")
+assert(seen["fire_service"], "fire service is a kind")
 assert(seen["police"] and seen["military"] and seen["looters"] and seen["robbers"],
-    "the request's factions are defaults")
+    "the request's group kinds exist")
+for _, instanceId in ipairs({ "barley", "voss", "turner", "mercer" }) do
+    assert(seen[instanceId] == nil, "a named family is not a shipped kind: " .. instanceId)
+end
+assert(seen["solo"], "solo still resolves so an older save keeps its people")
+-- Solo names a person who belongs to nothing: it is never offered as a group.
+for _, kind in ipairs(Creator.groupKinds()) do
+    assert(kind.id ~= "solo", "solo is not a group kind")
+end
+assert(#Creator.groupKinds() == 9, "nine kinds can be founded as a group")
+assert(Creator.isGroupKind("household") and not Creator.isGroupKind("solo"),
+    "the group test separates a kind from a solo person")
 
 -- Defaults first, a player's own after them, and nothing is merged into the
 -- default table itself.
@@ -35,9 +50,9 @@ local defs = {}
 local ok, added = Creator.addFaction(defs, "Riverside Runners")
 assert(ok == true, "a user faction is added")
 assert(added.id == "user_riverside_runners", "user id is prefixed: " .. tostring(added.id))
-assert(#Creator.FACTIONS == 6, "the default table is untouched")
+assert(#Creator.FACTIONS == 10, "the expanded default table is untouched")
 local merged = Creator.allFactions(defs)
-assert(#merged == 7, "merged list has the user faction")
+assert(#merged == #Creator.defaultEntries() + 1, "merged list has authoring defaults and the user group")
 assert(merged[1].id == Creator.FACTIONS[1].id, "defaults come first")
 assert(merged[#merged].id == added.id, "user factions follow in file order")
 
@@ -100,7 +115,7 @@ for index, row in ipairs(rows) do
         assert(row.index ~= nil, "a person row addresses the roster")
     end
 end
-assert(factionRows == 7, "every faction has a header: " .. tostring(factionRows))
+assert(factionRows == #Creator.defaultEntries() + 1, "every authoring default and custom group has a header: " .. tostring(factionRows))
 assert(personRows == 3, "every person has a row: " .. tostring(personRows))
 
 -- Deleting a faction that still holds people is refused.
@@ -137,15 +152,15 @@ assert(#legacyRoster == 1, "a format-2 person reads")
 assert(legacyGroup.factionId == "police", "a format-2 index resolves to its id")
 assert(legacyGroup.factionId == Creator.FACTIONS[2].id, "the id is the one at that index")
 
--- An id nobody knows falls back to the first default instead of losing the group.
+-- An id from a missing/future definition stays saved instead of being reassigned.
 local unknownRoster, unknownGroup = Creator.decode(
     "knox-creator 3\ngroup|Gone\ngroupfaction|no_such_faction\n")
-assert(unknownGroup.factionId == Creator.defaultFactionId(),
-    "an unknown faction falls back to the first default")
+assert(unknownGroup.factionId == "no_such_faction",
+    "an unknown faction id survives without silently becoming another group")
 
 -- A line a newer version wrote is preserved in the encode that follows.
 local futureRoster, futureGroup = Creator.decode(
-    "knox-creator 4\ngroup|Ahead\ngroupfaction|police\nfeature|new|line\n")
+    "knox-creator 5\ngroup|Ahead\ngroupfaction|police\nfeature|new|line\n")
 assert(#futureGroup.extras == 1, "an unknown line is kept")
 assert(futureGroup.factionId == "police", "the known lines still read")
 local forward = Creator.encode(futureRoster, futureGroup)
@@ -158,5 +173,49 @@ assert(record.faction == "police", "the record carries the faction id")
 local loose = { name = "No Faction", look = "casual", kit = "none", pack = "meal", slots = {} }
 assert(Creator.recordFor(loose, group).faction == "police",
     "a person without a choice uses the group's faction")
+
+-- The defect this pass repairs: a kind is not an instance. Two households, each
+-- its own group, both with they own people and settings.
+local homes = {}
+local okHomeA, homeA = Creator.addFaction(homes, "Barley", "household")
+local okHomeB, homeB = Creator.addFaction(homes, "Voss", "household")
+assert(okHomeA and okHomeB, "two households can be founded")
+assert(homeA.id ~= homeB.id, "each household is its own group")
+assert(homeA.profile == "household" and homeB.profile == "household",
+    "both groups are the household kind")
+assert(homeA.id == "user_barley" and homeB.id == "user_voss", "ids are per instance")
+assert(Creator.addFaction(homes, "Lone Wolves", "solo") == false,
+    "solo is not a kind you can found a group from")
+assert(Creator.addFaction(homes, "Nameless", "no_such_kind") == false,
+    "an invented kind is refused")
+local okRobbers, gang = Creator.addFaction(homes, "Road Robbers", "robbers")
+assert(okRobbers and gang.profile == "robbers", "a robber gang is its own group kind")
+assert(Creator.profileFor(gang.id, homes).attitude == "hostile",
+    "a robber group starts hostile because its kind does")
+assert(Creator.profileFor(homeA.id, homes).settlementPolicy == "home",
+    "a household settles its home")
+local blankDefs,blankRoster={},{}
+local blankOk,blank=Creator.addFaction(blankDefs,"My Custom Crew","custom")
+assert(blankOk and blank.profile=="custom" and blank.pack=="none" and blank.kit=="none",
+    "blank custom group has its own purpose and no inherited supply kit")
+local blankPolicy=Creator.profileFor(blank.id,blankDefs)
+assert(blankPolicy.attitude=="neutral" and blankPolicy.settlementPolicy=="mobile",
+    "custom group begins neutral and without a forced household home")
+local blankGroup=Creator.newGroup();blankGroup.defs=blankDefs
+Creator.populateFaction(blankRoster,blankGroup,blank.id,1)
+assert(#blankRoster==1 and Creator.recordFor(blankRoster[1],blankGroup).profile=="custom",
+    "custom purpose reaches the actual survivor record")
+local decodedRoster,decodedGroup=Creator.decode(Creator.encode(blankRoster,blankGroup))
+assert(decodedGroup.defs[1].profile=="custom" and #decodedRoster==1,
+    "custom group survives the existing creator codec")
+local examples={}
+for i,id in ipairs({"template_solo_civilian","template_solo_worker","template_solo_scavenger"}) do
+    assert(Creator.addSoloTemplate(examples,({"Maya Cole","Owen Brooks","Iris Reed"})[i],id))
+end
+assert(#examples==3 and examples[2].look=="work" and examples[2].faction=="solo",
+    "independent examples provide distinct editable builds without shared group membership")
+local fireLook=Creator.LOOKS[Creator.indexOf(Creator.LOOKS,"firefighter")]
+assert(fireLook.items[1]=="Base.Hat_Fireman" and fireLook.items[2]=="Base.Jacket_Fireman"
+    and Creator.profileFor("fire_service").look=="firefighter", "fire service uses installed turnout gear")
 
 print("creator_factions ok")

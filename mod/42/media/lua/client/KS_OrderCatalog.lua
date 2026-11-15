@@ -79,6 +79,8 @@ Catalog.tasks = {
     burn_corpse = { label = "Burn Corpses" },
     repair = { label = "Repair" },
     cook = { label = "Cook Food (Stove / Microwave)" },
+    craft_bed = { label = "Sew a Sleeping Bag" },
+    prepare_bed = { label = "Unpack / Place a Sleeping Bag" },
 }
 
 -- Compatibility names that may appear in early Knox saves or manually-created
@@ -208,6 +210,9 @@ Catalog.actions = {
     -- and the state it selects, using the same words as the talk panel's
     -- Doors/Climbing lines. A bare Allow/Disallow pair made the player read a
     -- switch instead of a state, and read the same either way in a submenu.
+    medical_help = { label = "Ask for Medical Help", description = "Ask this survivor to treat your bleeding with their supplies." },
+    enable_auto_medical = { label = "Auto Medical: On", description = "Automatically help nearby injured allies when safe." },
+    disable_auto_medical = { label = "Auto Medical: Off", description = "Wait for a direct medical request; keep personal self-care." },
     allow_climbing = { label = "Climbing: Allowed", description = "Vault and climb through windows and over low walls." },
     disallow_climbing = { label = "Climbing: Closed", description = "Do not vault or climb." },
     allow_doors = { label = "Doors: Allowed", description = "Open closed doors and windows." },
@@ -360,7 +365,7 @@ Catalog.baseRoleBlocks = {
     farming = { "sleep", "sleep", "work", "work", "work", "anything" },
     woodwork = { "sleep", "sleep", "work", "work", "work", "recreation" },
     barricade = { "sleep", "sleep", "work", "work", "work", "recreation" },
-    hauling = { "sleep", "sleep", "work", "work", "recreation", "sleep" },
+    hauling = { "sleep", "sleep", "work", "work", "recreation", "work" },
     repair = { "sleep", "sleep", "work", "work", "work", "recreation" },
     scavenger = { "sleep", "work", "work", "work", "recreation", "sleep" },
     cook = { "sleep", "work", "work", "recreation", "work", "sleep" },
@@ -372,6 +377,39 @@ Catalog.baseRoleBlocks = {
     runner = { "sleep", "work", "work", "work", "work", "sleep" },
 }
 
+-- A roster row is what the base-side menu needs and nothing more: the resident
+-- id, the stored preference and the two toggles the per-survivor menu already
+-- writes. The menu builds options from this, so both surfaces cannot drift.
+function Catalog.baseRosterModel(roster, dutyOf)
+    local rows = {}
+    for _, entry in ipairs(type(roster) == "table" and roster or {}) do
+        local id = type(entry) == "table" and entry.id or entry
+        if type(id) == "string" and id ~= "" then
+            local duty = type(dutyOf) == "function" and dutyOf(id) or nil
+            duty = type(duty) == "table" and duty or {}
+            rows[#rows + 1] = {
+                id = id,
+                jobPreference = duty.jobPreference,
+                stayHome = duty.allowLootRuns ~= true,
+                hasSupplyOrder = duty.baseSupplyOrder ~= nil,
+                mode = duty.mode,
+            }
+        end
+    end
+    return rows
+end
+
+-- A fetch order names one item type. The shape is the game's own Module.Type;
+-- anything else is refused rather than stored as a search that can never match.
+function Catalog.normalizeItemType(value)
+    if type(value) ~= "string" then return nil end
+    local text = value:gsub("^%s+", ""):gsub("%s+$", "")
+    if #text < 3 or #text > 64 then return nil end
+    local module, name = text:match("^([%a%d_]+)%.([%a%d_]+)$")
+    if module == nil or name == nil or #module > 32 or #name > 40 then return nil end
+    return module .. "." .. name
+end
+
 -- Return a fresh 24-hour draft for the selected existing role. A nil result
 -- means the role has no default hours; callers must leave the draft alone.
 function Catalog.roleScheduleHours(preference)
@@ -379,6 +417,55 @@ function Catalog.roleScheduleHours(preference)
     local blocks = normalized ~= nil and Catalog.baseRoleBlocks[normalized] or nil
     if blocks == nil then return nil end
     return Catalog.scheduleHoursFromBlocks(blocks)
+end
+
+-- A stable roster yields the same shifts regardless of the world clock. All
+-- output is a draft for the existing schedule writer; nothing is stored here.
+function Catalog.rotaFor(roster, worldAgeHours)
+    local rows, seen = {}, {}
+    for _, row in ipairs(type(roster) == "table" and roster or {}) do
+        if type(row) == "table" and type(row.id) == "string" and not seen[row.id] then
+            seen[row.id] = true
+            rows[#rows + 1] = row
+        end
+    end
+    table.sort(rows, function(a, b) return a.id < b.id end)
+    local result = {}
+    for i, row in ipairs(rows) do
+        local hours = Catalog.roleScheduleHours(row.role or row.jobPreference)
+            or Catalog.scheduleHoursFromBlocks({ "sleep", "sleep", "work", "work", "work", "recreation" })
+        -- Align each role's contiguous sleep window to one of three staggered
+        -- starts. This also handles templates whose sleep wraps midnight.
+        local sleepStart = 0
+        for block = 0, 5 do
+            if hours[block * 4 + 1] == "sleep"
+                and hours[((block + 5) % 6) * 4 + 1] ~= "sleep" then
+                sleepStart = block
+                break
+            end
+        end
+        local offset = ((i - 1) * 2 + 6 - sleepStart) % 6
+        local shifted = {}
+        for hour = 0, 23 do shifted[hour + 1] = hours[(hour + 24 - offset * 4) % 24 + 1] end
+        result[row.id] = shifted
+    end
+    -- In a very small crew a leisure block can otherwise coincide with the
+    -- only partner's sleep. Keep sleep intact and put an awake resident on
+    -- existing work/watch duty for that block; no task is invented here.
+    if #rows > 1 then
+        for block = 0, 5 do
+            local worker, awake = false, nil
+            for _, row in ipairs(rows) do
+                local assignment = result[row.id][block * 4 + 1]
+                if assignment == "work" or assignment == "guard" or assignment == "patrol" then worker = true end
+                if assignment ~= "sleep" and awake == nil then awake = row.id end
+            end
+            if not worker and awake ~= nil then
+                for h = 1, 4 do result[awake][block * 4 + h] = (block == 0 or block == 5) and "guard" or "work" end
+            end
+        end
+    end
+    return result
 end
 
 -- Resolve a copy scope against the caller's live base roster. A record is
@@ -611,12 +698,12 @@ function Catalog.roleKitStatusText(role, gear, missing, stock)
     end
     local gap = table.concat(labels, ", ")
     if #available == 0 then
-        return "Kit shortage: " .. gap .. " — no assigned stock."
+        return "Kit shortage: " .. gap .. " - no assigned stock."
     end
     if #unavailable == 0 then
-        return "Kit shortage: " .. gap .. " — stock available."
+        return "Kit shortage: " .. gap .. " - stock available."
     end
-    return "Kit shortage: " .. gap .. " — stock for "
+    return "Kit shortage: " .. gap .. " - stock for "
         .. table.concat(available, ", ") .. " only."
 end
 
@@ -684,6 +771,14 @@ function Catalog.rankMissionCandidates(candidates, missionType)
     local ids = {}
     for index, entry in ipairs(ranked) do ids[index] = entry.id end
     return ids
+end
+
+function Catalog.text(key, fallback)
+    if getTextOrNull ~= nil then
+        local value = getTextOrNull(key)
+        if type(value) == "string" and value ~= "" and value ~= key then return value end
+    end
+    return fallback
 end
 
 function Catalog.label(kind, fallback)
@@ -770,6 +865,8 @@ end
 -- Presentation only: the callback remains the existing service/action owner.
 -- Preserve both individual (ok, reason) and party (ok, count, reason) receipts.
 local FAILURE_TEXT = {
+    visitor_unavailable = Catalog.text("IGUI_Knox_VisitorGone", "Visitor is no longer in reach."),
+    overnight_request_expired = Catalog.text("IGUI_Knox_OvernightUnavailable", "That overnight request is no longer available."),
     player_unavailable = "Your character is unavailable.",
     invalid_player = "Your character is unavailable.",
     unavailable = "They are unavailable right now.",
@@ -804,6 +901,21 @@ local FAILURE_TEXT = {
     already_cancelled = "That job is already cancelled.",
     not_resumable = "That job can no longer be resumed. Refresh the task list.",
     unknown_task = "That job is no longer available. Choose another job.",
+    npc_driving_disabled = "Experimental NPC driving is off. Enable it in Sandbox Options, Vehicles page.",
+    engine_work_disabled = "Experimental resident engine repairs are off. Enable them in Sandbox Options, Settlement page.",
+    engine_work_unavailable = "That engine repair is no longer available.",
+    vehicle_moving = "Stop the vehicle first, then ask them to repair the engine.",
+    engine_running = "Turn the engine off first.",
+    engine_condition_complete = "That engine is already in good repair.",
+    mechanics_skill_too_low = "Their Mechanics skill is not high enough for this engine.",
+    mechanics_skill_unreadable = "Their Mechanics skill could not be read.",
+    missing_wrench = "They need a usable wrench.",
+    missing_engine_parts = "They need Engine Parts.",
+    vehicle_outside_base = "That vehicle is outside the base territory.",
+    engine_area_outside_base = "The engine work area is outside the base territory.",
+    engine_area_unreachable = "There is no standable spot beside that engine.",
+    engine_hood_locked = "The hood is locked.",
+    not_base_resident = "They are not a resident of this base.",
 }
 
 function Catalog.failureText(reason)

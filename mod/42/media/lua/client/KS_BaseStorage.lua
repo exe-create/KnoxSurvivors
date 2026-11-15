@@ -8,6 +8,7 @@ require "Util/AdjacentFreeTileFinder"
 local Storage = rawget(_G, "KnoxBaseStorage") or {}
 _G.KnoxBaseStorage = Storage
 local loadedContainerCache = {}
+local LOADED_CONTAINER_CACHE_MS = 10000
 
 local MEDICAL_TYPES = {
     ["Base.AlcoholWipes"] = true,
@@ -288,10 +289,9 @@ local function storageArea(base)
     return base ~= nil and (base.territory or base.home) or nil
 end
 
-local function loadedContainerCacheKey(base, area)
-    return table.concat({ tostring(base.id), tostring(area.minX), tostring(area.minY),
-        tostring(area.maxX), tostring(area.maxY), tostring(area.z),
-        tostring(area.allFloors) }, ":")
+local function loadedContainerCacheKey(base, minX, minY, maxX, maxY, firstZ, lastZ)
+    return table.concat({ tostring(base.id), tostring(minX), tostring(minY),
+        tostring(maxX), tostring(maxY), tostring(firstZ), tostring(lastZ) }, ":")
 end
 
 -- Discover real containers in loaded base squares without assigning them,
@@ -315,24 +315,41 @@ function Storage.operationalPolicies(base)
     local maxX = tonumber(area.maxX) or (minX and minX + (tonumber(area.width) or 1) - 1)
     local maxY = tonumber(area.maxY) or (minY and minY + (tonumber(area.height) or 1) - 1)
     if minX == nil or minY == nil or maxX == nil or maxY == nil then return result end
-    local cacheKey = loadedContainerCacheKey(base, area)
-    local now = type(getTimestampMs) == "function" and getTimestampMs() or nil
-    local cached = now ~= nil and loadedContainerCache[cacheKey] or nil
-    local found = cached ~= nil and now - cached.at < 10000 and cached.entries or nil
-    if found == nil then
-        found = {}
-        local firstZ, lastZ = tonumber(area.minZ), tonumber(area.maxZ)
-        if firstZ == nil or lastZ == nil then
-            if area.allFloors == true then
-                -- Build 42 loaded building levels, including basement floors.
-                firstZ, lastZ = -1, 7
-                local homeZ = tonumber(base.home ~= nil and base.home.z)
-                if homeZ ~= nil then firstZ, lastZ = math.min(firstZ, homeZ), math.max(lastZ, homeZ) end
+    local firstZ, lastZ = tonumber(area.minZ), tonumber(area.maxZ)
+    if firstZ == nil or lastZ == nil then
+        if area.allFloors == true then
+            local ok, nativeMin, nativeMax = pcall(function() return cell:getMinZ(), cell:getMaxZ() end)
+            nativeMin, nativeMax = tonumber(nativeMin), tonumber(nativeMax)
+            if ok and nativeMin ~= nil and nativeMax ~= nil and nativeMin > -math.huge
+                and nativeMax < math.huge and nativeMin <= nativeMax
+                and nativeMin == math.floor(nativeMin) and nativeMax == math.floor(nativeMax) then
+                firstZ, lastZ = nativeMin, nativeMax
             else
-                firstZ = tonumber(area.z) or tonumber(base.home ~= nil and base.home.z) or 0
+                firstZ = tonumber(area.z) or tonumber(base.home ~= nil and base.home.z)
+                if firstZ == nil then return result end
                 lastZ = firstZ
             end
+        else
+            firstZ = tonumber(area.z) or tonumber(base.home ~= nil and base.home.z) or 0
+            lastZ = firstZ
         end
+    end
+    local cacheKey = loadedContainerCacheKey(base, minX, minY, maxX, maxY, firstZ, lastZ)
+    local now = type(getTimestampMs) == "function" and getTimestampMs() or nil
+    local cached = now ~= nil and loadedContainerCache[cacheKey] or nil
+    -- Compare the live cell itself. A diagnostic tostring may include mutable
+    -- fields and must not become part of a cache identity.
+    local found = cached ~= nil and cached.cell == cell and now >= cached.at
+        and now - cached.at < LOADED_CONTAINER_CACHE_MS and cached.entries or nil
+    if found == nil then
+        if now ~= nil then
+            for key, entry in pairs(loadedContainerCache) do
+                if now < entry.at or now - entry.at >= LOADED_CONTAINER_CACHE_MS then
+                    loadedContainerCache[key] = nil
+                end
+            end
+        end
+        found = {}
         for z = firstZ, lastZ do
             for x = minX, maxX do
                 for y = minY, maxY do
@@ -364,7 +381,7 @@ function Storage.operationalPolicies(base)
                 end
             end
         end
-        if now ~= nil then loadedContainerCache[cacheKey] = { at = now, entries = found } end
+        if now ~= nil then loadedContainerCache[cacheKey] = { at = now, cell = cell, entries = found } end
     end
     for _, entry in ipairs(found) do
         local containerIndex = tonumber(entry.containerIndex) or 0
@@ -386,6 +403,25 @@ function Storage.operationalPolicies(base)
     return result
 end
 
+-- Classify only live native container state; unknown is not a cold claim.
+function Storage.coldContainer(container)
+    if container == nil then return nil end
+    local okF, fridge = pcall(function() return container:isFridge() end)
+    local okZ, freezer = pcall(function() return container:isFreezer() end)
+    local okP, powered = pcall(function() return container:isPowered() end)
+    if not okF or type(fridge) ~= "boolean" or not okZ or type(freezer) ~= "boolean"
+        or not okP or type(powered) ~= "boolean" then return nil end
+    local electricity = false
+    if powered and (fridge or freezer) then
+        local okGrid, grid = pcall(function() return container:getSourceGrid() end)
+        if not okGrid or grid == nil then return nil end
+        local okElec, value = pcall(function() return grid:haveElectricity() end)
+        if not okElec or type(value) ~= "boolean" then return nil end
+        electricity = value
+    end
+    return { fridge = fridge, freezer = freezer, powered = powered, electricity = electricity }
+end
+
 -- Transient, read-only migration for pre-typed-storage saves. Returns a
 -- food-role view of a legacy record when it still resolves to a loaded
 -- fridge/freezer, else nil. Never mutates the persisted record.
@@ -395,15 +431,10 @@ function Storage.legacyFridgePolicy(policy)
     if not ok or type(resolved) ~= "table" or resolved.container == nil then
         return nil
     end
-    local okType, containerType = pcall(function()
-        return resolved.container:getType()
-    end)
-    if not okType or type(containerType) ~= "string" then return nil end
-    local lower = string.lower(containerType)
-    if string.find(lower, "fridg", 1, true) == nil
-        and string.find(lower, "freez", 1, true) == nil then
-        return nil
-    end
+    local okF, fridge = pcall(function() return resolved.container:isFridge() end)
+    local okZ, freezer = pcall(function() return resolved.container:isFreezer() end)
+    if not okF or not okZ or type(fridge) ~= "boolean" or type(freezer) ~= "boolean"
+        or not (fridge or freezer) then return nil end
     return {
         key = policy.key,
         storageRole = "food",
@@ -662,13 +693,61 @@ local STORAGE_PRIORITY_RANKS = {
     critical = 0, preferred = 1, normal = 2, low = 3,
 }
 
+-- Owner-set fill order: 1 is drawn from first, 9 last. The order lives on the
+-- same stored policy record as its filters, under one fresh key, so a save
+-- contract nothing else reads is not disturbed.
+local STORAGE_ORDER_MAX = 9
+
+-- The single read accessor every walk and label consults. A stored numeric
+-- order wins; a record without one keeps the legacy named level; a record with
+-- neither reads as normal, which is today's behaviour.
+function Storage.storageOrder(policy)
+    local order = policy ~= nil and tonumber(policy.priorityOrder) or nil
+    if order == nil or order ~= math.floor(order)
+        or order < 1 or order > STORAGE_ORDER_MAX then
+        return nil
+    end
+    return order
+end
+
+-- The single write boundary for a storage's fill order. Numeric orders are
+-- validated here; the legacy named level is still accepted and clears any
+-- numeric order so one record can never carry two answers.
+function Storage.setStoragePriority(policy, value)
+    if type(policy) ~= "table" or type(policy.key) ~= "string" or policy.key == "" then
+        return nil, "unknown_storage"
+    end
+    if value == nil then
+        policy.priorityOrder = nil
+        return policy, "cleared"
+    end
+    if type(value) == "number" then
+        if value ~= math.floor(value) or value < 1 or value > STORAGE_ORDER_MAX then
+            return nil, "invalid_order"
+        end
+        policy.priorityOrder = value
+        policy.priority = nil
+        return policy, "saved"
+    end
+    if type(value) ~= "string" or STORAGE_PRIORITY_RANKS[value] == nil then
+        return nil, "invalid_order"
+    end
+    policy.priority = value
+    policy.priorityOrder = nil
+    return policy, "saved"
+end
+
 function Storage.priorityRank(policy)
+    local order = Storage.storageOrder(policy)
+    if order ~= nil then return order - 1 end
     local rank = policy ~= nil and STORAGE_PRIORITY_RANKS[policy.priority] or nil
     if rank == nil then return STORAGE_PRIORITY_RANKS.normal end
     return rank
 end
 
 function Storage.priorityLabel(policy)
+    local order = Storage.storageOrder(policy)
+    if order ~= nil then return "Order " .. tostring(order) end
     local labels = {
         critical = "Critical", preferred = "Preferred",
         normal = "Normal", low = "Low",
@@ -716,6 +795,22 @@ local function isFuelItem(item, full)
     end
     return displayCategory(item) == "Fuel"
 end
+
+-- REAL PETROL PROOF (pure)
+-- A fuel tag or display category says where a container belongs, not what is
+-- inside it. Vanilla refuelling hands the generator a container holding
+-- Fluid.Petrol; this is the same proof, and the only fuel proof this owner
+-- offers a generator maintenance caller.
+function Storage.hasPetrol(item)
+    if item == nil or item.getFluidContainer == nil then return false end
+    local ok, container = pcall(function() return item:getFluidContainer() end)
+    if not ok or container == nil then return false end
+    local okContains, contains = pcall(function() return container:contains(Fluid.Petrol) end)
+    if not okContains or contains ~= true then return false end
+    local okAmount, amount = pcall(function() return container:getAmount() end)
+    return okAmount and tonumber(amount) ~= nil and tonumber(amount) > 0
+end
+-- END REAL PETROL PROOF
 
 function Storage.matchesCategory(item, category)
     if item == nil then
@@ -840,31 +935,74 @@ local orderedPoliciesByDistance
 -- inventory container. Walk those real nested containers without inventing
 -- stock or counting the same ItemContainer twice if a malformed save loops
 -- back to an already visited container.
-local function walkContainerItems(container, visitor, seen)
-    if container == nil or type(visitor) ~= "function" then return end
-    -- A build that answers getFloor() with something other than a container
-    -- must not become a thrown exception once per square per summary.
-    if container.getItems == nil then return end
+local function walkContainerItems(container, visitor, seen, strict, allowContainer)
+    if container == nil or type(visitor) ~= "function" then return false end
+    if container.getItems == nil then return false end
     seen = seen or {}
-    if seen[container] then return end
+    if seen[container] then return true end
+    if allowContainer ~= nil then
+        local ok, allowed = pcall(allowContainer, container)
+        if not ok or allowed ~= true then return false end
+    end
     seen[container] = true
     local items = container:getItems()
-    if items == nil then return end
-    for index = 0, items:size() - 1 do
+    if items == nil or items.size == nil or items.get == nil then return false end
+    local count = items:size()
+    if type(count) ~= "number" or count < 0 or count ~= math.floor(count) then return false end
+    for index = 0, count - 1 do
         local item = items:get(index)
-        visitor(item, container)
-        local nested = false
-        if item ~= nil and item.IsInventoryContainer ~= nil then
-            local ok, value = pcall(function() return item:IsInventoryContainer() end)
-            nested = ok and value == true
-        end
-        if nested and item.getInventory ~= nil then
-            local ok, inventory = pcall(function() return item:getInventory() end)
-            if ok and inventory ~= nil then
-                walkContainerItems(inventory, visitor, seen)
+        if item == nil then
+            if strict then return false end
+        else
+            visitor(item, container)
+            local nested = false
+            if item.IsInventoryContainer ~= nil then
+                local ok, value = pcall(function() return item:IsInventoryContainer() end)
+                if strict and (not ok or type(value) ~= "boolean") then return false end
+                nested = ok and value == true
+            end
+            if nested then
+                if item.getInventory == nil then
+                    if strict then return false end
+                else
+                    local ok, inventory = pcall(function() return item:getInventory() end)
+                    if strict and (not ok or inventory == nil) then return false end
+                    if ok and inventory ~= nil then
+                        local complete = walkContainerItems(inventory, visitor, seen, strict, allowContainer)
+                        if strict and not complete then return false end
+                    end
+                end
             end
         end
     end
+    return true
+end
+
+-- A floor bag and its contents are one identity-deduplicated read. The root
+-- collector remains root-only for callers that need the world object itself.
+local function walkLooseItemTree(rootItem, visitor, seenContainers, seenItems)
+    local ok, complete = pcall(function()
+        if rootItem == nil then return false end
+        local function add(item)
+            if not seenItems[item] then
+                seenItems[item] = true
+                visitor(item)
+            end
+        end
+        add(rootItem)
+        if rootItem.IsInventoryContainer ~= nil then
+            local isBag = rootItem:IsInventoryContainer()
+            if type(isBag) ~= "boolean" then return false end
+            if isBag then
+                if rootItem.getInventory == nil then return false end
+                local inventory = rootItem:getInventory()
+                if inventory == nil then return false end
+                return walkContainerItems(inventory, add, seenContainers, true)
+            end
+        end
+        return true
+    end)
+    return ok and complete == true
 end
 
 local function containerContains(container, item)
@@ -903,27 +1041,40 @@ end
 -- Locate a real consumable in the base's assigned containers. This does not
 -- use summaries or item factories: the returned instance is the same object
 -- that will enter the survivor inventory and later serialized record.
-function Storage.findSurvivalSupply(base, character, kind)
+function Storage.findSurvivalSupply(base, character, kind, options)
     if kind ~= "food" and kind ~= "water" then return nil, "invalid_kind" end
-    local policies = orderedPoliciesByDistance(base, character)
+    local policies = options ~= nil and options.policies or orderedPoliciesByDistance(base, character)
     for pass = 1, 2 do
         for _, policy in ipairs(policies) do
+            local selectedPolicy = options ~= nil and options.policy or nil
+            local matchesPolicy = selectedPolicy == nil or policy == selectedPolicy
+                or (policy.key ~= nil and policy.key == selectedPolicy.key
+                    and policy.transientContainer == selectedPolicy.transientContainer
+                    and (policy.transientContainer ~= true
+                        or policy.container == selectedPolicy.container))
             local filtered = Storage.hasActiveFilters(policy)
-            if (pass == 1 and filtered) or (pass == 2 and not filtered) then
+            if matchesPolicy and ((pass == 1 and filtered) or (pass == 2 and not filtered)) then
                 local resolved = Storage.resolvePolicy(policy)
                 if resolved ~= nil then
                     local found = nil
                     walkContainerItems(resolved.container, function(candidate, sourceContainer)
-                        if found == nil and survivalKind(candidate) == kind
-                            and Storage.filterAllowsItem(policy, candidate) then
-                            found = {
-                                kind = kind,
-                                item = candidate,
-                                source = sourceContainer,
-                                policy = policy,
-                            }
+                        if found ~= nil then return end
+                        local function eligible()
+                            return (options ~= nil and kind == "food"
+                                    and KnoxSurvivorNeeds.isSafeFood(candidate)
+                                or (options == nil or kind ~= "food") and survivalKind(candidate) == kind)
+                                and Storage.filterAllowsItem(policy, candidate)
+                                and (options == nil or options.acceptItem == nil
+                                    or options.acceptItem(candidate, sourceContainer, resolved) == true)
                         end
-                    end)
+                        local ok, accepted
+                        if options ~= nil then ok, accepted = pcall(eligible)
+                        else ok, accepted = true, eligible() end
+                        if ok and accepted then
+                            found = { kind = kind, item = candidate,
+                                source = sourceContainer, policy = policy }
+                        end
+                    end, nil, false, options ~= nil and options.acceptContainer or nil)
                     if found ~= nil then return found, "found" end
                 end
             end
@@ -1061,28 +1212,63 @@ end
 -- base files nothing there, nothing is deposited there, and a category with no
 -- assigned container still reads as unassigned. The summary keeps the two
 -- apart for exactly that reason; the planner decides where they add up.
--- The solid floor answers as a container on some builds and as a world-object
--- list on others. Ask both surfaces, assume neither.
-local function floorContainerOf(square)
-    if square == nil or square.getFloor == nil then return nil end
-    local ok, value = pcall(function() return square:getFloor() end)
-    if not ok or value == nil or value.getItems == nil then return nil end
-    return value
-end
-
+-- One native collection seam. A missing/malformed read is never an empty floor.
 local function squareLooseItems(square)
-    local items = {}
-    if square == nil or square.getObjects == nil then return items end
-    local objects = square:getObjects()
-    if objects == nil or objects.size == nil then return items end
-    for index = 0, objects:size() - 1 do
-        local object = objects:get(index)
-        if object ~= nil and object.getItem ~= nil then
-            local ok, item = pcall(function() return object:getItem() end)
-            if ok and item ~= nil then items[#items + 1] = item end
+    if square==nil then return {},false end
+    local ok,items=pcall(function()
+        local objects=square:getWorldObjects()
+        local count=objects:size()
+        if type(count)~="number" or count<0 or count>4096 or count~=math.floor(count) then return nil end
+        local result={}
+        for index=0,count-1 do
+            local object=objects:get(index)
+            if object==nil then return nil end
+            local item=object:getItem()
+            if item==nil then return nil end
+            result[#result+1]=item
+        end
+        return result
+    end)
+    if not ok or items==nil then return {},false end
+    return items,true
+end
+Storage.collectSquareLooseItems=squareLooseItems
+
+-- Exported: the same floor read this owner counts for its summary, pointed at a
+-- home's own squares. `visitor(item)` sees each root and nested bag item once.
+-- Returns true only when every square and nested inventory in the area
+-- was readable, so a caller can tell unknown from a readable empty floor. An
+-- area larger than the bounded footprint is not read: unknown, not smaller.
+function Storage.walkFloorItems(base, visitor)
+    if base == nil or type(visitor) ~= "function" then return false end
+    local area = storageArea(base)
+    local cell = getCell ~= nil and getCell() or nil
+    if area == nil or cell == nil or cell.getGridSquare == nil then return false end
+    local minX, minY = tonumber(area.minX), tonumber(area.minY)
+    local maxX = tonumber(area.maxX) or (minX and minX + (tonumber(area.width) or 1) - 1)
+    local maxY = tonumber(area.maxY) or (minY and minY + (tonumber(area.height) or 1) - 1)
+    if minX == nil or minY == nil or maxX == nil or maxY == nil then return false end
+    if (maxX - minX + 1) * (maxY - minY + 1) > 4096 then return false end
+    local z = tonumber(area.z) or tonumber(base.home ~= nil and base.home.z) or 0
+    local readable = true
+    local seenContainers, seenItems = {}, {}
+    for x = minX, maxX do
+        for y = minY, maxY do
+            local square = cell:getGridSquare(x, y, z)
+            if square == nil then
+                readable = false
+            else
+                local loose,known = squareLooseItems(square)
+                if not known then readable=false
+                else
+                    for index = 1, #loose do
+                        if not walkLooseItemTree(loose[index], visitor, seenContainers, seenItems) then readable = false end
+                    end
+                end
+            end
         end
     end
-    return items
+    return readable
 end
 
 function Storage.floorStock(base)
@@ -1097,12 +1283,14 @@ function Storage.floorStock(base)
     local maxY = tonumber(area.maxY) or (minY and minY + (tonumber(area.height) or 1) - 1)
     if minX == nil or minY == nil or maxX == nil or maxY == nil then return result end
     local z = tonumber(area.z) or tonumber(base.home ~= nil and base.home.z) or 0
+    local seenContainers, seenItems = {}, {}
     for x = minX, maxX do
         for y = minY, maxY do
             local square = cell:getGridSquare(x, y, z)
-            local floor = floorContainerOf(square)
-            local loose = squareLooseItems(square)
-            if floor ~= nil or #loose > 0 then
+            local loose,known = squareLooseItems(square)
+            if not known then result.unreadable=(result.unreadable or 0)+1 end
+            if known then result.loaded=true end
+            if known and #loose > 0 then
                 result.squares = result.squares + 1
                 result.loaded = true
                 local function add(item)
@@ -1111,8 +1299,11 @@ function Storage.floorStock(base)
                     result.totals[category] = (result.totals[category] or 0)
                         + itemQuantity(item)
                 end
-                if floor ~= nil then walkContainerItems(floor, add) end
-                for index = 1, #loose do add(loose[index]) end
+                for index = 1, #loose do
+                    if not walkLooseItemTree(loose[index], add, seenContainers, seenItems) then
+                        result.unreadable = (result.unreadable or 0) + 1
+                    end
+                end
             end
         end
     end
@@ -1122,6 +1313,10 @@ end
 -- Returns an honest snapshot of assigned storage that is currently available in
 -- the loaded cell.  Unloaded/missing containers are reported separately rather
 -- than assumed empty or treated as an abstract stockpile.
+-- Exported so other owners measure real stock through this single traversal,
+-- nested-container and identity dedup included, instead of writing a second one.
+Storage.walkItems = walkContainerItems
+
 function Storage.summarize(base)
     local now = type(getTimestampMs) == "function" and getTimestampMs() or nil
     local key = now ~= nil and summarizeCacheKey(base) or nil
@@ -1235,11 +1430,35 @@ local CONSUMABLE_STORAGE_ROLES = {
 
 -- Matching filters precede fallback storage (D-037). Within a preference tier
 -- use configured priority, then live distance; discovery never proves receipt.
+-- Preserve policy priority; cold preference breaks ties before distance.
 local function depositOrder(a, b)
     if a.preference ~= b.preference then return a.preference < b.preference end
     if a.priorityRank ~= b.priorityRank then return a.priorityRank < b.priorityRank end
+    if (a.coldRank or 1) ~= (b.coldRank or 1) then return (a.coldRank or 1) < (b.coldRank or 1) end
     if a.distance ~= b.distance then return a.distance < b.distance end
     return a.policy.key < b.policy.key
+end
+
+-- Cold-storage preference asks for isFrozen()/isRotten(). The installed
+-- zombie.inventory.InventoryItem has hasTag and IsRotten only; isFrozen() and
+-- isRotten() live on zombie.inventory.types.Food. Calling them on a plain item
+-- threw once per item on every cleanup, which is what buried the log in stack
+-- dumps while the preference itself never engaged. safeBoolean() reads the
+-- method before calling it, the same way deposit filters already do.
+function Storage.isColdPerishable(item)
+    if item == nil then return false, nil end
+    local tag = ItemTag ~= nil and ItemTag.PRESERVED_FOOD or nil
+    -- A false hasTag() result must stay false: `false or nil` would turn it
+    -- back into nil and quietly disable the whole cold-storage preference.
+    local preserved = nil
+    if tag ~= nil then preserved = safeBoolean(item, "hasTag", tag) end
+    local frozen = safeBoolean(item, "isFrozen")
+    local rotten = safeBoolean(item, "isRotten")
+    if preserved == false and rotten == false and type(frozen) == "boolean"
+        and Storage.matchesCategory(item, "perishable") then
+        return true, frozen
+    end
+    return false, nil
 end
 
 -- The caller supplies only this survivor's canonical assigned/owned base.
@@ -1247,6 +1466,7 @@ local function findDeposit(base, character, item, trip, excluded, ticks, policyK
     local origin = character ~= nil and character:getCurrentSquare() or nil
     if base == nil or origin == nil then return nil, "no_owned_storage" end
     local candidates, capacityFallbacks = {}, {}
+    local coldFood, frozen = Storage.isColdPerishable(item)
     -- A pinned lookup revalidates a decision another owner already made (the
     -- planned shelf for a deposit trip), so it is not a new discovery.
     local pinned = policyKey ~= nil
@@ -1318,6 +1538,10 @@ local function findDeposit(base, character, item, trip, excluded, ticks, policyK
                     local rdy = resolved.square:getY() - origin:getY()
                     resolved.distance = rdx * rdx + rdy * rdy
                     resolved.priorityRank = Storage.priorityRank(policy)
+                    local cold = nil
+                    if coldFood and exact and role == "food" then
+                        cold = Storage.coldContainer(resolved.container)
+                    end
                     if capacityFallback and not pinned then
                         -- Held back until every matching shelf has refused.
                         resolved.preference = 3
@@ -1338,6 +1562,10 @@ local function findDeposit(base, character, item, trip, excluded, ticks, policyK
                             or exact and 2
                             or overflow and 3 or 4
                         resolved.overflow = capacityFallback or nil
+                        if cold ~= nil and cold.powered and cold.electricity
+                            and ((not frozen and cold.fridge and not cold.freezer) or (frozen and cold.freezer)) then
+                            resolved.coldRank = 0
+                        end
                         candidates[#candidates + 1] = resolved
                     end
                 elseif not capacityFallback then
@@ -1371,16 +1599,6 @@ function Storage.findDepositTrip(base, character, item, excluded, ticks)
     return findDeposit(base, character, item, true, excluded, ticks)
 end
 
-local function firstMatchingItem(container, category)
-    local found = nil
-    walkContainerItems(container, function(item)
-        if found == nil and Storage.matchesCategory(item, category) then
-            found = item
-        end
-    end)
-    return found
-end
-
 local function sourceForItem(resolved, sourceContainer)
     if resolved == nil or sourceContainer == nil then return nil end
     return {
@@ -1400,13 +1618,18 @@ end
 -- Multiple same-category storages must use the closest relative option.
 -- Sorts assigned policies by distance to the worker so withdrawals favor near
 -- containers instead of key order.
-orderedPoliciesByDistance = function(base, character)
-    local policies = Storage.operationalPolicies(base)
+-- The player's fill order comes first, then live distance, then key. A base
+-- whose shelves carry no order at all ties on rank and falls back to distance,
+-- exactly as it sorted before the order key existed.
+function Storage.sortByPriorityAndDistance(policies, character)
+    local list = policies or {}
     local origin = character ~= nil and character.getCurrentSquare ~= nil
         and character:getCurrentSquare() or nil
-    if origin == nil then return policies end
+    if origin == nil then return list end
     local ox, oy, oz = origin:getX(), origin:getY(), origin:getZ()
-    table.sort(policies, function(a, b)
+    table.sort(list, function(a, b)
+        local ar, br = Storage.priorityRank(a), Storage.priorityRank(b)
+        if ar ~= br then return ar < br end
         local adx = (tonumber(a.x) or ox) - ox
         local ady = (tonumber(a.y) or oy) - oy
         local adz = math.abs((tonumber(a.z) or oz) - oz) * 4
@@ -1418,7 +1641,12 @@ orderedPoliciesByDistance = function(base, character)
         if da ~= db then return da < db end
         return tostring(a.key) < tostring(b.key)
     end)
-    return policies
+    return list
+end
+
+orderedPoliciesByDistance = function(base, character)
+    return Storage.sortByPriorityAndDistance(
+        Storage.operationalPolicies(base), character)
 end
 Storage.orderedPoliciesByDistance = orderedPoliciesByDistance
 
@@ -1706,6 +1934,20 @@ function Storage.countAssignedItem(base, itemType, requirements)
     return count
 end
 
+-- On-hand count for one player-named item minimum. Same assigned shelves,
+-- same policy filters and the same intact-item rule as countAssignedItem, so
+-- the number a player reads in Stores is the number the supply run works to.
+function Storage.goalItemCount(base, fullType)
+    if base == nil then return 0 end
+    -- The planner owns the key shape; without it there is no rule to read and
+    -- no count to report, so this never invents one.
+    local planner = rawget(_G, "KnoxBaseSupplyPlanner")
+    local key = planner ~= nil and planner.itemTargetKey ~= nil
+        and planner.itemTargetKey(tostring(fullType)) or nil
+    if key == nil then return 0 end
+    return Storage.countAssignedItem(base, fullType, { items = { [fullType] = 1 } })
+end
+
 function Storage.requirementsAvailable(base, character, requirements)
     local settings = rawget(_G, "KnoxSettings")
     if settings ~= nil and settings.ignoreJobResourceRequirements ~= nil
@@ -1756,7 +1998,7 @@ function Storage.findTransfer(base) return nil, "sorting_retired" end
 function Storage.transferTarget(transfer) return nil, "sorting_retired" end
 function Storage.resolveTransfer(base, target) return nil, "sorting_retired" end
 
-function Storage.queueTransfer(character, transfer)
+function Storage.queueTransfer(character, transfer, guard)
     if character == nil or transfer == nil then
         return nil, "missing_transfer"
     end
@@ -1772,25 +2014,23 @@ function Storage.queueTransfer(character, transfer)
         transfer.item,
         transfer.source.container,
         transfer.destination.container,
-        nil
+        nil, guard
     )
 end
 
--- ===== DEPOT AREA (log processing as a stockpile floor) =====
--- N2 said a stockpile is a mode on the area record, not a container. A
--- log_processing area is that mode: the painted floor is the destination, the
--- filters say what may be set down on it, and nothing is created to hold it.
--- RimWorld's stockpile in one line: paint a floor, choose what belongs, and the
--- workers carry matching things there until the target is met or the floor is
--- full.
+-- ===== DEPOT AREA (the tile-drop yard) =====
+-- A depot area uses the painted floor as a stockpile; no container is created.
+-- The yard takes any item: the player's filter set says what the yard is for,
+-- not what may be set down. Deliveries stop at the target or when the floor is
+-- full, and bulky loads are the ones routed here first.
 Storage.DEPOT_ZONE_TYPES = { log_processing = true }
+Storage.DEPOT_LABEL = "Drop Point"
 
--- Raw timber and the processed building stock a yard actually collects. The
--- player edits this through the same filter window a container uses.
+-- What a new yard is for, shown and edited through the same filter window a
+-- container uses. These defaults shape the yard's purpose, not admission.
 Storage.DEPOT_DEFAULT_FILTERS = { logs = true, building = true }
 
--- Keep-N, reusing the settlement's existing amount idea instead of a new
--- setting: past the target the floor stops growing and the haul is refused.
+-- Reuse the settlement supply targets to limit items left on the floor.
 Storage.DEPOT_TARGETS = { logs = 60, building = 40 }
 
 local function depotCopyFilters(source)
@@ -1825,8 +2065,9 @@ function Storage.zoneFilters(zone)
 end
 
 -- Called when the area is created and when the player saves filters. A depot
--- with no stored filters accepts the default set; an empty set the player chose
--- stays empty and means "anything", exactly as it does for a container.
+-- with no stored filters starts on the default set; an empty set the player
+-- chose stays empty. Either way admission is universal: the yard takes any
+-- item, and the set only describes what it is for.
 function Storage.ensureDepotFilters(zone)
     if not Storage.isDepotZone(zone) then return nil end
     if type(zone.storageFilters) ~= "table" then
@@ -1861,10 +2102,30 @@ function Storage.depotZoneAt(base, x, y, z)
     return nil
 end
 
+-- A yard is a dumping ground, not a shelf: any real item may be set down on it.
+-- What the player selected still reads in the filter window and still sets the
+-- per-category targets; it never turns the yard away.
 function Storage.depotAccepts(zone, item)
-    local policy = Storage.zoneFilters(zone)
-    if policy == nil or item == nil then return false end
-    return Storage.acceptsDeposit(policy, item) == true
+    if item == nil then return false end
+    return Storage.isDepotZone(zone) == true
+end
+
+-- Heavy or large loads are the yard's business. Native items report their
+-- weight; the optional heavy flag is used when the item has one, and an
+-- unreadable weight never turns an item into a bulk load.
+local DEPOT_BULK_WEIGHT = 2.0
+
+function Storage.depotBulkRank(item)
+    if item == nil then return 2 end
+    if safeBoolean(item, "isHeavy") == true then return 1 end
+    local read, weight = pcall(function() return item:getActualWeight() end)
+    weight = read and tonumber(weight) or nil
+    if weight == nil then
+        local ok, baseWeight = pcall(function() return item:getWeight() end)
+        weight = ok and tonumber(baseWeight) or nil
+    end
+    if weight == nil then return 2 end
+    return weight >= DEPOT_BULK_WEIGHT and 1 or 2
 end
 
 function Storage.depotTarget(zone, category)
@@ -1888,6 +2149,7 @@ function Storage.depotPlacementDecision(facts)
 end
 
 Storage.DEPOT_REFUSALS = {
+    stock_unreadable = "Cannot check the Drop Point stock right now",
     no_depot = "There is no depot area at this base.",
     not_allowed = "The depot filters do not allow that.",
     target_reached = "The depot already holds what it wants of that.",
@@ -1917,20 +2179,33 @@ function Storage.depotStock(base, zone)
         local category = Storage.classifyItem(item)
         result.totals[category] = (result.totals[category] or 0) + itemQuantity(item)
     end
+    local seenContainers, seenItems = {}, {}
     for x = minX, maxX do
         for y = minY, maxY do
             local square = cell:getGridSquare(x, y, z)
-            local floor = floorContainerOf(square)
-            local loose = squareLooseItems(square)
-            if floor ~= nil or #loose > 0 then
+            local loose,known = squareLooseItems(square)
+            if not known then result.unreadable=(result.unreadable or 0)+1 end
+            if known then result.loaded=true end
+            if known and #loose > 0 then
                 result.squares = result.squares + 1
                 result.loaded = true
-                if floor ~= nil then walkContainerItems(floor, add) end
-                for index = 1, #loose do add(loose[index]) end
+                for index = 1, #loose do
+                    if not walkLooseItemTree(loose[index], add, seenContainers, seenItems) then
+                        result.unreadable = (result.unreadable or 0) + 1
+                    end
+                end
             end
         end
     end
     return result
+end
+
+-- A depot is real loaded world floor, never a terrain-object inventory.
+local function depotSquareAvailable(square)
+    if square == nil or square.isFree == nil then return false end
+    local ok,free=pcall(function() return square:isFree(false) end)
+    local loose,known=squareLooseItems(square)
+    return ok and free==true and known and #loose==0
 end
 
 -- A spot a survivor can actually set something down on: standable, on the
@@ -1951,19 +2226,7 @@ function Storage.depotFreeTiles(base, zone, limit)
             scanned = scanned + 1
             if scanned > cap then return free end
             local square = cell:getGridSquare(x, y, z)
-            if square ~= nil and square.isFree ~= nil then
-                local ok, value = pcall(function() return square:isFree(false) end)
-                local loose = squareLooseItems(square)
-                if ok and value == true and #loose == 0 then
-                    local floor = floorContainerOf(square)
-                    local full = false
-                    if floor ~= nil and floor.getItems ~= nil then
-                        local read, items = pcall(function() return floor:getItems() end)
-                        full = read and items ~= nil and items:size() > 0
-                    end
-                    if not full then free = free + 1 end
-                end
-            end
+            if depotSquareAvailable(square) then free = free + 1 end
         end
     end
     return free
@@ -1979,6 +2242,7 @@ function Storage.depotDestination(base, item, zone)
     local held = 0
     if accepted and category ~= nil then
         local stock = Storage.depotStock(base, depot)
+        if (stock.unreadable or 0)>0 then return nil,"stock_unreadable" end
         held = tonumber(stock.totals[category]) or 0
     end
     local preliminary = Storage.depotPlacementDecision({
@@ -2012,40 +2276,38 @@ function Storage.depotFreeSquare(base, zone)
             scanned = scanned + 1
             if scanned > 400 then return nil end
             local square = cell:getGridSquare(x, y, z)
-            if square ~= nil and square.isFree ~= nil then
-                local ok, value = pcall(function() return square:isFree(false) end)
-                if ok and value == true and #squareLooseItems(square) == 0 then
-                    local floor = floorContainerOf(square)
-                    local occupied = false
-                    if floor ~= nil and floor.getItems ~= nil then
-                        local read, items = pcall(function() return floor:getItems() end)
-                        occupied = read and items ~= nil and items:size() > 0
-                    end
-                    if not occupied then return square end
-                end
-            end
+            if depotSquareAvailable(square) then return square end
         end
     end
     return nil
 end
 
--- The whole destination, decided once: which yard, which free tile, and the
--- native floor container that tile's loose items live in. The Organize owner
--- moves to this square and transfers into this container; nothing is spawned.
+-- The destination is a real square. The existing Organize owner walks there
+-- and uses its native queueDrop; terrain has no inventory container.
 function Storage.depotStore(base, item, zone)
     local depot = zone or Storage.depotZone(base)
     if depot == nil then return nil, "no_depot" end
     if item == nil then return nil, "not_allowed" end
     if not Storage.depotAccepts(depot, item) then return nil, "not_allowed" end
     local category = Storage.classifyItem(item)
-    local held = tonumber(Storage.depotStock(base, depot).totals[category]) or 0
+    local stock=Storage.depotStock(base,depot)
+    if (stock.unreadable or 0)>0 then return nil,"stock_unreadable" end
+    local held = tonumber(stock.totals[category]) or 0
     local target = Storage.depotTarget(depot, category)
     if target > 0 and held >= target then return nil, "target_reached" end
     local square = Storage.depotFreeSquare(base, depot)
     if square == nil then return nil, "no_free_tile" end
-    local container = floorContainerOf(square)
-    if container == nil then return nil, "no_floor_container" end
-    return { zone = depot, square = square, container = container, category = category }
+    return { zone = depot, square = square, category = category }
+end
+
+-- Re-read the same yard's current policy/target and world floor before dropping.
+-- Filters describe intent; the approved drop-point policy still admits any item.
+function Storage.depotDropAllowed(base,item,square,zoneId)
+    if base==nil or square==nil or zoneId==nil then return false end
+    local zone=Storage.depotZoneAt(base,square:getX(),square:getY(),square:getZ())
+    if zone==nil or zone.id~=zoneId then return false end
+    local destination=Storage.depotStore(base,item,zone)
+    return destination~=nil and depotSquareAvailable(square)
 end
 -- DEPOT STATUS LINE (pure)
 -- One sentence the home band can show: what the yard wants, what stands on

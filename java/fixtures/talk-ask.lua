@@ -4,7 +4,7 @@
 -- question spoken by the player, the answer spoken once by the survivor, and
 -- the fact that asking never touches trust.
 local service = assert(CompanionService, "the ask owner must be loaded")
--- The health answer reads the real infection rule; lend it the production module
+-- The health answer reads the real bite rule; lend it the production module
 -- and put back whatever was there so later fixtures do not inherit it.
 local previousNeeds = rawget(_G, "KnoxSurvivorNeeds")
 KnoxSurvivorNeeds = assert(rawget(_G, "codecIllnessNeeds"), "the illness reader is loaded")
@@ -104,15 +104,17 @@ for _, topic in ipairs({ "day", "home", "group", "health", "need", "travels" }) 
     if topic == "travels" then
         assert(text:find("Ada", 1, true) ~= nil,
             "their travels retell a recorded encounter, not an invented one")
-        assert(text:find("walked on", 1, true) ~= nil,
-            "a second recorded line may follow the first")
+        assert(text:find("walked on", 1, true) == nil,
+            "one recorded memory is told at a time, leaving other real memories for later questions")
     end
 end
 
 -- 6a. A bitten survivor answers with the bite, and only when it is real.
 local bitten = false
 character.getBodyDamage = function()
-    return { IsInfected = function() return bitten end }
+    return { IsInfected = function() return true end,
+        getBodyParts = function() return { size = function() return 1 end,
+            get = function() return { bitten = function() return bitten end } end } end }
 end
 bitten = true
 reset()
@@ -125,7 +127,7 @@ reset()
 setState({ character = character })
 local soundOk, soundText = service.askAbout(player, "s1", "health")
 assert(soundOk == true and soundText:find("bit", 1, true) == nil,
-    "a clean survivor does not claim a bite: " .. tostring(soundText))
+    "infection without a bite does not invent a bitten health answer: " .. tostring(soundText))
 
 -- 6b. With no recorded history they say so, rather than inventing a story.
 reset()

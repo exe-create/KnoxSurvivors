@@ -1,4 +1,6 @@
 require "TimedActions/ISWashYourself"
+require "TimedActions/ISCleanBlood"
+require "TimedActions/ISEquipWeaponAction"
 require "TimedActions/ISWashClothing"
 require "TimedActions/ISTimedActionQueue"
 require "Util/AdjacentFreeTileFinder"
@@ -202,6 +204,175 @@ function Hygiene.step(plan, character, bridge, id, ticks)
         return "failed", "wash_no_change"
     end
     return "failed", "wash_invalid_phase"
+end
+
+-- Surface chores share this activity owner; they never change body-wash plans.
+do
+    local function stain(square)
+        return square:haveBloodFloor() or square:haveBloodWall()
+            or square:haveGrimeFloor() or square:haveGrimeWall()
+    end
+    local function eligible(square)
+        if square == nil then return false end
+        local room = square:getRoomDef()
+        return (room == nil or room:getName() ~= "bathroom") and stain(square)
+    end
+    local function cost() return ZomboidGlobals.CleanBloodBleachAmount end
+    local function cleaner(item)
+        local f = item:getFluidContainer()
+        return f ~= nil and (f:contains(Fluid.Bleach) or f:contains(Fluid.CleaningLiquid))
+            and f:getAmount() >= cost()
+    end
+    local function carried(character, item)
+        return character:getInventory():containsEvalRecurse(function(candidate) return candidate == item end)
+    end
+    local function supplies(character, available)
+        local inv = character:getInventory()
+        local liquid = inv:getFirstEvalRecurse(function(item)
+            return (available == nil or available(item)) and cleaner(item)
+        end)
+        local tool = inv:getFirstTagEvalRecurse(ItemTag.CLEAN_STAINS, function(item)
+            return not item:isBroken() and (available == nil or available(item))
+        end)
+        return tool, liquid
+    end
+    -- At most 64 loaded-square lookups; advance on empty/unloaded squares too.
+    function Hygiene.findSurface(character, base, cursor, available)
+        local area = base and (base.territory or base.home)
+        local origin = character and character:getCurrentSquare()
+        if not area or not origin or not inside(area, origin) then return nil, cursor end
+        local supplyOk,tool,liquid = pcall(supplies,character,available)
+        if not supplyOk or not tool or not liquid then return nil, cursor end
+        local minX, minY = tonumber(area.minX), tonumber(area.minY)
+        if not minX or not minY then return nil, cursor end
+        local maxX = tonumber(area.maxX) or minX + (tonumber(area.width) or 1) - 1
+        local maxY = tonumber(area.maxY) or minY + (tonumber(area.height) or 1) - 1
+        local width, height = maxX-minX+1, maxY-minY+1
+        if width<=0 or height<=0 then return nil, cursor end
+        local total, cell = width*height, getCell()
+        if not cell then return nil, cursor end
+        local index = (tonumber(cursor) or 0)%total
+        for _=1, math.min(total,64) do
+            local loaded,square = pcall(cell.getGridSquare,cell,minX+index%width,minY+math.floor(index/width),origin:getZ())
+            index=(index+1)%total
+            local ok, dirty = pcall(eligible,loaded and square or nil)
+            if ok and dirty then
+                local approach = AdjacentFreeTileFinder.Find(square,character)
+                if approach then
+                    return {kind="surface",square=square,approach=approach,tool=tool,
+                        cleaner=liquid,base=base,character=character,phase="surface_move"},index
+                end
+            end
+        end
+        return nil,index
+    end
+    local function allowed(plan, character)
+        if plan.cancelled or plan.character~=character or character:isDead()
+            or not carried(character,plan.tool) or not carried(character,plan.cleaner)
+            or plan.tool:isBroken() or not plan.tool:hasTag(ItemTag.CLEAN_STAINS)
+            or not cleaner(plan.cleaner) then return false end
+        local area=plan.base.territory or plan.base.home
+        local cell,here=getCell(),character:getCurrentSquare()
+        if not cell or cell:getGridSquare(plan.square:getX(),plan.square:getY(),plan.square:getZ())~=plan.square then return false end
+        if plan.phase~="surface_move" then
+            if not here or here:getZ()~=plan.square:getZ()
+                or (here:getX()-plan.square:getX())^2+(here:getY()-plan.square:getY())^2>2
+                or (here~=plan.square and (here.isSomethingTo==nil or here:isSomethingTo(plan.square))) then return false end
+        end
+        return inside(area,character:getCurrentSquare()) and inside(area,plan.square)
+            and eligible(plan.square) and (plan.permission==nil or plan.permission())
+    end
+    local function guarded(plan, character, action, completing)
+        for _, name in ipairs({"isValid","start","perform","complete"}) do
+            local original=action[name]
+            if original then
+                action[name]=function(self,...)
+                    local ok,permitted=pcall(allowed,plan,character)
+                    if name=="perform" then
+                        if completing then return original(self,...) end
+                        if not ok or not permitted then return ISBaseTimedAction.perform(self) end
+                    end
+                    if not ok or not permitted then return false end
+                    if name=="complete" and completing then
+                        if plan.cleanAttempted then return false end
+                        plan.cleanAttempted=true
+                    end
+                    local result=original(self,...)
+                    if name=="complete" and completing and result==true then plan.nativeCompleted=true end
+                    return result
+                end
+            end
+        end
+        return action
+    end
+    local function enqueue(plan,character,action,receipt,completing)
+        plan.action=guarded(plan,character,action,completing)
+        plan.receipt=receipt
+        local queue=ISTimedActionQueue.add(action)
+        if plan.cancelled or queue==nil or ISTimedActionQueue.queues[character]~=queue then
+            return "failed","surface_queue_refused"
+        end
+        plan.phase="surface_wait"
+        return "working"
+    end
+    function Hygiene.stepSurface(plan,character,bridge,id,ticks)
+        if plan.phase=="surface_done" then return "complete","surface_cleaned" end
+        if ticks-(plan.startedAt or ticks)>7200 then return "failed","surface_timeout" end
+        if plan.phase=="surface_wait" then
+            local q=ISTimedActionQueue.getTimedActionQueue(character)
+            if q and q:indexOf(plan.action)~=-1 then return "working" end
+            local ok,received=pcall(plan.receipt)
+            if not ok or not received then return "failed","surface_receipt_missing" end
+            plan.action,plan.receipt=nil,nil
+            if plan.nativeCompleted then plan.phase="surface_done";return "complete","surface_cleaned" end
+            plan.phase="surface_prepare"
+        end
+        if not allowed(plan,character) then return "failed","surface_permission_changed" end
+        if plan.phase=="surface_move" then
+            local result=tostring(bridge:tickNpc(id))
+            if result=="Succeeded" then plan.phase="surface_prepare"
+            elseif result:find("Failed",1,true) then return "failed","surface_route_failed"
+            else return "working" end
+        end
+        if plan.phase~="surface_prepare" then return "failed","surface_invalid_phase" end
+        local q=ISTimedActionQueue.getTimedActionQueue(character)
+        if not character:getCharacterActions():isEmpty() or q.current~=nil or #q.queue>0 then
+            return "failed","surface_foreign_action"
+        end
+        local inv=character:getInventory()
+        for _,item in ipairs({plan.tool,plan.cleaner}) do
+            if item:getContainer()~=inv then
+                local source=item:getContainer()
+                local function guard(_,candidate)
+                    return candidate==item and allowed(plan,character) and item:getContainer()==source
+                end
+                plan.guard=guard
+                local action,reason=KnoxInventoryActions.queueTransfer(character,item,source,inv,nil,guard)
+                if not action then return "failed",reason end
+                plan.action=action
+                plan.receipt=function() return item:getContainer()==inv and inv:contains(item) and not source:contains(item) end
+                plan.phase="surface_wait"
+                return "working"
+            end
+        end
+        local both=instanceof(plan.tool,"HandWeapon") and plan.tool:isTwoHandWeapon()
+        if character:getPrimaryHandItem()~=plan.tool or both and character:getSecondaryHandItem()~=plan.tool then
+            return enqueue(plan,character,ISEquipWeaponAction:new(character,plan.tool,50,true,both),function()
+                return character:getPrimaryHandItem()==plan.tool and (not both or character:getSecondaryHandItem()==plan.tool)
+            end)
+        end
+        if not both and character:getSecondaryHandItem()~=plan.cleaner then
+            return enqueue(plan,character,ISEquipWeaponAction:new(character,plan.cleaner,50,false,false),function()
+                return character:getSecondaryHandItem()==plan.cleaner
+            end)
+        end
+        local before=plan.cleaner:getFluidContainer():getAmount()
+        local action=ISCleanBlood:new(character,plan.square,plan.cleaner)
+        return enqueue(plan,character,action,function()
+            local delta=before-plan.cleaner:getFluidContainer():getAmount()
+            return plan.nativeCompleted==true and not stain(plan.square) and math.abs(delta-cost())<0.0001
+        end,true)
+    end
 end
 
 return Hygiene

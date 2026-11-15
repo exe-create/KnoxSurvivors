@@ -41,7 +41,7 @@ local isUsableMelee
 -- This is telemetry only.  It records a successful call into the same native
 -- hook a local player uses; it never substitutes for vanilla ballistics or
 -- changes a weapon's ammunition/chamber state.
-local successfulNativeShots = setmetatable({}, { __mode = "k" })
+local nativeHookAttempts = setmetatable({}, { __mode = "k" })
 -- Five tiers from useless to deadly. The number is added to the survivor's real
 -- Aiming level for the AI's own decision and settle time only; it never touches
 -- the perk, the XP or the engine's shot calculation, so a high tier makes an
@@ -408,11 +408,16 @@ end
 -- until the threat is genuinely close, so a target pacing across the
 -- survivor-choice threshold cannot flip ranged/melee every engagement. It never
 -- overrides an explicit melee order or the absence of a real threat.
-function Firearms.wantsRanged(id, character, target, retainRanged)
+function Firearms.wantsRanged(id, character, target, retainRanged, groupPresent)
     local preference = Firearms.preferenceFor(id)
     if preference == "ranged" then return true, "ordered_ranged" end
     if not hasUsableMelee(character) then return true, "no_usable_melee" end
     if preference == "melee" then return false, "ordered_melee" end
+    -- A party fights with steel. A shot pulls the whole neighbourhood onto
+    -- everyone standing nearby, so an automatic choice stays melee while
+    -- allies are present. An explicit ranged order above still wins.
+    if groupPresent == true then return false, "group_melee_preference" end
+
     local aiming = Firearms.aimingDecisionLevel(character)
     local distance = safe(function()
         if target == nil or character:getZ() ~= target:getZ() then return 0 end
@@ -496,7 +501,7 @@ end
 
 -- Returns ready, reloading, or melee.  Reloading deliberately yields combat ownership
 -- for the native timed action; a later threat scan resumes once the actual weapon can fire.
-function Firearms.prepareForThreat(id, character, bridge, target, retainRanged)
+function Firearms.prepareForThreat(id, character, bridge, target, retainRanged, groupPresent)
     if character == nil or bridge == nil or bridge.equipNpcOwnedWeapon == nil then
         return "melee", "bridge_unavailable"
     end
@@ -506,7 +511,7 @@ function Firearms.prepareForThreat(id, character, bridge, target, retainRanged)
     end
 
     local ranged, preferenceReason = Firearms.wantsRanged(
-        id, character, target, retainRanged
+        id, character, target, retainRanged, groupPresent
     )
     if not ranged then
         return "melee", preferenceReason .. " " .. Firearms.fallbackToMelee(id, bridge, character)
@@ -684,6 +689,8 @@ function Firearms.fireNative(character)
             charge = tonumber(character.useChargeDelta)
         end
     end)
+    -- The hook has no result indicating whether DoAttack or a hit occurred.
+    nativeHookAttempts[character] = (nativeHookAttempts[character] or 0) + 1
     local success, failure = pcall(
         ISReloadWeaponAction.attackHook,
         character,
@@ -697,19 +704,24 @@ function Firearms.fireNative(character)
         })
         return false, "native_attack_hook_failed " .. tostring(failure)
     end
-    successfulNativeShots[character] = (successfulNativeShots[character] or 0) + 1
     local log = rawget(_G, "KnoxDebugLog")
     if log ~= nil and log.log ~= nil then
         pcall(function() log.log("firearm", resolveId(character, nil), "attack_hook_called", {
             gun = safe(function() return gun:getFullType() end, "unknown"),
-            total = successfulNativeShots[character],
+            total = nativeHookAttempts[character],
         }) end)
     end
     return true, "native_attack_hook " .. tostring(gun:getFullType())
 end
 
+function Firearms.nativeHookAttemptCount(character)
+    return character ~= nil and (nativeHookAttempts[character] or 0) or 0
+end
+
+-- Compatibility for callers of the old diagnostic API. This has always counted
+-- hook dispatches, never confirmed shots or hits; new callers use the honest name.
 function Firearms.nativeShotCount(character)
-    return character ~= nil and (successfulNativeShots[character] or 0) or 0
+    return Firearms.nativeHookAttemptCount(character)
 end
 
 return Firearms

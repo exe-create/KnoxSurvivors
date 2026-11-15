@@ -108,8 +108,8 @@ local reserve = A.attentionItems(facts({
     shortage = { category = "water", label = "water", missing = 6,
         current = 2, target = 8 },
 }))
-assert(reserve[1].key == "reserve" and reserve[1].title == "Water is 6 below target (2 / 8)",
-    "a reserve shortage names its current and target amounts")
+assert(reserve[1].key == "reserve" and reserve[1].title == "Water: 6 below target (2 / 8)",
+    "a reserve shortage leads with its count and keeps its amounts")
 assert(reserve[1].detail == "The taps are dry; stored water is the whole supply.",
     "a dry water shortage says why the target is raised")
 assert(reserve[1].stockKey == "water",

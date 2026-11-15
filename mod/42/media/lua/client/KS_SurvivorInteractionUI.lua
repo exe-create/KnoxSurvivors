@@ -1,6 +1,7 @@
 require "ISUI/ISPanel"
 require "ISUI/ISLabel"
 require "ISUI/ISButton"
+require "ISUI/ISScrollingListBox"
 require "ISUI/ISUI3DModel"
 require "ISUI/ISCollapsableWindowJoypad"
 require "KS_SurvivorRuntime"
@@ -21,7 +22,6 @@ local INTERACTION_RANGE_SQUARED = 16
 local RETAINED_RANGE_SQUARED = 25 -- Existing controller departure boundary.
 local CONTACT_GRACE_MS = 1500
 local SCAN_INTERVAL_MS = 180
-local INTERACTION_KEY_BINDING = "KnoxSurvivorInteract"
 local WINDOW_WIDTH = 500
 local WINDOW_HEIGHT = 300
 local PADDING = 10
@@ -32,10 +32,6 @@ local nextScanAt = 0
 -- The one live key and the person's name, at the bottom of the screen. The
 -- world, the context menu and Viewpoint's action list still identify who is
 -- there; this strip only says what the key will do.
-local promptPanels = {}
-local PROMPT_WIDTH = 410
-local PROMPT_HEIGHT = 46
-local PROMPT_LIFT = 112
 
 -- The panel's shape depends on who is standing in front of the player. A
 -- stranger gets conversation; somebody who already follows or lives with the
@@ -204,10 +200,15 @@ function InteractionUI.tabPlan(context)
     end
     local orders = nil
     if context.resident == true then
+        -- Exercise is a home activity, not a marching order: a follower who is
+        -- walking behind the player has no idle time to spend on it, and the
+        -- orders tab is already at its six-row readable budget without it. A
+        -- companion can still be asked to exercise from their card.
         orders = {
             { id = "order", kind = "recall_to_party", label = "Recall to Party" },
             { id = "order", kind = "return_to_base", label = "Return to Base" },
             { id = "order", kind = "resume_normal_duty", label = "Cancel Supply Order" },
+            { id = "exercise", label = "Exercise" },
             { id = "unstick", label = "Unstick" },
             { id = "ask_needs", label = "Check Needs" },
         }
@@ -310,29 +311,6 @@ local function playerNumber(player)
     local number = nil
     pcall(function() number = player:getPlayerNum() end)
     return tonumber(number) or 0
-end
-
-local function registerInteractionKeyBinding()
-    local bindings = rawget(_G, "keyBinding")
-    if type(bindings) ~= "table" then return false end
-    for _, binding in ipairs(bindings) do
-        if type(binding) == "table" and binding.value == INTERACTION_KEY_BINDING then
-            return true
-        end
-    end
-    local hasSection = false
-    for _, binding in ipairs(bindings) do
-        if type(binding) == "table" and binding.value == "[Knox Survivors]" then
-            hasSection = true
-            break
-        end
-    end
-    if not hasSection then
-        table.insert(bindings, { value = "[Knox Survivors]" })
-    end
-    local key = Keyboard ~= nil and Keyboard.KEY_F or nil
-    table.insert(bindings, { value = INTERACTION_KEY_BINDING, key = key })
-    return true
 end
 
 local function identityName(survivorId, playerNum)
@@ -469,79 +447,6 @@ local function candidateFor(player)
     return best
 end
 
-local Prompt = ISPanel:derive("KnoxTalkPrompt")
-
-function Prompt:new(playerNum)
-    local scale = UILayout.uiScale()
-    local width = math.max(220, math.floor(PROMPT_WIDTH * scale))
-    local height = math.max(32, math.floor(PROMPT_HEIGHT * scale))
-    local panel = ISPanel:new(0, 0, width, height)
-    setmetatable(panel, self)
-    self.__index = self
-    panel.playerNum = playerNum
-    panel:initialise()
-    panel.backgroundColor = { r = THEME.charcoal[1], g = THEME.charcoal[2],
-        b = THEME.charcoal[3], a = 0.86 }
-    panel.borderColor = { r = THEME.border[1], g = THEME.border[2],
-        b = THEME.border[3], a = 0.90 }
-    local pad = math.max(8, math.floor(10 * scale))
-    local lineHeight = math.max(12, math.floor(17 * scale))
-    local top = math.max(4, math.floor(6 * scale))
-    panel.pad = pad
-    panel.line = ISLabel:new(pad, top, lineHeight, "",
-        THEME.bone[1], THEME.bone[2], THEME.bone[3], 1, UIFont.Small, true)
-    panel.line:initialise()
-    panel:addChild(panel.line)
-    panel.sub = ISLabel:new(pad, top + lineHeight, lineHeight, "",
-        THEME.muted[1], THEME.muted[2], THEME.muted[3], 1, UIFont.Small, true)
-    panel.sub:initialise()
-    panel:addChild(panel.sub)
-    panel:setVisible(false)
-    return panel
-end
-
--- PROMPT LAYOUT (pure)
--- A clamped box is centred by the room it actually has. The prompt used to be
--- centred on its uncut width, so on a narrow display it sat too far right and
--- its right edge left the screen.
-function Prompt.centreOffset(screenWidth, width)
-    local available = tonumber(screenWidth) or 0
-    local box = tonumber(width) or 0
-    if available <= 0 or box <= 0 then
-        return 0
-    end
-    return math.max(0, math.floor((available - box) / 2))
-end
--- END PROMPT LAYOUT
-
-function Prompt:place()
-    local screenWidth = getPlayerScreenWidth(self.playerNum)
-    local screenHeight = getPlayerScreenHeight(self.playerNum)
-    local width = math.max(220, math.min(self.width, screenWidth - 20))
-    self:setWidth(width)
-    self:setX(getPlayerScreenLeft(self.playerNum)
-        + Prompt.centreOffset(screenWidth, width))
-    self:setY(getPlayerScreenTop(self.playerNum)
-        + math.max(0, screenHeight - self.height - UILayout.scaled(PROMPT_LIFT)))
-    self:fit()
-end
-
--- One line of intent and one line of invitation, both cut to the panel's own
--- inner width. The strip is scanned about five times a second, so an unchanged
--- line is not measured again; only text that actually changed is re-cut.
-function Prompt:fit()
-    local pad = tonumber(self.pad) or 10
-    local inner = math.max(40, self:getWidth() - pad * 2)
-    if self.rawLine ~= nil and self.rawLine ~= self.shownLine then
-        self.shownLine = self.rawLine
-        self.line:setName(fitText(UIFont.Small, self.rawLine, inner))
-    end
-    if self.rawSub ~= nil and self.rawSub ~= self.shownSub then
-        self.shownSub = self.rawSub
-        self.sub:setName(fitText(UIFont.Small, self.rawSub, inner))
-    end
-end
-
 local Window = ISCollapsableWindowJoypad:derive("KnoxSurvivorInteractionWindow")
 
 local function playerIsOwner(player, survivorId)
@@ -597,11 +502,30 @@ local ACTION_REASON_TEXT = {
     player_unavailable = "You cannot interact right now.",
     prefers_alone = "They prefer to travel alone.",
     survivor_busy = "They are busy right now.",
+    -- The controller answers a mid-work-step pause with this code. It was not
+    -- in this table, so every talk or social during base work fell through to
+    -- the generic "could not be completed" line (owner report, 2026-11-10):
+    -- the player could not tell whether the refusal was distance, danger or a
+    -- job running. Wording mirrors the service's own order-failure table.
+    work_step_finishing = "They are finishing this step. Ask again in a moment.",
+    not_your_survivor = "They do not take orders from you.",
+    order_not_delivered = "They did not hear that order.",
+    unwilling = "They are not willing to do that yet.",
     survivor_unavailable = "They are temporarily unavailable.",
     too_far_away = "Move closer to interact.",
     unknown_base = "That base does not belong to you.",
     unknown_social_act = "That interaction is unavailable.",
 }
+
+local CONVERSATION_IDS = {
+    talk = true, ask_needs = true, joke = true, compliment = true,
+    funny_face = true, insult = true, mock = true, blame = true,
+    threaten = true, slap = true,
+}
+
+local function nowMs()
+    return getTimestampMs ~= nil and tonumber(getTimestampMs()) or 0
+end
 
 local function actionReasonText(reason, fallback)
     if type(reason) == "string" and ACTION_REASON_TEXT[reason] ~= nil then
@@ -675,6 +599,21 @@ local function standingLabel(window)
         if labelled and type(label) == "string" and label ~= "" then return label end
     end
     return "Unknown"
+end
+
+
+-- The header says who this is and where they stand, in words. Presentation
+-- only: the labels come from the same reads the state line already uses.
+local function roleLabel(window)
+    if window.resident == true then return "Resident" end
+    if window.owned == true then return "Companion" end
+    return "Stranger"
+end
+
+local function standingTone(window)
+    if isHostile(window.player, window.survivorId) then return "red" end
+    if window.owned == true then return "green" end
+    return "muted"
 end
 
 local function cycleCurrent(tactics, cycle)
@@ -756,10 +695,52 @@ local function actionLabel(tactics, action)
     return label
 end
 
+
+
+-- One current answer, never a transcript. The two text regions scroll only
+-- when their measured content cannot fit around the existing action buttons.
+local function talkTextLayout(width, height, scale, fontH, tabY, tabHeight, description, state, feedback, measure)
+    local padding = PADDING * scale
+    local contentX = math.min(122 * scale, math.max(padding, math.floor(width * 0.36)))
+    local contentWidth = math.max(1, width - contentX - padding)
+    local textWidth = math.max(1, contentWidth - 18)
+    local context, response = {}, {}
+    local function append(target, value, tone)
+        for _, line in ipairs(UILayout.wrapLines(tostring(value or ""), textWidth, measure)) do
+            target[#target + 1] = { text = line, tone = tone }
+        end
+    end
+    append(context, description, "description")
+    append(context, state, "state")
+    append(response, feedback, "feedback")
+    local rowH = fontH + 2
+    local contextY = tabY + tabHeight + 8 * scale
+    local actionHeight = math.floor((ACTION_LIMIT + 1) / 2) * (tabHeight + 5 * scale)
+    local available = math.max(2, height - padding - contextY - actionHeight - 2 * scale)
+    local contextH = math.max(1, math.min(math.max(rowH, #context * rowH), math.max(1, available - rowH)))
+    local actionY = contextY + contextH
+    local feedbackY = actionY + actionHeight + 2 * scale
+    local feedbackH = math.max(1, height - padding - feedbackY)
+    return { x = contentX, width = contentWidth, rowH = rowH, contextY = contextY,
+        contextH = contextH, actionY = actionY, feedbackY = feedbackY,
+        feedbackH = feedbackH, context = context, response = response }
+end
+
+local function drawTalkText(self, y, row)
+    local height = row.height or self.itemheight
+    local item = row.item
+    local r, g, b = 0.84, 0.82, 0.75
+    if item.tone == "description" then r, g, b = 0.70, 0.70, 0.67 end
+    if item.tone == "state" then r, g, b = 0.88, 0.85, 0.72 end
+    self:drawText(item.text, 0, y, r, g, b, 1, UIFont.Small)
+    return y + height
+end
+
 function Window:createChildren()
     ISCollapsableWindowJoypad.createChildren(self)
     if self.pinButton ~= nil then self.pinButton:setVisible(false) end
     if self.collapseButton ~= nil then self.collapseButton:setVisible(false) end
+    UILayout.finishWindow(self, "Close conversation")
 
     local scale = self.uiScale or 1
     local padding = PADDING * scale
@@ -780,7 +761,7 @@ function Window:createChildren()
     self.portrait:setYOffset(-0.85)
     self.portrait:setCharacter(self.character)
 
-    local contentX = 122 * scale
+    local contentX = math.min(122 * scale, math.max(padding, math.floor(self.width * 0.36)))
     local contentWidth = self.width - contentX - padding
     self.contentX = contentX
     local tabY = titleHeight + 10 * scale
@@ -813,6 +794,18 @@ function Window:createChildren()
 
     self.feedbackY = self.actionStartY
         + math.floor((ACTION_LIMIT + 1) / 2) * (buttonHeight + 5 * scale) + 2 * scale
+    local function textList()
+        local list = ISScrollingListBox:new(contentX, 0, math.max(1, contentWidth), 1)
+        list:initialise(); list:instantiate()
+        list:setFont(UIFont.Small)
+        list.joypadParent = self
+        list.background = false; list.backgroundColor.a = 0; list.drawBorder = false
+        list.doDrawItem = drawTalkText; list.autoAddJoypadButton = false
+        self:addChild(list)
+        return list
+    end
+    self.contextTextList = textList()
+    self.feedbackTextList = textList()
     self:selectCategory(self.category)
 end
 
@@ -851,6 +844,97 @@ function Window:layoutTabs(count)
     end
 end
 
+-- THE SHEET HEADER
+-- The panel used to open as a vanilla sub-window with the person's name in the
+-- game's own title strip, next to a close glyph and a collapse arrow nobody
+-- needed. It now repaints that strip as the same charcoal band the notebook
+-- uses: name in Medium, role and standing as chips on the right, a hairline
+-- under it and our own close glyph. The title string, the drag behaviour and
+-- the close path stay the window's own; only the paint changes.
+local inheritedSheetRender = Window.render
+local SHEET_CLOSE_HIT = 34
+
+function Window:sheetHeaderHeight()
+    if self.titleBarHeight == nil then return 0 end
+    local ok, height = pcall(function() return self:titleBarHeight() end)
+    local value = ok and tonumber(height) or nil
+    return value ~= nil and math.max(0, value) or 0
+end
+
+function Window:drawSheetHeader()
+    local titleH = self:sheetHeaderHeight()
+    if titleH <= 0 then return end
+    local theme = UILayout.theme
+    local manager = getTextManager()
+    self:drawRect(0, 0, self.width, titleH,
+        0.97, theme.charcoal[1], theme.charcoal[2], theme.charcoal[3])
+    self:drawRect(0, titleH - 1, self.width, 1,
+        0.90, theme.border[1], theme.border[2], theme.border[3])
+    local mediumH = manager:getFontHeight(UIFont.Medium)
+    local smallH = manager:getFontHeight(UIFont.Small)
+    local chips, blockWidth = nil, 0
+    if self.headerRole ~= nil or self.headerStanding ~= nil then
+        local entries = {}
+        if self.headerRole ~= nil then
+            entries[#entries + 1] = { text = tostring(self.headerRole), tone = "green" }
+        end
+        if self.headerStanding ~= nil then
+            entries[#entries + 1] = { text = tostring(self.headerStanding),
+                tone = self.headerTone or "muted" }
+        end
+        chips = UILayout.chipCells(entries, math.max(1, self.width - 46), {
+            gap = 6, pad = 7, height = math.max(14, smallH + 2),
+            measure = function(value) return manager:MeasureStringX(UIFont.Small, value) end,
+        })
+        -- Only the first row sits in the band; a third chip that wrapped would
+        -- be clipped by the page below, so it is not painted at all.
+        local visible = { cells = {}, rowHeight = chips.rowHeight, height = chips.rowHeight }
+        for _, cell in ipairs(chips.cells or {}) do
+            if cell.row == 0 then
+                visible.cells[#visible.cells + 1] = cell
+                blockWidth = math.max(blockWidth, cell.x + cell.width)
+            end
+        end
+        chips = visible
+    end
+    if blockWidth > self.width - 58 then blockWidth = math.max(0, self.width - 58) end
+    local chipX = self.width - 34 - blockWidth
+    if chipX < 12 then chipX = 12 end
+    if chips ~= nil then
+        local chipY = math.max(0, math.floor((titleH - (chips.rowHeight or smallH)) / 2))
+        UILayout.drawChips(self, chips, chipX, chipY, { font = UIFont.Small })
+    end
+    local name = tostring(self.knoxName or self.name or "Survivor")
+    name = UILayout.fitText(UIFont.Medium, name,
+        math.max(1, self.width - 34 - blockWidth - 20),
+        function(value) return manager:MeasureStringX(UIFont.Medium, value) end)
+    self:drawText(name, 12, math.max(0, math.floor((titleH - mediumH) / 2) - 1),
+        theme.bone[1], theme.bone[2], theme.bone[3], 0.96, UIFont.Medium)
+    self:drawText("X", self.width - 22, math.max(0, math.floor((titleH - mediumH) / 2) - 1),
+        theme.muted[1], theme.muted[2], theme.muted[3], 0.90, UIFont.Medium)
+end
+
+function Window:render()
+    if inheritedSheetRender ~= nil then inheritedSheetRender(self) end
+    if self.isCollapsed or not self:isVisible() then return end
+    self:drawSheetHeader()
+end
+
+-- The band covers the game's close glyph, so the same corner closes the panel.
+function Window:onMouseDown(x, y)
+    local titleH = self:sheetHeaderHeight()
+    if titleH > 0 and y >= 0 and y <= titleH
+        and x >= self.width - SHEET_CLOSE_HIT and x <= self.width then
+        self:close()
+        return true
+    end
+    if ISCollapsableWindowJoypad.onMouseDown ~= nil then
+        return ISCollapsableWindowJoypad.onMouseDown(self, x, y)
+    end
+    return false
+end
+-- END SHEET HEADER
+
 function Window:planFor()
     return InteractionUI.tabPlan({
         owned = self.owned == true,
@@ -860,21 +944,73 @@ function Window:planFor()
     })
 end
 
+function Window:layoutTalkText()
+    if self.contextTextList == nil or self.feedbackTextList == nil then return end
+    local manager = getTextManager()
+    local fontH = manager:getFontHeight(UIFont.Small)
+    local feedback = self.contactFeedback or self.feedback
+    local geometry = talkTextLayout(self.width, self.height, self.uiScale or 1, fontH,
+        self.tabY, self.tabHeight, self.description, self.stateLine, feedback,
+        function(value) return manager:MeasureStringX(UIFont.Small, value) end)
+    local widthChanged = self.knoxTalkWidth ~= self.width
+    self.contentX = geometry.x
+    if self.portrait ~= nil then
+        -- A viewport cap can shrink the text column without shrinking the
+        -- font scale. Keep the model in its own rail on those narrow screens.
+        local padding = PADDING * (self.uiScale or 1)
+        self.portrait:setWidth(math.max(1, geometry.x - padding * 2))
+        self.portrait:setHeight(math.max(1, math.min(132 * (self.uiScale or 1), self.height - self.tabY - padding)))
+    end
+    if widthChanged then self:layoutTabs(self.tabCount) end
+    local function fill(list, rows, y, height, sameText)
+        local oldScroll = sameText and list:getYScroll() or 0
+        list:setX(geometry.x); list:setY(y); list:setWidth(geometry.width); list:setHeight(height)
+        list.itemheight = geometry.rowH
+        list:clear(); list:setScrollHeight(0)
+        for _, row in ipairs(rows) do list:addItem(row.text, row) end
+        list:setYScroll(oldScroll)
+    end
+    fill(self.contextTextList, geometry.context, geometry.contextY, geometry.contextH,
+        self.knoxTalkDescription == self.description and self.knoxTalkState == self.stateLine)
+    fill(self.feedbackTextList, geometry.response, geometry.feedbackY, geometry.feedbackH,
+        self.knoxTalkFeedback == feedback)
+    local scale = self.uiScale or 1
+    local buttonWidth = math.max(1, math.floor((geometry.width - 6 * scale) / 2))
+    for index, button in ipairs(self.actionButtons or {}) do
+        button:setX(geometry.x + ((index - 1) % 2) * (buttonWidth + 6 * scale))
+        button:setY(geometry.actionY + math.floor((index - 1) / 2) * (self.tabHeight + 5 * scale))
+        button:setWidth(buttonWidth)
+    end
+    self.knoxTalkWidth, self.knoxTalkHeight, self.knoxTalkFont = self.width, self.height, fontH
+    self.knoxTalkDescription, self.knoxTalkState, self.knoxTalkFeedback = self.description, self.stateLine, feedback
+end
+
+-- Player action waiting on a running work step. The controller answers
+-- work_step_finishing while a native step is in flight; re-offering the same
+-- refused action is the only retry that needs no new state owner, and a
+-- delivered action has already cleared the row, so nothing is sent twice.
+function Window:updatePendingAction()
+    local pending = self.pendingAction
+    if pending == nil then return end
+    local now = nowMs()
+    if now == 0 or now >= pending.untilMs then
+        self.pendingAction = nil
+        return
+    end
+    if now < pending.nextAt then return end
+    pending.nextAt = now + 700
+    self.pendingAction = nil
+    self:onAction({ id = pending.id, label = pending.label, kind = pending.kind })
+end
+
 function Window:prerender()
     ISCollapsableWindowJoypad.prerender(self)
-    local contentX = self.contentX or 122 * (self.uiScale or 1)
-    if self.description ~= nil then
-        self:drawText(self.description, contentX, self.descriptionY,
-            0.70, 0.70, 0.67, 1, UIFont.Small)
-    end
-    if self.stateLine ~= nil and self.stateLine ~= "" then
-        self:drawText(self.stateLine, contentX, self.stateY,
-            0.88, 0.85, 0.72, 1, UIFont.Small)
-    end
-    local feedback = self.contactFeedback or self.feedback
-    if feedback ~= nil and feedback ~= "" then
-        self:drawText(feedback, contentX, self.feedbackY,
-            0.84, 0.82, 0.75, 1, UIFont.Small)
+    self:updatePendingAction()
+    local fontH = getTextManager():getFontHeight(UIFont.Small)
+    if self.knoxTalkWidth ~= self.width or self.knoxTalkHeight ~= self.height or self.knoxTalkFont ~= fontH
+        or self.knoxTalkDescription ~= self.description or self.knoxTalkState ~= self.stateLine
+        or self.knoxTalkFeedback ~= (self.contactFeedback or self.feedback) then
+        self:layoutTalkText()
     end
 end
 
@@ -951,6 +1087,19 @@ local function actionAvailability(window, action)
         if not ok or available ~= true then
             return false, actionReasonText(reason, "Not available")
         end
+    end
+    if id == "exercise" then
+        local exercise = rawget(_G, "KnoxSurvivorExercise")
+        if exercise == nil or exercise.refusal == nil then
+            return false, "Exercise is unavailable."
+        end
+        local checked, reason = safeCall(exercise.refusal, player, survivorId)
+        if not checked then return false, "Exercise is unavailable." end
+        if reason ~= nil then
+            return false, exercise.refusalText ~= nil
+                and exercise.refusalText(reason) or "They cannot exercise now."
+        end
+        return true
     end
     if id == "cycle" or id == "order" or id == "work" or id == "dismiss" or id == "unstick" then
         if window.owned ~= true then return false, "Not one of yours" end
@@ -1080,12 +1229,17 @@ function Window:refreshActions()
     for _, entry in ipairs(plan) do
         if entry.hidden ~= true then tabButtons[#tabButtons + 1] = entry end
     end
+
+    self.headerRole = roleLabel(self)
+    self.headerStanding = standingLabel(self)
+    self.headerTone = standingTone(self)
     self:layoutTabs(#tabButtons)
     for index, entry in ipairs(tabButtons) do
         local button = self.categoryButtons[index]
         if button ~= nil then
             button.knoxCategory = entry.key
-            button:setTitle(entry.label)
+            button:setTitle(UILayout.fitText(UIFont.Small,entry.label,math.max(1,button.width-12)))
+            button.tooltip=entry.label
             -- Selection is the shared green, muted through the charcoal so a
             -- category reads as chosen without becoming a second accent colour.
             button.backgroundColor = entry.key == self.category
@@ -1106,9 +1260,12 @@ function Window:refreshActions()
         button.knoxAction = action
         if action ~= nil then
             local available, reason = actionAvailability(self, action)
-            button:setTitle(actionLabel(tactics, action))
-            button.tooltip = not available and tostring(reason)
+            local label=actionLabel(tactics,action)
+            local fitted=UILayout.fitText(UIFont.Small,label,math.max(1,button.width-12))
+            button:setTitle(fitted)
+            local hint=not available and tostring(reason)
                 or cycleHint(tactics, action)
+            button.tooltip=fitted~=label and (label .. (hint and ("\n"..hint) or "")) or hint
             button:setEnable(available)
             button:setVisible(true)
         else
@@ -1199,6 +1356,23 @@ function Window:onAction(button)
         self.feedback = id == "give_item"
             and "Give Item could not be opened. Try again."
             or "Trade could not be opened. Try again."
+        self:refreshActions()
+        return
+    end
+    if id == "exercise" then
+        -- The native fitness action the player's own button queues, on the
+        -- survivor's body. One owner decides whether it can start; this panel
+        -- only reports what it said.
+        local exercise = rawget(_G, "KnoxSurvivorExercise")
+        local called, started, reason = safeCall(exercise ~= nil and exercise.start or nil,
+            self.player, self.survivorId, action.exercise or "squats")
+        if called and started == true then
+            self.attentionStarted = true
+            self.feedback = "Exercise - they start on the spot."
+        else
+            self.feedback = exercise ~= nil and exercise.refusalText ~= nil
+                and exercise.refusalText(reason) or actionReasonText(reason)
+        end
         self:refreshActions()
         return
     end
@@ -1350,16 +1524,31 @@ function Window:onAction(button)
         end
     else
         self.feedback = actionReasonText(result)
+        -- A work step is transient, so a player's word must not be dropped on
+        -- it. The refusal is not a dead end: remember what was asked and repeat
+        -- it until the step ends or the short window closes. Only conversation
+        -- actions re-arm - a refused line or the talk opener - because they are
+        -- safe to repeat and a delivered one clears the pending row first.
+        if result == "work_step_finishing" and CONVERSATION_IDS[id] == true then
+            self.pendingAction = { id = id, label = action.label, kind = action.kind,
+                untilMs = nowMs() + 15000, nextAt = nowMs() + 700 }
+        end
     end
     local character = liveCharacter(self.survivorId)
     if character ~= nil then self:setCharacter(character) end
     self:refreshActions()
 end
 
+local function interactionWindowSize(fontHeight,screenW,screenH)
+    local scale=math.max(1,(tonumber(fontHeight) or 14)/14)
+    local width,height=UILayout.fitRect(math.floor(WINDOW_WIDTH*scale),
+        math.floor(WINDOW_HEIGHT*scale),0,0,screenW,screenH,10)
+    return width,height,scale
+end
+
 function Window:new(playerNum, target, player)
-    local scale = math.max(1, getTextManager():getFontHeight(UIFont.Small) / 14)
-    local width = math.floor(WINDOW_WIDTH * scale)
-    local height = math.floor(WINDOW_HEIGHT * scale)
+    local width,height,scale=interactionWindowSize(getTextManager():getFontHeight(UIFont.Small),
+        getPlayerScreenWidth(playerNum),getPlayerScreenHeight(playerNum))
     local window = ISCollapsableWindowJoypad:new(0, 0, width, height)
     setmetatable(window, self)
     self.__index = self
@@ -1377,9 +1566,12 @@ function Window:new(playerNum, target, player)
     -- works for the player, conversation for a stranger.
     window.category = window.owned and "orders" or "friendly"
     window.jobPage = 1
+    window.knoxName = tostring(target.name or "Survivor")
+
     window.feedback = nil
     window.uiScale = scale
-    window:setTitle(target.name)
+    window:setTitle(UILayout.fitText(UIFont.Small, target.name,
+        math.max(1, width - 80)))
     UILayout.bindInteractionWindow(window)
     return window
 end
@@ -1401,8 +1593,6 @@ function InteractionUI.open(playerNum, target, player)
     window:addToUIManager()
     window:bringToTop()
     windows[playerNum] = window
-    local openPrompt = promptPanels[playerNum]
-    if openPrompt ~= nil then openPrompt:setVisible(false) end
     local runtime = rawget(_G, "KnoxSurvivorRuntime")
     if runtime ~= nil and runtime.beginPlayerConversation ~= nil then
         local ok, attentive, reason = safeCall(runtime.beginPlayerConversation, target.id, player)
@@ -1501,65 +1691,6 @@ function InteractionUI.nearest(player)
     return candidateFor(player)
 end
 
-function InteractionUI.onContextKey(player, timePressedContext)
-    if player == nil then return end
-    -- Viewpoint's crosshair is a second surface for the same panel, never a
-    -- replacement for the key. Returning here was why F did nothing in
-    -- perspective and vanilla's own Interact took the press instead.
-    local compat = rawget(_G, "KnoxViewpointCompatibility")
-    local perspective = false
-    if compat ~= nil and compat.ownsInteractionInput ~= nil then
-        local okOwned, owned = pcall(compat.ownsInteractionInput)
-        perspective = okOwned and owned == true
-    end
-    -- In first and third person this press belongs to the crosshair first and
-    -- to vanilla interact second: taking it here opened the talk panel instead
-    -- of a door, a container or a body. The panel is reached from the crosshair
-    -- row there, so the key stands aside.
-    local layout = rawget(_G, "KnoxSurvivorUILayout")
-    if layout ~= nil and layout.isPerspective ~= nil then
-        local okView, persp = pcall(layout.isPerspective)
-        if okView and persp == true then return end
-    end
-    if tonumber(timePressedContext) ~= nil
-        and tonumber(timePressedContext) > 700 then return end
-    local playerNum = playerNumber(player)
-    if windows[playerNum] ~= nil or anotherUIHasFocus(playerNum) then return end
-    local dead, vehicle, aiming = false, nil, false
-    pcall(function()
-        dead, vehicle = player:isDead(), player:getVehicle()
-        aiming = player:isAiming()
-    end)
-    -- Perspective keeps the crosshair up permanently, so aiming there is the
-    -- normal state rather than a reason to stay out of the way.
-    if dead or vehicle ~= nil or (aiming and not perspective) then return end
-    local target = candidateFor(player)
-    if target == nil then return end
-    InteractionUI.open(playerNum, target, player)
-end
-
-function InteractionUI.onKeyPressed(key)
-    local core = getCore ~= nil and getCore() or nil
-    if core == nil or core.isKey == nil then return end
-    local ok, matched = pcall(function()
-        return core:isKey(INTERACTION_KEY_BINDING, key)
-    end)
-    if not ok or matched ~= true then return end
-    -- In first and third person F is the vanilla interact key: it opens doors,
-    -- loots containers and searches bodies. Talking there belongs to the
-    -- crosshair panel, so the shortcut stands aside rather than stealing the
-    -- press the player aimed at the world.
-    local compat = rawget(_G, "KnoxViewpointCompatibility")
-    if compat ~= nil and compat.ownsInteractionInput ~= nil then
-        local ownedOk, owned = pcall(compat.ownsInteractionInput)
-        if ownedOk and owned == true then return end
-    end
-    -- Keep native Interact/OnContextKey available for PZ/controller behavior;
-    -- this adds the Knox-configurable F shortcut without rebinding vanilla.
-    local player = getSpecificPlayer ~= nil and getSpecificPlayer(0) or nil
-    if player ~= nil then InteractionUI.onContextKey(player, 0) end
-end
-
 function InteractionUI.ownsAttention(window)
     local runtime = rawget(_G, "KnoxSurvivorRuntime")
     local owner = runtime ~= nil and runtime.getController ~= nil and runtime.getController(window.survivorId) or nil
@@ -1582,69 +1713,6 @@ function InteractionUI.updatePendingAttention(window, now)
         return true
     end
     return ok and reason == "work_step_finishing"
-end
-
-local function interactKeyLabel()
-    local label = "F"
-    pcall(function()
-        local core = getCore()
-        if core ~= nil and core.getKey ~= nil and getKeyName ~= nil then
-            local value = getKeyName(core:getKey(INTERACTION_KEY_BINDING))
-            if value ~= nil and value ~= "" and value ~= "NONE" then
-                label = tostring(value)
-            end
-        end
-    end)
-    return label
-end
-
-function InteractionUI.refreshPrompt(playerNum, player)
-    local prompt = promptPanels[playerNum]
-    local target = nil
-    if player ~= nil then
-        local dead, vehicle, aiming = false, nil, false
-        pcall(function()
-            dead, vehicle, aiming = player:isDead(), player:getVehicle(), player:isAiming()
-        end)
-        local viewpointOwns = false
-        local compat = rawget(_G, "KnoxViewpointCompatibility")
-        if compat ~= nil and compat.ownsInteractionInput ~= nil then
-            local ok, owned = pcall(compat.ownsInteractionInput)
-            viewpointOwns = ok and owned == true
-        end
-        -- The hint is a promise that the key will work, and in perspective it
-        -- does not: onKeyPressed stands aside whenever the adapter owns input,
-        -- so F is Viewpoint's Interact. There is no version of this box that
-        -- belongs in first person - the crosshair's primary row is the way to
-        -- talk - so the whole hint is withheld there, owning the input or not.
-        local perspective = false
-        local layout = rawget(_G, "KnoxSurvivorUILayout")
-        if layout ~= nil and layout.isPerspective ~= nil then
-            local perspectiveOk, value = pcall(layout.isPerspective)
-            perspective = perspectiveOk and value == true
-        end
-        if not dead and vehicle == nil and (not aiming or viewpointOwns)
-            and not perspective
-            and windows[playerNum] == nil and not anotherUIHasFocus(playerNum) then
-            target = candidateFor(player)
-            if target ~= nil and isHostile(player, target.id) then target = nil end
-        end
-    end
-    if target == nil then
-        if prompt ~= nil and prompt:isVisible() then prompt:setVisible(false) end
-        return
-    end
-    if prompt == nil then
-        prompt = Prompt:new(playerNum)
-        prompt:addToUIManager()
-        promptPanels[playerNum] = prompt
-    end
-    prompt.rawLine = "[" .. interactKeyLabel() .. "] Talk to "
-        .. tostring(target.name or "Survivor")
-    prompt.rawSub = "Talk, trade or give orders"
-    prompt:place()
-    prompt:setVisible(true)
-    prompt:bringToTop()
 end
 
 function InteractionUI.update()
@@ -1745,39 +1813,80 @@ function InteractionUI.update()
                 InteractionUI.close(playerNum)
             end
         end
-        InteractionUI.refreshPrompt(playerNum, player)
     end
 end
 
 function InteractionUI.reset()
     for playerNum in pairs(windows) do InteractionUI.close(playerNum) end
-    for playerNum in pairs(promptPanels) do
-        local prompt = promptPanels[playerNum]
-        promptPanels[playerNum] = nil
-        if prompt ~= nil then
-            pcall(function() prompt:setVisible(false); prompt:removeFromUIManager() end)
-        end
-    end
     nextScanAt = 0
 end
 
 if Events ~= nil then
-    registerInteractionKeyBinding()
-    if Events.OnGameBoot ~= nil and Events.OnGameBoot.Add ~= nil then
-        Events.OnGameBoot.Add(registerInteractionKeyBinding)
-    end
     if Events.OnTick ~= nil and Events.OnTick.Add ~= nil then
         Events.OnTick.Add(InteractionUI.update)
-    end
-    if Events.OnKeyPressed ~= nil and Events.OnKeyPressed.Add ~= nil then
-        Events.OnKeyPressed.Add(InteractionUI.onKeyPressed)
-    end
-    if Events.OnContextKey ~= nil and Events.OnContextKey.Add ~= nil then
-        Events.OnContextKey.Add(InteractionUI.onContextKey)
     end
     if Events.OnGameStart ~= nil and Events.OnGameStart.Add ~= nil then
         Events.OnGameStart.Add(InteractionUI.reset)
     end
+    if Events.OnResolutionChange ~= nil and Events.OnResolutionChange.Add ~= nil then
+        -- Match Trade: close through the existing lease/focus handoff, then a
+        -- reopened conversation is laid out for the new player viewport.
+        Events.OnResolutionChange.Add(InteractionUI.reset)
+    end
 end
+
+-- F TALK (isometric only)
+-- The survival guide promised F for conversation, but no handler existed, so
+-- the key did nothing in the isometric view. F now opens the ordinary talk
+-- panel on the nearest survivor. It stands aside while a perspective session
+-- owns the target (the crosshair surface is the pointer there) and while
+-- another window is capturing input, so a typed F never opens a panel behind
+-- the player's back.
+local F_TALK_RADIUS = 2.5
+
+local function fTalkBlockedByUI()
+    if UIManager == nil or UIManager.getUI == nil then return false end
+    local ok, blocked = pcall(function()
+        local list = UIManager.getUI()
+        for index = list:size() - 1, 0, -1 do
+            local element = list:get(index)
+            if element:isVisible() and (element:isCapture() or element:isWantKeyEvents()) then
+                return true
+            end
+        end
+        return false
+    end)
+    return ok and blocked == true
+end
+
+local function openTalkToNearest(player)
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    if runtime == nil or runtime.nearestToSquare == nil
+        or runtime.getCharacter == nil then return false end
+    local id = runtime.nearestToSquare(player:getCurrentSquare(), F_TALK_RADIUS)
+    if id == nil then return false end
+    local character = runtime.getCharacter(id)
+    if character == nil then return false end
+    local view = rawget(_G, "KnoxSurvivorViewModel")
+    local snapshot = view ~= nil and view.getSurvivor ~= nil
+        and view.getSurvivor(id, player:getPlayerNum()) or nil
+    return InteractionUI.open(player:getPlayerNum(), { id = id, character = character,
+        name = snapshot ~= nil and snapshot.displayName or "Survivor" }, player)
+end
+
+local function onFTalkPressed(key)
+    if key ~= Keyboard.KEY_F then return end
+    local settings = rawget(_G, "KnoxSettings")
+    if settings ~= nil and settings.enabled ~= nil and not settings.enabled() then return end
+    local layout = rawget(_G, "KnoxSurvivorUILayout")
+    if layout ~= nil and layout.isPerspective ~= nil and layout.isPerspective() then return end
+    if fTalkBlockedByUI() then return end
+    local player = getSpecificPlayer(0)
+    if player == nil or player:isDead() then return end
+    local ok = pcall(openTalkToNearest, player)
+    if not ok then return end
+end
+
+Events.OnKeyPressed.Add(onFTalkPressed)
 
 return InteractionUI

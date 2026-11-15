@@ -14,7 +14,23 @@ public final class KnoxCombatControllerVerifier {
     }
 
     public static void main(String[] arguments) throws Exception {
+        RoleBody roleBody = new RoleBody();
+        KnoxNpcFactory.initializeNpcRole(roleBody, EmptyRole.class);
+        require(roleBody.role != null && "Knox Survivor".equals(roleBody.role.name),
+            "NPC creation supplies an independent native-compatible role");
+        require(KnoxNpcFactory.keepCombatFacing(true,true),
+            "aimed combat movement must preserve opponent facing for native strafing");
+        require(!KnoxNpcFactory.keepCombatFacing(false,true)
+            && !KnoxNpcFactory.keepCombatFacing(true,false)
+            && !KnoxNpcFactory.keepCombatFacing(false,false),
+            "ordinary movement and unready combat retain route-facing ownership");
+        verifyMovementAttackHandoff();
+        verifyContactOrder();
         verifyNativeAttackOwnership();
+        verifyRecoveryAdmission();
+        verifyDefensiveStep();
+        verifyEngagementPace();
+        verifyInjuryStall();
         verifyIdleAttackLatchRecovery();
         verifyAdmittedRangedInput();
         verifyTraversalOwnsCombat();
@@ -44,9 +60,9 @@ public final class KnoxCombatControllerVerifier {
         require((Boolean) targetFinished.invoke(null, human), "actual native death finishes a human target");
         require((Float) targetHealth.invoke(null, new GenericHealthTarget()) == 47.0f,
             "nonhuman zombie and obstacle health retains its native generic owner");
-        require(KnoxCombatController.recoveryTicks(false) == 30
+        require(KnoxCombatController.recoveryTicks(false) == 12
             && KnoxCombatController.recoveryTicks(true) == 24,
-            "small melee recovery increase must not slow firearms");
+            "melee recovery is shorter without slowing firearms");
         require(KnoxCombatController.clampAimSettleTicks(0) == 8
             && KnoxCombatController.clampAimSettleTicks(18) == 18
             && KnoxCombatController.clampAimSettleTicks(99) == 30,
@@ -102,6 +118,10 @@ public final class KnoxCombatControllerVerifier {
             "melee holds position through small target drift but reacquires inside native reach");
         require(attackEntry < 1.25f,
             "attack entry remains inside native melee reach");
+        require(Math.abs(KnoxCombatController.combatReapproachRange(true,6,12)-11.75f)<.001f,
+            "firearms hold usable native range instead of chasing the preferred range");
+        require(Math.abs(KnoxCombatController.rangedSpacingRange(2.25f)-2.90f)<.001f,
+            "close firearm spacing is a short move rather than a run to preferred firing range");
         npc.setMovementRoute(List.of(new float[] {meleeRange, 0, 0}));
         npc.setCombatActive(true);
         require(meleeRange + npc.movementNodeTolerance() < attackEntry,
@@ -137,6 +157,18 @@ public final class KnoxCombatControllerVerifier {
         require(!KnoxCombatController.shouldRepositionRanged(
             false, 0.5f, minimumRange, 61, 0, false
         ), "melee positioning is not changed by firearm policy");
+        require(!KnoxCombatController.rangedSilentExhausted(true, true, 5, 0, 400),
+            "a firearm that damaged its target is never retired for silence");
+        require(!KnoxCombatController.rangedSilentExhausted(false, false, 5, 0, 400),
+            "melee combat is not judged by firearm silence");
+        require(!KnoxCombatController.rangedSilentExhausted(true, false, 2, 0, 400),
+            "two firearm requests are not yet a silent engagement");
+        require(!KnoxCombatController.rangedSilentExhausted(true, false, 5, 0, 179),
+            "the silence window has to elapse before the verdict");
+        require(!KnoxCombatController.rangedSilentExhausted(true, false, 5, -1, 400),
+            "no firearm request means no silence verdict");
+        require(KnoxCombatController.rangedSilentExhausted(true, false, 3, 0, 180),
+            "a firearm that never damages its target fails the engagement");
         Method requestAttack = KnoxCombatController.class.getDeclaredMethod(
             "requestAttack", Object.class, boolean.class, boolean.class
         );
@@ -285,6 +317,197 @@ public final class KnoxCombatControllerVerifier {
             }
         }
         System.out.println("Combat stale latch PASS prior hit/animation recovers; live native owners preserved");
+    }
+
+    private static void verifyDefensiveStep() throws Exception {
+        FakeBody body=new FakeBody();
+        body.attackStarted=false;body.attacking=false;body.attackAnimation=false;
+        body.action="idle";body.state="IdleState";body.attackType="";
+        zombie.characters.IsoZombie zombie=new zombie.characters.IsoZombie();
+        body.cell.zombies.add(zombie);
+        Method destination=KnoxCombatController.class.getDeclaredMethod("defensiveStepDestination",Object.class,Object.class,float.class);
+        destination.setAccessible(true);
+        float[] point=(float[])destination.invoke(null,body,zombie,.5f);
+        require(point!=null && point[0]<body.getX(), "single close standing zombie admits a backward step");
+        require(body.cell.globalZombieReads==0,
+            "defensive spacing queries local native squares without scanning the loaded zombie list");
+        require(KnoxCombatController.defensiveStepStillFacesThreat(-1,0,.4f,0,.4f),
+            "an advancing target remains ahead of the retreat");
+        require(!KnoxCombatController.defensiveStepStillFacesThreat(-1,0,0,.4f,.4f)
+            && !KnoxCombatController.defensiveStepStillFacesThreat(-1,0,-.4f,0,.4f),
+            "a flanking or behind target cancels retreat");
+        body.cell.back.blocked=true;
+        require(destination.invoke(null,body,zombie,.5f)==null, "blocked reverse edge refuses step");
+        body.cell.back.blocked=false;body.cell.back.stairs=true;
+        require(destination.invoke(null,body,zombie,.5f)==null, "stairs refuse step");
+        body.cell.back.stairs=false; body.cell.back.floor=false;
+        require(destination.invoke(null,body,zombie,.5f)==null, "missing floor refuses step");
+        body.cell.back.floor=true; body.cell.current.window=new Object();
+        require(destination.invoke(null,body,zombie,.5f)==null, "window edge refuses step");
+        body.cell.current.window=null; zombie.onFloor=true;
+        require(destination.invoke(null,body,zombie,.5f)==null, "prone zombie does not trigger step");
+        zombie.onFloor=false;body.cell.zombies.add(new zombie.characters.IsoZombie());
+        require(destination.invoke(null,body,zombie,.5f)==null, "multiple threats refuse step");
+        body.cell.zombies.remove(1);
+        KnoxNpc npc=new KnoxNpc("defensive-step",body,10,20,0);
+        npc.setCombatActive(true);
+        KnoxCombatController combat=new KnoxCombatController();
+        combatField("npc").set(combat,npc);combatField("target").set(combat,zombie);
+        combatField("phase").set(combat,"ATTACKING");combatField("liveCombat").setBoolean(combat,true);
+        combatField("desiredAttackRange").setFloat(combat,.85f);
+        combatField("ticks").setInt(combat,100);combatField("defenseWindowUntil").setInt(combat,110);
+        combatField("lastTargetHealth").setFloat(combat,100);
+        require(combat.tick().equals("COMBAT_DEFENSIVE_STEP"), "recovery starts native route step");
+        require(body.controlVars.justMoved && body.playerMoveDir.x<0 && body.directionAngle==0,
+            "movement goes backward while facing the target");
+        body.cell.back.blocked=true;
+        combat.tick();
+        require(!body.controlVars.justMoved && !npc.hasMovementRoute(), "new obstruction cancels movement");
+
+        FakeBody ready=new FakeBody();
+        ready.attackStarted=false;ready.attacking=false;ready.attackAnimation=false;
+        ready.action="idle";ready.state="IdleState";ready.attackType="";ready.initiateAttack=false;
+        ready.heldWeapon=new Object();
+        zombie.characters.IsoZombie threat=new zombie.characters.IsoZombie();
+        ready.cell.zombies.add(threat);
+        KnoxNpc readyNpc=new KnoxNpc("recovery-step-end",ready,10,20,0);readyNpc.setCombatActive(true);
+        KnoxCombatController step=new KnoxCombatController();
+        combatField("npc").set(step,readyNpc);combatField("target").set(step,threat);
+        combatField("combatWeapon").set(step,ready.heldWeapon);
+        combatField("phase").set(step,"ATTACKING");combatField("liveCombat").setBoolean(step,true);
+        combatField("desiredAttackRange").setFloat(step,.85f);
+        combatField("ticks").setInt(step,100);combatField("defenseWindowUntil").setInt(step,103);
+        combatField("lastTargetHealth").setFloat(step,100);
+        require(step.tick().equals("COMBAT_DEFENSIVE_STEP"), "recovery step begins before window ends");
+        combatField("ticks").setInt(step,102);
+        step.tick();
+        require(!readyNpc.hasMovementRoute() && ready.pressedAttackCount==1 && ready.movementClearedBeforeAttack,
+            "expired recovery ends defensive step and requests ready attack");
+    }
+
+    private static void verifyMovementAttackHandoff() throws Exception {
+        for (String scenario : List.of("melee", "ranged", "outside", "active", "traversal")) {
+            FakeBody body=new FakeBody();
+            body.attackStarted=false;body.attacking=false;body.attackAnimation=false;
+            body.action="idle";body.state="IdleState";body.attackType="";body.initiateAttack=false;
+            body.heldWeapon=new Object();
+            body.playerMoveDir.x=.5f;body.playerMoveDir.y=.25f;body.justMoved=true;
+            body.controlVars.justMoved=true;body.controlVars.running=true;
+            body.controlVars.strafeX=.5f;body.controlVars.strafeY=.25f;
+            if (scenario.equals("active")) body.attacking=true;
+            if (scenario.equals("traversal")) body.climbing=true;
+            FakeTarget target=new FakeTarget();
+            if (scenario.equals("outside")) target.x=13;
+            KnoxNpc npc=new KnoxNpc("movement-handoff",body,10,20,0);
+            npc.setMovementRoute(List.of(new float[]{12,20,0}));npc.setCombatActive(true);
+            KnoxCombatController combat=new KnoxCombatController();
+            combatField("npc").set(combat,npc);combatField("target").set(combat,target);
+            combatField("combatWeapon").set(combat,body.heldWeapon);
+            combatField("approachSquare").set(combat,new IsoGridSquare());
+            combatField("phase").set(combat,"APPROACHING");combatField("liveCombat").setBoolean(combat,true);
+            combatField("rangedWeapon").setBoolean(combat,scenario.equals("ranged"));
+            combatField("desiredAttackRange").setFloat(combat,scenario.equals("ranged") ? 1.0f : .85f);
+            combatField("weaponMaxRange").setFloat(combat,1.0f);
+            combatField("lastTargetHealth").setFloat(combat,100);
+            combatField("lastRangedRepositionTick").setInt(combat,100);
+            Method metrics=KnoxCombatController.class.getDeclaredMethod("metricsSuffix");
+            metrics.setAccessible(true);
+            require(((String)metrics.invoke(combat)).contains("npcId=movement-handoff"),
+                "combat summary identifies its existing actor");
+            combat.tick();
+            if (scenario.equals("melee")) {
+                require(body.pressedAttackCount==1 && body.movementClearedBeforeAttack,
+                    "handoff clears movement before first melee press");
+                require(!npc.hasMovementRoute() && body.pathfinder.cancelled,"handoff retires route and pathfinder");
+            } else if (scenario.equals("ranged")) {
+                require(body.pressedAttackCount==0 && !body.justMoved && !body.controlVars.justMoved
+                    && !body.controlVars.running && body.controlVars.strafeX==0 && body.controlVars.strafeY==0
+                    && body.playerMoveDir.x==0 && body.playerMoveDir.y==0,
+                    "ranged handoff clears movement while aim settles");
+            } else {
+                require(body.pressedAttackCount==0 && npc.hasMovementRoute(),
+                    "outside range or native owner retains route " + scenario);
+            }
+        }
+        System.out.println("Combat movement handoff PASS nativeGameplay=false");
+    }
+
+    private static void verifyContactOrder() throws Exception {
+        for (String scenario : List.of("ready", "ranged", "unarmed", "outside", "zero", "nan", "range-infinity", "range-nan", "injured", "recovery", "not-ready", "active")) {
+            FakeBody body = new FakeBody();
+            body.attackStarted=false; body.attacking=false; body.attackAnimation=false;
+            body.action="idle"; body.state="IdleState"; body.attackType="";
+            body.initiateAttack=false;
+            FakeTarget target = new FakeTarget();
+            if (scenario.equals("outside")) target.x=10.9f;
+            if (scenario.equals("zero")) target.x=10.0f;
+            if (scenario.equals("nan")) target.x=Float.NaN;
+            if (scenario.equals("injured")) body.action="hitreaction";
+            if (scenario.equals("not-ready")) body.weaponReady=false;
+            if (scenario.equals("active")) body.attacking=true;
+            if (!scenario.equals("unarmed")) body.heldWeapon=new Object();
+            KnoxCombatController combat = new KnoxCombatController();
+            combatField("npc").set(combat,new KnoxNpc("contact-order",body,10,20,0));
+            combatField("target").set(combat,target);
+            combatField("approachSquare").set(combat,new IsoGridSquare());
+            combatField("combatWeapon").set(combat,body.heldWeapon);
+            combatField("phase").set(combat,"AIMING");
+            combatField("liveCombat").setBoolean(combat,true);
+            combatField("rangedWeapon").setBoolean(combat,scenario.equals("ranged"));
+            combatField("desiredAttackRange").setFloat(combat,
+                scenario.equals("range-infinity") ? Float.POSITIVE_INFINITY
+                    : scenario.equals("range-nan") ? Float.NaN : .85f);
+            combatField("weaponMaxRange").setFloat(combat,1.0f);
+            combatField("lastTargetHealth").setFloat(combat,100);
+            if (scenario.equals("recovery")) combatField("defenseWindowUntil").setInt(combat,30);
+            String result=combat.tick();
+            if (scenario.equals("ready")) {
+                require(body.pressedAttackCount==1 && combatField("firstSwingTick").getInt(combat)==1,
+                    "armed melee contact presses attack on first tick");
+            } else {
+                require(body.pressedAttackCount==0,"contact gate preserves " + scenario + " admission: " + result);
+                if (scenario.equals("ranged") || scenario.equals("unarmed") || scenario.equals("outside")
+                    || scenario.equals("zero") || scenario.equals("nan")
+                    || scenario.equals("range-infinity") || scenario.equals("range-nan"))
+                    require(!"ATTACKING".equals(combatField("phase").get(combat)),
+                        "aim settle remains for " + scenario);
+            }
+        }
+        System.out.println("Combat contact order PASS firstTick=true preservedGates=true nativeGameplay=false");
+    }
+
+    private static void verifyRecoveryAdmission() throws Exception {
+        for (boolean ranged : List.of(false, true)) {
+            FakeBody body = new FakeBody();
+            body.attackStarted=false; body.attacking=false; body.attackAnimation=false;
+            body.action="idle"; body.state="IdleState"; body.attackType="";
+            FakeTarget target = new FakeTarget();
+            KnoxCombatController combat = new KnoxCombatController();
+            combatField("lastRangedRepositionTick").setInt(combat, 100);
+            combatField("npc").set(combat, new KnoxNpc("recovery-interval", body, 10, 20, 0));
+            combatField("target").set(combat, target);
+            combatField("phase").set(combat, "ATTACKING");
+            combatField("liveCombat").setBoolean(combat, true);
+            combatField("rangedWeapon").setBoolean(combat, ranged);
+            combatField("desiredAttackRange").setFloat(combat, ranged ? 1.0f : .85f);
+            combatField("ticks").setInt(combat, 100);
+            combatField("lastTargetHealth").setFloat(combat, 100);
+            combatField("attackRequests").setInt(combat, 1);
+            combatField("attackCycleActive").setBoolean(combat, true);
+            combatField("attackAnimationObserved").setBoolean(combat, true);
+            require(combat.tick().startsWith("COMBAT_RECOVERING"), "completed attack enters recovery");
+            int interval = ranged ? 30 : 12;
+            for (int i=1; i<interval; i++) {
+                combat.tick();
+                require(combatField("attackRequests").getInt(combat)==1,
+                    "no request before recovery and retry admission");
+            }
+            combat.tick();
+            require(combatField("attackRequests").getInt(combat)==2,
+                "idle ready weapon requests at the correct interval");
+            require(body.pressedAttackCount==(ranged ? 0 : 1),
+                "melee presses native input and firearms yield to the Lua hook");
+        }
     }
 
     private static void verifyNativeAttackOwnership() throws Exception {
@@ -606,6 +829,70 @@ public final class KnoxCombatControllerVerifier {
         return field;
     }
 
+    private static void verifyEngagementPace() {
+        require(KnoxCombatController.approachPace(false, 1.6f, 0.7f).equals("run"),
+            "melee approach runs down a drifting target instead of orbiting at walk");
+        require(KnoxCombatController.approachPace(false, 1.0f, 0.7f).equals("walk"),
+            "melee final half tile stays a walk so arrival does not overshoot the swing");
+        require(KnoxCombatController.approachPace(false, 10.0f, 0.7f).equals("run"),
+            "distant melee approach still runs");
+        require(KnoxCombatController.approachPace(true, 3.0f, 9.8f).equals("walk"),
+            "firearm steadiness approach is unchanged inside four tiles");
+        require(KnoxCombatController.approachPace(true, 12.0f, 9.8f).equals("run"),
+            "distant firearm approach still runs");
+        require(KnoxCombatController.arrivedInMeleeReach(false, "Succeeded", 0.8f, 0.9f),
+            "a finished route inside native reach is a swing, not a re-route");
+        require(!KnoxCombatController.arrivedInMeleeReach(false, "Succeeded", 1.0f, 0.9f),
+            "beyond native reach the approach still re-routes");
+        require(!KnoxCombatController.arrivedInMeleeReach(false, "ManualRoute", 0.8f, 0.9f),
+            "an unfinished route never admits an early swing");
+        require(!KnoxCombatController.arrivedInMeleeReach(true, "Succeeded", 5.0f, 15.0f),
+            "firearm approach keeps its own spacing");
+    }
+
+    private static void verifyInjuryStall() throws Exception {
+        require(!KnoxCombatController.injuryStallExpired(0)
+            && !KnoxCombatController.injuryStallExpired(90)
+            && KnoxCombatController.injuryStallExpired(91),
+            "sustained hit-reaction fails the encounter instead of waiting until death");
+        FakeBody body = new FakeBody();
+        body.attackStarted=false; body.attacking=false; body.attackAnimation=false;
+        body.action="hitreaction-bitegeneric"; body.attackType="";
+        body.initiateAttack=false;
+        body.heldWeapon=new Object();
+        FakeTarget target = new FakeTarget();
+        KnoxCombatController combat = new KnoxCombatController();
+        combatField("npc").set(combat,new KnoxNpc("injury-stall",body,10,20,0));
+        combatField("target").set(combat,target);
+        combatField("approachSquare").set(combat,new IsoGridSquare());
+        combatField("combatWeapon").set(combat,body.heldWeapon);
+        combatField("phase").set(combat,"ATTACKING");
+        combatField("liveCombat").setBoolean(combat,true);
+        combatField("rangedWeapon").setBoolean(combat,false);
+        combatField("desiredAttackRange").setFloat(combat,.85f);
+        combatField("weaponMaxRange").setFloat(combat,1.0f);
+        combatField("lastTargetHealth").setFloat(combat,100);
+        combatField("attackRequests").setInt(combat,3);
+        combatField("lastAttackTick").setInt(combat,0);
+        String result = null;
+        for (int i = 0; i < 89; i++) result = combat.tick();
+        require(result != null && result.startsWith("COMBAT_REACTING"),
+            "brief hit-reaction keeps waiting for the body, got: " + result);
+        // One answering tick resets the stall: the next reaction is a fresh wait.
+        body.action="aim";
+        combat.tick();
+        body.action="hitreaction-bitegeneric";
+        for (int i = 0; i < 89; i++) result = combat.tick();
+        require(result != null && result.startsWith("COMBAT_REACTING"),
+            "an interrupted reaction never accumulates into a stall, got: " + result);
+        for (int i = 0; i < 5 && (result == null || result.startsWith("COMBAT_REACTING")); i++) {
+            result = combat.tick();
+        }
+        require(result != null && result.startsWith("COMBAT_FAILED INJURY_STALL"),
+            "chain-stun fails the encounter so Lua re-decides, got: " + result);
+        System.out.println("Combat injury stall PASS bound=90 reset=true nativeGameplay=false");
+    }
+
     private static void require(boolean condition, String message) {
         if (!condition) {
             throw new AssertionError(message);
@@ -638,7 +925,16 @@ public final class KnoxCombatControllerVerifier {
         public IsoGridSquare getSquare() { return new IsoGridSquare(); }
     }
 
-    public static final class FakeBody {
+    public static final class EmptyRole {
+        public final String name;
+        public EmptyRole(String name) { this.name = name; }
+    }
+
+    public static final class RoleBody {
+        public EmptyRole role;
+    }
+
+    public static final class FakeBody extends zombie.characters.IsoPlayer {
         public boolean isCharging = true;
         public float useChargeDelta = 36.0f;
         boolean isAiming = true;
@@ -660,18 +956,25 @@ public final class KnoxCombatControllerVerifier {
         boolean zombiesDontAttack = true;
         boolean bannedAttacking;
         int pressedAttackCount;
+        boolean justMoved, movementClearedBeforeAttack;
+        Object heldWeapon;
+        boolean weaponReady = true;
         String attackType = "swing";
         IsoGridSquare attackTargetSquare;
+        final FakeCell cell = new FakeCell();
         final FakePathfinder pathfinder = new FakePathfinder();
         final FakeControlVars controlVars = new FakeControlVars();
         final FakeAiComponent aiComponent = new FakeAiComponent(controlVars);
 
         public float getX() { return 10; }
+        public float getZ() { return 0; }
+        public FakeCell getCell() { return cell; }
         public float getY() { return 20; }
         public boolean isDead() { return dead; }
         public boolean isKnockedDown() { return knockedDown; }
-        public IsoGridSquare getCurrentSquare() { return missingSquare ? null : new IsoGridSquare(); }
-        public Object getPrimaryHandItem() { return null; }
+        public IsoGridSquare getCurrentSquare() { return missingSquare ? null : cell.current; }
+        public Object getPrimaryHandItem() { return heldWeapon; }
+        public boolean isWeaponReady() { return weaponReady; }
         public boolean isAttacking() { return attacking; }
         public boolean isAttackStarted() { return attackStarted; }
         public boolean isPerformingAttackAnimation() { return attackAnimation; }
@@ -684,7 +987,14 @@ public final class KnoxCombatControllerVerifier {
         public boolean isClimbing() { return climbing; }
         public void setTargetAndCurrentDirection(float x, float y) { }
         public void setForwardDirection(float x, float y) { }
-        public void setDirectionAngle(float angle) { }
+        float directionAngle;
+        public void setDirectionAngle(float angle) { directionAngle=angle; }
+        public boolean isAiming() { return isAiming; }
+        public void setJustMoved(boolean moved) { justMoved=moved; }
+        public void setSprinting(boolean value) { }
+        public void setSneaking(boolean value) { }
+        public float getAnimAngleRadians() { return 0; }
+        public Object getECSComponent(Class<?> type) { return aiComponent; }
         public void setRunning(boolean running) { }
         public void pathToLocationF(float x, float y, float z) { pathRequests++; pathX = x; pathY = y; }
 
@@ -697,7 +1007,12 @@ public final class KnoxCombatControllerVerifier {
         public void setDoShove(boolean value) { doShove = value; }
         public void setZombiesDontAttack(boolean value) { zombiesDontAttack = value; }
         public void setBannedAttacking(boolean value) { bannedAttacking = value; }
-        public void pressedAttack() { pressedAttackCount++; }
+        public void pressedAttack() {
+            movementClearedBeforeAttack=!justMoved && !controlVars.justMoved && !controlVars.running
+                && controlVars.strafeX==0 && controlVars.strafeY==0
+                && playerMoveDir.x==0 && playerMoveDir.y==0;
+            pressedAttackCount++;
+        }
         public void clearHandToHandAttack() { }
         public void clearVariable(String name) {
             if ("AttackType".equals(name)) {
@@ -714,6 +1029,17 @@ public final class KnoxCombatControllerVerifier {
         public FakePathfinder getPathFindBehavior2() { return pathfinder; }
     }
 
+    public static final class FakeCell {
+        final IsoGridSquare current=new IsoGridSquare(10,20,0),back=new IsoGridSquare(9,20,0),front=new IsoGridSquare(11,20,0);
+        final java.util.ArrayList<Object> zombies=current.moving;
+        int globalZombieReads;
+        public java.util.ArrayList<Object> getZombieList() { globalZombieReads++; return zombies; }
+        public IsoGridSquare getGridSquare(int x,int y,int z) {
+            if(y!=20 || z!=0) return null;
+            return x==10 ? current : x==9 ? back : x==11 ? front : null;
+        }
+    }
+
     public static final class FakePathfinder {
         boolean cancelled;
         public void cancel() { cancelled = true; }
@@ -727,6 +1053,8 @@ public final class KnoxCombatControllerVerifier {
 
     public static final class FakeControlVars {
         public boolean aiming = true;
+        public boolean justMoved, running;
+        public float strafeX, strafeY;
         public boolean melee = true;
         public boolean bannedAttacking = true;
         public boolean initiateAttack = true;

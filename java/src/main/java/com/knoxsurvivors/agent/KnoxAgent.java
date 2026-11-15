@@ -20,7 +20,8 @@ public final class KnoxAgent {
     private static final Set<String> RETRANSFORM_TARGETS = Set.of(
         "zombie.ai.states.SwipeStatePlayer",
         "zombie.CombatManager",
-        "zombie.characters.IsoZombie"
+        "zombie.characters.IsoZombie",
+        "zombie.characters.IsoGameCharacter"
     );
     private static final AtomicBoolean STARTED = new AtomicBoolean(false);
     private static volatile String runtimeSource = "none";
@@ -64,6 +65,10 @@ public final class KnoxAgent {
      */
     public static boolean usesZombieBuddyPatches() {
         return runtimeStarted && "zombiebuddy".equals(runtimeSource);
+    }
+
+    public static boolean usesBridgePatches() {
+        return runtimeStarted && ("knoxbridge".equals(runtimeSource) || runtimeSource.startsWith("legacy-"));
     }
 
     public static boolean isLegacyRuntimeActive() {

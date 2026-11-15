@@ -38,6 +38,25 @@ final class KnoxLocomotionPolicy {
         float health,
         boolean nativeCanSprint
     ) {
+        return decide(pace, remainingDistance, endurance, fatigue, health,
+            nativeCanSprint, false);
+    }
+
+    /**
+     * The same rule with one more observed fact: the next route edge crosses a
+     * doorway. A body running through a door frame clips the wall beside it,
+     * which the player reads as sprinting into a wall and getting stuck, so that
+     * single edge is walked and the requested pace resumes on the far side.
+     */
+    static Decision decide(
+        String pace,
+        float remainingDistance,
+        float endurance,
+        float fatigue,
+        float health,
+        boolean nativeCanSprint,
+        boolean doorwayAhead
+    ) {
         String requested = pace == null ? "normal" : pace.toLowerCase(Locale.ROOT);
         boolean catchUp = "catchup".equals(requested);
         boolean asksToRun = "run".equals(requested) || "sprint".equals(requested)
@@ -45,13 +64,18 @@ final class KnoxLocomotionPolicy {
         boolean asksToSprint = "sprint".equals(requested)
             || (catchUp && remainingDistance > 10.0f);
 
-        boolean canRun = endurance > 0.22f && fatigue < 0.88f && health > 15.0f;
-        boolean canSprint = nativeCanSprint
+        // An unreadable stat is unknown, not rested: a failed read must never
+        // present as a stamina allowance the engine never confirmed.
+        boolean staminaKnown = Float.isFinite(endurance) && Float.isFinite(fatigue);
+        boolean canRun = staminaKnown && endurance > 0.22f && fatigue < 0.88f && health > 15.0f;
+        boolean canSprint = staminaKnown && nativeCanSprint
             && endurance > 0.48f && fatigue < 0.72f && health > 25.0f;
-        boolean sprinting = asksToSprint
+        boolean sprinting = !doorwayAhead
+            && asksToSprint
             && remainingDistance > SPRINT_REMAINING_DISTANCE
             && canSprint;
-        boolean running = asksToRun
+        boolean running = !doorwayAhead
+            && asksToRun
             && remainingDistance > RUN_REMAINING_DISTANCE
             && canRun;
         return new Decision(running || sprinting, sprinting);

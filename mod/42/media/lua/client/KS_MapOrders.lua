@@ -35,6 +35,7 @@ local failureLines={
     vehicle_not_driveable="That car isn't going anywhere.",
     vehicle_doors_locked="That car's locked.",
     no_keys="Nobody has the keys to that car.",
+    npc_driving_disabled="Experimental NPC driving is off. Enable it in Sandbox Options, Vehicles page.",
 }
 
 local function displayName(id)
@@ -379,14 +380,14 @@ local function drawOwnedLocations(map)
                 label="X "..location.name
                 if type(location.deathCauseLabel) == "string"
                     and location.deathCauseLabel ~= "" then
-                    label=label.." — "..location.deathCauseLabel
+                    label=label.." - "..location.deathCauseLabel
                 end
             elseif group.count==1 then
                 local prefix=(location.source=="logical" or location.source=="simulated")
                     and "~ " or (location.source=="last_known" and "? " or "")
                 label=prefix..location.name
                 if location.condition~=nil then
-                    label=label.." — "..tostring(location.condition)
+                    label=label.." - "..tostring(location.condition)
                 end
             else
                 local names={}
@@ -478,6 +479,17 @@ function Orders.baseDestination(player)
     return centre
 end
 
+-- Does a right-click on the world map belong to us at all? Two callers, one
+-- rule: the optional legacy command group, and a crew armed in the notebook
+-- that is waiting for a destination. The mission draft never depended on the
+-- legacy toggle, yet the map handler returned before anything was offered
+-- whenever that toggle was off - which is its default - so the map opened
+-- from the roster and the click did nothing (owner report, 2026-11-10).
+function Orders.missionMapOffered(legacyEnabled, draft, hasBase)
+    if draft ~= nil then return true end
+    return legacyEnabled == true and hasBase == true
+end
+
 function Orders.hasDispatchBase(player)
     local manager=rawget(_G,"KnoxBaseManager")
     if player==nil or manager==nil or manager.getForOwner==nil
@@ -495,9 +507,15 @@ end
 function Orders.fillMission(context,player,x,y,z)
     local targets=rawget(_G,"KnoxMissionTargets")
     if context==nil or player==nil or targets==nil or targets.dispatchFlow==nil then return false end
-    local option=context:addOption("Send a Mission Here",player,Orders.mission,x,y,z)
+    local pn=player:getPlayerNum()
+    local draft=targets.mapDraft(pn)
+    local option=context:addOption(draft and ("Send crew here (" .. tostring(#draft.memberIds) .. ")")
+        or "Send a Mission Here",player,Orders.mission,x,y,z)
+    if draft then
+        context:addOption("Cancel mission placement",pn,targets.cancelMap)
+    end
     if missionDestinationSquare(x,y,z)==nil then
-        option.tooltip="Outside the loaded world. Walk closer before sending anyone."
+        option.tooltip="Remote travel and carried needs continue. Searching waits until real containers load; no supplies are invented."
     else
         option.tooltip="Send residents from your base to clear or search this place."
     end
@@ -505,6 +523,14 @@ function Orders.fillMission(context,player,x,y,z)
 end
 
 function Orders.mission(player,x,y,z)
+    local targets=rawget(_G,"KnoxMissionTargets")
+    local pn=player:getPlayerNum()
+    if targets and targets.mapDraft(pn) then
+        local ok,result=targets.sendMap(pn,player,x,y,0)
+        if KnoxActivityFeed then KnoxActivityFeed.event(ok
+            and "Crew dispatched. Their trip is in Missions." or result) end
+        return
+    end
     local square=missionDestinationSquare(x,y,z)
     if square==nil then
         if KnoxActivityFeed~=nil then
@@ -671,20 +697,22 @@ if ISWorldMap~=nil and not ISWorldMap.knoxDrivingOrdersInstalled then
     function ISWorldMap:onRightMouseUp(x,y)
         local result=original(self,x,y)
         if result==true then return result end -- A map-symbol tool consumed it.
-        local pn = tonumber(self.playerNum)
-        if pn == nil then return result end
+    local pn = tonumber(self.playerNum) or 0
         local player=getSpecificPlayer(pn)
-        if player==nil or not contextOrdersEnabled() then return result end
+    local targets=rawget(_G,"KnoxMissionTargets")
+    local draft=targets~=nil and targets.mapDraft~=nil and targets.mapDraft(pn) or nil
+    local legacy=contextOrdersEnabled()
+    if not Orders.missionMapOffered(legacy,draft,Orders.hasDispatchBase(player)) then return result end
         -- Two independent map orders, one menu. Handing over the wheel needs the
         -- player aboard a car; sending a mission needs an owned base. Neither
         -- entry appears for a player who could not receive it.
-        local canDrive=player:getVehicle()~=nil and KnoxSettings.enableExperimentalNpcDriving()
+        local canDrive=legacy and player:getVehicle()~=nil and KnoxSettings.enableExperimentalNpcDriving()
             and #KnoxCompanionService.getCompanionIds(player)>0
-        local canCar=player:getVehicle()==nil and KnoxSettings.enableExperimentalNpcDriving()
+        local canCar=legacy and player:getVehicle()==nil and KnoxSettings.enableExperimentalNpcDriving()
             and #KnoxCompanionService.getCompanionIds(player)>0
-        local canDispatch=Orders.hasDispatchBase(player)
-        local hint=Orders.vehicleMenuHint(player,KnoxSettings.enableExperimentalNpcDriving(),
-            #KnoxCompanionService.getCompanionIds(player))
+        local canDispatch=legacy and Orders.hasDispatchBase(player) or draft~=nil
+        local hint=legacy and Orders.vehicleMenuHint(player,KnoxSettings.enableExperimentalNpcDriving(),
+            #KnoxCompanionService.getCompanionIds(player)) or nil
         if not canDrive and not canCar and not canDispatch and hint==nil then return result end
         -- canHome adds only a base check on top of canDrive, so a player who can
         -- go home has already passed the gate above.
@@ -694,7 +722,7 @@ if ISWorldMap~=nil and not ISWorldMap.knoxDrivingOrdersInstalled then
         else context=ISContextMenu.get(pn,x+self:getAbsoluteX(),y+self:getAbsoluteY()) end
         local worldX=math.floor(self.mapAPI:uiToWorldX(x,y))+0.5
         local worldY=math.floor(self.mapAPI:uiToWorldY(x,y))+0.5
-        local canHome=player:getVehicle()~=nil and KnoxSettings.enableExperimentalNpcDriving()
+        local canHome=legacy and player:getVehicle()~=nil and KnoxSettings.enableExperimentalNpcDriving()
             and Orders.baseDestination(player)~=nil
             and #KnoxCompanionService.getCompanionIds(player)>0
         if canDrive then Orders.fill(context,player,worldX,worldY) end

@@ -2,13 +2,9 @@ require "KS_BaseManager"
 require "KS_ActivityFeed"
 require "KS_Persistence"
 
--- Where a player-issued base mission can go, chosen from the Missions tab.
--- `KnoxSurvivorAutonomy.dispatchBaseScout` needs a real loaded square (the
--- destination label, the watchability test and the travel estimate all read it),
--- so this owner lists the buildings the player can actually see around them and
--- never invents a far target from the ledger. Building what the player already
--- sees keeps the order, the search area and the item results tied to real world
--- state.
+-- Selection and transient map placement for the existing mission dispatcher.
+-- Nearby-building callers use actual BuildingDef IDs. Map orders name only
+-- coordinates; the world executor must establish rooms, routes and loot.
 local Targets = rawget(_G, "KnoxMissionTargets") or {}
 _G.KnoxMissionTargets = Targets
 
@@ -16,9 +12,8 @@ _G.KnoxMissionTargets = Targets
 -- watched. The ring scan stops early once it has enough places near the player.
 Targets.MAX_DISTANCE = 40
 Targets.MAX_RESULTS = 8
--- A map click sends the crew to search ground, not one house. Twenty tiles each
--- way covers a row of houses and a yard; the executor clamps to 4..40.
-Targets.AREA_RADIUS = 20
+-- A map order covers an 80-tile radius, searched in bounded native windows.
+Targets.AREA_RADIUS = 80
 -- A hard bound on visited squares: the scan is one-off (on a menu action), not a
 -- per-frame cost, and a dense town must not turn it into a full-cell walk.
 Targets.MAX_SQUARES = 2600
@@ -53,6 +48,7 @@ Targets.EXCLUSION_TEXT = {
 }
 
 Targets.AVAILABILITY_TEXT = {
+    crew_changed = "Someone in that crew is no longer available. Review the crew and try again.",
     dispatch_unavailable = "That order could not be checked: no loaded base or player was available.",
     invalid_mission = "That is not a mission the base can be sent on.",
     no_base_residents = "No resident is at this base right now.",
@@ -62,15 +58,15 @@ Targets.AVAILABILITY_TEXT = {
     need_settled_resident = "Everyone in sight is busy; a supply run needs a resident who is free.",
 }
 
--- Party sizes are trimmed to the crew that could actually go. Asking for
--- three residents when one is at the base set the player up to watch a smaller
--- party leave, which reads as a silent failure; the dispatch still caps at three.
+-- Legacy count-based callers can choose any number of eligible residents.
 function Targets.partyChoices(available)
     local limit = math.floor(tonumber(available) or 0)
     if limit < 1 then return {} end
-    if limit > #Targets.PARTY_CHOICES then limit = #Targets.PARTY_CHOICES end
     local choices = {}
-    for index = 1, limit do choices[index] = Targets.PARTY_CHOICES[index] end
+    for index = 1, limit do
+        choices[index] = Targets.PARTY_CHOICES[index]
+            or {id=tostring(index), name=tostring(index) .. " residents"}
+    end
     return choices
 end
 
@@ -116,17 +112,9 @@ end
 -- destination. Native identity first; the coordinates are only a fallback shape.
 local function buildingKey(building, square)
     if building ~= nil then
-        local id = ""
-        if type(building.getIDString) == "function" then
-            id = trimmed(safe(function() return building:getIDString() end, ""))
-        end
-        if id ~= "" then return id end
-        if type(building.getID) == "function" then
-            local number = safe(function() return building:getID() end, nil)
-            if tonumber(number) ~= nil then
-                return "building:" .. tostring(number)
-            end
-        end
+        local definition=building:getDef()
+        local id=definition ~= nil and definition:getID() or nil
+        if id ~= nil then return tostring(id) end
     end
     if square == nil then return nil end
     return "square:" .. tostring(square:getX()) .. ":" .. tostring(square:getY())
@@ -134,13 +122,9 @@ local function buildingKey(building, square)
 end
 
 local function buildingLabel(building, square)
-    local name = ""
-    if building ~= nil then
-        local def = safe(function() return building:getDef() end, nil)
-        if def ~= nil then name = trimmed(safe(function() return def:getName() end, "")) end
-    end
-    if name == "" then name = "Building" end
-    name = name:sub(1, 1):upper() .. name:sub(2)
+    -- BuildingDef has no getName in the installed 42.21 jar. A building
+    -- is not a shop/house merely because a display label would be convenient.
+    local name = "Building"
     if square == nil then return name end
     return name .. " (" .. tostring(square:getX()) .. ", " .. tostring(square:getY()) .. ")"
 end
@@ -151,6 +135,67 @@ function Targets.areaLabel(square)
     if square == nil then return "Search area" end
     return "Search area (" .. tostring(square:getX()) .. ", "
         .. tostring(square:getY()) .. ")"
+end
+
+-- Transient map placement belongs to this existing dispatch UI owner. It is
+-- never a saved trip: only the autonomy dispatch transaction may create one.
+local mapDrafts = {}
+
+function Targets.mapDraft(playerNum)
+    return mapDrafts[tonumber(playerNum) or 0]
+end
+
+function Targets.cancelMap(playerNum)
+    mapDrafts[tonumber(playerNum) or 0] = nil
+end
+
+function Targets.armMap(playerNum, baseId, missionType, members, options)
+    options = options or {}
+    local ids, seen = {}, {}
+    for _, id in ipairs(members or {}) do
+        if not seen[id] then ids[#ids+1]=id; seen[id]=true end
+    end
+    if baseId == nil or #ids == 0 then return false, "Choose at least one survivor." end
+    local valid = false
+    for _, choice in ipairs(Targets.MISSION_CHOICES) do
+        if choice.id == missionType then valid=true break end
+    end
+    if not valid then return false, "Choose a mission." end
+    local open = options.openMap or function(pn)
+        require "ISUI/Maps/ISWorldMap"
+        if not ISWorldMap.IsAllowed() then return false end
+        ISWorldMap.ShowWorldMap(pn)
+        return true
+    end
+    if open(tonumber(playerNum) or 0) ~= true then
+        return false, "The world map is unavailable."
+    end
+    mapDrafts[tonumber(playerNum) or 0] = {
+        baseId=baseId, missionType=missionType, memberIds=ids,
+    }
+    return true
+end
+
+function Targets.sendMap(playerNum, player, x, y, z, options)
+    options = options or {}
+    local draft = Targets.mapDraft(playerNum)
+    if draft == nil then return false, "No crew is waiting for a destination." end
+    x,y,z=tonumber(x),tonumber(y),tonumber(z) or 0
+    if x == nil or y == nil or x ~= x or y ~= y or math.abs(x)>1000000
+        or math.abs(y)>1000000 then return false, "That map position is invalid." end
+    x,y,z=math.floor(x),math.floor(y),math.floor(z)
+    -- A coordinate order is not an IsoGridSquare and supplies no building,
+    -- room, inventory or traversability evidence. The executor resolves those
+    -- only through the native world when the region is loaded.
+    local point={getX=function() return x end,getY=function() return y end,
+        getZ=function() return z end}
+    local autonomy=rawget(_G,"KnoxSurvivorAutonomy")
+    local dispatch=options.dispatch or (autonomy and autonomy.dispatchBaseScout)
+    if dispatch == nil then return false, "The mission service is unavailable." end
+    local ok, result=dispatch(player,draft.baseId,point,#draft.memberIds,
+        draft.missionType,Targets.AREA_RADIUS,Targets.areaLabel(point),draft.memberIds)
+    if ok then Targets.cancelMap(playerNum) end
+    return ok, ok and result or Targets.availabilityText(result)
 end
 
 -- A mission names people, not a headcount. Names come from the durable
@@ -201,7 +246,7 @@ function Targets.crewPick(crew, options, choose, finish)
         names[id] = tostring(nameOf(id) or "Survivor")
         order[#order + 1] = id
     end
-    local limit = math.min(#order, 3)
+    local limit = #order
     -- The remembered crew, kept only for names this order could still send. A
     -- stale id is dropped rather than offered and then refused, and counting the
     -- drops lets the row say so instead of quietly shrinking.
@@ -370,13 +415,7 @@ function Targets.scan(cell, originX, originY, originZ, options)
                     if building ~= nil then
                         local key = buildingKey(building, square)
                         if key ~= nil and seen[key] == nil then
-                            local buildingId = ""
-                            if type(building.getIDString) == "function" then
-                                buildingId = trimmed(safe(function()
-                                    return building:getIDString()
-                                end, ""))
-                            end
-                            if skip == "" or buildingId ~= skip then
+                            if skip == "" or key ~= skip then
                                 seen[key] = true
                                 places[#places + 1] = {
                                     id = key,

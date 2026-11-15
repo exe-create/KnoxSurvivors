@@ -41,3 +41,20 @@ assert(Capabilities.professionDenied("base:policeofficer", nil) == false,
 assert(Capabilities.denySet(nil) == nil, "no list builds no set")
 
 print("Profession origin PASS facility_only=true ordinary_anywhere=true")
+
+local oldEnsure,oldProfile=Capabilities.ensure,KnoxPersistence.getSurvivorCapabilities
+KnoxPersistence.getSurvivorCapabilities=function() return nil end
+local preferred,denied
+Capabilities.ensure=function(id,character,initialize,profession,deny)
+    preferred,denied=profession,deny
+    return {professionId=profession or "base:farmer"},"fixture"
+end
+local playerStart={source="player_spawn",context="law_enforcement",professionCandidates={"base:policeofficer"}}
+local civilian=assert(Capabilities.ensureForOrigin("civilian-fixture",nil,false,nil,playerStart))
+assert(preferred==nil and civilian.professionId=="base:farmer" and #denied==3,
+    "a profession-specific player start cannot bypass the civilian origin gate")
+local station={source="world_building",buildingId="station",context="law_enforcement",
+    professionCandidates={"base:policeofficer"}}
+local officer=assert(Capabilities.ensureForOrigin("officer-fixture",nil,false,nil,station))
+assert(officer.professionId=="base:policeofficer","an actual matching station still produces an officer")
+Capabilities.ensure,KnoxPersistence.getSurvivorCapabilities=oldEnsure,oldProfile

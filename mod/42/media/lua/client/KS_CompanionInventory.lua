@@ -77,9 +77,28 @@ function CompanionInventory.canManage(playerNum, survivorId, expectedBody)
     if not nearby(player, character) then return false, "too_far_away" end
     local held = attention[playerNum]
     if expectedBody ~= nil and held ~= nil and (held.id ~= survivorId
-        or KnoxSurvivorRuntime.getController(survivorId) ~= held.owner
-        or held.owner.playerConversation ~= held.lease
-        or held.owner.state ~= "PLAYER_CONVERSATION") then return false, "interaction_ended" end
+        or KnoxSurvivorRuntime.getController(survivorId) ~= held.owner) then
+        return false, "interaction_ended"
+    end
+    -- The conversation lease opens the pack; it is not a per-click gate. The
+    -- lease lapses while the pane is open (a work step resumes, a threat scan
+    -- clears it), and every later action - equipping a vest, moving a can -
+    -- was then refused as "interaction_ended" even though the real body was
+    -- still there and still owned by the player (owner report, 2026-11-10).
+    -- Renew the same lease through the existing managePack path, which skips
+    -- re-admission; a replaced body or controller still ends the interaction.
+    if expectedBody ~= nil and held ~= nil and held.owner ~= nil
+        and (held.owner.playerConversation ~= held.lease
+            or held.owner.state ~= "PLAYER_CONVERSATION") then
+        local runtime = rawget(_G, "KnoxSurvivorRuntime")
+        if runtime == nil or runtime.beginPlayerConversation == nil then
+            return false, "interaction_ended"
+        end
+        local called, accepted = pcall(runtime.beginPlayerConversation,
+            survivorId, player, { managePack = true })
+        if not called or accepted ~= true then return false, "interaction_ended" end
+        held.lease = held.owner.playerConversation
+    end
     return true, nil, character
 end
 
@@ -174,6 +193,22 @@ local function setVisiblePage(page, visible)
     end
 end
 
+local function ensureSurvivorButton(page, survivorId, inventory)
+    -- A test or stripped page may have no strip at all; nothing to register.
+    if page == nil or inventory == nil or page.addContainerButton == nil then return end
+    for _, btn in ipairs(page.backpacks or {}) do
+        if btn.inventory == inventory then return end
+    end
+    local title = displayName(survivorId) .. " - Inventory"
+    local ok = pcall(function()
+        page:addContainerButton(inventory, page.invbasic, title, title)
+    end)
+    if not ok then
+        -- Fallback without texture if invbasic unavailable in this layout.
+        pcall(function() page:addContainerButton(inventory, nil, title, title) end)
+    end
+end
+
 local function onRefreshContainers(page, state)
     if state ~= "buttonsAdded" then return end
     if page == nil or page.onCharacter then return end
@@ -189,20 +224,7 @@ local function onRefreshContainers(page, state)
     local inventory = character ~= nil and character:getInventory() or nil
     if inventory == nil then return end
     -- Ensure the survivor's main inventory is offered as a loot container.
-    local hasMain = false
-    for _, btn in ipairs(page.backpacks or {}) do
-        if btn.inventory == inventory then hasMain = true; break end
-    end
-    if not hasMain then
-        local title = displayName(survivorId) .. " - Inventory"
-        local ok = pcall(function()
-            page:addContainerButton(inventory, page.invbasic, title, title)
-        end)
-        if not ok then
-            -- Fallback without texture if invbasic unavailable in this layout.
-            pcall(function() page:addContainerButton(inventory, nil, title, title) end)
-        end
-    end
+    ensureSurvivorButton(page, survivorId, inventory)
     -- Expose equipped bags so the loot window can switch bags exactly as the
     -- player inventory does. Vanilla player inventory only shows equipped
     -- containers; follow the same rule for the survivor.
@@ -395,7 +417,7 @@ if ISInventoryPaneContextMenu ~= nil and ISInventoryPaneContextMenu.getContainer
     local origGetContainers = CompanionInventory._origGetContainers
     ISInventoryPaneContextMenu.getContainers = function(character)
         -- Survivor shells have playerNum -1 and no playerData; vanilla getContainers
-        -- does getPlayerInventory(-1).inventoryPane → null deref (Kahlua RuntimeException
+        -- does getPlayerInventory(-1).inventoryPane -> null deref (Kahlua RuntimeException
         -- not always pcall-catchable). Detect survivor first and bypass vanilla path.
         local isSurvivor = false
         for _, sid in pairs(active) do
@@ -469,7 +491,7 @@ if ISInventoryPaneContextMenu ~= nil and ISInventoryPaneContextMenu.createMenu ~
                 return nil
             end
             -- Keep original isInPlayerInventory (false for loot) so Drop is not offered
-            -- for survivor items — player must Take first. Wear branch is gated on
+            -- for survivor items - player must Take first. Wear branch is gated on
             -- tests.clothing, not isInPlayerInventory, so it still appears.
             local ok, result = pcall(function() return origCreate(player, isInPlayerInventory, items, x, y, origin) end)
             _G.getSpecificPlayer = savedGetSpecificPlayer
@@ -904,7 +926,9 @@ function CompanionInventory.show(playerNum, survivorId)
         and previousOwner.playerConversation.player == localPlayerFor(playerNum) then
         KnoxSurvivorRuntime.endPlayerConversation(survivorId, localPlayerFor(playerNum))
     end
-    local paused, pauseReason = KnoxSurvivorRuntime.beginPlayerConversation(survivorId, localPlayerFor(playerNum))
+    local paused, pauseReason = KnoxSurvivorRuntime.beginPlayerConversation(
+        survivorId, localPlayerFor(playerNum), { managePack = true }
+    )
     if not paused then return false, pauseReason end
     local owner = KnoxSurvivorRuntime.getController(survivorId)
     if owner == nil or owner.playerConversation == nil then return false, "survivor_unavailable" end
@@ -919,6 +943,28 @@ function CompanionInventory.show(playerNum, survivorId)
     -- container so all vanilla transfer actions, drag/drop, context menus and
     -- the bag button strip operate exactly as they do on a corpse or world
     -- container. The hook above keeps the button available after refresh.
+    -- Register the pack in the button strip before the page selects it.
+    -- refreshBackpacks rebuilds that strip on every refresh and drops a
+    -- container with no button, which blanked the pane a frame after it opened.
+    -- Register the pack in the button strip before the page selects it.
+    -- refreshBackpacks rebuilds that strip and drops a container with no button,
+    -- which blanked the pane a frame after it opened. Kept inline: this file's
+    -- show() is compiled alone by a fixture, so it cannot call a file-level local.
+    if loot.addContainerButton ~= nil then
+        local listed = false
+        for _, btn in ipairs(loot.backpacks or {}) do
+            if btn.inventory == inventory then listed = true; break end
+        end
+        if not listed then
+            local title = displayName(survivorId) .. " - Inventory"
+            local ok = pcall(function()
+                loot:addContainerButton(inventory, loot.invbasic, title, title)
+            end)
+            if not ok then
+                pcall(function() loot:addContainerButton(inventory, nil, title, title) end)
+            end
+        end
+    end
     loot:setNewContainer(inventory)
     loot.title = displayName(survivorId) .. " - Inventory"
 
@@ -975,14 +1021,19 @@ function CompanionInventory.updateAttention()
             -- The pack shares the person-surface close rule: a replaced body,
             -- death, hostility, lost sight or walking away ends it. Ownership,
             -- reach and the held conversation lease stay canManage's question.
+            -- A loot pane stays usable while the player holds aim, exactly as
+            -- a world container does. Distance, body, lease and hostility
+            -- remain this pass's close rules.
             keep, reason = UILayout.personSurfaceState(held.player, held.id, {
                 body = exposedBodies[playerNum], controller = held.owner, lease = held.lease,
                 state = held, maximumDistanceSquared = MAX_DISTANCE_SQUARED,
+                checkAiming = false,
             })
             if keep and not CompanionInventory.canManage(playerNum, held.id, exposedBodies[playerNum]) then
                 keep, reason = false, "survivor_unavailable"
             end
-            if keep and not KnoxSurvivorRuntime.beginPlayerConversation(held.id, held.player) then
+            if keep and not KnoxSurvivorRuntime.beginPlayerConversation(
+                held.id, held.player, { managePack = true }) then
                 keep, reason = false, "survivor_unavailable"
             end
         end

@@ -101,6 +101,9 @@ local loot={visible=true,inventoryPane={}}
 function loot:setNewContainer(value) self.inventoryPane.inventory=value end
 function loot:setVisible(value) self.visible=value end
 function loot:isVisible() return self.visible end
+local addedButtons={}
+loot.backpacks={}
+function loot:addContainerButton(value) addedButtons[#addedButtons+1]=value end
 local ownPage={setVisible=function() end}
 getPlayerLoot=function() return loot end
 getPlayerInventory=function() return ownPage end
@@ -109,6 +112,8 @@ p.isSurvivorAlive=function() return true end
 p.getSurvivorAffiliation=function() return {kind="player",ownerId="doctor"} end
 p.ensurePlayerId=function() return "doctor" end
 assert(codecInventory.show(0,"patient"))
+assert(addedButtons[1]==inventory,
+    "the pack is registered in the loot strip before it is selected")
 assert(loot.inventoryPane.inventory==inventory and owner.state=="PLAYER_CONVERSATION")
 startCount=starts
 assert(codecInventory.show(0,"patient") and starts==startCount,"reopening inventory retains the same pause and native actions")

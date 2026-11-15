@@ -22,7 +22,7 @@ local MISSION_PURPOSES = {
     building = "building",
 }
 
-function Executor.destinationDirective(team)
+function Executor.destinationDirective(team, searchStep)
     local destination = type(team) == "table" and team.destination or nil
     if type(destination) ~= "table" or number(destination.x) == nil
         or number(destination.y) == nil then
@@ -31,7 +31,8 @@ function Executor.destinationDirective(team)
     -- A saved team carries its search radius on the destination; the team-level
     -- field still wins when a caller sets one explicitly.
     local radius = number(team.searchRadius, number(destination.radius, SEARCH_RADIUS))
-    radius = math.max(4, math.min(40, math.floor(radius)))
+    radius = math.max(4, math.min(80, math.floor(radius)))
+    local wave=Executor.searchWave(radius,searchStep)
     return {
         kind = "loot_area",
         purpose = type(team) == "table" and MISSION_PURPOSES[team.missionType] or nil,
@@ -42,7 +43,26 @@ function Executor.destinationDirective(team)
         z = math.floor(number(destination.z, 0)),
         awayTeamId = team.id,
         awayMission = true,
+        scanX = math.floor(number(destination.x)+wave.dx),
+        scanY = math.floor(number(destination.y)+wave.dy),
+        scanRadius = wave.radius,
+        allowFallback = wave.fallback,
     }, "ready"
+end
+
+-- A large area is searched in bounded windows, not one huge square scan per
+-- survivor. A full preferred sweep precedes fallback; each new sweep tries the
+-- requested cargo first again. Only existing native squares supply evidence.
+function Executor.searchWave(radius, step)
+    radius=math.max(4,math.min(80,math.floor(number(radius,80))))
+    local half=math.ceil(radius/32)
+    local side=half*2+1
+    local count=side*side
+    local index=math.max(0,math.floor(number(step,0)))
+    local offset=(index+math.floor(count/2))%count
+    local stride=radius/half
+    return {dx=(offset%side-half)*stride,dy=(math.floor(offset/side)-half)*stride,
+        radius=16,fallback=math.floor(index/count)%2==1,count=count}
 end
 
 function Executor.beginCollection(teamId, now)
@@ -59,9 +79,10 @@ local function itemReceived(supply, character, item)
     if character == nil or item == nil or supply.container == nil then return false end
     local ok, received = pcall(function()
         local inventory = character:getInventory()
-        return inventory ~= nil and supply.container ~= inventory
+        local destination=item:getContainer()
+        return inventory ~= nil and supply.container ~= destination
             and supply.container:contains(item) == false
-            and inventory:contains(item) == true and item:getContainer() == inventory
+            and Executor.ownsContainer(character,destination) and destination:contains(item)==true
     end)
     return ok and received == true
 end
@@ -102,43 +123,66 @@ function Executor.recordCollection(teamId, survivorId, supply, character, now, f
         or type(supply.items) == "table" and #supply.items > 0) and #itemTypes == 0 then
         return nil, "collection_transfer_not_received"
     end
-    return KnoxPersistence.recordAwayTeamCollection(
+    local recorded,reason=KnoxPersistence.recordAwayTeamCollection(
         teamId, survivorId, itemTypes, now, final
     )
+    if recorded ~= nil and type(supply)=="table" then supply.awayReceiptCommitted=true end
+    return recorded,reason
 end
 
--- A supply run does not end because one container was opened. Three searches is
--- the same bound the ordinary loot chain uses, and a full pack is the other
--- real stop; a search area with nothing left ends the run through the existing
--- miss budget instead of a second exhaustion check. Pure, so the decision can
--- be driven offline without a body.
-Executor.RUN_SEARCH_LIMIT = 3
-
+-- Resource trips stay assigned through scarcity. Scouting keeps its bounded
+-- inspection result; resource runs return on actual storage/carrying limits.
 function Executor.runContinues(state)
     if type(state) ~= "table" then return false, "no_state" end
     if state.packFull == true then return false, "pack_full" end
-    local limit = math.max(1, math.floor(
-        tonumber(state.maxSearches) or Executor.RUN_SEARCH_LIMIT
-    ))
-    -- The caller asks this after a search finished, so an unknown count is one
-    -- completed search rather than zero: bad input can never buy extra searches.
-    local searches = math.max(1, math.floor(tonumber(state.searches) or 1))
-    if searches >= limit then return false, "search_budget" end
+    if state.missionType == "scout" and (tonumber(state.searches) or 0)>=3 then
+        return false,"scouted"
+    end
     return true, "continue"
 end
 
--- Real carried weight against real native capacity, never a guess. An
--- unreadable inventory is not "full": the run continues and the search bounds
--- still end it.
+function Executor.carriedBags(character)
+    local bags={}
+    if character == nil then return bags end
+    local inventory=character:getInventory()
+    local items=inventory and inventory:getItems()
+    if items == nil then return bags end
+    for i=0,items:size()-1 do
+        local item=items:get(i)
+        if instanceof(item,"InventoryContainer") then
+            local bag=item:getInventory()
+            if bag then bags[#bags+1]=bag end
+        end
+    end
+    return bags
+end
+
+function Executor.ownsContainer(character,container)
+    if character == nil or container == nil then return false end
+    if character:getInventory()==container then return true end
+    for _,bag in ipairs(Executor.carriedBags(character)) do
+        if bag==container then return true end
+    end
+    return false
+end
+
+-- Installed ItemContainer.getCapacityWeight is the CURRENT weight, not a
+-- capacity. There is no getWeight getter. getMaxWeight supplies the limit.
 function Executor.packFull(character)
     if character == nil or character.getInventory == nil then return false end
     local ok, full = pcall(function()
         local inventory = character:getInventory()
-        if inventory == nil or inventory.getWeight == nil
-            or inventory.getCapacityWeight == nil then return false end
-        local weight = tonumber(inventory:getWeight()) or 0
-        local capacity = tonumber(inventory:getCapacityWeight()) or 0
-        return capacity > 0 and weight / capacity >= 0.95
+        if inventory == nil then return false end
+        local function full(container)
+            local weight=tonumber(container:getCapacityWeight()) or 0
+            local capacity=tonumber(container:getMaxWeight()) or 0
+            return capacity>0 and weight/capacity>=0.95
+        end
+        if full(inventory) then return true end
+        local bags=Executor.carriedBags(character)
+        if #bags==0 then return false end
+        for _,bag in ipairs(bags) do if not full(bag) then return false end end
+        return true
     end)
     return ok and full == true
 end
@@ -221,7 +265,7 @@ function Executor.resultSummary(team)
     local collected = collectedCount(team)
     local outcome = team.missionType == "scout" and "scouted" or "searched"
     return label .. ": " .. who .. " " .. outcome .. " " .. place
-        .. (collected > 0 and (" and brought back " .. tostring(collected) .. " item(s)") or "")
+        .. (collected > 0 and ("; " .. tostring(collected) .. " item(s) collected during the trip") or "")
         .. "."
 end
 

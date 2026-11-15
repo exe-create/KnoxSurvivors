@@ -1,3 +1,4 @@
+local KS_SafeCall = require "KS_SafeCall"
 -- One base can be several buildings. A house, a garage across the street and a
 -- barn beyond the fence are the same home; the boundary drawn around the first
 -- building was never a second concept of ownership, only its first outline.
@@ -203,10 +204,8 @@ end
 -- KS_BaseManager turns a native name into a kind. Nothing here invents a room
 -- that the building definition does not already report.
 local function safeCall(object, method)
-    if object == nil or object[method] == nil then return nil end
-    local ok, value = pcall(function() return object[method](object) end)
-    if ok then return value end
-    return nil
+    local value = KS_SafeCall.invoke(object, method)
+    return value
 end
 
 function Compound.detectRooms(building, z)
@@ -222,7 +221,17 @@ function Compound.detectRooms(building, z)
         if native ~= nil and native ~= "" and bounds ~= nil then
             local kind, label = nil, nil
             if manager ~= nil and manager.classifyRoom ~= nil then
-                kind, label = manager.classifyRoom(native, 0, false)
+                -- Contents decide a bathroom or a living room when the building
+                -- data has the name wrong or missing.
+                local fixtures = manager.roomFixtures ~= nil
+                    and manager.roomFixtures(bounds) or nil
+                kind, label = manager.classifyRoom(native, 0, false, fixtures)
+                if type(fixtures) == "table" and fixtures.bathroom == true then
+                    label = "Bathroom"
+                elseif label == nil and type(fixtures) == "table"
+                    and fixtures.living == true and fixtures.bed ~= true then
+                    label = "Living Room"
+                end
             end
             local minX, minY = tonumber(bounds.x1), tonumber(bounds.y1)
             local width = (tonumber(bounds.x2) or 0) - (minX or 0) + 1

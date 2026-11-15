@@ -9,8 +9,10 @@ local function ownerFor(faction)
     return "KnoxSurvivors:" .. tostring(faction.id)
 end
 
-function FactionSafehouse.ensure(faction)
-    local home = faction ~= nil and faction.homeBase or nil
+function FactionSafehouse.ensure(faction, base)
+    if base and (not faction or base.ownerKind ~= "faction" or base.ownerId ~= faction.id) then return nil, "wrong_owner" end
+    local home = base and base.home or faction ~= nil and faction.homeBase or nil
+    local binding = base or faction
     if home == nil then
         return nil, "no_home_base"
     end
@@ -64,13 +66,13 @@ function FactionSafehouse.ensure(faction)
         return nil, tostring(safehouse)
     end
     local safehouseId = tostring(safehouse:getId())
-    local newlyBound = faction.engineSafehouseId ~= safehouseId
-    faction.engineSafehouseOwner = owner
-    faction.engineSafehouseId = safehouseId
+    local newlyBound = binding.engineSafehouseId ~= safehouseId
+    binding.engineSafehouseOwner = owner
+    binding.engineSafehouseId = safehouseId
     if newlyBound then
         print(
             TAG .. " protected=" .. tostring(faction.id)
-                .. " safehouse=" .. tostring(faction.engineSafehouseId)
+                .. " safehouse=" .. tostring(binding.engineSafehouseId)
                 .. " owner=" .. owner
                 .. " bounds=" .. tostring(home.minX) .. "," .. tostring(home.minY)
                     .. "," .. tostring(home.width) .. "," .. tostring(home.height)
@@ -81,7 +83,9 @@ end
 
 function FactionSafehouse.ensureAll()
     for _, faction in pairs(KnoxPersistence.getFactions()) do
-        if faction ~= nil and faction.homeBase ~= nil then
+        if faction ~= nil and faction.militaryCommand then
+            for _, base in ipairs(KnoxPersistence.getBasesForOwner("faction", faction.id)) do FactionSafehouse.ensure(faction, base) end
+        elseif faction ~= nil and faction.homeBase ~= nil then
             local _, result = FactionSafehouse.ensure(faction)
             if result ~= "protected" then
                 print(TAG .. " restore-failed=" .. tostring(faction.id)

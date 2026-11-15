@@ -1,5 +1,6 @@
 require "KS_SurvivorNeeds"
 require "KS_SurvivorInventoryActions"
+local KS_SafeCall = require "KS_SafeCall"
 
 local Support = rawget(_G, "KnoxGroupSupport") or {}
 _G.KnoxGroupSupport = Support
@@ -7,9 +8,8 @@ _G.KnoxGroupSupport = Support
 local SUPPORT_DISTANCE_SQUARED = 9
 
 local function safeCall(object, method, fallback, ...)
-    if object == nil or type(object[method]) ~= "function" then return fallback end
-    local ok, value = pcall(object[method], object, ...)
-    if ok and value ~= nil then return value end
+    local value = KS_SafeCall.invoke(object, method, ...)
+    if value ~= nil then return value end
     return fallback
 end
 
@@ -43,6 +43,7 @@ local function needKind(character)
 end
 
 local function category(item, kind)
+    if kind == "smoke" then return KnoxSurvivorNeeds.isSmokeItem(item) end
     if kind == "find_food" then
         local ok, result = pcall(KnoxSurvivorNeeds.isSafeFood, item)
         return ok and result == true
@@ -156,6 +157,27 @@ function Support.plan(donor, recipients, reservedRecipients, reservedItems, item
     return plan ~= nil and plan.source ~= nil and plan.destination ~= nil and plan or nil
 end
 
+-- Optional company offer uses the existing surplus and transfer owner. The
+-- controller supplies the live relationship and recipient acceptance gate.
+function Support.planSmoke(donor, recipients, reservedRecipients, reservedItems, accept)
+    if donor == nil or accept == nil then return nil end
+    for _, recipient in ipairs(recipients or {}) do
+        if recipient ~= donor and nearby(donor, recipient)
+            and (reservedRecipients == nil or reservedRecipients[recipient] == nil) then
+            local item = Support.findSafeSurplus(donor, "smoke", function(candidate)
+                return (reservedItems == nil or reservedItems[candidate] == nil)
+                    and accept(recipient, candidate) == true
+            end)
+            if item ~= nil then
+                return { kind="smoke", recipient=recipient, item=item,
+                    source=safeCall(item,"getContainer",nil),
+                    destination=safeCall(recipient,"getInventory",nil), accept=accept }
+            end
+        end
+    end
+    return nil
+end
+
 function Support.mostUrgentNeed(observer, recipients)
     local seen, best = {}, nil
     for _, recipient in ipairs(recipients or {}) do
@@ -184,7 +206,8 @@ function Support.transferAllowed(donor, plan)
         or plan.source == nil or plan.destination == nil or plan.item == nil
         or safeCall(donor, "isDead", true) ~= false
         or safeCall(plan.recipient, "isDead", true) ~= false
-        or needKind(plan.recipient) ~= plan.kind
+        or (plan.kind == "smoke" and (plan.accept == nil or plan.accept(plan.recipient, plan.item) ~= true))
+        or (plan.kind ~= "smoke" and needKind(plan.recipient) ~= plan.kind)
         or not nearby(donor, plan.recipient)
         or safeCall(plan.recipient, "getInventory", nil) ~= plan.destination
         or not plan.source:contains(plan.item) then return false end

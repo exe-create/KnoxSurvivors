@@ -180,6 +180,7 @@ function BaseScouting.findBestCandidate(character, factionId, worldAgeHours)
     local originX, originY, originZ = origin:getX(), origin:getY(), origin:getZ()
     local best = nil
     local faction = KnoxPersistence.getFaction ~= nil and KnoxPersistence.getFaction(factionId) or nil
+    if faction == nil then faction=KnoxPersistence.getTravelGroups()[factionId] end
     local background = faction ~= nil and faction.background or nil
     local preferredContext = (background == "law_enforcement" or background == "fire_service"
         or background == "military") and background or nil

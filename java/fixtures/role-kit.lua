@@ -183,18 +183,18 @@ assert(Catalog.roleKitStatusText(nil, nil, nil, nil) == "Kit: no role assigned."
 local missingTags = { "bandage", "water" }
 assert(Catalog.roleKitStatusText("guard", guardGear, missingTags,
     { bandage = samples.bandage, water = samples.water })
-    == "Kit shortage: bandage, water — stock available.",
+    == "Kit shortage: bandage, water - stock available.",
     "missing tags with stock read as a restockable shortage")
 assert(Catalog.roleKitStatusText("guard", guardGear, missingTags, {})
-    == "Kit shortage: bandage, water — no assigned stock.",
+    == "Kit shortage: bandage, water - no assigned stock.",
     "missing tags without stock name the real shortage")
 assert(Catalog.roleKitStatusText("guard", guardGear, missingTags,
     { bandage = samples.bandage })
-    == "Kit shortage: bandage, water — stock for bandage only.",
+    == "Kit shortage: bandage, water - stock for bandage only.",
     "partial stock names only the replacement that exists")
 assert(Catalog.roleKitStatusText("cook", Catalog.roleGear("cook"),
     { "can_opener" }, {})
-    == "Kit shortage: can opener — no assigned stock.",
+    == "Kit shortage: can opener - no assigned stock.",
     "tag labels are readable in the Crew line")
 
 local previousFinder = AdjacentFreeTileFinder
@@ -212,3 +212,8 @@ Storage.operationalPolicies = oldOperational
 Storage.resolvePolicy = oldResolve
 KnoxSurvivorNeeds = previousNeeds
 print("Role kit PASS tags=22 nested=true favorite=true filter=true stock=false approach=true")
+
+-- A named item minimum reads the same assigned shelves; without a base or a
+-- real item type it refuses to invent a count.
+assert(Storage.goalItemCount(nil, "Base.Bandage") == 0, "no base is no count")
+assert(Storage.goalItemCount({}, "not a type") == 0, "an invalid type has no count")

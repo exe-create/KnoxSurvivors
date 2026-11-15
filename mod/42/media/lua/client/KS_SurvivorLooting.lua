@@ -3,6 +3,37 @@ require "KS_SurvivorNeeds"
 local Looting = rawget(_G, "KnoxSurvivorLooting") or {}
 _G.KnoxSurvivorLooting = Looting
 
+-- Unclaimed buildings remain scavenging sites. Claimed stores belong to their
+-- residents; hostility alone is not a raid or permission to take supplies.
+function Looting.canLootSquare(survivorId, square)
+    if survivorId == nil or square == nil then return false end
+    local persistence, bases = rawget(_G, "KnoxPersistence"), rawget(_G, "KnoxBaseManager")
+    if persistence == nil or persistence.getBases == nil
+        or bases == nil or bases.containsSquare == nil then return false end
+    local duty = persistence.getSurvivorDuty(survivorId)
+    for _, base in pairs(persistence.getBases()) do
+        if bases.containsSquare(base, square) then
+            local resident = duty ~= nil and duty.mode == "base" and duty.baseId == base.id
+            if base.ownerKind == "group" then
+                resident = resident and persistence.isGroupBaseMember ~= nil
+                    and persistence.isGroupBaseMember(base,survivorId,true)
+            end
+            local companion = duty ~= nil and duty.mode == "companion"
+                and base.ownerKind == "player" and duty.ownerId == base.ownerId
+            if not resident and not companion then
+                local events = rawget(_G, "KnoxEvents")
+                local event = duty ~= nil and duty.eventId ~= nil and events ~= nil
+                    and events.get(duty.eventId) or nil
+                if event == nil or event.kind ~= "faction_raid"
+                    or event.phase ~= "objective" or event.targetBaseId ~= base.id then
+                    return false
+                end
+            end
+        end
+    end
+    return true
+end
+
 local ESSENTIAL_TOOLS = {
     ["Base.Axe"] = true,
     ["Base.HandAxe"] = true,
@@ -48,6 +79,73 @@ local function safe(call, fallback)
     local success, value = pcall(call)
     if success then return value end
     return fallback
+end
+
+-- A live assignment or a nearby player makes the car private for this scan.
+-- Missing ownership/access readers fail closed; an unassigned car is not a
+-- durable proof of ownership. Only already-explored native stock is planned.
+function Looting.vehicleStockAllowed(character, survivorId, vehicle, part, requireReach)
+    return safe(function()
+        if character == nil or survivorId == nil or vehicle == nil or part == nil then return false end
+        local persistence = rawget(_G, "KnoxPersistence")
+        if persistence == nil or persistence.getVehicleAssignmentFor == nil
+            or persistence.getVehicleAssignmentFor(vehicle) ~= nil then return false end
+        if getNumActivePlayers == nil or getSpecificPlayer == nil then return false end
+        local square, origin = vehicle:getSquare(), character:getCurrentSquare()
+        if square == nil or origin == nil or origin:getZ() ~= square:getZ()
+            or not Looting.canLootSquare(survivorId, square)
+            or vehicle:isRemovedFromWorld() or math.abs(vehicle:getCurrentSpeedKmHour()) > 0.1 then return false end
+        for i = 0, getNumActivePlayers() - 1 do
+            local player = getSpecificPlayer(i)
+            if player == nil then return false end
+            local ps = player:getCurrentSquare()
+            if player:getVehicle() == vehicle then return false end
+            if ps ~= nil and ps:getZ() == square:getZ() then
+                local dx, dy = ps:getX() - square:getX(), ps:getY() - square:getY()
+                if dx * dx + dy * dy <= 45 * 45 then return false end
+            end
+        end
+        local container = part:getItemContainer()
+        local source = container ~= nil and container:getSourceGrid() or nil
+        if part:getVehicle() ~= vehicle or vehicle:getPartByIndex(part:getIndex()) ~= part
+            or container == nil or container:getVehiclePart() ~= part
+            or source == nil or source:getZ() ~= square:getZ()
+            or not Looting.canLootSquare(survivorId, source)
+            or not container:isExistYet() or not container:isExplored() then return false end
+        if requireReach then
+            return character:getVehicle() == nil and vehicle:canAccessContainer(part:getIndex(), character) == true
+        end
+        return true
+    end, false) == true
+end
+
+-- Bound both vehicle parts and item planning; no native item fill occurs here.
+function Looting.vehicleCandidate(character, survivorId, vehicle, limit, forGroup, options, eligible)
+    return safe(function()
+        local count = math.min(16, vehicle:getPartCount())
+        for index = 0, count - 1 do
+            local part = vehicle:getPartByIndex(index)
+            local id = part ~= nil and tostring(part:getId() or "") or ""
+            if (id == "GloveBox" or id == "TruckBed" or string.find(id, "Seat", 1, true)
+                    or string.find(id, "Trunk", 1, true))
+                and Looting.vehicleStockAllowed(character, survivorId, vehicle, part, false) then
+                local container = part:getItemContainer()
+                local approach = vehicle:getSquareForArea(part:getArea())
+                local source = container:getSourceGrid()
+                if approach ~= nil and approach:canStand() == true
+                    and approach:getZ() == source:getZ()
+                    and (approach:getX()-source:getX())^2 + (approach:getY()-source:getY())^2 <= 4
+                    and (eligible == nil or eligible(container, approach)) then
+                    local candidates = Looting.plan(character, container, limit, forGroup, options)
+                    if #candidates > 0 then
+                        return {goal="explore", items=candidates, container=container,
+                            approach=approach, vehicle=vehicle, vehiclePart=part}
+                    end
+                end
+            end
+        end
+        return nil
+    end, nil)
 end
 
 function Looting.isEssentialTool(item)
@@ -147,7 +245,11 @@ function Looting.markSettlementDelivery(character, item, source, baseId, survivo
     if character == nil or source == nil or type(baseId) ~= "string"
         or type(survivorId) ~= "string" then return false end
     local inventory = character:getInventory()
-    if source == inventory or not safe(function() return inventory:contains(item) end, false)
+    local executor=rawget(_G,"KnoxAwayTeamExecutor")
+    local owned=safe(function() return inventory:contains(item) end,false)
+        or executor ~= nil and executor.ownsContainer(character,item:getContainer())
+            and safe(function() return item:getContainer():contains(item) end,false)
+    if source == inventory or not owned
         or safe(function() return source:contains(item) end, true) then return false end
     local data = safe(function() return item:getModData() end, nil)
     if data == nil then return false end
@@ -463,7 +565,7 @@ function Looting.plan(character, container, maximumItems, forGroup, options)
         local planner = rawget(_G, "KnoxBaseSupplyPlanner")
         if planner == nil or planner.matchesRequirement == nil then return false end
         for _, requirements in ipairs(rules) do
-            if planner.matchesRequirement(item, fullType, requirements) then return true end
+            if planner.matchesRequirement(item, requirements) then return true end
         end
         return false
     end
@@ -538,7 +640,22 @@ function Looting.plan(character, container, maximumItems, forGroup, options)
         return false
     end
     local function score(item)
-        if purpose ~= nil then return missionScore(item, purpose) end
+        if purpose ~= nil then
+            local value,reason=missionScore(item,purpose)
+            if value ~= nil then return value,reason end
+            if options.allowFallback == true then
+                -- Lower scores preserve the requested cargo's priority even
+                -- after scarcity opens collection to other useful supplies.
+                for _,other in ipairs({"food","medicine","tools","weapons","building"}) do
+                    local fallback,kind=missionScore(item,other)
+                    if fallback ~= nil then return fallback/2,kind end
+                end
+                if instanceof(item,"Clothing") and not safe(function()
+                    return item:isBroken()
+                end,true) then return 15,"mission_clothing" end
+            end
+            return nil,nil
+        end
         if type(supplyNeeds) == "table" and not wantedBySupply(item) then return nil, nil end
         if type(supplyNeeds) == "table" and needMatch(item) then
             return 75, "settlement_shortage"
@@ -566,6 +683,14 @@ function Looting.plan(character, container, maximumItems, forGroup, options)
         0,
         character:getInventory():getFreeCapacity(character)
     )
+    local missionBags,bagSpace={},{}
+    local executor=rawget(_G,"KnoxAwayTeamExecutor")
+    if purpose ~= nil and executor ~= nil then
+        missionBags=executor.carriedBags(character)
+        for _,bag in ipairs(missionBags) do
+            bagSpace[bag]=math.max(0,bag:getFreeCapacity(character))
+        end
+    end
     for _, candidate in ipairs(candidates) do
         local currentScore, currentReason = score(candidate.item)
         local weight = math.max(0, safe(function()
@@ -580,6 +705,13 @@ function Looting.plan(character, container, maximumItems, forGroup, options)
             local alreadySelected = categoryCounts[category] or 0
             if alreadySelected < categoryLimit then
                 selected[#selected + 1] = candidate
+                for _,bag in ipairs(missionBags) do
+                    if bagSpace[bag]>=weight then
+                        candidate.destination=bag
+                        bagSpace[bag]=bagSpace[bag]-weight
+                        break
+                    end
+                end
                 categoryCounts[category] = alreadySelected + 1
                 remainingCapacity = math.max(0, remainingCapacity - weight)
                 applySelectedFacts(facts, candidate.item)

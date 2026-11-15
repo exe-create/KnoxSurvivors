@@ -34,11 +34,16 @@ function LifecyclePolicy.detachedDecision(
     tileLoaded,
     recognizedTransient
 )
-    if recognizedTransient == true then
-        return false, "preserve-native-transient"
-    end
     grace = math.max(1, math.floor(tonumber(grace) or 1))
     graceLimit = math.max(1, math.floor(tonumber(graceLimit) or 1))
+    if recognizedTransient == true then
+        -- A stale native traversal flag must not hold an actor forever after
+        -- both its square and chunk have been confirmed absent beyond grace.
+        if tileLoaded == false and grace >= graceLimit then
+            return true, "hibernate-unloaded-tile"
+        end
+        return false, "preserve-native-transient"
+    end
     if finiteDistanceSquared == nil then
         return true, "hibernate-no-finite"
     end
@@ -57,13 +62,15 @@ function LifecyclePolicy.detachedDecision(
 end
 
 function LifecyclePolicy.distanceEligible(
-    isWorldSurvivor,
+    isPersistentSurvivor,
     dutyMode,
     distanceSquared,
-    activeDistanceSquared
+    activeDistanceSquared,
+    visible
 )
-    return isWorldSurvivor == true
+    return isPersistentSurvivor == true
         and dutyMode ~= "companion"
+        and visible ~= true
         and distanceSquared ~= nil
         and distanceSquared > activeDistanceSquared
 end

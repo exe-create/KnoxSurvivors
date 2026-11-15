@@ -3,6 +3,7 @@ require "KS_FactionBaseScouting"
 require "KS_FactionSafehouse"
 require "KS_ActivityFeed"
 require "KS_Settings"
+require "KS_OrderCatalog"
 pcall(function() require "KS_DebugLog" end)
 
 -- Group-vs-group and faction-vs-faction conflict telemetry. Encounters are
@@ -202,6 +203,12 @@ end
 -- greeting or no interaction at all; it must not turn every pair inside view
 -- into an instant travelling party.  Existing aggression can still create the
 -- established robbery outcome, while already-hostile people stop socializing.
+local function prefersSolitude(id)
+    local creator = KnoxPersistence.getSurvivorCreatorRecord ~= nil
+        and KnoxPersistence.getSurvivorCreatorRecord(id) or nil
+    return creator ~= nil and creator.settlementPolicy == "independent"
+end
+
 local function decideEncounterOutcome(firstId, secondId, record)
     local disposition = relationshipDisposition(firstId, secondId)
     if disposition == "self" or disposition == "allied" then
@@ -247,6 +254,12 @@ local function decideEncounterOutcome(firstId, secondId, record)
     local nowHours = getGameTime() ~= nil and getGameTime():getWorldAgeHours() or 0
     local factionRecruitment = factionGroup ~= nil
         and nowHours >= (tonumber(factionGroup.recruitmentNextHours) or 0)
+    local militaryMode=nil
+    if factionGroup~=nil then
+        local faction=KnoxPersistence.getFaction(factionGroup.factionId)
+        militaryMode=KnoxPersistence.militaryRecruitmentMode(faction,firstGroup==nil and firstId or secondId,firstGroup==nil and secondId or firstId)
+        if militaryMode=="hostile" then return "avoid_hostile" end
+    end
     local joinChance = factionRecruitment
         and clamp(24 + (sociability - 50) * 0.22
             + math.min(6, math.max(0, #(factionGroup.memberIds or {}) - 3) * 0.8), 18, 42)
@@ -254,6 +267,13 @@ local function decideEncounterOutcome(firstId, secondId, record)
             and clamp(32 + (sociability - 50) * 0.35, 20, 50)
             or 0)
     local roll = pairRoll(firstId, secondId, record ~= nil and record.meetings or 0)
+    local independentLoner = (firstGroup == nil and prefersSolitude(firstId))
+        or (secondGroup == nil and prefersSolitude(secondId))
+    if independentLoner then joinChance = 0 end
+    if militaryMode=="recruit" then
+        return factionRecruitment and not independentLoner and "join" or "greet"
+    end
+    if militaryMode=="screen" then return "greet" end
     if KnoxSettings.allowHostileEncounters() and roll < hostileChance then
         return "hostile"
     end
@@ -432,69 +452,45 @@ local function activateLocalAllyDefense(controllers, aggressor, victim, ticks)
 end
 
 local function coordinateFactionBaseScouting(controllers, orderedIds, ticks)
-    if not KnoxSettings.allowNPCFactions() then
-        return
-    end
-    if ticks - lastBaseScoutingTick < 600 or getGameTime() == nil then
-        return
-    end
-    lastBaseScoutingTick = ticks
-    local handled = {}
-    for _, id in ipairs(orderedIds) do
-        local controller = controllers[id]
-        local group = KnoxPersistence.getTravelGroupFor(id)
-        local faction = group ~= nil and group.factionId ~= nil
-            and KnoxPersistence.getFaction(group.factionId)
-            or nil
-        if controller ~= nil and (faction == nil or faction.kind == "player"
-            or faction.leaderId ~= id) then
-            controller:clearFactionBaseCandidate()
+    if not KnoxSettings.allowNPCFactions() or ticks-lastBaseScoutingTick < 600 or getGameTime()==nil then return end
+    lastBaseScoutingTick=ticks
+    local handled,now={},getGameTime():getWorldAgeHours()
+    for _,id in ipairs(orderedIds) do
+        local controller=controllers[id]
+        local group=KnoxPersistence.getTravelGroupFor(id)
+        local faction=group ~= nil and group.factionId ~= nil and KnoxPersistence.getFaction(group.factionId) or nil
+        local owner=faction or (group ~= nil and group.factionId==nil and group or nil)
+        local ownerKind=faction ~= nil and "faction" or "group"
+        local leaderId=owner ~= nil and owner.leaderId or nil
+        local eligible=owner ~= nil and owner.kind~="player"
+        if ownerKind=="group" and eligible then
+            local record=KnoxPersistence.getSurvivorCreatorRecord(leaderId)
+            local policy=record ~= nil and record.settlementPolicy or nil
+            eligible=policy~="mobile" and policy~="independent"
         end
-        if faction ~= nil and faction.kind ~= "player" and not handled[faction.id] then
-            handled[faction.id] = true
-            local leader = controllers[faction.leaderId]
-            if faction.homeBase == nil and leader ~= nil and leader.character ~= nil then
-                local candidate = KnoxPersistence.getFactionBaseCandidate(faction.id)
-                if candidate ~= nil and KnoxPersistence.expireFactionBaseCandidate(
-                    faction.id,
-                    getGameTime():getWorldAgeHours(),
-                    72
-                ) then
-                    candidate = nil
-                    leader:clearFactionBaseCandidate()
-                    print(TAG .. " faction-base-candidate-expired=" .. faction.id)
+        if controller ~= nil and (not eligible or leaderId ~= id) then controller:clearFactionBaseCandidate() end
+        local key=owner ~= nil and ownerKind..":"..owner.id or nil
+        if eligible and not handled[key] then
+            handled[key]=true
+            local leader=controllers[leaderId]
+            local base=ownerKind=="group" and KnoxPersistence.getBaseForOwner("group",owner.id) or nil
+            local homed=base ~= nil or owner.homeBase ~= nil
+            if not homed and leader ~= nil and leader.character ~= nil then
+                local candidate=KnoxPersistence.getFactionBaseCandidate(owner.id)
+                if candidate ~= nil and KnoxPersistence.expireFactionBaseCandidate(owner.id,now,72) then
+                    candidate=nil;leader:clearFactionBaseCandidate()
                 end
-                if candidate == nil then
-                    local found = KnoxFactionBaseScouting.findBestCandidate(
-                        leader.character,
-                        faction.id,
-                        getGameTime():getWorldAgeHours()
-                    )
-                    if found ~= nil then
-                        candidate = KnoxPersistence.recordFactionBaseCandidate(
-                            faction.id,
-                            found,
-                            getGameTime():getWorldAgeHours()
-                        )
-                        print(
-                            TAG .. " faction-base-candidate=" .. faction.id
-                                .. " building=" .. tostring(found.buildingId)
-                                .. " score=" .. tostring(found.score)
-                                .. " rooms=" .. tostring(found.rooms)
-                                .. " area=" .. tostring(found.area)
-                                .. " water=" .. tostring(found.water)
-                        )
-                    end
+                if candidate==nil then
+                    local found=KnoxFactionBaseScouting.findBestCandidate(leader.character,owner.id,now)
+                    if found ~= nil then candidate=KnoxPersistence.recordFactionBaseCandidate(owner.id,found,now) end
                 end
-                if candidate ~= nil and getGameTime():getWorldAgeHours()
-                    >= (tonumber(candidate.retryAtHours) or 0) then
-                    leader:setFactionBaseCandidate(faction.id, candidate)
+                if candidate ~= nil and now >= (tonumber(candidate.retryAtHours) or 0) then
+                    leader:setFactionBaseCandidate(owner.id,candidate,ownerKind)
                 end
             elseif leader ~= nil then
                 leader:clearFactionBaseCandidate()
-                if faction.homeBase ~= nil then
-                    KnoxFactionSafehouse.ensure(faction)
-                end
+                if ownerKind=="faction" and owner.homeBase ~= nil then KnoxFactionSafehouse.ensure(owner) end
+                if ownerKind=="group" and KnoxBaseManager ~= nil then KnoxBaseManager.ensureGroupBase(owner) end
             end
         end
     end
@@ -523,6 +519,26 @@ local function recordFinalizedEncounter(firstId, secondId, outcome, worldAge)
     pcall(stories.recordLoadedEncounter, secondId, firstId, outcome, worldAge)
 end
 
+function Relationships.companySeeker(first, second)
+    local p = KnoxPersistence
+    if p.getTravelGroupFor == nil or p.getSurvivorDuty == nil or p.getSurvivorAffiliation == nil then return nil end
+    local a, b = p.getTravelGroupFor(first.id), p.getTravelGroupFor(second.id)
+    if (a == nil) == (b == nil) then return nil end
+    local solo, member, group = a == nil and first or second, a == nil and second or first, a or b
+    if #(group.memberIds or {}) < 2 or member.id ~= group.leaderId or prefersSolitude(solo.id) then return nil end
+    local duty, affiliation = p.getSurvivorDuty(solo.id), p.getSurvivorAffiliation(solo.id)
+    if duty == nil or duty.mode ~= "autonomous" or affiliation == nil
+        or affiliation.kind ~= "independent" or affiliation.factionId ~= nil
+        or not mutuallyAware(solo.character, member.character)
+        or relationshipDisposition(solo.id, member.id) == "hostile"
+        or solo.canInterruptForMeeting == nil or not solo:canInterruptForMeeting() then return nil end
+    local needs = rawget(_G, "KnoxSurvivorNeeds")
+    if needs == nil or needs.decide == nil then return nil end
+    local ok, decision = pcall(needs.decide, solo.character, nil)
+    if not ok or type(decision) ~= "table" or decision.kind ~= "roam" then return nil end
+    return solo, member, group
+end
+
 local function observePair(first, second, worldAge, ticks, participants)
     local key = pairKey(first.id, second.id)
     local state = pairStates[key] or {
@@ -533,6 +549,16 @@ local function observePair(first, second, worldAge, ticks, participants)
         firstPending = { roam = 0, loot = 0, combat = 0 },
         secondPending = { roam = 0, loot = 0, combat = 0 },
     }
+    local resumingPending = state.needsBaseline and pendingMeetings[key] ~= nil
+    if state.needsBaseline then
+        if not resumingPending then state.near = false end
+        state.lastWorldAge = worldAge
+        state.firstCounters = copyCounters(first)
+        state.secondCounters = copyCounters(second)
+        state.firstPending = { roam = 0, loot = 0, combat = 0 }
+        state.secondPending = { roam = 0, loot = 0, combat = 0 }
+        state.needsBaseline = nil
+    end
     local firstSquare = first.character:getCurrentSquare()
     local secondSquare = second.character:getCurrentSquare()
     local sameLevel = firstSquare ~= nil and secondSquare ~= nil
@@ -543,6 +569,9 @@ local function observePair(first, second, worldAge, ticks, participants)
     local near = perceived
     local cautiouslyClose = perceived
         and pairDistance <= CAUTIOUS_APPROACH_RADIUS * CAUTIOUS_APPROACH_RADIUS
+    local companySeeker, companyMember, companyGroup = nil, nil, nil
+    if perceived then companySeeker, companyMember, companyGroup = Relationships.companySeeker(first, second) end
+    cautiouslyClose = cautiouslyClose or companySeeker ~= nil
     local elapsed = math.max(0, worldAge - state.lastWorldAge)
 
     if near then
@@ -571,7 +600,7 @@ local function observePair(first, second, worldAge, ticks, participants)
         state.secondPending.loot = state.secondPending.loot - sharedLoot
         state.firstPending.combat = state.firstPending.combat - sharedCombat
         state.secondPending.combat = state.secondPending.combat - sharedCombat
-        local began = not state.near
+        local began = not state.near and not resumingPending
         local record = KnoxPersistence.recordEncounter(first.id, second.id, {
             worldAgeHours = worldAge,
             began = began,
@@ -619,6 +648,8 @@ local function observePair(first, second, worldAge, ticks, participants)
             )
             local outcome = pendingOverride
                 or decideEncounterOutcome(first.id, second.id, record)
+            if companySeeker ~= nil and pairDistance > CAUTIOUS_APPROACH_RADIUS * CAUTIOUS_APPROACH_RADIUS
+                and outcome ~= "join" and outcome ~= "greet" then outcome = "none" end
             if pendingOverride ~= nil then
                 print(TAG .. " pending-meet-override=" .. first.id .. "," .. second.id
                     .. " outcome=" .. tostring(pendingOverride))
@@ -659,19 +690,29 @@ local function observePair(first, second, worldAge, ticks, participants)
                     and (firstGroup ~= nil and second.id
                         or (secondGroup ~= nil and first.id or nil))
                     or nil
+                local seeking = companySeeker ~= nil and (outcome == "join" or outcome == "greet")
+                local initiator = seeking and companySeeker or first
+                local receiver = seeking and companyMember or second
+                local reversed = initiator == second
                 pendingMeetings[key] = {
-                    firstId = first.id,
-                    secondId = second.id,
+                    firstId = initiator.id,
+                    secondId = receiver.id,
                     phase = "REQUESTED",
                     startedAt = ticks,
                     outcome = outcome,
                     pendingMeetToken = pendingMeetToken,
                     aggressorId = aggressorId,
-                    firstGroupId = firstGroup ~= nil and firstGroup.id or nil,
-                    secondGroupId = secondGroup ~= nil and secondGroup.id or nil,
+                    firstGroupId = reversed and (secondGroup ~= nil and secondGroup.id or nil)
+                        or (not reversed and firstGroup ~= nil and firstGroup.id or nil),
+                    secondGroupId = reversed and (firstGroup ~= nil and firstGroup.id or nil)
+                        or (not reversed and secondGroup ~= nil and secondGroup.id or nil),
                     joinGroupId = joinGroupId,
                     lonerId = lonerId,
                 }
+                if seeking then
+                    companySeeker:setLifeIntent("seek_group", "seeking", companyMember.character:getCurrentSquare(),
+                        "group:" .. tostring(companyGroup.id))
+                end
                 participants[first.id] = true
                 participants[second.id] = true
                 print(
@@ -703,7 +744,7 @@ function Relationships.observe(controllers, orderedIds, ticks)
     -- Eligibility and identity are survivor-level facts for this observation.
     -- Snapshot them once in the same ordered roster used by the pair walk;
     -- re-reading them for every pair made persistence work grow quadratically.
-    local eligible = {}
+    local eligible, observedPairKeys = {}, {}
     for index = 1, #orderedIds do
         local first = controllers[orderedIds[index]]
         if first ~= nil and first.character ~= nil
@@ -716,12 +757,26 @@ function Relationships.observe(controllers, orderedIds, ticks)
     for index = 1, #eligible do
         local first = eligible[index]
         for otherIndex = index + 1, #eligible do
-            observePair(first, eligible[otherIndex], worldAge, ticks or 0, participants)
+            local second = eligible[otherIndex]
+            observedPairKeys[pairKey(first.id, second.id)] = true
+            observePair(first, second, worldAge, ticks or 0, participants)
+        end
+    end
+    for key, state in pairs(pairStates) do
+        if not observedPairKeys[key] then
+            if pendingMeetings[key] ~= nil then
+                state.needsBaseline = true
+            else
+                pairStates[key] = nil
+            end
         end
     end
 end
 
 local function resumeMeetingController(controller, ticks)
+    if controller ~= nil and controller.lifeIntent ~= nil and controller.lifeIntent.kind == "seek_group" then
+        controller:clearLifeIntent()
+    end
     if controller ~= nil and (controller.state == "MEETING_WAIT"
         or controller.state == "MEETING_APPROACH"
         or controller.state == "MEETING_READY"
@@ -787,6 +842,17 @@ local function assignGroupLeaders(controllers, orderedIds, ticks, forceReadOnly)
                 and KnoxPersistence.getTravelGroupLeaderOrder(group.id, now) or nil
             if group ~= nil and group.leaderId ~= id then
                 local leader = controllers[group.leaderId]
+                local leaderCharacter = leader ~= nil and leader.character or nil
+                if leaderCharacter == nil then
+                    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+                    if runtime ~= nil and runtime.getCharacter ~= nil then
+                        local ok, live = pcall(runtime.getCharacter, group.leaderId)
+                        if ok and type(live) == "table"
+                            and type(live.getCurrentSquare) == "function" then
+                            leaderCharacter = live
+                        end
+                    end
+                end
                 local members = {}
                 for _, memberId in ipairs(group.memberIds or {}) do
                     local member = controllers[memberId]
@@ -807,7 +873,7 @@ local function assignGroupLeaders(controllers, orderedIds, ticks, forceReadOnly)
                 end
                 controller:setGroupLeader(
                     group.leaderId,
-                    leader ~= nil and leader.character or nil,
+                    leaderCharacter,
                     formationSlot,
                     #(group.memberIds or {}),
                     objective,
@@ -955,6 +1021,9 @@ function Relationships.coordinate(controllers, orderedIds, ticks)
             if first:canInterruptForMeeting() and second:canInterruptForMeeting()
                 and first:interruptForMeeting() and second:interruptForMeeting() then
                 if first:beginMeetingApproach(second.character) then
+                    if first.lifeIntent ~= nil and first.lifeIntent.kind == "seek_group" then
+                        first:setLifeIntent("seek_group", "traveling", second.character:getCurrentSquare(), first.lifeIntent.targetKey)
+                    end
                     meeting.phase = "APPROACHING"
                     print(TAG .. " greeting-approach=" .. first.id .. "->" .. second.id)
                 else
@@ -1097,6 +1166,16 @@ function Relationships.coordinate(controllers, orderedIds, ticks)
                         meeting.lonerId
                     )
                     if group ~= nil and group.factionId ~= nil then
+                        local uniform=rawget(_G,"KnoxEquipmentIntelligence")
+                        local faction=KnoxPersistence.getFaction(group.factionId)
+                        if faction~=nil and faction.background=="military" and uniform~=nil then
+                            local recruit=meeting.lonerId==first.id and first or second
+                            local donor=recruit==first and second or first
+                            local offered=uniform.offerFactionUniform(donor,recruit,faction,ticks)
+                            KnoxActivityFeed.speak(donor.character,offered
+                                and KnoxOrderCatalog.text("IGUI_Knox_UniformOffer","I've got spare clothes for you.")
+                                or KnoxOrderCatalog.text("IGUI_Knox_UniformMissing","I've no spare uniform."))
+                        end
                         -- Keep faction growth organic. The cooldown is stored on
                         -- the existing travel-group record, so reloads do not
                         -- reset it and no second social system is introduced.

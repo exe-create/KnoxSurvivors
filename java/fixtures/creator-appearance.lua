@@ -94,18 +94,20 @@ group|X
 faction|household
 p|Cy|casual|none|bat|base:carpenter|meal|0|0|||||nonsense]])
 assert(#handEdited == 1, "the hand-edited line still yields one person")
-assert(handEdited[1].faction == nil, "a file cannot invent a faction")
+assert(handEdited[1].faction == "nonsense", "an unknown faction id is preserved as data")
+assert(Creator.profileFor(handEdited[1].faction, {}) == nil,
+    "preserving a future id cannot invent a usable faction profile")
 -- Per-slot clothing: one item replaces the preset's item in that slot, the
 -- rest of the preset is kept, and nothing else can be named.
 local base = Creator.lookItems("police")
-assert(#base == 3, "the police preset is three items, got " .. tostring(#base))
+assert(#base == 4, "the police preset includes shoes and is four items, got " .. tostring(#base))
 assert(Creator.encodeSlots({}) == "", "no choices encode as an empty field")
 local chosen = Creator.decodeSlots(Creator.encodeSlots(
     { legs = "Base.Trousers_Denim", head = "Base.Hat_Army" }))
 assert(chosen.legs == "Base.Trousers_Denim" and chosen.head == "Base.Hat_Army",
     "slot choices survive the file")
 local merged = Creator.lookItemsWithSlots("police", chosen)
-assert(#merged == 3, "a swap keeps the item count, got " .. tostring(#merged))
+assert(#merged == 4, "a swap keeps the item count, got " .. tostring(#merged))
 local function has(list, value)
     for _, entry in ipairs(list) do if entry == value then return true end end
     return false
@@ -117,16 +119,17 @@ assert(has(merged, "Base.Shirt_PoliceBlue"), "an untouched slot keeps the preset
 
 -- A file naming an item that slot never offered is ignored, not worn.
 local invented = Creator.decodeSlots("legs:Base.Trousers_Nonexistent;head:Base.Trousers_Denim")
-assert(invented.legs == nil, "an unknown item is not carried")
-assert(invented.head == nil, "an item from another slot is not carried")
+assert(invented.legs == "Base.Trousers_Nonexistent", "missing items stay saved for when their mod returns")
+assert(Creator.slotChoice("legs", invented) == nil, "a missing item is not applied")
+assert(Creator.slotChoice("head", invented) == nil, "an item from another slot is not worn")
 
 -- The reading the appearance owner uses takes the saved record shape.
 local fromRecord = Creator.lookItemsFromRecord({ look = "police",
     slots = "legs:Base.Trousers_Denim" })
 assert(has(fromRecord, "Base.Trousers_Denim"), "the record path applies the slot")
-assert(#fromRecord == 3, "the record path keeps the preset's other items")
+assert(#fromRecord == 4, "the record path keeps the preset's other items")
 assert(#Creator.lookItemsFromRecord(nil) == 0, "a missing record dresses nothing")
-assert(#Creator.lookItemsFromRecord({ look = "police" }) == 3,
+assert(#Creator.lookItemsFromRecord({ look = "police" }) == 4,
     "a record without slots is the plain preset")
 
 -- The hand-over built at spawn carries every choice the card showed. This is

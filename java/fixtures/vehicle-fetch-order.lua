@@ -37,7 +37,8 @@ local function vehicleAt(x, y, z, overrides)
 end
 
 -- One survivor standing on an empty street; the car has to come to them.
-local driver = { getCurrentSquare = function() return squareAt(10, 10, 0) end,
+local driver = { getInventory = function() return { haveThisKeyId = function() return false end } end,
+    getCurrentSquare = function() return squareAt(10, 10, 0) end,
     getX = function() return 10 end, getY = function() return 10 end }
 
 local near = vehicleAt(14, 10, 0)
@@ -48,11 +49,13 @@ assert(travel.readyVehicleNear(driver, { near, far }) == near,
 assert(travel.readyVehicleNear(driver, { far, near }) == near,
     "candidate order does not choose the car")
 
+assert(travel.readyVehicleNear(driver, { vehicleAt(12, 10, 0, { engine = false }) }) ~= nil,
+    "a parked car can be selected for a real engine start attempt")
+
 -- Every refusal keeps the car out of the order instead of promising a trip.
 local cases = {
     { vehicleAt(12, 10, 0, { locked = true }), "a locked car is not sent" },
     { vehicleAt(12, 10, 0, { keys = false }), "a keyless car is not sent" },
-    { vehicleAt(12, 10, 0, { engine = false }), "a dead engine is not sent" },
     { vehicleAt(12, 10, 0, { driveable = false }), "a wreck is not sent" },
     { vehicleAt(12, 10, 0, { speed = 12 }), "a moving car is not sent" },
     { vehicleAt(12, 10, 0, { fuel = 0 }), "an empty tank is not sent" },

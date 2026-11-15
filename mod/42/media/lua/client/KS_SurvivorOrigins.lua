@@ -49,7 +49,7 @@ local EXACT_ROOM_CONTEXT = {
     pharmacy = "medical",
     pharmacystorage = "medical",
     armystorage = "military",
-    armysurplus = "military",
+    armysurplus = "generic", -- a retail shop is not a military post
     armytent = "military",
     firegarage = "fire_service",
     firestorage = "fire_service",
@@ -229,6 +229,14 @@ function Origins.professionAllowedAtContext(professionId, context)
     return expected ~= nil and expected == tostring(context or "generic")
 end
 
+function Origins.professionAllowedAtOrigin(professionId, origin)
+    local normalized=Origins.normalizeProfessionId(professionId)
+    if normalized==nil or FACILITY_PROFESSIONS[normalized]~=true then return true end
+    return type(origin)=="table" and origin.source=="world_building"
+        and type(origin.buildingId)=="string" and origin.buildingId~=""
+        and Origins.professionAllowedAtContext(normalized,origin.context)
+end
+
 function Origins.classifyRooms(roomNames)
     local selected, priority = "generic", 0
     for _, rawName in ipairs(roomNames or {}) do
@@ -248,6 +256,85 @@ function Origins.classifyRooms(roomNames)
         end
     end
     return selected
+end
+
+-- A family home is a sleep room plus a room where a household lives. The
+-- former test only knew the words "bedroom" and "kitchen", which excluded the
+-- trailers, mobile homes and small shelters the county actually contains. The
+-- classifier still refuses anything with a facility context, so police quarters
+-- cannot become a civilian household merely because they contain a bed.
+local HOUSEHOLD_SLEEP_ROOMS = {
+    bedroom = true, bed = true, bunk = true, sleep = true,
+}
+local HOUSEHOLD_LIVING_ROOMS = {
+    kitchen = true, livingroom = true, living = true, trailer = true,
+    mobilehome = true, cabin = true, shelter = true, bunkhouse = true,
+}
+
+local function householdRoomKind(name)
+    name = Origins.normalizeRoomName(name)
+    if name == nil then return nil end
+    if HOUSEHOLD_SLEEP_ROOMS[name] == true or name:match("bedroom$") ~= nil
+        or name:match("bed$") ~= nil then
+        return "sleep"
+    end
+    if HOUSEHOLD_LIVING_ROOMS[name] == true or name:match("kitchen$") ~= nil then
+        return "living"
+    end
+    if name:match("trailer") ~= nil or name:match("mobilehome") ~= nil then
+        return "trailer"
+    end
+    if name:match("cabin") ~= nil then return "cabin" end
+    if name:match("shelter") ~= nil then return "shelter" end
+    return nil
+end
+
+function Origins.isHouseholdRooms(roomNames)
+    if Origins.classifyRooms(roomNames)~="generic" then return false end
+    local sleep,living=false,false
+    for _,name in ipairs(roomNames or {}) do
+        local kind=householdRoomKind(name)
+        if kind=="sleep" then sleep=true end
+        if kind~=nil and kind~="sleep" then living=true end
+    end
+    return sleep and living
+end
+
+-- Read-only evidence for diagnostics and household selection. A room-name
+-- kind never creates a resident or a supply; it only says what the building is.
+function Origins.householdKind(roomNames)
+    if not Origins.isHouseholdRooms(roomNames) then return nil end
+    local kind="house"
+    for _,name in ipairs(roomNames or {}) do
+        local normalized=Origins.normalizeRoomName(name)
+        if normalized~=nil and (normalized:match("trailer")~=nil
+            or normalized:match("mobilehome")~=nil) then kind="trailer"
+        elseif normalized~=nil and normalized:match("cabin")~=nil then kind="cabin"
+        elseif normalized~=nil and normalized:match("shelter")~=nil then kind="shelter" end
+    end
+    return kind
+end
+
+function Origins.isHouseholdRoster(origins)
+    if type(origins)~="table" or #origins<2 or #origins>5 then return false end
+    local buildingId=nil
+    for _,origin in ipairs(origins) do
+        if type(origin)~="table" then return false end
+        -- Allocation stores the one household bit derived from the real rooms;
+        -- old callers that still hold room names can prove it directly.
+        local household=origin.household==true
+            or Origins.isHouseholdRooms(origin.roomNames)
+        if origin.source~="world_building" or type(origin.buildingId)~="string"
+            or origin.buildingId=="" or not household then return false end
+        if buildingId~=nil and buildingId~=origin.buildingId then return false end
+        buildingId=origin.buildingId
+    end
+    return true
+end
+
+function Origins.inRoomBounds(x,y,bounds)
+    return type(bounds)=="table" and x>=bounds.minX and x<=bounds.maxX
+        and y>=bounds.minY and y<=bounds.maxY
 end
 
 function Origins.mergeProfessionCandidate(values, value)
@@ -322,7 +409,7 @@ end
 function Origins.sanitizeMetadata(origin, preserveMissing)
     if type(origin) ~= "table" then return { context = "generic" } end
     local hasMetadata = origin.context ~= nil or origin.professionCandidates ~= nil
-        or origin.buildingId ~= nil
+        or origin.buildingId ~= nil or origin.household ~= nil
     if preserveMissing and not hasMetadata then return {} end
     if origin.context ~= nil and not Origins.isContext(origin.context) then
         return { context = "generic" }
@@ -351,10 +438,18 @@ function Origins.sanitizeMetadata(origin, preserveMissing)
         end
         buildingId = origin.buildingId
     end
+    local household = origin.household == true
+    local householdKind = nil
+    if household and (origin.householdKind == "house" or origin.householdKind == "trailer"
+        or origin.householdKind == "cabin" or origin.householdKind == "shelter") then
+        householdKind = origin.householdKind
+    end
     return {
         context = context,
         professionCandidates = #candidates > 0 and candidates or nil,
         buildingId = buildingId,
+        household = household or nil,
+        householdKind = householdKind,
     }
 end
 

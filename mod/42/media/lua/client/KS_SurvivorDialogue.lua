@@ -25,6 +25,8 @@ local BANKS = {
     no_supplies = {
         "Nothing useful here.", "Place is picked clean.", "No luck here.",
     },
+    offer_cigarette = { "Want a smoke?", "I've got a spare cigarette, if you want it." },
+    accept_cigarette = { "Thanks. I could use one.", "Yeah, thanks." },
     share_supply = {
         "Take this. I have enough.",
         "Here. You need this more than I do.",
@@ -49,7 +51,7 @@ local BANKS = {
         "Contact!", "Got one here!", "Watch yourself!",
     },
     flee = {
-        "Too many—move!", "We need to get clear!", "Fall back!",
+        "Too many - move!", "We need to get clear!", "Fall back!",
     },
     base_work = {
         "I'll get this handled.", "I've got work to do.", "I'll take care of it.",
@@ -69,6 +71,11 @@ local BANKS = {
         "Going in before it soaks me.",
         "That's rain. I'll be inside.",
     },
+    weather_heat = {
+        "Too hot. I need some shade.",
+        "I'm overheating. Getting out of the sun.",
+        "Need somewhere cooler for a minute.",
+    },
     weather_cold = {
         "Too cold out here. Going in.",
         "My hands are stiff. I'll be inside.",
@@ -80,6 +87,29 @@ local BANKS = {
         "Soaked through. I need to dry off.",
         "My clothes are wringing wet. I'm going in.",
         "I can't work like this. I'm wet to the skin.",
+    },
+    -- A trained survivor's diagnosis: what is worst, and who is first. The
+    -- name is filled from the person being spoken about; a bank line without
+    -- the placeholder still speaks, so a voice is never silenced for it.
+    diagnosis_bleeding = {
+        "{name} is bleeding out. They are first.",
+        "Bleeding first. {name}, you are with me.",
+    },
+    diagnosis_fracture = {
+        "{name}'s bone is broken. They go first.",
+        "That needs splinting before anything else. {name} first.",
+    },
+    diagnosis_infection = {
+        "{name}'s wound is turning. They are next.",
+        "That wound is infected. {name} first.",
+    },
+    diagnosis_wound = {
+        "{name} is hurt. They are first.",
+        "Wounds next. {name} first.",
+    },
+    diagnosis_dressing = {
+        "{name}'s dressing is spent. That comes first.",
+        "That bandage is done. {name} first.",
     },
     -- A broken weapon is a small, concrete loss. The line says what happened;
     -- it does not explain durability or promise a repair.
@@ -115,6 +145,42 @@ local BANKS = {
         "Sit with me a minute. Tell me what you have seen out there.",
         "This place is starting to feel like ours, do you not think?",
         "When the work is done we should eat together, all of us.",
+    },
+    base_greet = {
+        "Morning. Good to see you up.",
+        "You are back. We held the place down.",
+        "Hey. Anything need doing?",
+        "Good, you are here. It has been quiet.",
+    },
+    -- Musing is an idle voice, not a report: a resident thinking out loud while
+    -- it walks the base. One category per feeling its own moodles describe.
+    base_musing = {
+        "Should move the fuel cans before it rains.",
+        "I used to know every street in this town.",
+        "Count the days by what we fixed, not by what we lost.",
+        "Someone should check that back fence again.",
+        "One day I am finding a cabin by the water. Just quiet for a while.",
+        "I still catch myself planning what I would do on a proper day off.",
+    },
+    base_musing_hurt = {
+        "This arm is not healing as fast as I would like.",
+        "I will keep going. Slower, but I will keep going.",
+        "Should have let the others handle the heavy side.",
+    },
+    base_musing_hungry = {
+        "I keep thinking about a hot meal.",
+        "We are going to have to do better than cold cans.",
+        "Note to self: find the can opener next time.",
+    },
+    base_musing_tired = {
+        "Just need to sit for a minute. Just one.",
+        "I have been on my feet since dawn.",
+        "Sleep would be a luxury right now.",
+    },
+    base_musing_frightened = {
+        "I heard something out there. Probably nothing.",
+        "I do not like how quiet it gets after dark.",
+        "Keep the rifle close tonight.",
     },
     base_snack = {
         "I am having a bite. There is enough if you want some.",
@@ -236,11 +302,6 @@ local function enabled()
         or KnoxSettings.showSurvivorSpeech()
 end
 
-local PLACE_WORDS = {
-    "the ridge road", "empty houses", "the treeline", "a burned-out stop",
-    "the river bend", "quiet streets", "a stripped farmhouse", "the rail line",
-}
-
 local function hashText(text)
     local hash = 23
     text = tostring(text or "")
@@ -248,10 +309,6 @@ local function hashText(text)
         hash = (hash * 37 + string.byte(text, index)) % 2147483647
     end
     return hash
-end
-
-local function placeWord(id, timestamp)
-    return PLACE_WORDS[(hashText(tostring(id) .. ":" .. tostring(timestamp)) % #PLACE_WORDS) + 1]
 end
 
 --- How `viewerId` refers to `subjectId` inCampfire-style speech. Disposition
@@ -324,12 +381,17 @@ function Dialogue.recountLines(survivorId)
     if stories == nil or stories.historyFor == nil then return {} end
     local ok, history = pcall(stories.historyFor, survivorId)
     if not ok or type(history) ~= "table" or #history == 0 then return {} end
-    local lines = {}
-    for index = #history, math.max(1, #history - 2), -1 do
+    local lines, seen = {}, {}
+    -- The canonical ledger retains twelve entries. Unsupported or duplicate
+    -- recent rows must not hide the older facts that are still in that ledger.
+    for index = #history, math.max(1, #history - 11), -1 do
         local entry = history[index]
         if type(entry) == "table" then
             local line = Dialogue.recountEntry(survivorId, entry)
-            if line ~= nil then lines[#lines + 1] = line end
+            if line ~= nil and not seen[line] then
+                lines[#lines + 1] = line
+                seen[line] = true
+            end
             if #lines >= 3 then break end
         end
     end
@@ -337,19 +399,18 @@ function Dialogue.recountLines(survivorId)
 end
 
 function Dialogue.recountEntry(survivorId, entry)
+    if type(entry) ~= "table" then return nil end
     local kind = tostring(entry.kind or "")
     if kind == "heard" then
         -- Second-hand memory keeps its source. The line says who told them and
-        -- where that person's event happened; it never borrows the listener's
+        -- what that person's event was; it never borrows the listener's
         -- first-person voice for something they did not see.
         local source = forenameOf(entry.from)
         local attribution = source ~= nil and (source .. " told me") or "Someone told me"
-        local sourcePlace = placeWord(entry.from, entry.heardAtHours)
         local fact = tostring(entry.heardKind or "")
         if fact == "meet" then
             local met = forenameOf(entry.heardWith) or "someone"
-            local line = attribution .. " about crossing " .. met
-                .. " out past " .. sourcePlace .. "."
+            local line = attribution .. " about crossing " .. met .. "."
             if entry.heardOutcome == "hostile" then
                 line = line .. " It turned hostile between them."
             elseif entry.heardOutcome == "joined" then
@@ -360,29 +421,31 @@ function Dialogue.recountEntry(survivorId, entry)
             return line
         end
         if fact == "scar" then
-            return attribution .. " about coming back to a place out past "
-                .. sourcePlace .. " where weapons had been drawn."
+            if entry.heardDetail == "came back to where weapons were drawn" then
+                return attribution .. " about returning to a place where weapons had been drawn."
+            end
+            if entry.heardDetail == "came back to where blood was left" then
+                return attribution .. " about returning to a place where blood was left."
+            end
+            return attribution .. " about returning to a place they remembered."
         end
         if fact == "close_call" then
             if entry.heardOutcome == "severe" then
-                return attribution .. " about taking a bad wound out past "
-                    .. sourcePlace .. "."
+                return attribution .. " about taking a bad wound."
             end
             if entry.heardOutcome == "hurt" then
-                return attribution .. " about getting hurt out past "
-                    .. sourcePlace .. "."
+                return attribution .. " about getting hurt."
             end
-            return attribution .. " something stalked them near " .. sourcePlace .. "."
+            return nil
         end
         if fact == "cache" then
-            return attribution .. " they marked a cache out past " .. sourcePlace .. "."
+            return attribution .. " they marked a cache."
         end
         if fact == "ride" then
-            return attribution .. " they caught a ride out past " .. sourcePlace .. "."
+            return attribution .. " they caught a ride."
         end
         return nil
     end
-    local place = placeWord(survivorId, entry.t)
     local subject = nil
     if entry.with ~= nil then
         subject = Dialogue.relationNoun(survivorId, entry.with)
@@ -393,48 +456,50 @@ function Dialogue.recountEntry(survivorId, entry)
     end
     if kind == "meet" and subject ~= nil then
         if entry.outcome == "hostile" then
-            return "Crossed " .. subject .. " out past " .. place .. ". Things turned hostile between us."
+            return "Crossed " .. subject .. ". Things turned hostile between us."
         end
         if entry.outcome == "joined" then
-            return "Met " .. subject .. " out past " .. place .. ". We decided to travel together."
+            return "Met " .. subject .. ". We decided to travel together."
         end
         if entry.outcome == "declined" or entry.outcome == "parted" then
-            return "Met " .. subject .. " out past " .. place .. ". We decided to go our separate ways."
+            return "Met " .. subject .. ". We decided to go our separate ways."
         end
-        return "Ran into " .. subject .. " out past " .. place .. ". We talked and walked on."
+        return "Ran into " .. subject .. "."
     end
     if kind == "close_call" then
         if entry.outcome == "severe" then
-            return "Took a bad wound out near " .. place .. ". Patched it as best I could."
+            return "Took a bad wound."
         end
         if entry.outcome == "hurt" then
-            return "Got hurt out near " .. place .. ". It still bled when I found cover."
+            return "Got hurt."
         end
-        return "Something stalked me near " .. place .. ". Went still until it passed."
+        return nil
     end
     if kind == "rest" then
-        return "Found a quiet moment out past " .. place .. ". Caught my breath."
+        return "Stopped to rest."
     end
     if kind == "haunt" then
-        return "Walked ground that felt known, out past " .. place .. ". Steadied me."
+        return "Walked through a place I remembered."
     end
     if kind == "weather" then
-        return "Pushed through bad weather past " .. place .. ". Still moving."
+        return "Was out in bad weather."
     end
     if kind == "cache" then
-        return "Marked a spot out past " .. place .. " in my head. Might matter later."
+        return "Marked a cache."
     end
     if kind == "ride" then
         if entry.outcome == "arrived" then
-            return "Caught wheels out past " .. place .. ". Rode all the way."
+            return "Reached the end of a ride."
         end
-        return "Caught a ride out past " .. place .. ". Saved my legs."
+        return "Caught a ride."
     end
     if kind == "scar" then
-        if subject ~= nil then
-            return "Came back to where " .. subject .. " and I drew weapons. Still standing."
+        if entry.detail == "came back to where weapons were drawn" then
+            if subject ~= nil then return "Came back to where " .. subject .. " and I drew weapons." end
+            return "Came back to where weapons were drawn."
         end
-        return "Came back to where I bled out past " .. place .. ". It looks different in daylight."
+        if entry.detail == "came back to where blood was left" then return "Came back to where blood was left." end
+        return "Came back to a place I remembered."
     end
     return nil
 end
@@ -680,6 +745,114 @@ for key, events in pairs(WEATHER_BY_PERSONALITY) do
     end
 end
 
+-- First sight of a living stranger: one factual line in the existing voices.
+BANKS.recognition_living = { "Someone's there.", "There's someone alive." }
+local RECOGNITION_VOICES = {
+    frightened = { "Someone's there. Careful.", "Who is that?" },
+    guarded = { "Someone's over there.", "I see someone." },
+    loner = { "There's someone.", "Someone's out there." },
+    sociable = { "Look, someone's alive.", "Hey, someone made it." },
+    brave = { "Someone's there. Stay ready.", "I see someone alive." },
+}
+for voice, lines in pairs(RECOGNITION_VOICES) do
+    if PERSONALITY_BANKS[voice] ~= nil then PERSONALITY_BANKS[voice].recognition_living = lines end
+end
+
+-- A visual player greeting is grounded in the existing prior meeting count.
+BANKS.player_first = { "Who are you?", "Good to see someone alive." }
+BANKS.player_known = { "I remember you.", "Good to see you again." }
+local PLAYER_RECOGNITION_VOICES = {
+    frightened = { player_first={"You startled me.","You're alive. Good."}, player_known={"Oh. It's you.","Good to see you."} },
+    guarded = { player_first={"Who are you?","Keep your hands where I can see."}, player_known={"It's you. All right.","I remember you."} },
+    loner = { player_first={"You need something?","What do you want?"}, player_known={"You again.","We've met."} },
+    sociable = { player_first={"Hey. Glad you're alive.","Another person. Good to see you."}, player_known={"There you are.","Good to see you again."} },
+    brave = { player_first={"Easy. Who are you?","You all right?"}, player_known={"You're still standing. Good.","Good to see you."} },
+}
+for voice, events in pairs(PLAYER_RECOGNITION_VOICES) do
+    if PERSONALITY_BANKS[voice] ~= nil then
+        for event, lines in pairs(events) do PERSONALITY_BANKS[voice][event] = lines end
+    end
+end
+
+-- One admitted combat-start cue, grounded only in a live zombie target.
+BANKS.combat_zombie = { "Come on, then.", "Back off, you b*stard." }
+local ZOMBIE_COMBAT_VOICES = {
+    frightened = { "Stay back!", "Please, just stay back!" },
+    guarded = { "Keep coming. See what happens.", "Back off, you b*stard." },
+    loner = { "Get the f*ck back.", "Come on, then." },
+    sociable = { "Not getting me today.", "Back the h*ll off." },
+    brave = { "Come get some!", "Come on, you f*cker." },
+}
+for voice, lines in pairs(ZOMBIE_COMBAT_VOICES) do
+    if PERSONALITY_BANKS[voice] ~= nil then PERSONALITY_BANKS[voice].combat_zombie = lines end
+end
+
+-- Names come from the owner's existing observation record, not a new NPC memory.
+BANKS.npc_known = { "There's {name}.", "I can see {name}." }
+local KNOWN_RECOGNITION_VOICES = {
+    frightened = { "There's {name}.", "{name}. Over there." },
+    guarded = { "I see {name}.", "{name} is there." },
+    loner = { "There's {name}.", "{name}. That way." },
+    sociable = { "Look, there's {name}.", "I can see {name}." },
+    brave = { "I've got eyes on {name}.", "There's {name}." },
+}
+for voice, lines in pairs(KNOWN_RECOGNITION_VOICES) do
+    if PERSONALITY_BANKS[voice] ~= nil then PERSONALITY_BANKS[voice].npc_known = lines end
+end
+
+-- Anonymous undead sighting: no name, identity or aftermath is implied.
+BANKS.recognition_undead = { "One of them.", "Zombie. Right there." }
+local UNDEAD_RECOGNITION_VOICES = {
+    frightened = { "One of them. Careful.", "There's a zombie." },
+    guarded = { "Zombie. Right there.", "I see one of them." },
+    loner = { "One of them.", "Zombie. Over there." },
+    sociable = { "Look out. A zombie.", "One of them, over there." },
+    brave = { "There's a zombie.", "One of them. Stay ready." },
+}
+for voice, lines in pairs(UNDEAD_RECOGNITION_VOICES) do
+    if PERSONALITY_BANKS[voice] ~= nil then PERSONALITY_BANKS[voice].recognition_undead = lines end
+end
+
+-- Only an actually witnessed death of an owner-known person can use these.
+BANKS.known_corpse = { "That's {name}.", "There's {name}'s body." }
+do
+    local corpseVoices = {
+        frightened = { "Oh no. That's {name}.", "{name}. They're dead." },
+        guarded = { "That's {name}.", "{name}'s body." },
+        loner = { "That's {name}.", "{name}. Dead." },
+        sociable = { "Oh no. That's {name}.", "That's {name}'s body." },
+        brave = { "That's {name}.", "{name}'s body is here." },
+    }
+    for voice, lines in pairs(corpseVoices) do
+        if PERSONALITY_BANKS[voice] ~= nil then PERSONALITY_BANKS[voice].known_corpse = lines end
+    end
+end
+
+BANKS.known_death = { "{name} is dead.", "That's {name}. Dead." }
+local KNOWN_DEATH_VOICES = {
+    frightened = { "{name} is dead.", "Oh no. {name}." },
+    guarded = { "{name} is dead.", "{name} is down." },
+    loner = { "{name} is dead.", "That's {name}. Dead." },
+    sociable = { "Oh no. {name} is dead.", "That's {name}. They're dead." },
+    brave = { "{name} is down.", "{name} is dead." },
+}
+for voice, lines in pairs(KNOWN_DEATH_VOICES) do
+    if PERSONALITY_BANKS[voice] ~= nil then PERSONALITY_BANKS[voice].known_death = lines end
+end
+
+-- A confirmed, witnessed zombie death can end an encounter with one cue.
+BANKS.combat_zombie_done = { "Stay dead.", "That one's down." }
+local ZOMBIE_OUTCOME_VOICES = {
+    frightened = { "Stay down. Please.", "It's down." },
+    guarded = { "Stay dead.", "That one's down." },
+    loner = { "Stay down.", "It's down." },
+    sociable = { "It's down.", "Stay dead, you b*stard." },
+    brave = { "Stay dead!", "Back to the dirt." },
+}
+for voice, lines in pairs(ZOMBIE_OUTCOME_VOICES) do
+    if PERSONALITY_BANKS[voice] ~= nil then PERSONALITY_BANKS[voice].combat_zombie_done = lines end
+end
+
 -- Which voice a person has, from the scores their identity already carries.
 -- Fear speaks first because it is the loudest thing in a refusal, then warmth,
 -- then hardness; a survivor whose scores sit in the middle keeps their
@@ -731,7 +904,45 @@ function Dialogue.linesFor(survivorId, event)
     return lines, key
 end
 
-function Dialogue.sayLines(character, survivorId, event, lines, ticks, cooldown)
+-- Select without consuming a line. Call rememberLine only once the response has
+-- actually been accepted, so a refused attempt cannot change the next words.
+function Dialogue.chooseLine(survivorId, event, lines, ticks)
+    if type(lines) ~= "table" or #lines == 0 then return nil, false end
+    local state = states[tostring(survivorId or "survivor")]
+    local recent = state ~= nil and state.recent or nil
+    local used, last = {}, nil
+    for _, item in ipairs(recent or {}) do
+        if item.event == event then used[item.line] = true; last = item.line end
+    end
+    local start = stableIndex(survivorId, event, ticks, #lines)
+    for offset = 0, #lines - 1 do
+        local line = lines[((start + offset - 1) % #lines) + 1]
+        if not used[line] then return line, false end
+    end
+    for offset = 0, #lines - 1 do
+        local line = lines[((start + offset - 1) % #lines) + 1]
+        if line ~= last then return line, true end
+    end
+    return lines[start], true
+end
+
+function Dialogue.rememberLine(survivorId, event, line, reset)
+    if line == nil then return end
+    local id = tostring(survivorId or "survivor")
+    local state = states[id] or { nextGlobal = 0, events = {} }
+    states[id] = state
+    local recent = state.recent or {}
+    state.recent = recent
+    if reset then
+        for index = #recent, 1, -1 do
+            if recent[index].event == event then table.remove(recent, index) end
+        end
+    end
+    recent[#recent + 1] = { event = event, line = line }
+    if #recent > 32 then table.remove(recent, 1) end
+end
+
+function Dialogue.sayLines(character, survivorId, event, lines, ticks, cooldown, delivery)
     if character == nil or type(lines) ~= "table" or #lines == 0 or not enabled() then
         return false, "unavailable"
     end
@@ -742,12 +953,60 @@ function Dialogue.sayLines(character, survivorId, event, lines, ticks, cooldown)
     if now < (state.nextGlobal or 0) or now < (state.events[event] or 0) then
         return false, "cooldown"
     end
-    local line = lines[stableIndex(id, event, now, #lines)]
-    KnoxActivityFeed.speak(character, line)
+    local line, reset = Dialogue.chooseLine(id, event, lines, now)
+    if delivery ~= nil then
+        if delivery(character, line) ~= true then return false, "unavailable" end
+    elseif KnoxActivityFeed.speak(character, line) == false then
+        return false, "unavailable"
+    end
+    Dialogue.rememberLine(id, event, line, reset)
     state.nextGlobal = now + GLOBAL_COOLDOWN
     state.events[event] = now + math.max(GLOBAL_COOLDOWN,
         tonumber(cooldown) or DEFAULT_COOLDOWN)
+    local signals = rawget(_G, "KnoxOrderSignals")
+    if signals ~= nil and signals.dialogue ~= nil then pcall(signals.dialogue, character, event) end
     return true, line
+end
+
+-- Recent spoken subjects are bounded voice state, not persisted knowledge.
+function Dialogue.sayRecognition(character, survivorId, subjectId, ticks, delivery, event, name)
+    event = event or "recognition_living"
+    if event == "recognition_undead" then
+        if type(subjectId) ~= "table" and type(subjectId) ~= "userdata" then return false, "unavailable" end
+    elseif subjectId == nil or tostring(subjectId) == "" then return false, "unavailable" end
+    if event ~= "recognition_living" and event ~= "player_first" and event ~= "player_known"
+        and event ~= "npc_known" and event ~= "recognition_undead" and event ~= "known_death" and event ~= "known_corpse" then
+        return false, "unavailable"
+    end
+    local id = tostring(survivorId or "survivor")
+    local subject = event == "recognition_undead" and subjectId or event .. ":" .. tostring(subjectId)
+    local state = states[id]
+    for _, recent in ipairs(state ~= nil and state.recognitionSubjects or {}) do
+        if event == "recognition_undead" then
+            if type(recent) == "table" and recent.kind == "undead" and recent.object == subject then
+                return false, "recent"
+            end
+        elseif recent == subject then return false, "recent" end
+    end
+    local lines = Dialogue.linesFor(survivorId, event)
+    if event == "npc_known" or event == "known_death" or event == "known_corpse" then
+        if type(name) ~= "string" or name:match("^%s*$") then return false, "unavailable" end
+        local grounded = {}
+        for _, template in ipairs(lines or {}) do
+            grounded[#grounded + 1] = template:gsub("{name}", function() return name end)
+        end
+        lines = grounded
+    end
+    local spoke, line = Dialogue.sayLines(character, survivorId, event,
+        lines, ticks, GLOBAL_COOLDOWN, delivery)
+    if spoke then
+        state = states[id]
+        local recent = state.recognitionSubjects or {}
+        state.recognitionSubjects = recent
+        recent[#recent + 1] = event == "recognition_undead" and {kind="undead", object=subject} or subject
+        if #recent > 32 then table.remove(recent, 1) end
+    end
+    return spoke, line
 end
 
 function Dialogue.say(character, survivorId, event, ticks, cooldown)
@@ -776,19 +1035,41 @@ function Dialogue.sayWitness(character, witnessId, targetId, ticks, cooldown, ev
     event = event or "witnessed_mean"
     local lines = Dialogue.linesFor(witnessId, event)
     if type(lines) ~= "table" or #lines == 0 then return false, "no_lines" end
-    local now = math.max(0, tonumber(ticks) or 0)
-    local line = lines[stableIndex(tostring(witnessId), event, now, #lines)]
     local name = nil
     local persistence = rawget(_G, "KnoxPersistence")
     if persistence ~= nil and persistence.getSurvivorIdentity ~= nil and targetId ~= nil then
         local identity = persistence.getSurvivorIdentity(targetId)
-        name = type(identity) == "table" and identity.firstName or nil
+        name = type(identity) == "table" and identity.forename or nil
     end
-    line = tostring(line):gsub("{name}", name ~= nil and tostring(name) or "them")
-    return Dialogue.sayLines(character, witnessId, event, { line }, ticks, cooldown)
+    local grounded = {}
+    for _, line in ipairs(lines) do
+        grounded[#grounded + 1] = tostring(line):gsub("{name}", function()
+            return name ~= nil and tostring(name) or "them"
+        end)
+    end
+    return Dialogue.sayLines(character, witnessId, event, grounded, ticks, cooldown)
+end
+
+-- The diagnosis speaks under the same voice rules as everything else: the
+-- bank for what the body said, the speaker's own manner where it has words,
+-- and the patient's name filled in. A missing name is "them", never invented.
+function Dialogue.sayDiagnosis(character, doctorId, kind, name, ticks, cooldown)
+    if character == nil or type(kind) ~= "string" then return false, "unavailable" end
+    local event = "diagnosis_" .. kind
+    local lines = Dialogue.linesFor(doctorId, event)
+    if type(lines) ~= "table" or #lines == 0 then return false, "no_lines" end
+    local grounded = {}
+    for _, line in ipairs(lines) do
+        local text = tostring(line):gsub("{name}", function()
+            return name ~= nil and tostring(name) or "them"
+        end)
+        grounded[#grounded + 1] = text
+    end
+    return Dialogue.sayLines(character, doctorId, event, grounded, ticks, cooldown)
 end
 
 function Dialogue.lines(event)
+
     return BANKS[event]
 end
 

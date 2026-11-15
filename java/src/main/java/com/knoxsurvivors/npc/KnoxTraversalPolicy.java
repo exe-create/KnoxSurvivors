@@ -10,6 +10,7 @@ final class KnoxTraversalPolicy {
 
     enum WindowAction {
         TRY_NATIVE_OPEN,
+        CLEAR_GLASS,
         CLIMB,
         FAIL_BARRICADED,
         FAIL_UNUSABLE
@@ -38,11 +39,13 @@ final class KnoxTraversalPolicy {
         boolean smashed,
         boolean barricaded,
         boolean canClimb,
+        boolean glassRemoved,
         String interactionStage
     ) {
         if (barricaded) {
             return WindowAction.FAIL_BARRICADED;
         }
+        if (smashed && !glassRemoved) return WindowAction.CLEAR_GLASS;
         if (open || smashed) {
             return canClimb ? WindowAction.CLIMB : WindowAction.FAIL_UNUSABLE;
         }

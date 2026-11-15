@@ -10,6 +10,15 @@ public final class KnoxNpcRegistry {
 
     private final Map<String, KnoxNpcRuntime> activeNpcs = new LinkedHashMap<>();
 
+    /** Membership of the currently active body, by identity rather than persistent ID. */
+    public synchronized boolean containsActiveBody(Object body) {
+        if (body == null) return false;
+        for (KnoxNpcRuntime runtime : activeNpcs.values()) {
+            if (runtime.npc().getBody() == body) return true;
+        }
+        return false;
+    }
+
     public synchronized String spawnOne(Object square) {
         return spawn(TEST_SURVIVOR_ID, square);
     }
@@ -89,6 +98,13 @@ public final class KnoxNpcRegistry {
     public synchronized String tick(String id) {
         KnoxNpcRuntime runtime = activeNpcs.get(id);
         return runtime == null ? "IDLE" : runtime.tickMovement();
+    }
+
+    /** Exact native window selected by the existing route, never a nearby guess. */
+    public synchronized Object windowForGlassRemoval(String id) {
+        KnoxNpcRuntime runtime = activeNpcs.get(id);
+        return runtime != null && "GLASS_REQUIRED".equals(runtime.npc().getTraversalInteractionStage())
+            ? runtime.npc().getTraversalInteractionTarget() : null;
     }
 
     /** Observe a native receipt without running or replacing a movement request. */
@@ -234,6 +250,7 @@ public final class KnoxNpcRegistry {
                 scheduleNativeReanimation(corpse);
                 runtime.corpseRetirement().markReanimationScheduled();
             }
+            tagCorpseSurvivorId(corpse, id);
             return finishCorpseRetirement(id, runtime, false);
         } catch (Throwable throwable) {
             Throwable cause = rootCause(throwable);
@@ -245,6 +262,24 @@ public final class KnoxNpcRegistry {
                     + ": " + cause.getMessage()
             );
             return state + " " + cause.getClass().getName() + ": " + cause.getMessage();
+        }
+    }
+
+    static boolean tagCorpseSurvivorId(Object corpse, String id) {
+        if (corpse == null || id == null || id.trim().isEmpty()) return false;
+        try {
+            Object data = corpse.getClass().getMethod("getModData").invoke(corpse);
+            data.getClass().getMethod("rawset", Object.class, Object.class)
+                .invoke(data, "KnoxSurvivorsCorpseSurvivorId", id);
+            boolean matches = id.equals(data.getClass().getMethod("rawget", Object.class)
+                .invoke(data, "KnoxSurvivorsCorpseSurvivorId"));
+            if (!matches) KnoxAgent.writeLog("ERROR NPC corpse identity tag readback mismatch");
+            return matches;
+        } catch (Throwable error) {
+            Throwable cause = rootCause(error);
+            KnoxAgent.writeLog("ERROR NPC corpse identity tag " + cause.getClass().getName()
+                + ": " + cause.getMessage());
+            return false;
         }
     }
 

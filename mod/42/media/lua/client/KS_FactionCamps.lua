@@ -768,11 +768,10 @@ function Camps.reconcile(controllers, activeIds, worldAgeHours)
                         playerDisplayName(), currentHourOfDay())
                 end
                 if kind ~= nil and speechKey ~= nil then
-                    -- They look at you before they speak. A person who talks
-                    -- to your back reads as a bug, not a neighbour.
-                    pcall(function()
-                        character:faceLocationF(player:getX(), player:getY())
-                    end)
+                    -- A greeting must not steal facing from a running route,
+                    -- attack, traversal or timed action.
+                    local owner = controllers[chosen.id]
+                    if owner and owner.faceForAmbient then owner:faceForAmbient(player) end
                     local feed = rawget(_G, "KnoxActivityFeed")
                     local said = false
                     if feed ~= nil and feed.speak ~= nil then

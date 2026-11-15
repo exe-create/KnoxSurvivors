@@ -33,6 +33,11 @@ local scout = assert(p.createAwayTeam("player", "codec-owner", { "notice-a" },
 assert(#Executor.takePlayerNotices("codec-owner", 10.5, 3) == 0,
     "an outbound mission is not reported as finished")
 p.advanceAwayTeams(12.5)
+assert(p.getAwayTeam(scout.id).state=="awaiting_collection","elapsed travel is not a scout result")
+assert(p.beginAwayTeamCollection(scout.id,12.5))
+assert(p.recordAwayTeamCollection(scout.id,"notice-a",{},12.5,true))
+assert(p.beginAwayTeamReturn(scout.id,12.5))
+assert(p.completeAwayTeamMember(scout.id,"notice-a",true,"returned",12.5))
 local scoutProgress = p.getAwayTeam(scout.id)
 assert(scoutProgress.state == "complete" and type(scoutProgress.result) == "table",
     "the scout reaches its persisted completed state")

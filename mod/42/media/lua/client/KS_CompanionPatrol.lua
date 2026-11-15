@@ -128,14 +128,14 @@ end
 -- and everybody else is a stranger. This is a word choice, not a relationship
 -- change or a second faction read.
 function Patrol.contactWord(affiliation, factionName, knownName)
-    if type(affiliation) ~= "table" then return "a stranger" end
-    if affiliation.kind == "player" then return nil end
-    if type(knownName) == "string" and knownName ~= "" then return knownName end
+    if type(affiliation) ~= "table" then return "a stranger", "stranger" end
+    if affiliation.kind == "player" then return nil, "player" end
+    if type(knownName) == "string" and knownName ~= "" then return knownName, "known" end
     if affiliation.kind == "faction" and type(factionName) == "string"
         and factionName ~= "" then
-        return "a member of " .. factionName
+        return "a member of " .. factionName, "faction"
     end
-    return "a stranger"
+    return "a stranger", affiliation.kind == "faction" and "faction" or "stranger"
 end
 
 function Patrol.feedLine(line)

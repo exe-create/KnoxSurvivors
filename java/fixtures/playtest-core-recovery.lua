@@ -120,18 +120,19 @@ local entryBody = { getCurrentSquare = function() return origin end,
     getPrimaryHandItem = function() return { IsWeapon = function() return true end,
         isRanged = function() return false end, isBroken = function() return false end } end }
 local finder = setmetatable({ character = entryBody }, C)
-assert(C.findForcedEntryDoor(finder, nil) == lockedDoor,
-    "forced entry resolves the adjacent locked door instead of a cleared traversal target")
+assert(C.findForcedEntryDoor(finder, nil) == nil,
+    "an incidental adjacent door is not proof of the target edge")
 local rivalDoor = doorObject(true, false, false)
 assert(C.findForcedEntryDoor(finder, rivalDoor) == rivalDoor,
     "an explicitly known door wins over the neighbourhood scan")
-assert(C.findForcedEntryDoor(finder, openDoor) == lockedDoor,
-    "an open preferred object is not a forced-entry target")
+assert(C.findForcedEntryDoor(finder, openDoor) == nil,
+    "an open preferred object cannot substitute an incidental door")
 
 local targetSquare = entrySquare(11, 10, {})
 local breaks, blockedReason = 0, nil
 local breaker = setmetatable({
     id = "door-breaker", character = entryBody, activeDecision = "base_task_move",
+    entryDetour = {object=lockedDoor},
     blockedAreas = {},
     pendingSupply = {
         container = { getSourceGrid = function() return targetSquare end },

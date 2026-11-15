@@ -85,7 +85,10 @@ if ISInventoryTransferAction ~= nil and ISInventoryTransferAction.transferItem ~
             local relation, status = KnoxPersistence.recordPlayerFactionTheft(
                 context.playerId, context.baseId, worldAge()
             )
-            if relation ~= nil and status == "hostile" then
+            -- The owner decides the stage; the wrapper only says which one it was.
+            if status == "warning" then
+                KnoxActivityFeed.event("You took supplies from an NPC faction base. They have warned you.")
+            elseif relation ~= nil and status == "hostile" then
                 KnoxActivityFeed.event("You took supplies from an NPC faction base. They are now hostile.")
             end
         end

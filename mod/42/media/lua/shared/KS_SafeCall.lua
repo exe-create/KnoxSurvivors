@@ -17,7 +17,7 @@
 --
 -- DO NOT use this for cases where nil dispatch is already impossible
 -- (literal string methods, module-level functions). Keep `safe(fn, fb)` for
--- those — `KS_SafeCall.invoke` is specifically for engine-returned objects.
+-- those - `KS_SafeCall.invoke` is specifically for engine-returned objects.
 local KS_SafeCall = {}
 
 function KS_SafeCall.invoke(obj, methodName, ...)

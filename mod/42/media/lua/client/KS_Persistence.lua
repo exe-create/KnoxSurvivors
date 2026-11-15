@@ -189,11 +189,17 @@ local LIFE_INTENT_KINDS = {
     find_medical = true,
     find_weapon = true,
     find_tools = true,
+    find_wood = true,
+    find_materials = true,
+    find_clothing = true,
+    find_ammo = true,
+    find_fuel = true,
     base_supply_deposit = true,
     scavenge = true,
     investigate_building = true,
     travel_area = true,
     night_shelter = true,
+    seek_group = true,
 }
 
 -- Explicit base supply runs use the resident's existing duty record.  This is
@@ -227,11 +233,35 @@ local FACTION_NAME_STYLES = {
     function(name) return name .. "'s Outfit" end,
 }
 
+-- The stored region is free text from the origin record. Take the settlement
+-- part before a comma ("Muldraugh, KY") and keep only a plain place word; a
+-- road or a coordinate is not a name a survivor would use.
+local function placeWord(value)
+    if type(value) ~= "string" then return nil end
+    local first = value:match("^%s*([^,]+)") or value
+    first = first:gsub("%s+$", "")
+    if #first < 3 or #first > 24 or first == "Unknown"
+        or first:find("[^%a%s%-']") ~= nil then return nil end
+    return first
+end
+
 local function stableFactionName(data, factionId, faction)
     if faction ~= nil and type(faction.name) == "string" and faction.name ~= "" then
         return faction.name
     end
     if faction ~= nil and faction.kind == "player" then return "Your Group" end
+    -- A household is named once, when its group forms, so promotion cannot lose
+    -- the family identity just because the leader has not loaded yet.
+    local householdName = faction ~= nil and type(faction.householdName) == "string"
+        and faction.householdName or nil
+    if householdName ~= nil then
+        householdName = householdName:gsub("^%s+", ""):gsub("%s+$", "")
+        -- A name the player typed is kept verbatim. The old five-character floor
+        -- rewrote short families ("Voss") into a generated sentence, which is the
+        -- group being renamed behind the player's back. Two characters is the same
+        -- bound the creator accepts, so anything it can save it can keep.
+        if #householdName >= 2 and #householdName <= 64 then return householdName end
+    end
     local identity = faction ~= nil and faction.leaderId ~= nil
         and data.survivors[faction.leaderId] ~= nil
         and data.survivors[faction.leaderId].identity or nil
@@ -241,7 +271,52 @@ local function stableFactionName(data, factionId, faction)
         law_enforcement = "Police Survivors", fire_service = "Fire and Rescue",
         medical = "Medical Volunteers", military = "Military Survivors",
     }
-    local backgroundName = faction ~= nil and backgroundNames[faction.background] or nil
+    -- Place-based identity (2026-11-04): a station, a facility and a family home
+    -- are named by where they are, not by whichever surname happened to lead
+    -- them. Only the origin already stored on the leader is read, a name already
+    -- written still wins above this whole function, and a group with no usable
+    -- place keeps the older surname style.
+    local placeOrigin = faction ~= nil and faction.leaderId ~= nil
+        and data.survivors[faction.leaderId] ~= nil
+        and data.survivors[faction.leaderId].origin or nil
+    local place = placeOrigin ~= nil and type(placeOrigin.region) == "string"
+        and placeOrigin.region or nil
+    -- The stored region is free text from the origin record. Only a plain place
+    -- word is safe to put in a faction name.
+
+    place = placeWord(place)
+    if place ~= nil then
+        -- Promotion names the faction before a caller can stamp a household
+        -- background, so identity is also read from the leader's own origin.
+        local placeIdentity = faction.background
+        if placeIdentity == nil and placeOrigin ~= nil then
+            if placeOrigin.context == "military" then placeIdentity = "military"
+            elseif placeOrigin.context == "law_enforcement" then placeIdentity = "law_enforcement"
+            elseif placeOrigin.household == true
+                or (KnoxSurvivorOrigins ~= nil
+                    and KnoxSurvivorOrigins.isHouseholdRooms ~= nil
+                    and KnoxSurvivorOrigins.isHouseholdRooms(placeOrigin.roomNames)) then
+                placeIdentity = "household"
+            end
+        end
+        if placeIdentity == "law_enforcement" or placeIdentity == "police" then
+            return place .. " Police"
+        end
+        if placeIdentity == "military" then return place .. " Military" end
+        if placeIdentity == "household" and leaderName ~= "" then
+            return "The " .. leaderName .. " Household"
+        end
+    end
+    local background = faction ~= nil and faction.background or nil
+    if background == "police" then background = "law_enforcement" end
+    -- No usable place is still a county institution, not a leader's private
+    -- militia. This fallback is only reached when the origin has no place word.
+    if background == "law_enforcement" then return "County Police" end
+    if background == "military" then return "County Military" end
+    if background == "household" and leaderName ~= "" then
+        return "The " .. leaderName .. " Household"
+    end
+    local backgroundName = background ~= nil and backgroundNames[background] or nil
     if backgroundName ~= nil then
         return leaderName ~= "" and leaderName .. "'s " .. backgroundName
             or backgroundName .. " " .. tostring((tostring(factionId):match("(%d+)$")) or "")
@@ -1385,6 +1460,16 @@ local function creatorText(value, maximum)
     return text
 end
 
+local function creatorId(value)
+    if type(value) ~= "string" or #value == 0 or #value > 32
+        or not string.match(value, "^[%w_]+$") then return nil end
+    return value
+end
+
+local CREATOR_PROFILES = { custom=true, household=true, police=true, military=true, fire_service=true,
+    looters=true, robbers=true, doctors=true, cannibals=true, solo=true }
+local CREATOR_ATTITUDES = { friendly=true, neutral=true, hostile=true, random=true, dynamic=true }
+
 function KnoxPersistence.setSurvivorCreatorRecord(id, record)
     if type(id) ~= "string" or id == "" or type(record) ~= "table" then
         return false, "invalid_record"
@@ -1392,6 +1477,12 @@ function KnoxPersistence.setSurvivorCreatorRecord(id, record)
     local survivor = ensureSurvivorState(id)
     local name = creatorText(record.name, 24)
     if name == nil then return false, "invalid_name" end
+    -- A chosen name is durable identity, including before a body materializes.
+    -- Keep personality/age fields; only the explicitly authored name changes.
+    local forename, surname = name:match("^(.-)%s+([^%s]+)$")
+    survivor.identity = survivor.identity or {}
+    survivor.identity.forename = forename or name
+    survivor.identity.surname = surname or ""
     survivor.creator = {
         name = name,
         look = creatorText(record.look, 24),
@@ -1405,11 +1496,24 @@ function KnoxPersistence.setSurvivorCreatorRecord(id, record)
         hair = creatorText(record.hair, 32),
         beard = creatorText(record.beard, 32),
         hairColour = creatorText(record.hairColour, 24),
+        skin = (tonumber(record.skin) ~= nil and tonumber(record.skin) >= 0
+            and tonumber(record.skin) <= 4 and tonumber(record.skin) == math.floor(tonumber(record.skin)))
+            and tostring(record.skin) or nil,
         female = record.female == true and "1" or nil,
-        skills = creatorText(record.skills, 200),
+        profession = creatorText(record.profession, 80),
+        traits = type(record.traits) == "string" and #record.traits <= 4096
+            and not record.traits:find("[|\r\n]") and record.traits or nil,
+        skills = creatorText(record.skills, 4096),
         -- Per-slot clothing, encoded by the creator model so this store never
         -- learns the catalogue.
-        slots = creatorText(record.slots, 200),
+        slots = creatorText(record.slots, 4096),
+        profile = CREATOR_PROFILES[record.profile] and record.profile or nil,
+        attitude = CREATOR_ATTITUDES[record.attitude] and record.attitude or nil,
+        spawnContext = creatorId(record.spawnContext),
+        vehiclePolicy = creatorId(record.vehiclePolicy),
+        settlementPolicy = creatorId(record.settlementPolicy),
+        cargo = creatorText(record.cargo, 4096),
+        bagCargo = creatorText(record.bagCargo, 4096),
     }
     return true, "set"
 end
@@ -1421,11 +1525,97 @@ function KnoxPersistence.getSurvivorCreatorRecord(id)
     if type(record) ~= "table" then return nil end
     local view = {}
     for _, key in ipairs({ "name", "look", "kit", "weapon", "pack", "faction",
-        "groupName", "hair", "beard", "hairColour", "female", "skills", "slots" }) do
+        "groupName", "hair", "beard", "hairColour", "skin", "female", "profession", "traits", "skills", "slots",
+        "profile", "attitude", "spawnContext", "vehiclePolicy", "settlementPolicy", "cargo", "bagCargo" }) do
         view[key] = record[key]
     end
+    view.skin = tonumber(record.skin)
     view.female = record.female == "1"
     return view
+end
+
+-- Names are durable identity, not presentation. The county must have a name
+-- for a household before it forms a group, even when nobody has loaded yet.
+-- The game's own SurvivorFactory pools are used when present; the small local
+-- fallback keeps an offline or early-load pass from creating "Survivor" rows.
+local POPULATION_FORENAMES = {
+    "Alex", "Avery", "Blake", "Cameron", "Casey", "Dana", "Devin", "Elliot",
+    "Emerson", "Finley", "Harper", "Hayden", "Jamie", "Jordan", "Kai", "Kendall",
+    "Morgan", "Parker", "Quinn", "Reese", "Riley", "Robin", "Rowan", "Sage",
+    "Skyler", "Taylor",
+}
+local POPULATION_SURNAMES = {
+    "Adams", "Bennett", "Carter", "Dawson", "Ellis", "Foster", "Grant", "Hayes",
+    "Ingram", "Jensen", "Keller", "Lawson", "Mercer", "Nolan", "Osborne", "Parker",
+    "Reed", "Sutton", "Turner", "Vaughn", "Walker", "Walsh", "Ward", "Webb", "Young",
+}
+
+local function fallbackPopulationName(id, salt)
+    local index = (stableTrait(id, salt) % #POPULATION_FORENAMES) + 1
+    local surnameIndex = (stableTrait(id, salt + 1) % #POPULATION_SURNAMES) + 1
+    return POPULATION_FORENAMES[index], POPULATION_SURNAMES[surnameIndex]
+end
+
+local function generatedPopulationName(id, householdSurname)
+    local forename, surname = nil, nil
+    local factory = rawget(_G, "SurvivorFactory")
+    if factory ~= nil and type(factory.getRandomForename) == "function" then
+        local female = stableTrait(id, 7) % 2 == 0
+        local ok, value = pcall(factory.getRandomForename, female)
+        if ok and type(value) == "string" and value ~= "" then forename = value end
+    end
+    if householdSurname == nil and factory ~= nil
+        and type(factory.getRandomSurname) == "function" then
+        local ok, value = pcall(factory.getRandomSurname)
+        if ok and type(value) == "string" and value ~= "" then surname = value end
+    end
+    local fallbackForename, fallbackSurname = fallbackPopulationName(id, 11)
+    if forename == nil then forename = fallbackForename end
+    if surname == nil then surname = fallbackSurname end
+    if householdSurname ~= nil and householdSurname ~= "" then surname = householdSurname end
+    return forename, surname
+end
+
+local function populationNameKey(name)
+    if type(name) ~= "string" then return nil end
+    name = name:lower():gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    return name ~= "" and name or nil
+end
+
+-- Search a finite set, including familiar two-part given names for large
+-- households. No durable index is needed: the allocation scan sees all saved
+-- identities, including dead people and creator-authored names.
+local function uniquePopulationName(id, householdSurname, household, used)
+    for attempt = 1, 8 do
+        local first, last = generatedPopulationName(id, householdSurname)
+        if household and householdSurname == nil then householdSurname = last end
+        if not used[populationNameKey(first .. " " .. last)] then return first, last end
+    end
+    local surnameCount = householdSurname and 1 or #POPULATION_SURNAMES
+    local firstOffset = stableTrait(id, 17) % #POPULATION_FORENAMES
+    local lastOffset = stableTrait(id, 19) % #POPULATION_SURNAMES
+    for surnameStep = 0, surnameCount - 1 do
+        local candidateLast = householdSurname or POPULATION_SURNAMES[(lastOffset + surnameStep) % #POPULATION_SURNAMES + 1]
+        for i = 0, #POPULATION_FORENAMES - 1 do
+            local candidateFirst = POPULATION_FORENAMES[(firstOffset + i) % #POPULATION_FORENAMES + 1]
+            if not used[populationNameKey(candidateFirst .. " " .. candidateLast)] then
+                return candidateFirst, candidateLast
+            end
+        end
+        for i = 0, #POPULATION_FORENAMES - 1 do
+            local part = POPULATION_FORENAMES[(firstOffset + i) % #POPULATION_FORENAMES + 1]
+            for j = 0, #POPULATION_FORENAMES - 1 do
+                local second = POPULATION_FORENAMES[(firstOffset + j) % #POPULATION_FORENAMES + 1]
+                if part ~= second then
+                    local candidateFirst = part .. " " .. second
+                    if not used[populationNameKey(candidateFirst .. " " .. candidateLast)] then
+                        return candidateFirst, candidateLast
+                    end
+                end
+            end
+        end
+    end
+    return nil, nil
 end
 
 function KnoxPersistence.allocateWorldSurvivor(origin, worldAgeHours)
@@ -1437,8 +1627,31 @@ function KnoxPersistence.allocateWorldSurvivor(origin, worldAgeHours)
     local y = math.floor(tonumber(origin.y))
     local z = math.floor(tonumber(origin.z) or 0)
     local metadata = sanitizeOriginMetadata(origin, false)
+    -- Room names are not persisted on a survivor origin, so the household
+    -- evidence is reduced once, from the real building, to one boolean.
+    local household = origin.household == true or origin.residential == true
+    if not household and KnoxSurvivorOrigins ~= nil
+        and KnoxSurvivorOrigins.isHouseholdRooms ~= nil then
+        household = KnoxSurvivorOrigins.isHouseholdRooms(origin.roomNames) == true
+    end
     local originKey = tostring(x) .. "," .. tostring(y) .. "," .. tostring(z)
+    local usedNames, householdSurname = {}, nil
     for _, existing in pairs(data.survivors) do
+        if type(existing) == "table" then
+            local identity = existing.identity
+            if type(identity) == "table" then
+                local name = populationNameKey(tostring(identity.forename or "") .. " " .. tostring(identity.surname or ""))
+                if name then usedNames[name] = true end
+                if household and householdSurname == nil and existing.populationManaged == true
+                    and type(existing.origin) == "table" and metadata.buildingId ~= nil
+                    and metadata.buildingId ~= "" and existing.origin.buildingId == metadata.buildingId
+                    and type(identity.surname) == "string" and identity.surname ~= "" then
+                    householdSurname = identity.surname
+                end
+            end
+            local authored = type(existing.creator) == "table" and populationNameKey(existing.creator.name) or nil
+            if authored then usedNames[authored] = true end
+        end
         local existingOrigin = type(existing) == "table" and existing.origin or nil
         if existing ~= nil and existing.populationManaged == true
             and type(existingOrigin) == "table" then
@@ -1446,7 +1659,6 @@ function KnoxPersistence.allocateWorldSurvivor(origin, worldAgeHours)
                 or (tostring(math.floor(tonumber(existingOrigin.x) or 0))
                     .. "," .. tostring(math.floor(tonumber(existingOrigin.y) or 0))
                     .. "," .. tostring(math.floor(tonumber(existingOrigin.z) or 0)))
-            existingOrigin.key = existingKey
             if existingKey == originKey then
                 return nil, "origin_already_used"
             end
@@ -1458,6 +1670,9 @@ function KnoxPersistence.allocateWorldSurvivor(origin, worldAgeHours)
         value = value + 1
         id = "ks-world-" .. tostring(value)
     end
+    -- Pick the name before allocating the ID or inserting the survivor.
+    local forename, generatedSurname = uniquePopulationName(id, householdSurname, household, usedNames)
+    if forename == nil then return nil, "name_pool_exhausted" end
     data.nextWorldSurvivorId = value + 1
     local survivor = ensureSurvivorState(id)
     survivor.populationManaged = true
@@ -1473,6 +1688,7 @@ function KnoxPersistence.allocateWorldSurvivor(origin, worldAgeHours)
         context = metadata.context,
         professionCandidates = metadata.professionCandidates,
         buildingId = metadata.buildingId,
+        household = household or nil,
     }
     survivor.createdAtHours = tonumber(worldAgeHours) or 0
     survivor.unloadedSurvival = {
@@ -1482,6 +1698,11 @@ function KnoxPersistence.allocateWorldSurvivor(origin, worldAgeHours)
         currentTravelKey = originKey,
         departAtHours = survivor.createdAtHours + 1 + value % 4,
     }
+    -- The person exists before the body does. Name them now so an opening
+    -- household, a nameplate and a faction record all refer to a person rather
+    -- than an id or the word "Survivor".
+    KnoxPersistence.ensureSurvivorIdentity(id, forename, generatedSurname,
+        survivor.createdAtHours, nil)
     return id, copySerializable(survivor.origin, 0)
 end
 
@@ -1765,9 +1986,9 @@ function KnoxPersistence.succeedDeadLeader(record, deadId, isAlive)
     return successor, "succeeded"
 end
 
--- Called from the death path after the roster edit, when the dead member is
--- already out of every memberIds list. The dead leader's own orders go first:
--- they were issued by someone who is no longer there.
+-- Called after recording death but before roster normalization can replace the
+-- old leader. The alive predicate excludes the deceased while real tenure still
+-- selects the successor. Retire the dead leader's directives at that boundary.
 function KnoxPersistence.promoteSuccessorForSurvivor(id, worldAgeHours)
     if type(id) ~= "string" then return {} end
     local data = root()
@@ -1814,7 +2035,7 @@ function KnoxPersistence.markSurvivorDead(id, worldAgeHours, reason, evidence)
     survivor.deathEvidence = deathEvidenceFor(survivor, worldAgeHours, reason, evidence)
     survivor.alive = false
     local assignedBed = survivor.policies ~= nil and survivor.policies.assignedBed or nil
-    if type(assignedBed) == "table" and assignedBed.autoFactionId ~= nil then
+    if type(assignedBed) == "table" and (assignedBed.autoFactionId ~= nil or assignedBed.autoGroupId ~= nil) then
         survivor.policies.assignedBed = nil
     end
     -- Death wins over a same-tick event withdrawal. The corpse lifecycle must
@@ -1823,13 +2044,13 @@ function KnoxPersistence.markSurvivorDead(id, worldAgeHours, reason, evidence)
     survivor.departure = nil
     survivor.diedAtHours = tonumber(worldAgeHours) or 0
     survivor.deathReason = tostring(reason or "died")
-    if KnoxPersistence.removeSurvivorFromSocialDomains ~= nil then
-        KnoxPersistence.removeSurvivorFromSocialDomains(id, "died", worldAgeHours)
-    end
-    -- A group whose leader just died keeps leading itself. This runs after the
-    -- roster edit, so the successor is chosen only from the people who remain.
+    -- Elect before social cleanup: normalization otherwise replaces a missing
+    -- leader with the first roster ID and hides the death from succession.
     if KnoxPersistence.promoteSuccessorForSurvivor ~= nil then
         KnoxPersistence.promoteSuccessorForSurvivor(id, worldAgeHours)
+    end
+    if KnoxPersistence.removeSurvivorFromSocialDomains ~= nil then
+        KnoxPersistence.removeSurvivorFromSocialDomains(id, "died", worldAgeHours)
     end
     -- A death that happened somewhere real leaves a physical trace: the
     -- materializer turns it into blood when a player walks back into range.
@@ -2054,9 +2275,7 @@ function KnoxPersistence.setSurvivorLifeIntent(id, intent, worldAgeHours)
     end
     local autonomousIntent = survivor.duty.mode == "autonomous"
     local baseIntent = survivor.duty.mode == "base"
-        and (intent.kind == "find_food" or intent.kind == "find_water"
-            or intent.kind == "find_medical" or intent.kind == "find_weapon"
-            or intent.kind == "find_tools" or intent.kind == "base_supply_deposit")
+        and (BASE_SUPPLY_ORDER_KINDS[intent.kind] == true or intent.kind == "base_supply_deposit")
     if not autonomousIntent and not baseIntent then return false end
     survivor.lifeIntent = copySerializable(intent)
     survivor.lifeIntent.updatedAtHours = tonumber(worldAgeHours) or 0
@@ -2242,13 +2461,35 @@ function KnoxPersistence.getAwayTeamProgress(id, worldAgeHours)
     team.collectionProgress = team.memberCount > 0
         and math.max(0, math.min(1, collectingMembers / team.memberCount)) or 0
     team.statusLabel = team.state == "outbound" and "En route"
-        or team.state == "awaiting_collection" and "At destination"
+        or team.state == "awaiting_collection" and "Waiting for area to load"
         or team.state == "collecting" and "Collecting supplies"
         or team.state == "returning" and "Returning"
         or team.state == "complete" and "Returned"
         or team.state == "blocked" and "Unable to complete"
         or tostring(team.state or "Unknown")
+    if team.state=="collecting" then
+        local waiting,fallback=0,0
+        for _,search in pairs(team.searchProgress or {}) do
+            if search.status=="waiting_for_world" then waiting=waiting+1 end
+            if search.status=="fallback" then fallback=fallback+1 end
+        end
+        if waiting>=team.memberCount and team.memberCount>0 then
+            team.statusLabel="Waiting for area to load"
+        elseif fallback>0 then team.statusLabel="Searching for useful supplies" end
+    end
     return team
+end
+
+function KnoxPersistence.recordAwaySearch(teamId, survivorId, step, status, hours)
+    local team=root().awayTeams[tostring(teamId)]
+    if team==nil or (team.state~="collecting" and team.state~="awaiting_collection") then return false end
+    local member=false
+    for _,id in ipairs(team.memberIds or {}) do if id==survivorId then member=true break end end
+    if not member then return false end
+    team.searchProgress=type(team.searchProgress)=="table" and team.searchProgress or {}
+    team.searchProgress[survivorId]={step=math.max(0,math.floor(tonumber(step) or 0)),
+        status=tostring(status),atHours=tonumber(hours) or 0}
+    return true
 end
 
 function KnoxPersistence.getAwayTeamForSurvivor(survivorId)
@@ -2273,7 +2514,7 @@ end
 -- loaded bodies; this data operation deliberately does not fabricate a world result or
 -- mutate their inventories.
 local function validateAwayTeamInput(ownerKind, ownerId, memberIds, missionType, destination)
-    if (ownerKind ~= "player" and ownerKind ~= "faction")
+    if (ownerKind ~= "player" and ownerKind ~= "faction" and ownerKind ~= "group")
         or type(ownerId) ~= "string" or ownerId == ""
         or not AWAY_MISSION_TYPES[missionType]
         or type(destination) ~= "table"
@@ -2393,6 +2634,7 @@ function KnoxPersistence.createAwayTeam(
             label = tostring(destination.label or "Unknown destination"),
             -- Optional: an area order keeps the ground it was sent to search.
             radius = tonumber(destination.radius),
+            fillPacks = destination.fillPacks == true,
         },
         -- A dispatching team has durable roster ownership but is not a mission
         -- until every native body removal has been acknowledged. This lets the
@@ -2760,12 +3002,19 @@ function KnoxPersistence.awayTeamCollectionReady(teamId)
     local byMember = type(team.collection) == "table"
         and type(team.collection.byMember) == "table"
         and team.collection.byMember or {}
+    local living=0
     for _, id in ipairs(team.memberIds or {}) do
-        if not validAwayMember(team, id) or type(byMember[id]) ~= "table" or byMember[id].collected ~= true then
+        local survivor=root().survivors[id]
+        if survivor ~= nil and survivor.alive ~= false then
+            living=living+1
+            if not validAwayMember(team,id) or type(byMember[id])~="table" or byMember[id].collected~=true then
+                return false
+            end
+        elseif survivor == nil then
             return false
         end
     end
-    return #(team.memberIds or {}) > 0
+    return living>0
 end
 
 function KnoxPersistence.beginAwayTeamCollection(teamId, worldAgeHours)
@@ -2776,6 +3025,46 @@ function KnoxPersistence.beginAwayTeamCollection(teamId, worldAgeHours)
     team.state = "collecting"
     team.collectionStartedAtHours = tonumber(worldAgeHours) or 0
     return copySerializable(team), "collecting"
+end
+
+-- A death is written by the canonical survivor owner. The mission only observes
+-- that fact; it must neither wait for a dead walker nor rewrite an earlier return.
+local function recordAwayTeamCasualties(team, hours)
+    local changed=0
+    team.memberResults=type(team.memberResults)=="table" and team.memberResults or {}
+    for _,id in ipairs(team.memberIds or {}) do
+        local survivor=root().survivors[id]
+        if survivor ~= nil and survivor.alive == false and team.memberResults[id] == nil then
+            team.memberResults[id]={success=false,reason="died_on_mission",
+                completedAtHours=tonumber(hours) or 0}
+            changed=changed+1
+        end
+    end
+    return changed
+end
+
+local function finishAwayTeamReturn(team, hours)
+    local results=team.memberResults or {}
+    local returned,allDead=0,true
+    for _,id in ipairs(team.memberIds or {}) do
+        local result=results[id]
+        if result==nil then return false end
+        if result.success==true then returned=returned+1 end
+        if result.reason~="died_on_mission" then allDead=false end
+    end
+    local lost=returned==0 and allDead
+    team.state=lost and "blocked" or "complete"
+    if lost then team.blockedAtHours=tonumber(hours) or 0
+    else team.completedAtHours=tonumber(hours) or 0 end
+    team.result={
+        kind=lost and "mission_lost" or "resource_run",
+        reason=lost and "crew_lost" or nil,
+        destination=copySerializable(team.destination),
+        resources=copySerializable(team.collection ~= nil and team.collection.resources or {}),
+        members=copySerializable(results),
+    }
+    restoreAwayTeamDuties(team,hours)
+    return true
 end
 
 -- The live executor calls this after it has finished searching the destination
@@ -2794,6 +3083,7 @@ function KnoxPersistence.beginAwayTeamReturn(teamId, worldAgeHours)
     if not KnoxPersistence.awayTeamCollectionReady(teamId) then
         return nil, "members_pending_collection"
     end
+    recordAwayTeamCasualties(team,worldAgeHours)
     team.state = "returning"
     team.returnStartedAtHours = tonumber(worldAgeHours) or 0
     return copySerializable(team), "returning"
@@ -2812,6 +3102,7 @@ function KnoxPersistence.completeAwayTeamMember(teamId, survivorId, success, rea
         or team.state ~= "returning" then
         return nil, "invalid_completion"
     end
+    recordAwayTeamCasualties(team,worldAgeHours)
     team.memberResults = type(team.memberResults) == "table" and team.memberResults or {}
     if team.memberResults[survivorId] ~= nil then
         return copySerializable(team), "member_recorded"
@@ -2824,31 +3115,12 @@ function KnoxPersistence.completeAwayTeamMember(teamId, survivorId, success, rea
     -- The member is home now, so release it immediately even when the rest of
     -- the team is still finishing its own return.
     restoreAwayTeamMemberDuty(team, survivorId, worldAgeHours)
-    local complete = true
-    for _, id in ipairs(team.memberIds or {}) do
-        if team.memberResults[id] == nil then complete = false; break end
-    end
-    if not complete then
-        return copySerializable(team), "member_recorded"
-    end
-    team.state = "complete"
-    team.completedAtHours = tonumber(worldAgeHours) or 0
-    team.result = {
-        kind = "resource_run",
-        destination = copySerializable(team.destination),
-        resources = copySerializable(team.collection ~= nil and team.collection.resources or {}),
-        members = copySerializable(team.memberResults),
-    }
-    restoreAwayTeamDuties(team, worldAgeHours)
-    return copySerializable(team), "complete"
+    local complete=finishAwayTeamReturn(team,worldAgeHours)
+    return copySerializable(team), complete and "complete" or "member_recorded"
 end
 
--- A reconnaissance the player is actually watching stays real: the team waits
--- for its live member to walk to and search the place. If nobody stayed to
--- watch, this grace resolves it from the ledger instead of stranding the trip
--- until the resource-collection timeout. Two game hours is far longer than a
--- nearby sweep and far shorter than three days.
-local AWAY_SCOUT_LIVE_GRACE_HOURS = 2
+-- Arrival means travel time elapsed, not that anyone inspected a room. Scouts
+-- require the same real-world handoff as collectors; no timer creates success.
 
 -- A returning team that nobody is watching still walks home. Elapsed time at
 -- the dispatch pace is enough to place and finally resolve each member whose
@@ -2883,70 +3155,45 @@ end
 -- Scouting has an explicit non-resource result. Resource missions advance only
 -- to an awaiting-collection state; no item is generated and duty ownership is
 -- retained until a live executor transfers real loot and returns the team.
--- Optional callbacks let the world layer decide whether a site is currently
--- watched and whether a team member is loaded; the ledger itself never looks at
--- players, bodies or squares, so an absent option keeps the old behaviour.
+-- The optional return-member callback distinguishes real loaded walkers from
+-- stored return journeys. Arrival alone never creates a scout result.
 function KnoxPersistence.advanceAwayTeams(worldAgeHours, options)
     local now, changed = tonumber(worldAgeHours) or 0, 0
-    local watched = type(options) == "table"
-        and type(options.scoutSiteWatched) == "function"
-        and options.scoutSiteWatched or nil
-    local loaded = type(options) == "table"
-        and type(options.memberLoaded) == "function"
-        and options.memberLoaded or nil
     -- Per-member presence, so a returning team with one loaded body and one
     -- hibernated body resolves only the member that is actually off-screen.
     local returnLoaded = type(options) == "table"
         and type(options.returnMemberLoaded) == "function"
         and options.returnMemberLoaded or nil
     for _, team in pairs(root().awayTeams) do
+        if type(team)=="table" and team.state=="returning" then
+            changed=changed+recordAwayTeamCasualties(team,now)
+            if finishAwayTeamReturn(team,now) then changed=changed+1 end
+        end
+        if type(team)=="table" and team.state~="complete" and team.state~="blocked"
+            and team.state~="dispatching" then
+            local allLost=#(team.memberIds or {})>0
+            for _,id in ipairs(team.memberIds or {}) do
+                local member=root().survivors[id]
+                if member==nil or member.alive~=false then allLost=false break end
+            end
+            if allLost then
+                team.state,team.blockedAtHours="blocked",now
+                team.result={kind="mission_lost",reason="crew_lost",resources={},
+                    destination=copySerializable(team.destination)}
+                changed=changed+1
+            end
+        end
         if type(team) == "table" and team.state == "outbound"
             and now >= (tonumber(team.etaHours) or math.huge) then
-            if team.missionType == "scout" then
-                if watched ~= nil and watched(team) == true then
-                    team.state = "awaiting_collection"
-                    team.arrivedAtHours = now
-                    team.result = {
-                        kind = "awaiting_live_scout",
-                        destination = copySerializable(team.destination),
-                        resources = {},
-                    }
-                else
-                    team.state = "complete"
-                    team.completedAtHours = now
-                    team.result = {
-                        kind = "scouted",
-                        destination = copySerializable(team.destination),
-                        resources = {},
-                    }
-                    restoreAwayTeamDuties(team, now)
-                end
-            else
-                team.state = "awaiting_collection"
-                team.arrivedAtHours = now
-                team.result = {
-                    kind = "awaiting_live_collection",
-                    destination = copySerializable(team.destination),
-                    resources = {},
-                }
-            end
-            changed = changed + 1
-        elseif type(team) == "table" and team.missionType == "scout"
-            and (team.state == "awaiting_collection" or team.state == "collecting")
-            and (loaded == nil or loaded(team) ~= true)
-            and now >= (tonumber(team.arrivedAtHours) or now) + AWAY_SCOUT_LIVE_GRACE_HOURS then
-            -- The watcher left (or the member was hibernated mid-sweep), so the
-            -- reconnaissance resolves from the ledger with no invented loot.
-            team.state = "complete"
-            team.completedAtHours = now
+            team.state = "awaiting_collection"
+            team.arrivedAtHours = now
             team.result = {
-                kind = "scouted",
-                destination = copySerializable(team.destination),
-                resources = {},
+                kind = team.missionType == "scout" and "awaiting_live_scout" or "awaiting_live_collection",
+                destination = copySerializable(team.destination), resources = {},
             }
-            restoreAwayTeamDuties(team, now)
             changed = changed + 1
         elseif type(team) == "table" and (team.state == "awaiting_collection" or team.state == "collecting")
+            and not (team.destination and team.destination.fillPacks == true)
             and now >= (tonumber(team.collectionStartedAtHours) or tonumber(team.arrivedAtHours) or now)
                 + AWAY_COLLECTION_TIMEOUT_HOURS then
             team.state = "blocked"
@@ -3257,11 +3504,109 @@ function KnoxPersistence.setFactionBaseResident(id, factionId, baseId, worldAgeH
     return true, "base_resident"
 end
 
+-- Forward declaration: the group-home owner predicates below sit above the
+-- helper's definition, so the name must be bound before its first use.
+local containsId
+
+-- Group homes reuse the base/duty owners; membership alone never grants stock.
+function KnoxPersistence.isGroupBaseMember(base, id, requireDuty)
+    local data = root()
+    if type(base) ~= "table" or base.ownerKind ~= "group"
+        or data.bases[base.id] ~= base then return false end
+    local group = data.travelGroups[base.ownerId]
+    local survivor = data.survivors[id]
+    local affiliation = survivor ~= nil and survivor.affiliation or {}
+    local duty = survivor ~= nil and survivor.duty or {}
+    if group == nil or group.factionId ~= nil or survivor == nil or survivor.alive == false
+        or affiliation.kind ~= "independent" or affiliation.factionId ~= nil
+        or not containsId(group.memberIds, id) or KnoxPersistence.getTravelGroupFor(id) ~= group
+        or survivor.eventManaged == true or duty.mode == "companion" or duty.mode == "away"
+        or duty.mode == "event" or duty.eventId ~= nil
+        or type(survivor.departure) == "table" and (survivor.departure.status == "pending"
+            or survivor.departure.status == "departed")
+        or KnoxPersistence.getAwayTeamForSurvivor(id) ~= nil then return false end
+    return requireDuty ~= true or duty.mode == "base" and duty.baseId == base.id
+        and duty.ownerId == group.id
+end
+
+function KnoxPersistence.setGroupBaseResident(id, groupId, baseId, character, worldAgeHours)
+    local base = KnoxPersistence.getBase(baseId)
+    if base == nil or base.ownerId ~= groupId
+        or not KnoxPersistence.isGroupBaseMember(base,id,false) then return false,"not_group_member" end
+    local runtime=rawget(_G,"KnoxSurvivorRuntime")
+    if runtime==nil or runtime.getCharacter==nil or runtime.getCharacter(id)~=character then
+        return false,"member_unavailable"
+    end
+    -- Residency starts on physical arrival, never from an origin or virtual position.
+    local ok, arrived = pcall(function()
+        local square = character:getCurrentSquare()
+        local building = square ~= nil and square:getBuilding() or nil
+        local definition = building ~= nil and building:getDef() or nil
+        local inside = definition ~= nil and tostring(definition:getID())==base.home.buildingId
+        local dx= square ~= nil and square:getX()-(base.home.x or base.home.minX) or math.huge
+        local dy= square ~= nil and square:getY()-(base.home.y or base.home.minY) or math.huge
+        local near = square ~= nil and square:getZ()==(base.home.z or 0) and dx*dx+dy*dy<=9
+        local cell=getCell ~= nil and getCell() or nil
+        local probe=cell ~= nil and cell:getGridSquare(base.home.probeX or base.home.minX,base.home.probeY or base.home.minY,base.home.probeZ or base.home.z or 0) or nil
+        local known=probe ~= nil and probe:getBuilding() or nil
+        local knownDef=known ~= nil and known:getDef() or nil
+        -- The scout's reachable exterior anchor counts as arrival; the loaded
+        -- building must still be identifiable there before granting base duty.
+        return character:isDead()==false and (inside or near and knownDef ~= nil
+            and tostring(knownDef:getID())==base.home.buildingId)
+    end)
+    if not ok or arrived ~= true then return false,"member_not_at_home" end
+    local survivor = root().survivors[id]
+    if survivor.duty.mode == "base" then
+        if survivor.duty.baseId == baseId and survivor.duty.ownerId == groupId then return true,"existing" end
+        return false,"already_resident" end
+    if survivor.duty.mode ~= "autonomous" then return false,"member_unavailable" end
+    local previous = survivor.duty
+    survivor.duty = {mode="base",order="available",ownerId=groupId,baseId=baseId,
+        jobPreference=previous.jobPreference or "auto",workPriorities=normalizeWorkPreferences(previous.workPriorities),
+        changedAtHours=tonumber(worldAgeHours) or 0,revision=(tonumber(previous.revision) or 0)+1}
+    survivor.lifeIntent = nil
+    return true,"base_resident"
+end
+
+-- Logical release touches no world object or inventory. Notify the narrow runtime
+-- revocation owner before its old context is lost; it retires exact pending work.
+function KnoxPersistence.releaseGroupBaseResident(id, baseId, reason)
+    local survivor = root().survivors[id]
+    local duty = survivor ~= nil and survivor.duty or nil
+    if duty == nil or duty.mode ~= "base" or duty.baseId ~= baseId then return false end
+    requeueClaimsForSurvivor(id,baseId,reason or "group_home_revoked")
+    local runtime = rawget(_G,"KnoxSurvivorRuntime")
+    local controller = runtime ~= nil and runtime.getController ~= nil and runtime.getController(id) or nil
+    if controller ~= nil and controller.onGroupHomeRevoked ~= nil then controller:onGroupHomeRevoked(baseId) end
+    local bed = survivor.policies ~= nil and survivor.policies.assignedBed or nil
+    if type(bed)=="table" and bed.autoGroupId ~= nil and bed.autoBaseId == baseId then survivor.policies.assignedBed=nil end
+    survivor.duty={mode="autonomous",order="none",changedAtHours=duty.changedAtHours,
+        revision=(tonumber(duty.revision) or 0)+1}
+    return true
+end
+
+function KnoxPersistence.abandonGroupHome(groupId)
+    local base = KnoxPersistence.getBaseForOwner("group",groupId)
+    if base == nil then return false end
+    for id, survivor in pairs(root().survivors) do
+        if survivor.duty ~= nil and survivor.duty.baseId == base.id then
+            KnoxPersistence.releaseGroupBaseResident(id,base.id,"group_home_abandoned")
+        end
+    end
+    root().bases[base.id]=nil
+    local group=root().travelGroups[groupId]
+    if group ~= nil and #(group.memberIds or {})<2 then root().travelGroups[groupId]=nil end
+    return true
+end
+
 function KnoxPersistence.getBaseResidentIds(baseId)
     local ids = {}
     for id, survivor in pairs(root().survivors) do
         if survivor ~= nil and survivor.duty ~= nil
-            and survivor.duty.mode == "base" and survivor.duty.baseId == baseId then
+            and survivor.duty.mode == "base" and survivor.duty.baseId == baseId
+            and (root().bases[baseId] == nil or root().bases[baseId].ownerKind ~= "group"
+                or KnoxPersistence.isGroupBaseMember(root().bases[baseId],id,true)) then
             ids[#ids + 1] = id
         end
     end
@@ -3470,7 +3815,7 @@ function KnoxPersistence.setDutySchedule(id, schedule, worldAgeHours)
     if survivor.duty == nil then return false end
     survivor.duty.schedule = schedule ~= nil
         and copySerializable(schedule) or nil
-    if schedule == nil then survivor.duty.scheduleAuto = nil end
+    survivor.duty.scheduleAuto = nil
     survivor.duty.changedAtHours = tonumber(worldAgeHours) or 0
     survivor.duty.revision = (tonumber(survivor.duty.revision) or 0) + 1
     return true
@@ -3479,16 +3824,17 @@ end
 -- One-time default for NPC groups/factions (by skill-neutral clock; the
 -- work windows still defer to profession/skill/rotation). Player survivors
 -- keep nil (anything) until the schedule tab writes an explicit one.
-function KnoxPersistence.ensureAutoDutySchedule(id, worldAgeHours)
+function KnoxPersistence.ensureAutoDutySchedule(id, worldAgeHours, schedule)
     local survivor = ensureSurvivorState(id)
     if survivor == nil or survivor.alive == false
-        or survivor.duty == nil or survivor.duty.schedule ~= nil then
+        or survivor.duty == nil
+        or (survivor.duty.schedule ~= nil and survivor.duty.scheduleAuto ~= true) then
         return false
     end
-    survivor.duty.schedule = KnoxPersistence.defaultDutySchedule()
+    if not KnoxPersistence.setDutySchedule(id, schedule or KnoxPersistence.defaultDutySchedule(), worldAgeHours) then
+        return false
+    end
     survivor.duty.scheduleAuto = true
-    survivor.duty.changedAtHours = tonumber(worldAgeHours) or 0
-    survivor.duty.revision = (tonumber(survivor.duty.revision) or 0) + 1
     return true
 end
 
@@ -3733,7 +4079,8 @@ function KnoxPersistence.setResidentLootRuns(id, playerId, baseId, allowed, worl
     return true
 end
 
-function KnoxPersistence.setBaseSupplyOrder(id, playerId, baseId, kind, worldAgeHours, durationHours)
+function KnoxPersistence.setBaseSupplyOrder(id, playerId, baseId, kind, worldAgeHours, durationHours,
+    itemFullType)
     local survivor = ensureSurvivorState(id)
     local normalized = canonicalOrder(kind)
     local now = math.max(0, tonumber(worldAgeHours) or 0)
@@ -3746,11 +4093,23 @@ function KnoxPersistence.setBaseSupplyOrder(id, playerId, baseId, kind, worldAge
         or survivor.duty.baseId ~= baseId then
         return false
     end
+    -- A fetch order names one type and travels through this same field, so the
+    -- trip, the permission checks and the cancel path are the ones that already
+    -- exist. An unreadable type is refused rather than stored as a search that
+    -- can never match.
+    local item = nil
+    if itemFullType ~= nil then
+        local catalog = rawget(_G, "KnoxOrderCatalog")
+        item = catalog ~= nil and catalog.normalizeItemType ~= nil
+            and catalog.normalizeItemType(itemFullType) or nil
+        if item == nil then return false end
+    end
     survivor.duty.baseSupplyOrder = {
         kind = normalized,
         issuedAtHours = now,
         expiresAtHours = now + duration,
         attempts = 0,
+        item = item,
     }
     -- A replacement player order supersedes an older in-flight supply search.
     -- The loaded controller receives the duty revision and releases its
@@ -3956,6 +4315,19 @@ function KnoxPersistence.setCompanionWeaponPreference(id, playerId, preference, 
     return true
 end
 
+-- Automatic aid is a preference for owned companions AND residents. Nil in
+-- older saves means enabled; it never changes their own self-care permission.
+function KnoxPersistence.setSurvivorAutoMedical(id, playerId, allowed, worldAgeHours)
+    local survivor = ensureSurvivorState(id)
+    if survivor == nil or survivor.affiliation.kind ~= "player"
+        or survivor.affiliation.ownerId ~= playerId
+        or (survivor.duty.mode ~= "companion" and survivor.duty.mode ~= "base") then return false end
+    survivor.policies.autoMedical = allowed == true
+    survivor.duty.changedAtHours = tonumber(worldAgeHours) or 0
+    survivor.duty.revision = (tonumber(survivor.duty.revision) or 0) + 1
+    return true
+end
+
 function KnoxPersistence.setCompanionClimbing(id, playerId, allowed, worldAgeHours)
     local survivor = ensureSurvivorState(id)
     if survivor == nil or survivor.affiliation.kind ~= "player"
@@ -4118,10 +4490,9 @@ function KnoxPersistence.getBaseRadioMode(baseId)
     return "off"
 end
 
--- The last answered call is one value on the record the player already owns.
--- It is written only while the set is broadcasting, so a stale entry cannot
--- keep a silent tower on the books, and it names the survivor it created so a
--- later pass can tell a real arrival from a missing one.
+-- The last attempted call owns the daily cooldown, even when unanswered or
+-- allocation is refused. An optional ID names only a real created survivor.
+-- The same record shape remains readable by older saves and callers.
 function KnoxPersistence.getBaseRadioArrival(baseId)
     local base = KnoxPersistence.getBase(baseId)
     local record = type(base) == "table" and base.radioTower or nil
@@ -4150,9 +4521,8 @@ function KnoxPersistence.recordBaseRadioArrival(baseId, worldAgeHours, survivorI
     return true, hours
 end
 
--- A call that nobody answered may have been heard by someone else. The record
--- keeps the last hostile answer the same way the arrival keeps the last friend:
--- one hour and one name on the base the player already owns.
+-- An unanswered call spends its daily risk attempt even when no faction hears
+-- or accepts it. Only a successfully scheduled answer stores a faction ID.
 function KnoxPersistence.getBaseRadioRisk(baseId)
     local base = KnoxPersistence.getBase(baseId)
     local record = type(base) == "table" and base.radioTower or nil
@@ -4184,11 +4554,12 @@ function KnoxPersistence.setFactionResidentBed(id, factionId, baseId, bedRef, wo
     local survivor = ensureSurvivorState(id)
     local faction = KnoxPersistence.getFaction(factionId)
     local base = KnoxPersistence.getBase(baseId)
-    if survivor == nil or survivor.alive == false
-        or faction == nil or faction.kind == "player"
-        or base == nil or base.ownerKind ~= "faction" or base.ownerId ~= factionId
-        or faction.homeBaseId ~= baseId
-        or survivor.affiliation.factionId ~= factionId
+    local groupResident = base ~= nil and base.ownerKind == "group" and base.ownerId == factionId
+        and KnoxPersistence.isGroupBaseMember(base,id,true)
+    local factionResident = survivor ~= nil and faction ~= nil and faction.kind ~= "player"
+        and base ~= nil and base.ownerKind == "faction" and base.ownerId == factionId
+        and survivor.affiliation.factionId == factionId
+    if survivor == nil or survivor.alive == false or not (groupResident or factionResident)
         or survivor.duty.mode ~= "base" or survivor.duty.baseId ~= baseId
         or type(bedRef) ~= "table" then
         return false, "not_faction_resident"
@@ -4205,16 +4576,17 @@ function KnoxPersistence.setFactionResidentBed(id, factionId, baseId, bedRef, wo
         local alreadyThisBed = tonumber(existing.x) == x
             and tonumber(existing.y) == y and tonumber(existing.z) == z
             and tonumber(existing.objectIndex) == objectIndex
-            and existing.autoFactionId == factionId
+            and (groupResident and existing.autoGroupId == factionId or not groupResident and existing.autoFactionId == factionId)
             and existing.autoBaseId == baseId
         if alreadyThisBed then return true, "existing" end
-        if existing.autoFactionId ~= factionId then
+        if (groupResident and existing.autoGroupId ~= factionId) or (not groupResident and existing.autoFactionId ~= factionId) then
             return false, "bed_already_assigned"
         end
     end
     survivor.policies.assignedBed = {
         x = x, y = y, z = z, objectIndex = objectIndex,
-        autoFactionId = factionId, autoBaseId = baseId,
+        autoFactionId = not groupResident and factionId or nil,
+        autoGroupId = groupResident and factionId or nil, autoBaseId = baseId,
     }
     survivor.duty.changedAtHours = tonumber(worldAgeHours) or 0
     survivor.duty.revision = (tonumber(survivor.duty.revision) or 0) + 1
@@ -4567,6 +4939,22 @@ function KnoxPersistence.getSurvivorServiceRole(id)
     return nil
 end
 
+-- Only real living membership makes a military remnant understaffed. A solo
+-- creator survivor is one member; no combat strength or supplies are inferred.
+function KnoxPersistence.creatorMilitaryUnderstaffed(id, faction, group)
+    local data = root()
+    local survivor = data.survivors[id]
+    if survivor == nil or survivor.alive == false then return false end
+    local roster = faction ~= nil and faction.memberIds or group ~= nil and group.memberIds or { id }
+    local alive, member = 0, false
+    for _, memberId in ipairs(roster or {}) do
+        local other = data.survivors[memberId]
+        if memberId == id then member = true end
+        if other ~= nil and other.alive ~= false then alive = alive + 1 end
+    end
+    return member and alive > 0 and alive <= 2
+end
+
 function KnoxPersistence.getPlayerSocialDisposition(playerId, survivorId)
     local relation = KnoxPersistence.getPlayerRelationship(playerId, survivorId)
     if relation == nil then return nil end
@@ -4574,6 +4962,32 @@ function KnoxPersistence.getPlayerSocialDisposition(playerId, survivorId)
         local identity = KnoxPersistence.getSurvivorPersonality(survivorId) or {}
         local response = identity.playerResponse
         if KnoxPersistence.getSurvivorServiceRole(survivorId) ~= nil then response="warm_up" end
+        local creator = KnoxPersistence.getSurvivorCreatorRecord(survivorId)
+        -- The same stance owner the engagement scan reads, so the sentence the
+        -- player sees and the fight they get cannot disagree, and a kind with no
+        -- stored stance is read here too.
+        local attitude = KnoxPersistence.creatorEngagementStance(creator,
+            KnoxPersistence.getFactionForSurvivor(survivorId))
+        -- A pre-existing interaction belongs to the relationship owner, even
+        -- if an older save never recorded its initial disposition.
+        if (tonumber(relation.meetings) or 0) > 0
+            or relation.firstMetHours ~= nil or relation.lastSocialEvent ~= nil
+            or (tonumber(relation.trust) or 30) ~= 30 then attitude = nil end
+        if attitude == "random" then
+            local key = creator.faction or survivorId
+            local choice = stableTrait(key, 47) % 3
+            attitude = ({ "friendly", "neutral", "hostile" })[choice + 1]
+        end
+        if attitude == "friendly" then response = "warm_up"
+        elseif attitude == "neutral" then response = "independent"
+        elseif attitude == "hostile" then
+            response = "attack_on_sight"
+            if creator.profile == "military" then
+                local faction = KnoxPersistence.getFactionForSurvivor(survivorId)
+                local group = faction == nil and KnoxPersistence.getTravelGroupFor(survivorId) or nil
+                if KnoxPersistence.creatorMilitaryUnderstaffed(survivorId, faction, group) then response = "warm_up" end
+            end
+        end
         if response ~= "join" and response ~= "warm_up"
             and response ~= "independent" and response ~= "volatile"
             and response ~= "lure" and response ~= "attack_on_sight"
@@ -4779,6 +5193,33 @@ end
 
 function KnoxPersistence.getFactions()
     return root().factions
+end
+
+-- A group is known to the player only through a real record with one of its
+-- people: a meeting, or an observer note of what was seen or reported. Storage
+-- alone is not knowledge. This read never creates a relation record, unlike
+-- getPlayerRelationship, which materializes one on first read.
+function KnoxPersistence.factionKnownToPlayer(playerId, factionId)
+    if type(playerId) ~= "string" or playerId == "" or factionId == nil then return false end
+    local faction = KnoxPersistence.getFaction(factionId)
+    if faction == nil then return false end
+    local data = root()
+    local survivorRecords = data ~= nil and data.survivors or nil
+    for _, memberId in ipairs(faction.memberIds or {}) do
+        local survivor = survivorRecords ~= nil and survivorRecords[memberId] or nil
+        local relation = survivor ~= nil and survivor.playerRelationships ~= nil
+            and survivor.playerRelationships[playerId] or nil
+        if relation ~= nil and relation.firstMetHours ~= nil then return true end
+        local knowledge = KnoxPersistence.getObserverKnowledge(playerId, memberId)
+        if knowledge ~= nil then
+            local seen, report = knowledge.seen, knowledge.report
+            if (seen ~= nil and tonumber(seen.atHours) ~= nil)
+                or (report ~= nil and tonumber(report.atHours) ~= nil) then
+                return true
+            end
+        end
+    end
+    return false
 end
 
 -- Event factions remain ordinary Knox factions. This metadata identifies why
@@ -5004,6 +5445,8 @@ function KnoxPersistence.isSurvivorHostileToPlayer(survivorId, playerId)
         local data = root()
         local faction = data.factions ~= nil and data.factions[survivorFactionId] or nil
         if type(faction) == "table" and faction.hostilePatrol ~= nil then return true end
+        if type(faction)=="table" and faction.background=="military"
+            and #(faction.memberIds or {})>=KnoxSettings.npcFactionMinimumMembers() then return true end
     end
     -- Flagged deserters want a home, not a fight: faction records never make
     -- them hostile. Explicit per-survivor flags above still apply.
@@ -5047,6 +5490,21 @@ function KnoxPersistence.recordPlayerFactionTheft(playerId, baseId, worldAgeHour
     local playerFaction = KnoxPersistence.ensurePlayerFaction(playerId, now)
     if playerFaction == nil or playerFaction.id == faction.id then return nil, "same_faction" end
     local prior = KnoxPersistence.getFactionRelationship(faction.id, playerFaction.id)
+    if prior ~= nil and prior.disposition == "hostile" then
+        return prior, "already_hostile"
+    end
+    -- A first theft is a warning: one wrong has not made a war. The warning is
+    -- recorded per player and faction in an optional field beside the hostile
+    -- action; an old save simply has no field and starts at the warning.
+    local warnings = type(faction.theftWarnings) == "table" and faction.theftWarnings or {}
+    if warnings[playerId] == nil then
+        warnings[playerId] = now
+        faction.theftWarnings = warnings
+        faction.lastPlayerWarning = {
+            kind = "theft", playerId = playerId, baseId = base.id, atHours = now,
+        }
+        return prior, "warning"
+    end
     local relation, result = KnoxPersistence.setFactionRelationshipDisposition(
         faction.id, playerFaction.id, "hostile", now, "player_theft"
     )
@@ -5252,7 +5710,7 @@ function KnoxPersistence.recordSocialReputation(playerId, survivorId, act, world
     return factionRelation, "recorded"
 end
 
-local function containsId(ids, id)
+function containsId(ids, id)
     for _, existing in ipairs(ids or {}) do
         if existing == id then
             return true
@@ -5474,12 +5932,7 @@ function KnoxPersistence.commitEventFactionEntry(eventId, expectedRevision, fact
     return copySerializable(event), "committed"
 end
 
-function KnoxPersistence.addFactionMember(factionId, survivorId, worldAgeHours)
-    local faction = KnoxPersistence.getFaction(factionId)
-    local survivor = ensureSurvivorState(survivorId)
-    -- Each gate answers with its own reason so a surface can say why a move was
-    -- refused instead of printing a generic failure. The decision is still made
-    -- here and nowhere else.
+local function factionMemberPreflight(faction, survivor, survivorId)
     if faction == nil then return false, "missing_faction" end
     if survivor == nil then return false, "missing_survivor" end
     if survivor.alive == false then return false, "dead" end
@@ -5489,25 +5942,19 @@ function KnoxPersistence.addFactionMember(factionId, survivorId, worldAgeHours)
             or survivor.departure.status == "departed") then
         return false, "departing"
     end
-    if KnoxPersistence.getAwayTeamForSurvivor(survivorId) ~= nil then
+    if survivor.duty ~= nil and type(root().awayTeams[survivor.duty.awayTeamId]) == "table" then
         return false, "away_team"
     end
-    if faction.kind ~= "player" and (survivor.affiliation.kind == "player"
-        or survivor.duty.mode == "companion"
-        or survivor.duty.mode == "base" and survivor.affiliation.kind == "player") then
+    if faction.kind ~= "player" and ((survivor.affiliation or {}).kind == "player"
+        or (survivor.duty or {}).mode == "companion"
+        or (survivor.duty or {}).mode == "base" and (survivor.affiliation or {}).kind == "player") then
         return false, "player_affiliated"
     end
-    local group = KnoxPersistence.getTravelGroupFor ~= nil
-        and KnoxPersistence.getTravelGroupFor(survivorId)
-        or nil
-    if group ~= nil and group.factionId ~= factionId
-        and KnoxPersistence.removeTravelGroupMember ~= nil then
-        KnoxPersistence.removeTravelGroupMember(survivorId)
-    end
-    local previousFactionId = survivor.affiliation.factionId
-    if previousFactionId ~= nil and previousFactionId ~= factionId then
-        KnoxPersistence.removeFactionMember(previousFactionId, survivorId, false)
-    end
+    return true
+end
+
+local function writeFactionMember(faction, survivor, survivorId, worldAgeHours)
+    local factionId = faction.id
     faction.memberIds = faction.memberIds or {}
     if not containsId(faction.memberIds, survivorId) then
         faction.memberIds[#faction.memberIds + 1] = survivorId
@@ -5522,15 +5969,39 @@ function KnoxPersistence.addFactionMember(factionId, survivorId, worldAgeHours)
     survivor.affiliation.ownerId = faction.kind == "player"
         and faction.ownerPlayerId
         or nil
+end
+
+function KnoxPersistence.addFactionMember(factionId, survivorId, worldAgeHours)
+    local faction = KnoxPersistence.getFaction(factionId)
+    local survivor = ensureSurvivorState(survivorId)
+    local allowed, reason = factionMemberPreflight(faction, survivor, survivorId)
+    if not allowed then return false, reason end
+    -- A settlement grows only into the room its own beds, food and water
+    -- allow (design/SOCIETY_AND_AUTONOMY.md, owner revision 2026-11-04).
+    -- An unmeasured settlement is not refused, so no move that used to
+    -- work is blocked by a missing read.
+    local capacity = rawget(_G, "KnoxSettlementCapacity")
+    if capacity ~= nil and capacity.admitsMember ~= nil
+        and not containsId(faction.memberIds or {}, survivorId) then
+        local allowed, capacityReason = capacity.admitsMember(faction, 1)
+        if not allowed then return false, capacityReason or "settlement_at_capacity" end
+    end
+    local group = KnoxPersistence.getTravelGroupFor ~= nil
+        and KnoxPersistence.getTravelGroupFor(survivorId)
+        or nil
+    if group ~= nil and group.factionId ~= factionId
+        and KnoxPersistence.removeTravelGroupMember ~= nil then
+        KnoxPersistence.removeTravelGroupMember(survivorId)
+    end
+    local previousFactionId = survivor.affiliation.factionId
+    if previousFactionId ~= nil and previousFactionId ~= factionId then
+        KnoxPersistence.removeFactionMember(previousFactionId, survivorId, false)
+    end
+    writeFactionMember(faction, survivor, survivorId, worldAgeHours)
     return true
 end
 
-function KnoxPersistence.removeFactionMember(factionId, survivorId, preserveDuty)
-    local faction = KnoxPersistence.getFaction(factionId)
-    local survivor = ensureSurvivorState(survivorId)
-    if faction == nil or survivor == nil then
-        return false
-    end
+local function removeFactionMemberEffects(faction, survivor, factionId, survivorId, preserveDuty, wasAffiliated, priorDuty)
     local retained = {}
     for _, id in ipairs(faction.memberIds or {}) do
         if id ~= survivorId then
@@ -5542,11 +6013,11 @@ function KnoxPersistence.removeFactionMember(factionId, survivorId, preserveDuty
         faction.memberJoinedAtHours[survivorId] = nil
     end
     KnoxPersistence.clearFactionResidentBed(survivorId, factionId)
-    if survivor.affiliation.factionId == factionId then
-        if survivor.duty.mode == "base" then
+    if wasAffiliated then
+        if priorDuty.mode == "base" then
             requeueClaimsForSurvivor(
                 survivorId,
-                survivor.duty.baseId,
+                priorDuty.baseId,
                 "faction_membership_changed"
             )
         end
@@ -5558,12 +6029,18 @@ function KnoxPersistence.removeFactionMember(factionId, survivorId, preserveDuty
             survivor.duty = {
                 mode = "autonomous",
                 order = "survive",
-                revision = (tonumber(survivor.duty.revision) or 0) + 1,
+                revision = (tonumber(priorDuty.revision) or 0) + 1,
             }
         end
     end
-    -- Membership changes are a lifecycle boundary. A departing leader or last
-    -- resident must not leave stale faction/base state until a later reload.
+end
+
+function KnoxPersistence.removeFactionMember(factionId, survivorId, preserveDuty)
+    local faction = KnoxPersistence.getFaction(factionId)
+    local survivor = ensureSurvivorState(survivorId)
+    if faction == nil or survivor == nil then return false end
+    removeFactionMemberEffects(faction, survivor, factionId, survivorId, preserveDuty,
+        survivor.affiliation.factionId == factionId, survivor.duty)
     KnoxPersistence.normalizeRelationshipDomains()
     return true
 end
@@ -5646,7 +6123,9 @@ function KnoxPersistence.survivorCompany(id)
     -- The leader belongs to the household too: a person who leads three others
     -- looked unattached on their own nameplate, which was the wrong picture.
     return { groupId = tostring(group.id or ""), leaderId = leaderId,
-        memberCount = members, home = home, isLeader = leaderId == id }
+        memberCount = members, home = home, isLeader = leaderId == id,
+        name = type(group.name) == "string" and group.name or nil,
+        background = type(group.background) == "string" and group.background or nil }
 end
 
 -- Fresh read-only batch lookup: same owner/tie rules as the single getter,
@@ -5839,7 +6318,12 @@ function KnoxPersistence.removeTravelGroupMember(survivorId)
                 group.leaderOrder = nil
                 group.leaderOrderRevision = (tonumber(group.leaderOrderRevision) or 0) + 1
             end
-            if #retained < 2 then data.travelGroups[groupId] = nil end
+            local home = KnoxPersistence.getBaseForOwner("group",groupId)
+            if home ~= nil then KnoxPersistence.releaseGroupBaseResident(survivorId,home.id,"group_member_removed") end
+            if #retained < 2 and not (#retained == 1 and home ~= nil and group.factionId == nil) then
+                KnoxPersistence.abandonGroupHome(groupId)
+                data.travelGroups[groupId] = nil
+            end
             removed = true
         end
     end
@@ -6032,6 +6516,22 @@ function KnoxPersistence.clearFactionCamp(factionId, reason, worldAgeHours)
     return true
 end
 
+-- The identity a faction lookup is keyed on, without copying anything. The
+-- faction table itself is live, so a renamed or recoloured faction needs no
+-- re-read; only the survivor's own faction changing does. Nameplates validate this
+-- every draw and refresh the record only when it moves, which keeps a plate
+-- exactly as fresh as the per-frame lookup it replaced.
+function KnoxPersistence.getSurvivorFactionId(id)
+    local survivor = type(id) == "string" and root().survivors[id] or nil
+    local affiliation = survivor ~= nil and survivor.affiliation or nil
+    if affiliation ~= nil and affiliation.factionId ~= nil then
+        return affiliation.factionId
+    end
+    if KnoxPersistence.getTravelGroupFor == nil then return nil end
+    local group = KnoxPersistence.getTravelGroupFor(id)
+    return group ~= nil and group.factionId or nil
+end
+
 function KnoxPersistence.getFactionForSurvivor(id)
     local survivor = ensureSurvivorState(id)
     if survivor ~= nil and survivor.affiliation.factionId ~= nil then
@@ -6049,6 +6549,68 @@ end
 -- Persisted affiliation and rosters are authoritative.  Runtime controllers
 -- may cache characters for movement, but every friend-or-foe decision should
 -- derive from this classifier so unloaded members and save/load agree.
+function KnoxPersistence.militaryRecruitmentMode(faction, candidateId, recruiterId)
+    if faction==nil or faction.kind~="npc" or faction.background~="military" then return nil end
+    local creator = KnoxPersistence.getSurvivorCreatorRecord(faction.leaderId)
+    if creator ~= nil and (creator.attitude == "friendly" or creator.attitude == "neutral"
+        or creator.attitude == "random") then return "screen" end
+    local settings=rawget(_G,"KnoxSettings")
+    local minimum=settings~=nil and settings.npcFactionMinimumMembers() or 4
+    local roster = faction.memberIds or {}
+    local contactId = recruiterId or faction.leaderId
+    if recruiterId then
+        local owner = KnoxPersistence.getFactionForSurvivor(recruiterId)
+        if not owner or owner.id ~= faction.id then return "screen" end
+    end
+    local duty = contactId and KnoxPersistence.getSurvivorDuty(contactId) or nil
+    local base = duty and duty.mode == "base" and KnoxPersistence.getBase(duty.baseId) or nil
+    if base and base.ownerKind == "faction" and base.ownerId == faction.id then
+        roster = KnoxPersistence.getBaseResidentIds(base.id)
+    elseif recruiterId then
+        local patrol = KnoxPersistence.getTravelGroupFor(recruiterId)
+        if patrol and patrol.factionId == faction.id then roster = patrol.memberIds or {} end
+    end
+    local manpower = 0
+    for _, id in ipairs(roster) do if KnoxPersistence.isSurvivorAlive(id) then manpower = manpower + 1 end end
+    if manpower>=minimum then return "hostile" end
+    local affiliation=KnoxPersistence.getSurvivorAffiliation(candidateId)
+    if affiliation==nil or affiliation.kind~="independent" then return "hostile" end
+    local runtime,needs=rawget(_G,"KnoxSurvivorRuntime"),rawget(_G,"KnoxSurvivorNeeds")
+    local character=runtime~=nil and runtime.getCharacter(candidateId) or nil
+    local leader=runtime~=nil and runtime.getCharacter(contactId) or nil
+    if character==nil or leader==nil then return "screen" end
+    local contactOk,inReach=pcall(function()
+        return character:getZ()==leader:getZ() and leader:CanSee(character)
+            and (character:getX()-leader:getX())^2+(character:getY()-leader:getY())^2<=9
+    end)
+    if not contactOk or not inReach then return "screen" end
+    local bitten=nil
+    if needs~=nil and needs.biteReading~=nil then bitten=needs.biteReading(character) end
+    if bitten==false then return "recruit" end
+    return bitten==true and "hostile" or "screen"
+end
+
+-- The engagement stance of one recorded survivor toward an outsider, in one
+-- place. An explicit stored stance is the group's own choice and always wins -
+-- the military doctrine depends on a custom peaceful group staying peaceful.
+-- With no stored stance the kind decides, so an older record that predates the
+-- field is still a robber when it is a robber rather than a leftover neutral.
+-- The threat scan reaches this through areSurvivorsHostile, so the kind table
+-- and the fight cannot answer differently.
+function KnoxPersistence.creatorEngagementStance(creator, faction)
+    if type(creator) ~= "table" then return nil end
+    if creator.attitude ~= nil then return creator.attitude end
+    local model = rawget(_G, "KnoxCreator")
+    local behaviour = model ~= nil and model.behaviourFor ~= nil
+        and model.behaviourFor(creator.profile) or nil
+    if behaviour ~= nil then
+        if behaviour.hostileToOutsiders == true then return "hostile" end
+        if behaviour.attitude == "random" then return "random" end
+        return behaviour.attitude
+    end
+    return nil
+end
+
 function KnoxPersistence.getSurvivorDisposition(firstId, secondId)
     if type(firstId) ~= "string" or type(secondId) ~= "string" then
         return "neutral"
@@ -6086,6 +6648,18 @@ function KnoxPersistence.getSurvivorDisposition(firstId, secondId)
     if personal ~= nil and personal.disposition == "hostile" then
         return "hostile"
     end
+    -- Two people the creator put in one group are one group even before a faction
+    -- or travel record exists: a robber does not fight its own roster while it is
+    -- still a roster. The explicit personal hostility above still wins, so a real
+    -- grudge between two members is not erased by their shared group.
+    local firstCreatorGroup = KnoxPersistence.getSurvivorCreatorRecord(firstId)
+    local secondCreatorGroup = KnoxPersistence.getSurvivorCreatorRecord(secondId)
+    if firstCreatorGroup ~= nil and secondCreatorGroup ~= nil
+        and type(firstCreatorGroup.faction) == "string"
+        and firstCreatorGroup.faction ~= ""
+        and firstCreatorGroup.faction == secondCreatorGroup.faction then
+        return "allied"
+    end
     -- Flagged deserters want a home, not a fight: faction records never make
     -- them hostile (explicit personal hostility above still applies).
     local eitherDeserter = first.deserter == true or second.deserter == true
@@ -6103,6 +6677,33 @@ function KnoxPersistence.getSurvivorDisposition(firstId, secondId)
     if personal ~= nil and personal.disposition == "allied" then
         return "allied"
     end
+    -- Explicit recorded encounters and faction relations own the next answer;
+    -- creator policy is only an unobserved initial boundary, not a new ledger.
+    local factionHistory = firstFaction ~= nil and secondFaction ~= nil
+        and KnoxPersistence.getFactionRelationship(firstFaction.id, secondFaction.id) or nil
+    if personal == nil and factionHistory == nil then
+        if KnoxPersistence.militaryRecruitmentMode(firstFaction,secondId,firstId)=="hostile"
+            or KnoxPersistence.militaryRecruitmentMode(secondFaction,firstId,secondId)=="hostile" then return "hostile" end
+        for _, entry in ipairs({ {firstId, firstFaction, firstGroup}, {secondId, secondFaction, secondGroup} }) do
+            local creator = KnoxPersistence.getSurvivorCreatorRecord(entry[1])
+            -- The kind owns the stance; a stored per-person value only answers
+            -- for kinds that have no fixed one. This is the same call the
+            -- engagement scan makes, so what is proven here is what fights.
+            local attitude = KnoxPersistence.creatorEngagementStance(
+                creator, entry[2])
+            if attitude == "random" then
+                local groupId = entry[3] ~= nil and entry[3].id or creator.faction or entry[1]
+                local otherId = entry[1] == firstId and secondId or firstId
+                local otherGroup = entry[1] == firstId and secondGroup or firstGroup
+                local key = tostring(groupId) .. "::" .. tostring(otherGroup ~= nil and otherGroup.id or otherId)
+                attitude = stableTrait(key, 47) % 3 == 2 and "hostile" or "neutral"
+            end
+            if attitude == "hostile" and not (creator.profile == "military"
+                and KnoxPersistence.creatorMilitaryUnderstaffed(entry[1], entry[2], entry[3])) then
+                return "hostile"
+            end
+        end
+    end
     return "neutral"
 end
 
@@ -6113,6 +6714,57 @@ end
 
 function KnoxPersistence.areSurvivorsHostile(firstId, secondId)
     return KnoxPersistence.getSurvivorDisposition(firstId, secondId) == "hostile"
+end
+
+-- A group is named by the home its members share, never by the fact that it
+-- happens to contain two people. Mixed survivors keep their own names until a
+-- faction is created; a facility roster carries its facility background so the
+-- police and military rules apply before the first name is written.
+local function groupFamilyIdentity(memberIds, data)
+    local contexts, householdCount = {}, 0
+    local buildingId, surname = nil, nil
+    local sameBuilding = true
+    for _, memberId in ipairs(memberIds or {}) do
+        local survivor = type(memberId) == "string" and data.survivors[memberId] or nil
+        local origin = type(survivor) == "table" and survivor.origin or nil
+        if type(origin) ~= "table" then
+            sameBuilding = false
+        else
+            if type(origin.buildingId) == "string" and origin.buildingId ~= "" then
+                if buildingId == nil then buildingId = origin.buildingId
+                elseif buildingId ~= origin.buildingId then sameBuilding = false end
+            else sameBuilding = false end
+            local household = origin.household == true
+            if not household and KnoxSurvivorOrigins ~= nil
+                and KnoxSurvivorOrigins.isHouseholdRooms ~= nil then
+                household = KnoxSurvivorOrigins.isHouseholdRooms(origin.roomNames) == true
+            end
+            if household then householdCount = householdCount + 1 end
+            local context = origin.context
+            if type(context) == "string" and context ~= "generic" then
+                contexts[context] = (contexts[context] or 0) + 1
+            end
+        end
+        local identity = type(survivor) == "table" and survivor.identity or nil
+        if surname == nil and type(identity) == "table"
+            and type(identity.surname) == "string" and identity.surname ~= "" then
+            surname = identity.surname
+        end
+    end
+    if sameBuilding and buildingId ~= nil and householdCount == #memberIds then
+        local name = surname ~= nil and ("The " .. surname .. " Household") or nil
+        return "household", name, true, buildingId
+    end
+    local topContext, topCount = nil, 0
+    for context, count in pairs(contexts) do
+        if count > topCount or (count == topCount and (topContext == nil or context < topContext)) then
+            topContext, topCount = context, count
+        end
+    end
+    if topContext ~= nil and topCount > #memberIds / 2 then
+        return topContext, nil, false, nil
+    end
+    return nil, nil, false, nil
 end
 
 function KnoxPersistence.createTravelGroup(memberIds, worldAgeHours)
@@ -6152,6 +6804,7 @@ function KnoxPersistence.createTravelGroup(memberIds, worldAgeHours)
         return nil
     end
     table.sort(members)
+    local background, groupName, household, homeBuildingId = groupFamilyIdentity(members, data)
     local group = {
         id = id,
         leaderId = members[1],
@@ -6163,11 +6816,22 @@ function KnoxPersistence.createTravelGroup(memberIds, worldAgeHours)
         objectiveRevision = 0,
         leaderOrder = nil,
         leaderOrderRevision = 0,
+        name = groupName,
+        background = background,
+        household = household or nil,
+        homeBuildingId = homeBuildingId,
     }
     for _, memberId in ipairs(members) do
         group.memberJoinedAtHours[memberId] = group.formedAtHours
     end
     data.travelGroups[id] = group
+    -- A newly spawned or organically formed group must not wait for the next
+    -- 60-tick social pass to receive its leader link.  The relationship owner
+    -- consumes this request and assigns on its next coordinate call.
+    local relationships = rawget(_G, "KnoxSurvivorRelationships")
+    if relationships ~= nil and relationships.requestGroupAssignmentRefresh ~= nil then
+        pcall(relationships.requestGroupAssignmentRefresh)
+    end
     for firstIndex = 1, #members do
         for secondIndex = firstIndex + 1, #members do
             KnoxPersistence.setRelationshipDisposition(
@@ -6237,12 +6901,22 @@ function KnoxPersistence.addTravelGroupMember(groupId, survivorId)
         -- autonomous duty would make them appear recruited while the base
         -- roster and task planner never see them.
         local faction = KnoxPersistence.getFaction(group.factionId)
-        if faction ~= nil and faction.homeBaseId ~= nil then
+        local baseId = faction ~= nil and faction.homeBaseId or nil
+        -- Local recruitment belongs to the recruiting party's established home.
+        -- Keep an existing valid duty; a county-wide primary is only a fallback.
+        for _, id in ipairs({survivorId, group.leaderId}) do
+            local assignedDuty = KnoxPersistence.getSurvivorDuty(id)
+            local assignedBase = assignedDuty ~= nil and assignedDuty.mode == "base"
+                and KnoxPersistence.getBase(assignedDuty.baseId) or nil
+            if assignedBase ~= nil and assignedBase.ownerKind == "faction"
+                and assignedBase.ownerId == group.factionId then
+                baseId = assignedBase.id
+                break
+            end
+        end
+        if faction ~= nil and baseId ~= nil then
             local resident, residentResult = KnoxPersistence.setFactionBaseResident(
-                survivorId,
-                group.factionId,
-                faction.homeBaseId,
-                now
+                survivorId, group.factionId, baseId, now
             )
             if resident and residentResult ~= "existing"
                 and rawget(_G, "KnoxSurvivorRuntime") ~= nil
@@ -6274,6 +6948,20 @@ function KnoxPersistence.getFactionReadiness(groupId, minimumMembers)
         if ready then status.sharedMembers=status.sharedMembers+1
         else status.missingShared[#status.missingShared+1]=memberId end
     end
+    -- A group that already holds a home is not ready on unreadable or short
+    -- stores: this boundary re-measures the real items every time.
+    local homeBase = KnoxPersistence.getBaseForOwner("group", groupId)
+    if homeBase ~= nil then
+        local capacityOwner = rawget(_G, "KnoxSettlementCapacity")
+        if capacityOwner ~= nil and type(capacityOwner.supportsFormation) == "function" then
+            local support, why = capacityOwner.supportsFormation(homeBase, status.members)
+            status.provisions = support
+            if type(support) ~= "table" or support.supported ~= true then
+                status.reason = "provisions_" .. tostring(why or "unreadable")
+                return status
+            end
+        end
+    end
     status.reason=status.members<required and ("requires_"..required.."_members")
         or (#status.missingShared>0 and "requires_shared_survival" or "ready")
     return status
@@ -6286,6 +6974,137 @@ function KnoxPersistence.evaluateTravelGroupFaction(groupId, worldAgeHours, mini
     return KnoxPersistence.promoteTravelGroupToFaction(groupId,tonumber(worldAgeHours) or 0,status.required)
 end
 
+-- Military origin cohorts retain their local travel groups while joining one
+-- faction. A veteran in a civilian household is never a military cohort.
+function KnoxPersistence.isMilitaryCohort(group)
+    if type(group) ~= "table" or group.originCohort ~= true or #(group.memberIds or {}) == 0 then return false end
+    for _, id in ipairs(group.memberIds) do
+        local origin = KnoxPersistence.getSurvivorOrigin(id)
+        if origin == nil or origin.source ~= "world_building" or origin.context ~= "military" then return false end
+    end
+    return true
+end
+
+function KnoxPersistence.getMilitaryCommand()
+    local chosen
+    for _, faction in pairs(root().factions) do
+        if faction.kind == "npc" and faction.militaryCommand == true
+            and (chosen == nil or faction.id < chosen.id) then chosen = faction end
+    end
+    return chosen
+end
+
+-- Promotion writes remain reversible until every member has been admitted.
+-- Old-faction lifecycle effects are committed only after that boundary.
+local function commitPromotedCohort(data, group, faction, members, hours, isNew, home)
+    -- The home travels inside the same transaction: its owner, the faction link
+    -- and every resident duty are snapshotted and restored on failure.
+    local homeSnapshot = nil
+    if type(home) == "table" and type(home.base) == "table" then
+        local base = home.base
+        local duties, beds = {}, {}
+        for _, id in ipairs(home.residents or {}) do
+            local survivor = data.survivors[id]
+            duties[id] = survivor ~= nil and survivor.duty or nil
+            local bed = survivor ~= nil and survivor.policies ~= nil
+                and survivor.policies.assignedBed or nil
+            beds[id] = type(bed) == "table"
+                and { autoGroupId = bed.autoGroupId, autoFactionId = bed.autoFactionId } or nil
+        end
+        homeSnapshot = { base = base, ownerKind = base.ownerKind, ownerId = base.ownerId,
+            factionHomeBaseId = faction.homeBaseId, duties = duties, beds = beds }
+    end
+    local oldGroupFaction, oldNext = group.factionId, data.nextFactionId
+    local oldMembers, oldJoined = faction.memberIds, faction.memberJoinedAtHours
+    local snapshots = {}
+    for _, id in ipairs(members) do
+        local survivor = data.survivors[id]
+        snapshots[#snapshots + 1] = { id = id, survivor = survivor,
+            affiliation = survivor.affiliation, duty = survivor.duty }
+    end
+    faction.memberIds = copyIds(oldMembers or {})
+    faction.memberJoinedAtHours = {}
+    for id, joined in pairs(oldJoined or {}) do faction.memberJoinedAtHours[id] = joined end
+    if isNew then data.factions[faction.id] = faction end
+    group.factionId = faction.id
+    local failure
+    for _, snapshot in ipairs(snapshots) do
+        local old = snapshot.affiliation or {}
+        snapshot.survivor.affiliation = {}
+        for key, value in pairs(old) do snapshot.survivor.affiliation[key] = value end
+        local ok, reason = pcall(writeFactionMember, faction, snapshot.survivor, snapshot.id, hours)
+        if not ok then failure = "membership_write_error: " .. tostring(reason); break end
+    end
+    if failure ~= nil then
+        for _, snapshot in ipairs(snapshots) do snapshot.survivor.affiliation = snapshot.affiliation end
+        faction.memberIds, faction.memberJoinedAtHours = oldMembers, oldJoined
+        group.factionId, data.nextFactionId = oldGroupFaction, oldNext
+        if isNew then data.factions[faction.id] = nil end
+        if homeSnapshot ~= nil then
+            homeSnapshot.base.ownerKind, homeSnapshot.base.ownerId =
+                homeSnapshot.ownerKind, homeSnapshot.ownerId
+            faction.homeBaseId = homeSnapshot.factionHomeBaseId
+            for id, duty in pairs(homeSnapshot.duties) do
+                local survivor = data.survivors[id]
+                if survivor ~= nil and duty ~= nil then survivor.duty = duty end
+            end
+        end
+        return nil, failure
+    end
+    if isNew then data.nextFactionId = oldNext + 1 end
+    local departed = false
+    for _, snapshot in ipairs(snapshots) do
+        local previousId = snapshot.affiliation and snapshot.affiliation.factionId
+        local previous = previousId ~= faction.id and data.factions[previousId] or nil
+        if previous ~= nil then
+            local targetAffiliation = snapshot.survivor.affiliation
+            removeFactionMemberEffects(previous, snapshot.survivor, previousId, snapshot.id, false,
+                true, snapshot.duty or {})
+            snapshot.survivor.affiliation = targetAffiliation
+            departed = true
+        end
+    end
+    -- Keep existing references live on successful admission as the single-member
+    -- writer does; no original table was touched before the commit boundary.
+    if oldMembers ~= nil then
+        for key in pairs(oldMembers) do oldMembers[key] = nil end
+        for key, value in pairs(faction.memberIds) do oldMembers[key] = value end
+        faction.memberIds = oldMembers
+    end
+    if oldJoined ~= nil then
+        for key in pairs(oldJoined) do oldJoined[key] = nil end
+        for key, value in pairs(faction.memberJoinedAtHours) do oldJoined[key] = value end
+        faction.memberJoinedAtHours = oldJoined
+    end
+    for _, snapshot in ipairs(snapshots) do
+        if snapshot.affiliation ~= nil then
+            local current = snapshot.survivor.affiliation
+            for key in pairs(snapshot.affiliation) do snapshot.affiliation[key] = nil end
+            for key, value in pairs(current) do snapshot.affiliation[key] = value end
+            snapshot.survivor.affiliation = snapshot.affiliation
+        end
+    end
+    if homeSnapshot ~= nil then
+        local base = homeSnapshot.base
+        base.ownerKind, base.ownerId = "faction", faction.id
+        faction.homeBaseId = base.id
+        for id, duty in pairs(homeSnapshot.duties) do
+            local survivor = data.survivors[id]
+            if survivor ~= nil and survivor.duty == duty and duty ~= nil then
+                duty.ownerId = faction.id
+            end
+            local bed = survivor ~= nil and survivor.policies ~= nil
+                and survivor.policies.assignedBed or nil
+            if type(bed) == "table" and bed.autoGroupId ~= nil then
+                bed.autoFactionId = faction.id
+                bed.autoGroupId = nil
+            end
+        end
+    end
+    if departed then KnoxPersistence.normalizeRelationshipDomains() end
+    return faction
+end
+
 function KnoxPersistence.promoteTravelGroupToFaction(groupId, worldAgeHours, minimumMembers)
     local data = root()
     local group = type(groupId) == "string" and data.travelGroups[groupId] or nil
@@ -6293,31 +7112,78 @@ function KnoxPersistence.promoteTravelGroupToFaction(groupId, worldAgeHours, min
     if group == nil or #group.memberIds < required then
         return nil, "requires_" .. tostring(required) .. "_members"
     end
-    for _, memberId in ipairs(group.memberIds) do
-        local survivor = ensureSurvivorState(memberId)
-        if survivor.affiliation.kind == "player"
-            or survivor.duty.mode == "companion"
-            or survivor.duty.mode == "base" and survivor.affiliation.kind == "player" then
-            KnoxPersistence.removeTravelGroupMember(memberId)
-            return nil, "contains_player_survivor"
+    if group.factionId == nil then
+        local creator = KnoxPersistence.getSurvivorCreatorRecord(group.leaderId)
+        local policy = creator ~= nil and creator.settlementPolicy or nil
+        local kind = creator ~= nil and creator.profile or nil
+        local model = rawget(_G, "KnoxCreator")
+        local behaviour = model ~= nil and model.behaviourFor ~= nil
+            and model.behaviourFor(kind) or nil
+        -- A normally mobile or independent background may found only when its
+        -- author explicitly chose home and the group actually owns one. The
+        -- existing home authorization below still checks current readiness.
+        local explicitHome = policy == "home"
+            and KnoxPersistence.getBaseForOwner("group", groupId) ~= nil
+        if (behaviour ~= nil and behaviour.formsFaction == false and not explicitHome)
+            or policy == "mobile" or policy == "independent" then
+            return nil, "mobile_group"
         end
     end
     if group.factionId ~= nil then
         return data.factions[group.factionId], "already_faction"
     end
+    -- A group that already holds a home promotes only while that home still
+    -- proves itself now: beds, a defender, residents and readable provisions.
+    local home = nil
+    if KnoxPersistence.getBaseForOwner("group", groupId) ~= nil then
+        local authorized, homeWhy = KnoxPersistence.groupHomeAuthorization(groupId, worldAgeHours)
+        if authorized == nil then return nil, homeWhy or "home_unverified" end
+        home = authorized
+    end
+    local members = copyIds(group.memberIds)
+    local military = KnoxPersistence.isMilitaryCohort(group)
+    local command = military and KnoxPersistence.getMilitaryCommand() or nil
+    local target = command or { id = "faction-" .. tostring(data.nextFactionId), kind = "npc", memberIds = {} }
+    local arrivals = 0
+    for _, memberId in ipairs(members) do
+        local survivor = data.survivors[memberId]
+        local allowed, reason = factionMemberPreflight(target, survivor, memberId)
+        if not allowed then return nil, reason end
+        if not containsId(target.memberIds or {}, memberId) then arrivals = arrivals + 1 end
+    end
+    local capacity = rawget(_G, "KnoxSettlementCapacity")
+    if command ~= nil and arrivals > 0 and capacity ~= nil and capacity.admitsMember ~= nil then
+        local allowed, reason = capacity.admitsMember(command, arrivals)
+        if not allowed then return nil, reason or "settlement_at_capacity" end
+    end
+    if command then
+        local linked, reason = commitPromotedCohort(data, group, command, members, worldAgeHours, false, home)
+        if not linked then return nil, reason end
+        return linked, "linked_military_command"
+    end
     local factionId = "faction-" .. tostring(data.nextFactionId)
-    data.nextFactionId = data.nextFactionId + 1
     local faction = {
         id = factionId,
         kind = "npc",
+        militaryCommand = military or nil,
         leaderId = group.leaderId,
-        memberIds = copyIds(group.memberIds),
+        memberIds = {},
         formedAtHours = tonumber(worldAgeHours) or 0,
         homeSafehouse = nil,
         -- formationNoticed is written only once a player has actually seen a
         -- member. Absence means "not yet seen", so the record never stores a
         -- false that the codec would drop and a reload would have to invent.
     }
+    -- The group carries the place it was formed in. Read it before the name is
+    -- written so a station is "Rosewood Police" and a family is "The Smith
+    -- Household" on the first frame, not after a later background stamp.
+    if faction.background == nil and type(group.background) == "string"
+        and group.background ~= "" then
+        faction.background = group.background
+    end
+    if type(group.name) == "string" and group.name ~= "" then
+        faction.householdName = group.name
+    end
     -- A shared verified origin background describes this roster; it grants no
     -- equipment, hostility, skills, territory or invented survival history.
     local backgrounds = {}
@@ -6330,7 +7196,10 @@ function KnoxPersistence.promoteTravelGroupToFaction(groupId, worldAgeHours, min
         end
     end
     for context, count in pairs(backgrounds) do
-        if count > #group.memberIds / 2 then faction.background = context break end
+        if faction.background == nil and count > #group.memberIds / 2 then
+            faction.background = context
+            break
+        end
     end
     local factionName = uniqueFactionName(data, factionId, faction)
     -- A group the player made carries the name they gave it. It is used only
@@ -6356,15 +7225,10 @@ function KnoxPersistence.promoteTravelGroupToFaction(groupId, worldAgeHours, min
     faction.name = creatorApi ~= nil and creatorApi.chooseFactionName ~= nil
         and creatorApi.chooseFactionName(factionName, requested, taken)
         or factionName
+    if military then faction.name = "Fort Knox Military" end
     faction.accent = factionAccent(faction.name)
-    data.factions[factionId] = faction
-    group.factionId = factionId
-    for _, memberId in ipairs(group.memberIds) do
-        local survivor = ensureSurvivorState(memberId)
-        survivor.affiliation.kind = "faction"
-        survivor.affiliation.ownerId = nil
-        KnoxPersistence.addFactionMember(factionId, memberId, worldAgeHours)
-    end
+    local created, reason = commitPromotedCohort(data, group, faction, members, worldAgeHours, true, home)
+    if not created then return nil, reason end
     -- Every path to a faction passes through here, so every path speaks once.
     print("[KnoxSurvivors][Faction] formed=" .. factionId
         .. " name=" .. tostring(faction.name)
@@ -6393,6 +7257,132 @@ local function livingIds(data, ids)
     end
     table.sort(result)
     return result
+end
+
+-- GH3: what a group must be, re-derived from current state. Nothing here reads
+-- a saved confirmation: membership, policy and leader availability are asked
+-- again at the write boundary.
+function KnoxPersistence.groupHomeRequirements(groupId, worldAgeHours)
+    local data = root()
+    local group = type(groupId) == "string" and data.travelGroups[groupId] or nil
+    if group == nil then return nil, "no_group" end
+    if group.factionId ~= nil then return nil, "already_faction" end
+    local living = livingIds(data, group.memberIds)
+    if #living < 2 then return nil, "requires_2_members" end
+    local leader = data.survivors[group.leaderId]
+    local affiliation = leader ~= nil and leader.affiliation or {}
+    if leader == nil or leader.alive == false
+        or affiliation.kind ~= "independent" or affiliation.factionId ~= nil
+        or leader.eventManaged == true
+        or (leader.duty or {}).eventId ~= nil
+        or (leader.duty or {}).mode == "companion" or (leader.duty or {}).mode == "away"
+        or KnoxPersistence.getAwayTeamForSurvivor(group.leaderId) ~= nil then
+        return nil, "leader_unavailable"
+    end
+    local creator = KnoxPersistence.getSurvivorCreatorRecord(group.leaderId)
+    local policy = creator ~= nil and creator.settlementPolicy or nil
+    if policy == "mobile" or policy == "independent" then return nil, "mobile_group" end
+    return { group = group, living = living, leader = leader }, "qualified"
+end
+
+-- Occupancy of one existing home, asked again now: a resident who is really
+-- there, a bed, a defender and readable provisions that actually support them.
+function KnoxPersistence.groupHomeOccupancy(base, population, worldAgeHours)
+    if type(base) ~= "table" then return nil, "no_home" end
+    local residents = KnoxPersistence.getBaseResidentIds(base.id)
+    if #residents == 0 then return nil, "no_residents" end
+    local manager = rawget(_G, "KnoxBaseManager")
+    local defenders = 0
+    if manager ~= nil and type(manager.defenceAssignment) == "function" then
+        for _, id in ipairs(residents) do
+            local okDefence = manager.defenceAssignment(base, {
+                id = id, groupId = base.ownerId, dutyBaseId = base.id, kind = "household",
+            })
+            if okDefence then defenders = defenders + 1 end
+        end
+    end
+    if defenders == 0 then return nil, "defence_unverified" end
+    local capacity = rawget(_G, "KnoxSettlementCapacity")
+    local beds = nil
+    if capacity ~= nil and type(capacity.forBase) == "function" then
+        local measured = capacity.forBase(base)
+        beds = measured ~= nil and tonumber(measured.beds) or nil
+    end
+    if beds == nil or beds < 1 then return nil, "beds_unverified" end
+    if capacity ~= nil and type(capacity.supportsFormation) == "function" then
+        local support, why = capacity.supportsFormation(base, math.max(1, tonumber(population) or 1))
+        if type(support) ~= "table" or support.supported ~= true then
+            local reason = tostring(why or "unreadable")
+            if reason:find("provisions_", 1, true) ~= 1 then
+                reason = "provisions_" .. reason
+            end
+            return nil, reason
+        end
+    end
+    return { residents = residents, defenders = defenders, beds = beds }, "occupied"
+end
+
+function KnoxPersistence.groupHomeAuthorization(groupId, worldAgeHours)
+    local requirements, why = KnoxPersistence.groupHomeRequirements(groupId, worldAgeHours)
+    if requirements == nil then return nil, why end
+    local base = KnoxPersistence.getBaseForOwner("group", groupId)
+    if base == nil then return nil, "no_home" end
+    local occupancy, occupiedWhy = KnoxPersistence.groupHomeOccupancy(
+        base, #requirements.living, worldAgeHours)
+    if occupancy == nil then return nil, occupiedWhy end
+    return { base = base, group = requirements.group, living = requirements.living,
+        residents = occupancy.residents, defenders = occupancy.defenders,
+        beds = occupancy.beds }, "authorized"
+end
+
+-- Hand an existing home to another qualifying group. The recipient must be
+-- physically at that home: a handover never teleports a group.
+function KnoxPersistence.transferGroupHome(fromGroupId, toGroupId, worldAgeHours)
+    local data = root()
+    if type(fromGroupId) ~= "string" or type(toGroupId) ~= "string"
+        or fromGroupId == "" or toGroupId == "" or fromGroupId == toGroupId then
+        return false, "invalid_owner"
+    end
+    local base = KnoxPersistence.getBaseForOwner("group", fromGroupId)
+    if base == nil then return false, "no_home" end
+    local recipient, why = KnoxPersistence.groupHomeRequirements(toGroupId, worldAgeHours)
+    if recipient == nil then return false, why end
+    if KnoxPersistence.getBaseForOwner("group", toGroupId) ~= nil then
+        return false, "recipient_has_home"
+    end
+    local occupancy, occupiedWhy = KnoxPersistence.groupHomeOccupancy(
+        base, #recipient.living, worldAgeHours)
+    if occupancy == nil then return false, occupiedWhy end
+    local runtime = rawget(_G, "KnoxSurvivorRuntime")
+    local character = runtime ~= nil and runtime.getCharacter ~= nil
+        and runtime.getCharacter(recipient.group.leaderId) or nil
+    local square = character ~= nil and character.getCurrentSquare ~= nil
+        and character:getCurrentSquare() or nil
+    local area = base.home
+    if square == nil or type(area) ~= "table" then return false, "recipient_not_arrived" end
+    local x, y, z = square:getX(), square:getY(), square:getZ()
+    local minX = tonumber(area.minX)
+    local minY = tonumber(area.minY)
+    if minX == nil or minY == nil or z ~= (tonumber(area.z) or 0)
+        or x < minX or x > minX + (tonumber(area.width) or 1) - 1
+        or y < minY or y > minY + (tonumber(area.height) or 1) - 1 then
+        return false, "recipient_not_arrived"
+    end
+    -- Release the previous holder first, then bind the new holder; the base
+    -- record itself, its territory, tasks and storage are untouched.
+    for _, id in ipairs(occupancy.residents) do
+        KnoxPersistence.releaseGroupBaseResident(id, base.id, "home_transferred")
+    end
+    base.ownerId = toGroupId
+    for _, id in ipairs(recipient.living) do
+        local survivor = data.survivors[id]
+        if survivor ~= nil then
+            KnoxPersistence.setGroupBaseResident(id, toGroupId, base.id,
+                (runtime ~= nil and runtime.getCharacter ~= nil) and runtime.getCharacter(id) or nil,
+                worldAgeHours)
+        end
+    end
+    return true, "transferred"
 end
 
 -- Repair old or interrupted saves at one persistence boundary.  This is not a
@@ -6511,7 +7501,8 @@ function KnoxPersistence.normalizeRelationshipDomains()
             end
         end
         group.memberIds = retained
-        if #retained < 2 then
+        local home = KnoxPersistence.getBaseForOwner("group",groupId)
+        if #retained < 2 and not (#retained == 1 and home ~= nil and group.factionId == nil) then
             for _, survivorId in ipairs(retained) do
                 if groupOwner[survivorId] == groupId then
                     groupOwner[survivorId] = nil
@@ -6559,6 +7550,26 @@ function KnoxPersistence.normalizeRelationshipDomains()
                 faction.leaderId = faction.memberIds[1]
                 changes = changes + 1
             end
+        end
+    end
+
+    -- Validate the enum's owner on load, and revoke stale duties immediately.
+    -- No normalization path claims an origin or creates physical goods.
+    local groupBaseSeen = {}
+    for _, baseId in ipairs(sortedKeys(data.bases)) do
+        local base = data.bases[baseId]
+        if base.ownerKind == "group" then
+            local group = data.travelGroups[base.ownerId]
+            local valid = group ~= nil and group.factionId == nil and #(group.memberIds or {}) > 0
+                and not groupBaseSeen[base.ownerId]
+            if valid then groupBaseSeen[base.ownerId] = true end
+            for survivorId,survivor in pairs(data.survivors) do
+                if survivor.duty ~= nil and survivor.duty.mode == "base" and survivor.duty.baseId == baseId
+                    and (not valid or not KnoxPersistence.isGroupBaseMember(base,survivorId,true)) then
+                    if KnoxPersistence.releaseGroupBaseResident(survivorId,baseId,"group_home_invalid") then changes=changes+1 end
+                end
+            end
+            if not valid then data.bases[baseId]=nil;changes=changes+1 end
         end
     end
 
@@ -6761,8 +7772,14 @@ function KnoxPersistence.getPendingEventDepartureIds()
     return ids
 end
 
+local function baseSearchOwner(id)
+    local data = root()
+    return data.factions[id] or (data.travelGroups[id] ~= nil
+        and data.travelGroups[id].factionId == nil and data.travelGroups[id] or nil)
+end
+
 function KnoxPersistence.getFactionBaseCandidate(factionId)
-    local faction = KnoxPersistence.getFaction(factionId)
+    local faction = baseSearchOwner(factionId)
     return faction ~= nil and faction.baseSearch ~= nil
         and faction.baseSearch.candidate
         or nil
@@ -6772,7 +7789,7 @@ end
 -- (or the leader cannot reach the building) an old lead must eventually be
 -- reconsidered instead of pinning the faction to it forever.
 function KnoxPersistence.expireFactionBaseCandidate(factionId, worldAgeHours, maxAgeHours)
-    local faction = KnoxPersistence.getFaction(factionId)
+    local faction = baseSearchOwner(factionId)
     local search = faction ~= nil and faction.baseSearch or nil
     local candidate = search ~= nil and search.candidate or nil
     if candidate == nil then return false end
@@ -6787,7 +7804,7 @@ function KnoxPersistence.expireFactionBaseCandidate(factionId, worldAgeHours, ma
 end
 
 function KnoxPersistence.isFactionBaseCandidateRejected(factionId, buildingId, worldAgeHours)
-    local faction = KnoxPersistence.getFaction(factionId)
+    local faction = baseSearchOwner(factionId)
     local rejected = faction ~= nil and faction.baseSearch ~= nil
         and faction.baseSearch.rejected
         or nil
@@ -6800,8 +7817,10 @@ function KnoxPersistence.isFactionBaseCandidateRejected(factionId, buildingId, w
 end
 
 function KnoxPersistence.recordFactionBaseCandidate(factionId, candidate, worldAgeHours)
-    local faction = KnoxPersistence.getFaction(factionId)
-    if faction == nil or faction.homeBase ~= nil or type(candidate) ~= "table"
+    local faction = baseSearchOwner(factionId)
+    if faction == nil or faction.homeBase ~= nil
+        or (root().travelGroups[factionId] == faction and KnoxPersistence.getBaseForOwner("group",factionId) ~= nil)
+        or type(candidate) ~= "table"
         or type(candidate.buildingId) ~= "string" then
         return nil, "invalid_candidate"
     end
@@ -6821,7 +7840,7 @@ function KnoxPersistence.recordFactionBaseCandidate(factionId, candidate, worldA
 end
 
 function KnoxPersistence.rejectFactionBaseCandidate(factionId, buildingId, worldAgeHours)
-    local faction = KnoxPersistence.getFaction(factionId)
+    local faction = baseSearchOwner(factionId)
     if faction == nil or type(buildingId) ~= "string" then
         return false
     end
@@ -6900,6 +7919,7 @@ local function copyWorldArea(source)
     end
     return {
         buildingId = source.buildingId,
+        probeX = tonumber(source.probeX), probeY = tonumber(source.probeY), probeZ = tonumber(source.probeZ),
         x = tonumber(source.x),
         y = tonumber(source.y),
         z = tonumber(source.z) or 0,
@@ -7062,7 +8082,6 @@ function KnoxPersistence.setBaseLastCrew(baseId, missionType, memberIds, worldAg
     local ids = {}
     for _, id in ipairs(type(memberIds) == "table" and memberIds or {}) do
         ids[#ids + 1] = tostring(id)
-        if #ids >= 3 then break end
     end
     if #ids == 0 then return false end
     base.lastCrew = type(base.lastCrew) == "table" and base.lastCrew or {}
@@ -7118,12 +8137,28 @@ local BASE_RESERVE_TARGET_KEYS = {
     weapons = true, tools = true, logs = true, building = true, clothing = true,
 }
 local BASE_RESERVE_TARGET_MAX = 50
+-- An item minimum names one exact item type: "Bandages: 20" is a base-wide
+-- floor, not a container limit. Item keys live in the same optional table as
+-- the category defaults, so the save shape stays additive and every older
+-- target keeps working unchanged.
+local BASE_RESERVE_ITEM_PREFIX = "item:"
+
+local function validBaseReserveTargetKey(key)
+    if BASE_RESERVE_TARGET_KEYS[key] == true then return true end
+    if type(key) ~= "string"
+        or string.sub(key, 1, #BASE_RESERVE_ITEM_PREFIX) ~= BASE_RESERVE_ITEM_PREFIX then
+        return false
+    end
+    local fullType = string.sub(key, #BASE_RESERVE_ITEM_PREFIX + 1)
+    if fullType == "" or #fullType > 64 then return false end
+    return string.match(fullType, "^[%w_%.%-]+$") ~= nil
+end
 
 function KnoxPersistence.validBaseReserveTargets(targets)
     if targets == nil then return true end
     if type(targets) ~= "table" then return false end
     for key, value in pairs(targets) do
-        if BASE_RESERVE_TARGET_KEYS[key] ~= true then return false end
+        if not validBaseReserveTargetKey(key) then return false end
         local count = tonumber(value)
         if count == nil or count < 0 or count > BASE_RESERVE_TARGET_MAX
             or math.floor(count) ~= count then return false end
@@ -7137,7 +8172,7 @@ function KnoxPersistence.getBaseReserveTargets(baseId)
     local result, any = {}, false
     for key, value in pairs(base.reserveTargets) do
         local count = tonumber(value)
-        if BASE_RESERVE_TARGET_KEYS[key] == true and count ~= nil
+        if validBaseReserveTargetKey(key) and count ~= nil
             and count >= 0 and count <= BASE_RESERVE_TARGET_MAX
             and math.floor(count) == count then
             result[key] = count
@@ -7301,6 +8336,45 @@ end
 -- Territory is the durable ownership boundary for both player and NPC bases.
 -- Keep this lookup in persistence so interaction rules cannot drift from base
 -- creation, relocation, or save restoration.
+-- A guest is a timed permission on an existing base, never a second roster or
+-- resident duty. The same record carries the answer and prevents repeat asks.
+function KnoxPersistence.requestOvernightStay(baseId, survivorId, hours)
+    local base = KnoxPersistence.getBase(baseId)
+    if base == nil or base.ownerKind ~= "player"
+        or not KnoxPersistence.isSurvivorAlive(survivorId) then return nil end
+    hours=tonumber(hours) or 0
+    base.overnightGuests=base.overnightGuests or {}
+    local count=0
+    for id,record in pairs(base.overnightGuests) do
+        if type(record)~="table" or (tonumber(record.nextAskHours) or 0)<=hours then
+            base.overnightGuests[id]=nil
+        else count=count+1 end
+    end
+    local old=base.overnightGuests[survivorId]
+    if old~=nil or count>=8 then return nil end
+    local record={status="pending",untilHours=hours+2,nextAskHours=hours+24}
+    base.overnightGuests[survivorId]=record
+    return record
+end
+
+function KnoxPersistence.answerOvernightStay(baseId, playerId, survivorId, accepted, hours, dawnHours)
+    local base=KnoxPersistence.getBase(baseId)
+    local record=base~=nil and base.overnightGuests~=nil and base.overnightGuests[survivorId] or nil
+    hours=tonumber(hours) or 0
+    if type(accepted)~="boolean" or base==nil or base.ownerKind~="player" or base.ownerId~=playerId
+        or record==nil or record.status~="pending" or (tonumber(record.untilHours) or 0)<=hours
+        or KnoxPersistence.isSurvivorHostileToPlayer(survivorId,playerId)
+        or not KnoxPersistence.isSurvivorAlive(survivorId) then return false,"request_expired" end
+    record.status=accepted and "accepted" or "refused"
+    record.untilHours=accepted and math.min(hours+24,math.max(hours,tonumber(dawnHours) or hours)) or hours
+    local relation=KnoxPersistence.recordPlayerSocialAct(playerId,survivorId,
+        accepted and "overnight_welcome" or "overnight_refusal",accepted and 4 or -4,24,hours)
+    if not accepted and relation~=nil and (tonumber(relation.trust) or 30)<=10 then
+        KnoxPersistence.setSurvivorHostileToPlayer(survivorId,playerId,true)
+    end
+    return true,accepted and "overnight_accepted" or "overnight_refused"
+end
+
 function KnoxPersistence.getBaseAtSquare(x, y, z, ownerKind)
     x, y, z = tonumber(x), tonumber(y), tonumber(z) or 0
     if x == nil or y == nil then return nil end
@@ -7548,10 +8622,39 @@ function KnoxPersistence.canSetBaseTerritory(baseId, bounds, worldAgeHours)
     return normalizedBaseTerritory(baseId, bounds, worldAgeHours)
 end
 
+local function groupHomeClaimAdmission(groupId, home, worldAgeHours)
+    local group=root().travelGroups[groupId]
+    if group==nil or group.factionId~=nil or #(livingIds(root(),group.memberIds))<2
+        or home~=(group.baseSearch ~= nil and group.baseSearch.candidate or nil) then return false,"arrival_unverified" end
+    local creator=KnoxPersistence.getSurvivorCreatorRecord(group.leaderId)
+    local policy=creator ~= nil and creator.settlementPolicy or nil
+    if policy=="mobile" or policy=="independent" then return false,"mobile_group" end
+    local survivor=root().survivors[group.leaderId]
+    if survivor==nil or survivor.alive==false or survivor.eventManaged==true
+        or (survivor.affiliation or {}).kind~="independent" or (survivor.affiliation or {}).factionId~=nil
+        or (survivor.duty or {}).mode~="autonomous" or survivor.departure~=nil
+        or KnoxPersistence.getAwayTeamForSurvivor(group.leaderId)~=nil then return false,"leader_unavailable" end
+    local runtime=rawget(_G,"KnoxSurvivorRuntime")
+    local character=runtime ~= nil and runtime.getCharacter ~= nil and runtime.getCharacter(group.leaderId) or nil
+    local scouting=rawget(_G,"KnoxFactionBaseScouting")
+    if character==nil or scouting==nil or scouting.validateArrival==nil then return false,"home_unverified" end
+    return scouting.validateArrival(character,home,groupId,worldAgeHours)
+end
+
 function KnoxPersistence.createBase(ownerKind, ownerId, home, worldAgeHours, territoryBounds, allowMultiple)
-    if (ownerKind ~= "player" and ownerKind ~= "faction")
+    -- "group" is a base owner in the same registry, never a faction alias: the
+    -- branch below re-proves claim admission before any base exists.
+    if (ownerKind ~= "player" and ownerKind ~= "faction" and ownerKind ~= "group")
         or type(ownerId) ~= "string" or ownerId == "" then
         return nil, "invalid_owner"
+    end
+    if ownerKind == "group" then
+        local existing=KnoxPersistence.getBaseForOwner("group",ownerId)
+        if existing ~= nil then return existing,"existing" end
+        local valid,reason=groupHomeClaimAdmission(ownerId,home,worldAgeHours)
+        if not valid then return nil,reason end
+        if territoryBounds ~= nil then return nil,"group_home_territory_fixed" end
+        allowMultiple = false
     end
     local area = copyWorldArea(home)
     if area == nil or area.minX == nil or area.minY == nil
@@ -7605,6 +8708,39 @@ function KnoxPersistence.createBase(ownerKind, ownerId, home, worldAgeHours, ter
     }
     data.bases[id] = base
     return base, "created"
+end
+
+function KnoxPersistence.confirmGroupHomeBase(groupId, buildingId, character, worldAgeHours)
+    local group = root().travelGroups[groupId]
+    local existing = KnoxPersistence.getBaseForOwner("group",groupId)
+    if existing ~= nil then return existing,"existing" end
+    local candidate = group ~= nil and group.baseSearch ~= nil and group.baseSearch.candidate or nil
+    if group == nil or group.factionId ~= nil or #(livingIds(root(),group.memberIds)) < 2
+        or candidate == nil or candidate.buildingId ~= buildingId then return nil,"candidate_mismatch" end
+    local record = KnoxPersistence.getSurvivorCreatorRecord(group.leaderId)
+    local policy = record ~= nil and record.settlementPolicy or nil
+    if policy == "mobile" or policy == "independent" then return nil,"mobile_group" end
+    local runtime = rawget(_G,"KnoxSurvivorRuntime")
+    if runtime == nil or runtime.getCharacter == nil or runtime.getCharacter(group.leaderId) ~= character then
+        return nil,"leader_unavailable"
+    end
+    local survivor = root().survivors[group.leaderId]
+    if survivor == nil or survivor.alive == false or survivor.eventManaged == true
+        or (survivor.affiliation or {}).kind ~= "independent"
+        or (survivor.duty or {}).mode ~= "autonomous"
+        or KnoxPersistence.getAwayTeamForSurvivor(group.leaderId) ~= nil then return nil,"leader_unavailable" end
+    local scouting = rawget(_G,"KnoxFactionBaseScouting")
+    if scouting == nil or scouting.validateArrival == nil then return nil,"home_unverified" end
+    local valid, reason = scouting.validateArrival(character,candidate,groupId,worldAgeHours)
+    if valid ~= true then return nil,reason end
+    -- The validator checks current loaded geometry, standability, bases and
+    -- native SafeHouse conflicts again at this commit boundary.
+    local base,result=KnoxPersistence.createBase("group",groupId,candidate,worldAgeHours)
+    if base == nil then return nil,result end
+    group.baseSearch.candidate=nil
+    KnoxPersistence.clearSurvivorLifeIntent(group.leaderId)
+    KnoxPersistence.clearTravelGroupObjective(groupId,group.leaderId)
+    return base,result
 end
 
 -- An unshelvable settlement haul is an open problem the leader can see, not
@@ -7732,7 +8868,7 @@ end
 -- save made before the rename still carries that string. Translating it for
 -- display only means one yard never reads two ways.
 local LEGACY_ZONE_LABELS = {
-    log_processing = { ["Log Processing"] = "Log Yard" },
+    log_processing = { ["Log Processing"] = "Drop Point", ["Log Yard"] = "Drop Point" },
 }
 function KnoxPersistence.zoneDisplayLabel(zone, fallback)
     if type(zone) ~= "table" then return fallback end
@@ -7790,6 +8926,7 @@ function KnoxPersistence.addBaseZone(baseId, zoneType, bounds, label)
     end
     return zone, "created"
 end
+
 
 function KnoxPersistence.removeBaseZone(baseId, zoneId)
     local base = KnoxPersistence.getBase(baseId)
@@ -7997,10 +9134,15 @@ function KnoxPersistence.setBaseStoragePriority(baseId, key, priority)
     end
     local policy = base.storage ~= nil and base.storage[key] or nil
     if type(policy) ~= "table" then return false, "storage_missing" end
-    local normalized = KnoxPersistence.validStoragePriority(priority)
-    if normalized == nil then return false, "unknown_priority" end
-    policy.priority = normalized
-    return true, "saved"
+    -- One rule owner: the storage module validates and writes the fill order,
+    -- so a numeric order and the legacy named level cannot diverge here.
+    local storage = rawget(_G, "KnoxBaseStorage")
+    if storage == nil or storage.setStoragePriority == nil then
+        return false, "storage_missing"
+    end
+    local saved, result = storage.setStoragePriority(policy, priority)
+    if saved == nil then return false, result end
+    return true, result
 end
 
 function KnoxPersistence.baseTaskTargetSignature(target)
@@ -8109,6 +9251,10 @@ function KnoxPersistence.claimBaseTask(baseId, taskId, survivorId, worldAgeHours
     if survivor.duty == nil or survivor.duty.mode ~= "base"
         or survivor.duty.baseId ~= baseId or survivor.duty.eventId ~= nil then
         return nil, "not_base_resident"
+    end
+    if base ~= nil and base.ownerKind == "group"
+        and not KnoxPersistence.isGroupBaseMember(base,survivorId,true) then
+        return nil,"not_group_resident"
     end
     -- A resident owns one native task at a time.  This guard protects the
     -- persistent board from duplicate claims when controller refreshes or UI
@@ -8413,6 +9559,17 @@ function KnoxPersistence.captureActiveSurvivor(id)
     local saved = KnoxPersistence.setRecord(id, encoded)
     if not saved then return false, "record_store_failed" end
     local postFailures = {}
+    -- The bridge just captured a living body, so any older hibernated route is
+    -- no longer authoritative even if the optional needs snapshot fails. A
+    -- stale route otherwise relocates this fresh record during activation.
+    local priorState = KnoxPersistence.getUnloadedSurvivalState(id)
+    if priorState ~= nil then
+        priorState.status = "loaded"
+        priorState.pendingMaterialization = nil
+        if not KnoxPersistence.setUnloadedSurvivalState(id, priorState) then
+            postFailures[#postFailures + 1] = "loaded_state_store_failed"
+        end
+    end
     if saved and bridge.getNpcRecordInventorySummary ~= nil then
         local summaryOk, summary = pcall(bridge.getNpcRecordInventorySummary, bridge, encoded)
         if summaryOk and type(summary) == "string" then
@@ -8614,6 +9771,15 @@ function KnoxPersistence.setVehicleAssignment(record, worldAgeHours)
         end
     end
     local data = root()
+    local existing = data.vehicleAssignments[key]
+    -- A live autonomous claim is not silently transferred to a different
+    -- faction by an ordinary driver run. Legacy records remain transient.
+    if existing ~= nil and existing.claimSource == "autonomous"
+        and (record.ownerKind ~= existing.ownerKind or record.ownerId ~= existing.ownerId) then
+        return nil, "vehicle_claimed"
+    end
+    if record.claimSource == "autonomous" and existing ~= nil
+        and existing.claimSource ~= "autonomous" then return nil, "vehicle_assigned" end
     -- One survivor belongs to one vehicle. Re-setting the same vehicle is an
     -- update, not a conflict; every other record is checked.
     for otherKey, other in pairs(data.vehicleAssignments) do
@@ -8638,6 +9804,8 @@ function KnoxPersistence.setVehicleAssignment(record, worldAgeHours)
         passengerIds = passengers,
         role = record.role,
         createdAtHours = created ~= nil and created or (now or 0),
+        claimSource = (record.claimSource == "autonomous"
+            or existing ~= nil and existing.claimSource == "autonomous") and "autonomous" or nil,
     }
     data.vehicleAssignments[key] = normalized
     return normalized, "assigned"

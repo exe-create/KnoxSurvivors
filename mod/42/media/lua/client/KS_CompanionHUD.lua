@@ -59,7 +59,7 @@ local function initials(snapshot)
     local first = string.sub(tostring(snapshot.forename or ""), 1, 1)
     local last = string.sub(tostring(snapshot.surname or ""), 1, 1)
     local result = string.upper(first .. last)
-    return result ~= "" and result or "?"
+    return result ~= "" and result or "--"
 end
 
 local function screenBounds(playerNum)
@@ -228,7 +228,7 @@ function Panel:headline()
     if viewModel ~= nil and viewModel.partyHeadline ~= nil then
         return viewModel.partyHeadline(self.snapshots, false)
     end
-    return tostring(#(self.snapshots or {})) .. " · all clear"
+    return tostring(#(self.snapshots or {})) .. ", all clear"
 end
 
 function Panel:partyTone()
@@ -418,7 +418,7 @@ function Panel:drawBar(x, y, width, value, colour, label)
         self:drawRect(x, y, width, BAR_HEIGHT, 0.92, 0.10, 0.10, 0.10)
         self:drawRectBorder(x, y, width, BAR_HEIGHT, 0.70, 0.36, 0.36, 0.36)
         if label ~= nil then
-            self:drawTextCentre(label .. "?", x + width / 2, y - 3,
+            self:drawTextCentre(label .. " unknown", x + width / 2, y - 3,
                 0.58, 0.58, 0.56, 1, UIFont.Small)
         end
         return
@@ -556,7 +556,7 @@ function Panel:prerender()
 
         local status = tostring(snapshot.activity or "Unknown")
         if snapshot.distanceTiles ~= nil then
-            status = status .. " · " .. tostring(math.floor(snapshot.distanceTiles + 0.5)) .. " tiles"
+            status = status .. ", " .. tostring(math.floor(snapshot.distanceTiles + 0.5)) .. " tiles"
         end
         self:drawText(trimText(UIFont.Small, status, textWidth), textX,
             y + 8 + self.mediumFontHeight, 0.70, 0.68, 0.63, 1, UIFont.Small)
@@ -892,9 +892,9 @@ function BaseLine:prerender()
         parts[#parts + 1] = attention == 1 and "1 needs you"
             or (tostring(attention) .. " need you")
     else
-        parts[#parts + 1] = "all clear"
+        parts[#parts + 1] = model ~= nil and model.quietLabel or "no known issues"
     end
-    -- "4 home · 2 away" with a middle dot rendered as nothing on some fonts is
+    -- "4 home, 2 away" with a middle dot rendered as nothing on some fonts is
     -- the same defect the hour ranges had, so the strip uses the ASCII form.
     local summary = table.concat(parts, " - ")
     local nameWidth = getTextManager():MeasureStringX(UIFont.Small, name)

@@ -54,4 +54,11 @@ C.releaseThreat(reservations, groupZed, "a")
 C.releaseThreat(reservations, groupZed, "b")
 assert(reservations.threats[groupZed] == nil, "the last release drops the entry")
 
-print("Threat reservations PASS single=true pair=true triple=false idempotent=true release=true")
+local human = {}
+for n=1,8 do
+    assert(C.reserveThreat(reservations, human, "human-defender-" .. n,
+        C.threatAttackerLimit("group_target", true, false)), "all human defenders may engage")
+end
+assert(C.reserveThreat(reservations, groupZed, "self-defense",
+    C.threatAttackerLimit("active_target", false, true)), "personal defense cannot be vetoed by leases")
+print("Threat reservations PASS zombie_spread=true human_defenders=8 self_defense=true release=true")

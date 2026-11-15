@@ -229,7 +229,7 @@ function KnoxEvents.raidThreatText(warning, hours)
     if #parts == 0 and eta == nil then return nil end
     local body = table.concat(parts, ", ")
     if eta ~= nil then body = body .. (body ~= "" and "; " or "") .. eta end
-    return "Raid on your home — " .. body
+    return "Raid on your home - " .. body
 end
 
 -- How the home's own watch lines up with an inbound raid. The counts come from

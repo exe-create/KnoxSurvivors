@@ -1,0 +1,23 @@
+local Creator = assert(rawget(_G, "KnoxCreator"), "creator missing")
+assert(Creator.decodeTraits(nil) == nil, "legacy traits remain automatic")
+assert(#Creator.decodeTraits("") == 0, "authored empty traits remain explicit")
+assert(Creator.encodeTraits({"base:z", "base:a", "base:z"}) == "base:a;base:z", "traits are stable and unique")
+local roster = {{name="Nora Baker", look="casual", kit="none", weaponId="none", profession="base:unemployed", pack="none", traits={}, skills={Aiming=0}}}
+local encoded = Creator.encode(roster, {name="", faction=1})
+local read = Creator.decode(encoded)
+assert(read[1] and read[1].traits and #read[1].traits == 0, "empty authored trait selection survives")
+assert(read[1].skills.Aiming == 0, "an explicitly chosen zero skill survives")
+local legacy = Creator.decode(encoded:gsub("|traits=", ""))
+assert(legacy[1] and legacy[1].traits == nil, "old record keeps automatic trait selection")
+local withUnknown = Creator.decode(encoded:gsub("|traits=", "|future=keep|traits="))
+local again = Creator.encode(withUnknown, {name="", faction=1})
+assert(again:find("future=keep", 1, true), "unknown optional fields survive")
+local P=assert(KnoxPersistence)
+local record=Creator.recordFor(read[1],Creator.newGroup())
+assert(P.setSurvivorCreatorRecord("trait-codec-person",record))
+local stored=P.getSurvivorCreatorRecord("trait-codec-person")
+assert(stored.profession=="base:unemployed" and stored.traits=="" and stored.skills:find("Aiming=0",1,true),
+    "world record retains profession, explicitly empty traits and zero skills")
+record.traits="base:a;base:z"
+assert(P.setSurvivorCreatorRecord("trait-codec-person",record))
+assert(P.getSurvivorCreatorRecord("trait-codec-person").traits==record.traits, "authored world traits survive readback")

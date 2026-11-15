@@ -7,13 +7,19 @@ access to this repository does not grant permission to use, copy, modify, adapt,
 redistribute, repackage, sell, upload, or create derivative works from any part of Knox
 Survivors.
 
-You must receive prior written permission from .exe before doing any of those
-things. Permission given to one person or for one purpose does not apply to anyone else
-or to any other use.
+Official release downloads published by .exe under this repository's GitHub
+Releases may be downloaded, copied onto your own devices and run for personal
+gameplay and testing. This permission applies to those release builds only. It
+does not permit redistribution, reuploading, modification, sale, derivative
+works or use of the project's code or assets in another project.
 
-People personally authorized as testers may download and run the project only for the
-agreed testing purpose and may send test results, logs, screenshots, and feedback back
-to the project owner. Test permission does not include redistribution, modification,
+For uses beyond that limited release permission, you must receive prior written
+permission from .exe. Other permission given to one person or for one purpose
+does not apply to anyone else or to any other use.
+
+People separately authorized as source testers may download and run the source
+project for the agreed testing purpose and may send test results, logs,
+screenshots and feedback to the project owner. That test permission does not include redistribution, modification,
 reuploading, publishing builds, or using the work in another project.
 
 The limited rights GitHub requires to host and display a public repository are not a

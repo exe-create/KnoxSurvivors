@@ -1,3 +1,4 @@
+local KS_SafeCall = require "KS_SafeCall"
 require "Farming/TimedActions/ISWaterPlantAction"
 require "Farming/TimedActions/ISHarvestPlantAction"
 require "Farming/TimedActions/ISPlowAction"
@@ -31,12 +32,8 @@ local function plantAt(square)
 end
 
 local function safeCall(object, method, ...)
-    if object == nil or object[method] == nil then
-        return nil
-    end
-    local success, value = pcall(object[method], object, ...)
-    if success then return value end
-    return nil
+    local value = KS_SafeCall.invoke(object, method, ...)
+    return value
 end
 
 local function walkItems(container, visitor)
@@ -152,6 +149,76 @@ local function seedItem(character, desiredItemType, desiredCrop)
         end
     end)
     return found, foundType
+end
+
+-- The area's crop plan is the player's decision and rides the existing zone
+-- record as a fresh key (owner thought, 2026-11-06): survivors own the labour,
+-- not what grows. One owner reads and writes it, so no second registry.
+function Farming.zoneCrops(zone)
+    if type(zone) ~= "table" or zone.type ~= "farming" then return {} end
+    if type(zone.crops) ~= "table" then return {} end
+    local crops = {}
+    for _, crop in ipairs(zone.crops) do
+        if type(crop) == "string" and crop ~= "" then crops[#crops + 1] = crop end
+    end
+    table.sort(crops)
+    return crops
+end
+
+function Farming.setZoneCrops(zone, crops)
+    if type(zone) ~= "table" then return nil, "unknown_zone" end
+    if zone.type ~= "farming" then return nil, "not_a_farm" end
+    if type(crops) ~= "table" then return nil, "invalid_plan" end
+    local planned = {}
+    for _, crop in ipairs(crops) do
+        if type(crop) ~= "string" or crop == "" then return nil, "invalid_crop" end
+        planned[#planned + 1] = crop
+    end
+    table.sort(planned)
+    zone.crops = planned
+    return planned, "updated"
+end
+
+-- Seed for the crops this area may grow, in a deterministic order. A plan with
+-- no usable seed plants nothing: substituting another crop would invent a
+-- decision the player did not make.
+local function seedForZone(character, base, crops)
+    if type(crops) ~= "table" or #crops == 0 then return nil, nil end
+    local storage = rawget(_G, "KnoxBaseStorage")
+    for _, crop in ipairs(crops) do
+        local found, foundType = seedItem(character, nil, crop)
+        if found == nil and storage ~= nil and storage.findItemType ~= nil then
+            local _, stored = storage.findItemType(base, function(item)
+                return usableSeed(item) and ItemTag ~= nil
+                    and itemHasTag(item, ItemTag.IS_SEED)
+                    and seedTypeForItem(item) == crop
+            end)
+            found, foundType = stored, seedTypeForItem(stored)
+        end
+        -- The item's own crop, never the planned name: a seed that does not match
+        -- the plan is refused below instead of being relabelled.
+        if found ~= nil then return found, foundType or crop end
+    end
+    return nil, nil
+end
+
+-- One usable seed stays behind while the area still has another plowed square
+-- waiting, so a planned field never eats the seed it needs to replant itself.
+local SEED_RESERVE_PER_AREA = 1
+
+local function usableSeedCount(character, crop)
+    if character == nil or crop == nil or ItemTag == nil or ItemTag.IS_SEED == nil
+        or character.getInventory == nil then
+        return 0
+    end
+    local count = 0
+    walkItems(character:getInventory(), function(item)
+        if usableSeed(item) and itemHasTag(item, ItemTag.IS_SEED)
+            and seedTypeForItem(item) == crop then
+            count = count + 1
+        end
+    end)
+    return count
 end
 
 local function canDig(square)
@@ -291,19 +358,11 @@ function Farming.findTask(base, character, eligible)
         return nil, "base_or_cell_unavailable"
     end
     local water, waterUses = wateringItem(character)
-    local seed, seedType = seedItem(character)
     local plowTool = plowItem(character)
     -- Discovery may use real cupboard supplies; execution still requires
     -- the job supply planner to transfer them into the worker's inventory.
     local storage = rawget(_G, "KnoxBaseStorage")
     if storage ~= nil and storage.findItemType ~= nil then
-        if seed == nil then
-            local _, storedSeed = storage.findItemType(base, function(item)
-                return usableSeed(item) and ItemTag ~= nil
-                    and itemHasTag(item, ItemTag.IS_SEED) and seedTypeForItem(item) ~= nil
-            end)
-            seed, seedType = storedSeed, seedTypeForItem(storedSeed)
-        end
         if plowTool == nil then
             local _, storedTool = storage.findItemType(base, function(item)
                 return itemUsable(item) and ItemTag ~= nil
@@ -328,6 +387,23 @@ function Farming.findTask(base, character, eligible)
     -- four separate scans and prevents an early zone's new plots hiding harvests.
     for _, zone in ipairs(orderedZones(base)) do
         local minX, minY, maxX, maxY, z = zoneBounds(zone)
+        local plan = Farming.zoneCrops(zone)
+        local seed, seedType = seedForZone(character, base, plan)
+        if seed ~= nil then
+            local plowed = 0
+            for scanX = minX, maxX do
+                for scanY = minY, maxY do
+                    local scanned = cell:getGridSquare(scanX, scanY, z)
+                    local plant = scanned ~= nil and plantAt(scanned) or nil
+                    if plant ~= nil and tostring(plant.state or "") == "plow" then
+                        plowed = plowed + 1
+                    end
+                end
+            end
+            if plowed > 1 and usableSeedCount(character, seedType) <= SEED_RESERVE_PER_AREA then
+                seed, seedType = nil, nil
+            end
+        end
         for x = minX, maxX do
             for y = minY, maxY do
                 local square = cell:getGridSquare(x, y, z)

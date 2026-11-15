@@ -3,11 +3,13 @@
 -- and the spawn hand-over read the same tables, so the fixture reads them too.
 local Creator = assert(rawget(_G, "KnoxCreator"), "the creator model is loaded")
 
-local IDS = { "head", "torso", "legs", "feet", "backpack", "primary", "secondary" }
+local IDS = { "head", "torso", "legs", "feet", "backpack", "primary", "secondary", "vest", "undershirt", "gloves", "mask", "belt", "holster", "eyes", "socks", "neck" }
 local KINDS = { head = "clothing", torso = "clothing", legs = "clothing",
-    feet = "clothing", backpack = "bag", primary = "weapon", secondary = "weapon" }
+    feet = "clothing", backpack = "bag", primary = "weapon", secondary = "weapon",
+    vest = "clothing", undershirt = "clothing", gloves = "clothing", mask = "clothing",
+    belt="clothing", holster="clothing", eyes="clothing", socks="clothing", neck="clothing" }
 
-assert(#Creator.SLOTS == 7, "seven slots: " .. tostring(#Creator.SLOTS))
+assert(#Creator.SLOTS == 16, "sixteen named clothing and carry cells: " .. tostring(#Creator.SLOTS))
 for _, slot in ipairs(Creator.SLOTS) do
     assert(KINDS[slot.id] ~= nil, "known slot id: " .. tostring(slot.id))
     assert(slot.kind == KINDS[slot.id], "kind is as stated: " .. slot.id)
@@ -51,7 +53,7 @@ for _, slotId in ipairs({ "primary", "secondary" }) do
 end
 
 -- A full set of choices survives the roster's own encoding, and a choice that is
--- not in that slot's catalogue is dropped rather than written.
+-- missing from this session's catalogue is preserved rather than erased.
 local slots = {
     head = "Base.Hat_Police",
     torso = "Base.Shirt_Workman",
@@ -67,10 +69,12 @@ for slotId, fullType in pairs(slots) do
 end
 assert(decoded.primary == "Base.Crowbar" and decoded.secondary == "Base.BaseballBat",
     "both carried weapons are written")
-assert(Creator.decodeSlots("torso:Base.NotAThing")["torso"] == nil,
-    "an item the catalogue does not offer is dropped")
-assert(Creator.decodeSlots("wing:Base.Hat_Police")["wing"] == nil,
-    "an unknown slot is dropped")
+assert(Creator.decodeSlots("torso:Base.NotAThing")["torso"] == "Base.NotAThing",
+    "a temporarily missing item survives without being offered for wear")
+assert(Creator.decodeSlots("wing:Base.Hat_Police")["wing"] == "Base.Hat_Police",
+    "a future slot survives a version round trip")
+assert(Creator.slotOption("torso", "Base.NotAThing") == nil,
+    "preserving data does not claim an unavailable item exists")
 
 -- The outfit merge swaps clothing only. A bag is worn by its own call and a
 -- weapon is carried, so neither may be handed to the dressing path.

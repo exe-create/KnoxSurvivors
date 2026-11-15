@@ -1,3 +1,4 @@
+local KS_SafeCall = require "KS_SafeCall"
 require "TimedActions/ISGrabCorpseAction"
 require "TimedActions/ISDropCorpseAction"
 require "TimedActions/ISUnequipAction"
@@ -11,11 +12,8 @@ local GRAB_SETTLE_TICKS = 180
 local GRAB_RETRY_SETTLE_TICKS = 180
 
 local function safeCall(object, method, ...)
-    if object == nil or object[method] == nil then
-        return nil
-    end
-    local success, value = pcall(object[method], object, ...)
-    return success and value or nil
+    local value = KS_SafeCall.invoke(object, method, ...)
+    return value or nil
 end
 
 local function zoneBounds(zone)
@@ -417,6 +415,13 @@ local function bodyAtSquare(square, objectIndex, corpseItemId)
     return nil
 end
 
+function CorpseHandling.readTaggedSurvivorId(body)
+    if body == nil then return nil end
+    local ok, value = pcall(function() return body:getModData().KnoxSurvivorsCorpseSurvivorId end)
+    if not ok or type(value) ~= "string" or value:match("^%s*$") then return nil end
+    return value
+end
+
 function CorpseHandling.resolveTarget(base, target, character)
     local cell = getCell ~= nil and getCell() or nil
     if base == nil or target == nil or cell == nil then
@@ -451,6 +456,7 @@ function CorpseHandling.resolveTarget(base, target, character)
     end
     return {
         body = body,
+        survivorId = CorpseHandling.readTaggedSurvivorId(body),
         corpseSquare = corpseSquare,
         approach = approach,
         dropSquare = dropSquare,

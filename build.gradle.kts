@@ -3,7 +3,7 @@ import java.util.Properties
 
 plugins { base }
 group = "com.knoxsurvivors"
-version = "0.3.0-rc1"
+version = "0.3.0-rc2"
 
 val localProperties = Properties().apply {
     val config = file("local.properties")
@@ -80,16 +80,22 @@ val stageUnifiedMod by tasks.registering(Sync::class) {
     } else {
         from(unifiedJar) { rename { "knox-survivors.jar" }; into("42/media/java") }
     }
-    from(checksum) { into("42/media/java") }
+    // checksum sidecar not shipped; stays in build dir only (owner 2026-11-10: no dev artifacts in payload)
 }
 tasks.register<Zip>("packageUnifiedMod") {
     group = "distribution"
     dependsOn(stageUnifiedMod)
     archiveFileName.set("KnoxSurvivors-${project.version}.zip")
     destinationDirectory.set(layout.buildDirectory.dir("distribution/archives"))
-    from(layout.buildDirectory.dir("distribution")) {
-        include("KnoxSurvivors/**")
+    from(layout.buildDirectory.dir("distribution/KnoxSurvivors")) {
+        into("mods/KnoxSurvivors")
     }
+    from("release/README.txt") {
+        expand("version" to project.version) { escapeBackslash = true }
+    }
+    includeEmptyDirs = false
+    isPreserveFileTimestamps = false
+    isReproducibleFileOrder = true
 }
 // Staging into the owner's normal paths is a separate, explicitly authorized operation.
 fun requireInstalledStagingApproval() {
@@ -128,7 +134,7 @@ tasks.register("deployDev") {
 fun writeWorkshopMetadata(root: File) {
     root.mkdirs()
     val description = file("workshop/description.bbcode").readLines(Charsets.UTF_8)
-    val metadata = listOf("version=1", "id=3749727604", "title=[42.21 TEST] Knox Survivors - Survivor NPC Rebuild") +
+    val metadata = listOf("version=1", "id=3749727604", "title=[42.22] Knox Survivors") +
         description.map { "description=$it" } + listOf("tags=Build 42", "visibility=public")
     root.resolve("workshop.txt").writeText(metadata.joinToString("\n", postfix = "\n"))
     file("mod/poster.png").copyTo(root.resolve("preview.png"), overwrite = true)

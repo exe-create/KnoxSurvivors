@@ -259,11 +259,6 @@ local function usable(object)
     return false
 end
 
-local function applianceType(object)
-    if call(object, "isMicrowave", false) then return "microwave" end
-    return "stove"
-end
-
 local function markedItem(object,base)
     local mark=object:getModData().KnoxCooking
     if type(mark)~="table" or mark.baseId~=base.id then return nil end
@@ -485,8 +480,16 @@ end
 local function move(plan,square,character,bridge,ticks,phase)
     local approach=AdjacentFreeTileFinder.Find(square,character)
     if approach==nil then return "failed","kitchen_unreachable" end
+    local started=plan.moveStarted
     local result=tostring(bridge:moveNpc(plan.id,approach))
-    if result:find("MOVE_STARTED",1,true)~=1 then return "failed","kitchen_route:"..result end
+    if result:find("MOVE_STARTED",1,true)~=1 then
+        -- A route the movement owner refuses is retried by the phase that
+        -- asked for it, inside the leg's existing deadline, instead of
+        -- cancelling the whole cook order on the first obstacle.
+        plan.moveStarted=started or ticks
+        if ticks-plan.moveStarted>1800 then return "failed","kitchen_route:"..result end
+        return "working"
+    end
     plan.phase,plan.afterMove,plan.moveStarted="move",phase,ticks
     return "working"
 end
@@ -509,7 +512,14 @@ function Cooking.step(plan,character,base,bridge,ticks)
     if plan.phase=="move" then
         local result=tostring(bridge:tickNpc(plan.id))
         if result=="Succeeded" then plan.phase=plan.afterMove
-        elseif result:find("Failed",1,true) or ticks-plan.moveStarted>1800 then return "failed","kitchen_route:"..result end
+        elseif ticks-(plan.moveStarted or ticks)>1800 then return "failed","kitchen_route:"..result
+        elseif result:find("Failed",1,true) then
+            -- The movement owner has already cooled the failed edge down and
+            -- recorded it. Hand the leg back to its phase so the same approach
+            -- is re-issued; only the deadline above ends a trip that cannot
+            -- reach the store.
+            plan.phase=plan.afterMove
+        end
         return "working"
     end
     local queue=ISTimedActionQueue.getTimedActionQueue(character)

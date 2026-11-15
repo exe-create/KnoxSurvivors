@@ -31,8 +31,11 @@ assert(C.withdrawalDue({ members = "3", dead = 0, healthFraction = "0.2" }) == t
 -- The order record carries the directive, and it expires.
 local a = assert(P.allocateWorldSurvivor({ x = 31, y = 41, z = 0, key = "wd-a", region = "WD" }, 10))
 local b = assert(P.allocateWorldSurvivor({ x = 32, y = 41, z = 0, key = "wd-b", region = "WD" }, 10))
+-- Production chooses the sorted ID, which need not be allocation order when
+-- the shared harness crosses a decimal serial boundary (e.g. 99 -> 100).
+if b < a then a, b = b, a end
 local group = assert(P.createTravelGroup({ a, b }, 10))
-assert(group.leaderId == a, "the first member leads")
+assert(group.leaderId == a, "the first sorted member leads")
 
 local order, detail = P.issueTravelGroupLeaderOrder(group.id, a, "withdraw", 12, 12.5)
 assert(order ~= nil and detail == "issued", "a leader can order a withdrawal")
